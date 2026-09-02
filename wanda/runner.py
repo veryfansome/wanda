@@ -5,12 +5,14 @@ import json
 import logging
 import os
 import signal
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
 log = logging.getLogger(__name__)
 
 KILL_GRACE_S = 10
+MIN_BILLABLE_S = 10  # below this, a failed run bought no tokens
 
 
 @dataclass
@@ -88,6 +90,7 @@ class RunnerService:
 
         # start_new_session so a timeout can kill the whole process group —
         # claude spawns children for shell tools that would otherwise orphan.
+        t0 = time.monotonic()
         proc = await asyncio.create_subprocess_exec(
             *argv,
             stdin=asyncio.subprocess.PIPE,  # prompt goes via stdin: no ARG_MAX/quoting limits
@@ -117,7 +120,11 @@ class RunnerService:
 
         rr = self._parse(proc.returncode, stdout, stderr)
         if rr.envelope is None:
-            rr.cost_usd = max_budget_usd
+            # No envelope means the true cost is unknown, so charge the ceiling
+            # — unless it exited too fast to have bought anything (a bad flag,
+            # a missing binary), where billing $2 a time would trip the daily
+            # breaker after a few failures.
+            rr.cost_usd = max_budget_usd if time.monotonic() - t0 > MIN_BILLABLE_S else 0.0
         return rr
 
     @staticmethod

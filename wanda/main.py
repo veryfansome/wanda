@@ -48,6 +48,7 @@ log = logging.getLogger("wanda")
 PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 SKILLS_DIR = Path(__file__).resolve().parent.parent / "skills"
 MAX_APPLY_ATTEMPTS = 8
+MAX_DELIVERY_ATTEMPTS = 8
 RETRY_BASE_S = 60          # backoff 1, 2, 4, 8, 16, 30, 30, 30 minutes
 RETRY_MAX_S = 1800
 DEFER_S = 900  # how long a rate-capped trash waits before the cap is re-tested
@@ -128,9 +129,11 @@ def conversation_seed_prompt(p: dict, transcript: str, asker: str) -> str:
         f"{HOW_TO_REPLY}\n"
         "Recent conversation, oldest first:\n"
         "<transcript>\n"
-        f"{transcript}\n"
+        # Escaped like the email seed: anyone in the workspace can write these
+        # lines, and an unescaped </transcript> would forge harness framing.
+        f"{sanitize(transcript)}\n"
         "</transcript>\n\n"
-        f"The message addressed to you, from {asker}:\n{p['text']}"
+        f"The message addressed to you, from {sanitize(asker)}:\n{sanitize(p['text'])}"
     )
 
 
@@ -505,7 +508,15 @@ class Processor:
             try:
                 await self.slack.reply(run["reply_thread"], text, channel=run["slack_channel"])
             except Exception:
-                log.warning("could not deliver run %s yet; will retry", run["id"])
+                attempts = self.store.bump_delivery_attempt(run["id"])
+                if attempts >= MAX_DELIVERY_ATTEMPTS:
+                    log.exception("giving up delivering run %s to %s after %d attempts",
+                                  run["id"], run["slack_channel"], attempts)
+                    self.store.mark_run_notified(run["id"])  # stop blocking the queue
+                    self.store.set_meta("abandoned_alert_pending", "1")
+                else:
+                    log.warning("could not deliver run %s yet (attempt %d); will retry",
+                                run["id"], attempts)
                 continue
             self.store.mark_run_notified(run["id"])
 
@@ -611,6 +622,14 @@ class Processor:
                     # were bought. Charge the expected cost — billing the
                     # ceiling would let two restarts trip the daily breaker.
                     elapsed = max(0.0, time.monotonic() - t0)
+                    # If it already answered before being cancelled, the owner
+                    # needs no "restarted, reply again" notice.
+                    answered = self._answered_here(posted, channel, p.get("reply_thread"))
+                    posted.unlink(missing_ok=True)
+                    if rr_session := (task["claude_session_id"] or sid):
+                        # Keep the session so the next reply resumes rather than
+                        # re-seeding with no memory of what was already said.
+                        self.store.set_task_session(task["id"], rr_session)
                     self.store.record_run(
                         kind="agent", task_id=task["id"], session_id=sid, started_at=started,
                         exit_code=None,
@@ -618,7 +637,8 @@ class Processor:
                             self.cfg.agent_max_budget_usd,
                             self.cfg.agent_expected_usd * max(1.0, elapsed / 60),
                         ),
-                        status="cancelled", error="daemon shut down mid-run", notified=0,
+                        status="cancelled", error="daemon shut down mid-run",
+                        notified=1 if answered else 0,
                     )
                     state["recorded"] = True
                     raise
@@ -630,6 +650,14 @@ class Processor:
             # hit its timeout has still answered.
             self_posted = self._answered_here(posted, channel, p.get("reply_thread"))
             posted.unlink(missing_ok=True)
+            if self_posted and not rr.ok:
+                # It said something, then died. Don't repeat its answer, but
+                # don't pretend the run succeeded either — the message it
+                # posted may be a holding note or half an answer.
+                text = ("⚠️ that run ended early "
+                        f"({'timed out' if rr.timed_out else 'failed'}) — ask again if the "
+                        "message above looks incomplete.")
+                self_posted = False
             run_id = self.store.record_run(
                 kind="agent", task_id=task["id"], session_id=rr.session_id or sid, started_at=started,
                 exit_code=rr.exit_code, cost_usd=rr.cost_usd,

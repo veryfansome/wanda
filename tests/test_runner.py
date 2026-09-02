@@ -64,10 +64,12 @@ def test_timeout_charges_pessimistic_cost(tmp_path):
     assert rr.timed_out and rr.cost_usd == 0.25
 
 
-def test_unparseable_envelope_charges_pessimistic_cost(tmp_path):
+def test_fast_unparseable_failure_is_not_billed(tmp_path):
+    """A run that dies immediately (bad flag, missing binary) bought no tokens.
+    Billing it the ceiling tripped the daily breaker after a few failures."""
     fake = make_fake_claude(tmp_path, "cat > /dev/null\necho 'not json'")
     rr = run(RunnerService(fake).run("x", model="m", max_budget_usd=0.25, timeout_s=10))
-    assert not rr.ok and rr.cost_usd == 0.25
+    assert not rr.ok and rr.cost_usd == 0.0
 
 
 def test_cancellation_kills_the_process_group(tmp_path):

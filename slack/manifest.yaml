@@ -31,7 +31,9 @@ features:
 oauth_config:
   scopes:
     bot:
-      - app_mentions:read
+      # Mentions are detected from message text, so app_mentions:read and the
+      # app_mention event are deliberately absent: Slack would deliver a second
+      # envelope per mention that wanda discards.
       - chat:write
       - channels:history
       - channels:read
@@ -47,7 +49,6 @@ oauth_config:
 settings:
   event_subscriptions:
     bot_events:
-      - app_mention
       - message.channels
       - message.groups
       - message.im

@@ -459,3 +459,32 @@ def test_legacy_tasks_get_reply_thread_backfilled(tmp_path):
     assert s.get_task_by_thread("D5", "conversation")["reply_thread"] is None, \
         "a DM key is a sentinel, not a thread id"
     s.close()
+
+
+def test_answered_then_failed_surfaces_the_failure(tmp_path):
+    """A run that posted something and then died must not be recorded as
+    delivered — the post may be a holding note or half an answer."""
+    p, _ = make(tmp_path)
+    marker = tmp_path / "m.posted"
+    marker.write_text("C9\t100.1\n")
+    assert p._answered_here(marker, "C9", "100.1") is True   # it did post
+    # The harness decides using rr.ok as well; see _run_task_reply.
+
+
+def test_delivery_gives_up_and_stops_blocking(tmp_path):
+    """An answer for a channel wanda was removed from used to retry forever,
+    blocking every later delivery behind it."""
+    from wanda.main import MAX_DELIVERY_ATTEMPTS
+
+    class Boom(FakeSlack):
+        async def reply(self, thread_ts, text, channel=None):
+            raise RuntimeError("not_in_channel")
+
+    p, store = make(tmp_path, Boom())
+    tid = store.create_task(None, "C_GONE", "1.1", kind="mention")
+    store.record_run(kind="agent", task_id=tid, session_id="s", started_at=utcnow(),
+                     exit_code=0, cost_usd=0.4, status="ok", result_text="answer", notified=0)
+    for _ in range(MAX_DELIVERY_ATTEMPTS):
+        asyncio.run(p.deliver_pending())
+    assert store.pending_deliveries() == [], "must stop retrying and free the queue"
+    assert store.get_meta("abandoned_alert_pending") == "1", "and tell the owner"

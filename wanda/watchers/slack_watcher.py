@@ -11,6 +11,7 @@ from slack_sdk.socket_mode.response import SocketModeResponse
 from wanda.config import Config
 from wanda.events import Event
 from wanda.store import Store
+from wanda.transcript import MENTION_RE
 from wanda.tls import ssl_context
 
 log = logging.getLogger(__name__)
@@ -23,14 +24,18 @@ DM_TASK_KEY = "conversation"
 
 class SlackWatcher:
     """Socket Mode listener. Acks every envelope immediately (Slack retries
-    past ~3s), then classifies it into one of three triggers:
+    past ~3s), then classifies it into one of four triggers:
 
-      mention — @wanda in a channel, at top level or inside a thread
-      dm      — any message in a DM or group DM
-      task    — a reply in a thread wanda already owns (e.g. an email task)
+      dm            — any message in a DM or group DM; no mention needed
+      task          — a message in a thread wanda owns (e.g. an email task)
+      mention       — @wanda rooting its own thread in a channel
+      mention_guest — @wanda inside a thread wanda does not own; it answers,
+                      but later un-mentioned replies there are left alone
 
-    Channel mentions arrive twice (as app_mention and as message.channels), so
-    only app_mention is taken for channels and plain messages are used for DMs.
+    Only `message` events are handled. Slack also sends `app_mention` for the
+    same text, but acting on both ran the agent twice, and only the message
+    event reliably carries channel_type — so app_mention is acked and dropped,
+    and a mention is detected from the message text.
     """
 
     def __init__(self, cfg: Config, store: Store, loop: asyncio.AbstractEventLoop, queue: asyncio.Queue):
@@ -80,22 +85,26 @@ class SlackWatcher:
         thread_ts = event.get("thread_ts")
         ts = event.get("ts")
 
-        mentioned = bool(self.bot_user_id) and f"<@{self.bot_user_id}>" in (event.get("text") or "")
+        # Parsed, not substring-matched, so the labelled form <@U123|name>
+        # counts too — transcript.render already treats it as a mention.
+        mentioned = bool(self.bot_user_id) and self.bot_user_id in MENTION_RE.findall(
+            event.get("text") or ""
+        )
+        existing = self.store.get_task_by_thread(channel, thread_ts) if thread_ts else None
         if channel_type in DM_TYPES:
             kind = "dm"  # a DM needs no mention
+        elif existing and existing["kind"] != "mention_guest":
+            # A thread wanda owns: follow-ups count whether or not they mention
+            # it, and a mention here must not open a competing guest task.
+            kind = "task"
         elif mentioned:
             # A mention rooting its own thread makes that thread wanda's; a
             # mention inside someone else's thread does not.
             kind = "mention" if not thread_ts else "mention_guest"
-        elif thread_ts and (task := self.store.get_task_by_thread(channel, thread_ts)):
-            # Follow-ups without a mention are only for threads wanda owns —
-            # otherwise one @wanda would make it answer a human conversation
-            # forever.
-            if task["kind"] == "mention_guest":
-                return
-            kind = "task"
         else:
-            return  # ordinary channel chatter wanda was not addressed in
+            # Ordinary chatter, including plain replies in a guest thread —
+            # otherwise one @wanda would capture a human conversation forever.
+            return
 
         if not self._allowed(user):
             log.warning("ignoring %s from non-allowed user %s", kind, user)

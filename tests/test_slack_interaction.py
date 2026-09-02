@@ -228,3 +228,28 @@ def test_same_thread_reuses_one_task(store):
 def test_trim_thread_keeps_parent_and_newest(limit, expected):
     msgs = [{"id": f"m{i}"} for i in range(6)]
     assert [m["id"] for m in trim_thread(msgs, limit)] == expected
+
+
+def test_labelled_mention_form_is_detected(store):
+    """<@U123|name> is a real Slack form; the repo's own parser accepts it, so
+    the trigger path must too or the person gets no reply at all."""
+    ev = fire(store, {"type": "message", "user": "U1", "channel": "C9", "channel_type": "channel",
+                      "ts": "9.9", "text": "<@UBOT|wanda> hi"})
+    assert ev is not None and ev.payload["kind"] == "mention"
+
+
+def test_mention_in_wandas_own_thread_stays_a_task(store):
+    """A mention inside a thread wanda owns must resume that task, not open a
+    competing guest task keyed to the same thread."""
+    store.create_task(None, "C_TRIAGE", "77.1", kind="email")
+    ev = fire(store, {"type": "message", "user": "U1", "channel": "C_TRIAGE",
+                      "channel_type": "channel", "ts": "77.9", "thread_ts": "77.1",
+                      "text": "<@UBOT> handle this"})
+    assert ev.payload["kind"] == "task"
+
+
+def test_owned_thread_replies_work_without_a_mention(store):
+    store.create_task(None, "C9", "100.1", kind="mention")
+    ev = fire(store, {"type": "message", "user": "U1", "channel": "C9", "channel_type": "channel",
+                      "ts": "100.5", "thread_ts": "100.1", "text": "and the other one?"})
+    assert ev is not None and ev.payload["kind"] == "task"

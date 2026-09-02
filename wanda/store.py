@@ -98,6 +98,7 @@ MIGRATIONS = (
     # Where replies are posted. Distinct from thread_ts, which is the task KEY
     # and for a DM holds a sentinel that is not a Slack timestamp.
     ("tasks", "reply_thread", "TEXT"),
+    ("runs", "deliver_attempts", "INTEGER NOT NULL DEFAULT 0"),
 )
 
 
@@ -127,14 +128,7 @@ class Store:
             existing = {r["name"] for r in self._db.execute(f"PRAGMA table_info({table})")}
             if column not in existing:
                 self._db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
-                if (table, column) == ("tasks", "reply_thread"):
-                    # Pre-existing tasks replied in their own thread; a bare
-                    # ADD COLUMN would leave NULL and post them at channel top
-                    # level. DM rows keep NULL — their key is a sentinel.
-                    self._db.execute(
-                        "UPDATE tasks SET reply_thread = thread_ts "
-                        "WHERE reply_thread IS NULL AND kind <> 'dm'"
-                    )
+
         # Repair databases migrated by the build that backfilled notified=0,
         # which would replay every historical answer into Slack on startup.
         marked = self._db.execute(
@@ -143,6 +137,18 @@ class Store:
         if not marked:
             self._db.execute("UPDATE runs SET notified=1")
             self._db.execute("INSERT INTO meta(key, value) VALUES('notified_backfilled','1')")
+        # Pre-existing tasks reply in their own thread; without this they post
+        # at channel top level. Meta-guarded rather than tied to the ADD COLUMN,
+        # because an earlier build already added the column full of NULLs.
+        # DM rows keep NULL — their key is a sentinel, not a thread id.
+        if not self._db.execute(
+            "SELECT value FROM meta WHERE key='reply_thread_backfilled'"
+        ).fetchone():
+            self._db.execute(
+                "UPDATE tasks SET reply_thread = thread_ts "
+                "WHERE reply_thread IS NULL AND kind <> 'dm'"
+            )
+            self._db.execute("INSERT INTO meta(key, value) VALUES('reply_thread_backfilled','1')")
 
     def _relax_task_message_fk(self) -> None:
         """A task used to require an email row. Mention- and DM-driven tasks
@@ -416,6 +422,19 @@ class Store:
 
     def mark_run_notified(self, run_id: int) -> None:
         self._exec("UPDATE runs SET notified=1 WHERE id=?", (run_id,))
+
+    def bump_delivery_attempt(self, run_id: int) -> int:
+        """Delivery cannot retry forever: an answer for a channel wanda was
+        removed from would block every later delivery behind it."""
+        with self._lock:
+            self._db.execute(
+                "UPDATE runs SET deliver_attempts = deliver_attempts + 1 WHERE id=?", (run_id,)
+            )
+            row = self._db.execute(
+                "SELECT deliver_attempts FROM runs WHERE id=?", (run_id,)
+            ).fetchone()
+            self._db.commit()
+        return row["deliver_attempts"] if row else 0
 
     def runs_today(self) -> tuple[int, float]:
         midnight_utc = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
