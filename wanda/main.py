@@ -242,7 +242,7 @@ class Processor:
                     with self._reserve(self.cfg.triage_expected_usd):
                         rr = await self.runner.run(
                             prompt,
-                            model=self.cfg.triage_model,
+                            model=self.cfg.email_triage_model,
                             max_budget_usd=self.cfg.triage_max_budget_usd,
                             timeout_s=self.cfg.triage_timeout_s,
                             output_schema=VERDICT_SCHEMA,
@@ -621,7 +621,8 @@ async def run_daemon(cfg: Config) -> None:
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, stop.set)
 
-    log.info("wanda running (enforcement=%s, triage=%s, agent=%s)", cfg.enforcement, cfg.triage_model, cfg.agent_model)
+    log.info("wanda running (enforcement=%s, email triage=%s, agent=%s)",
+             cfg.enforcement, cfg.email_triage_model, cfg.agent_model)
     # slack_loop starts first: recovery can take many paced Slack calls, and an
     # owner reply arriving during it must not sit undispatched in the queue.
     tasks = [asyncio.create_task(processor.slack_loop())]
@@ -692,7 +693,7 @@ async def run_doctor(cfg: Config, smoke: bool) -> int:
             try:
                 rr = await RunnerService(claude_bin).run(
                     "Return ok=true.",
-                    model=cfg.triage_model,
+                    model=cfg.email_triage_model,
                     max_budget_usd=0.05,
                     timeout_s=60,
                     output_schema={"type": "object", "properties": {"ok": {"type": "boolean"}}, "required": ["ok"]},
@@ -806,7 +807,7 @@ async def run_triage_once(cfg: Config, limit: int) -> None:
         started = utcnow()
         rr = await runner.run(
             prompt,
-            model=cfg.triage_model,
+            model=cfg.email_triage_model,
             max_budget_usd=cfg.triage_max_budget_usd,
             timeout_s=cfg.triage_timeout_s,
             output_schema=VERDICT_SCHEMA,

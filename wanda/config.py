@@ -40,7 +40,7 @@ class Config(BaseSettings):
 
     # claude CLI
     claude_bin: str = ""
-    triage_model: str = "claude-haiku-4-5-20251001"
+    email_triage_model: str = "claude-haiku-4-5-20251001"
     agent_model: str = "sonnet"
     triage_batch_size: int = 10
     triage_timeout_s: int = 120
