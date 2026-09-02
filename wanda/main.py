@@ -21,6 +21,7 @@ from wanda.config import Config, load_config
 from wanda.events import Event
 from wanda.runner import RunnerService, RunResult
 from wanda.store import Store, utcnow
+from wanda.tls import ssl_context
 from wanda.triage import (
     VERDICT_SCHEMA,
     Verdict,
@@ -723,7 +724,7 @@ async def run_doctor(cfg: Config, smoke: bool) -> int:
         try:
             from slack_sdk import WebClient
 
-            auth = WebClient(token=cfg.slack_bot_token).auth_test()
+            auth = WebClient(token=cfg.slack_bot_token, ssl=ssl_context()).auth_test()
             report("bot token", True, f"bot user {auth['user_id']} in {auth['team']}")
         except Exception as e:
             report("bot token", False, str(e))
@@ -732,14 +733,15 @@ async def run_doctor(cfg: Config, smoke: bool) -> int:
 
             # app_token is a keyword arg on this method; the constructor token
             # is the bot token and is not used here.
-            WebClient().apps_connections_open(app_token=cfg.slack_app_token)
+            WebClient(ssl=ssl_context()).apps_connections_open(app_token=cfg.slack_app_token)
             report("app token", True)
         except Exception as e:
             report("app token", False, str(e))
         try:
             from slack_sdk import WebClient
 
-            ch = WebClient(token=cfg.slack_bot_token).conversations_info(channel=cfg.slack_channel_id)
+            ch = WebClient(token=cfg.slack_bot_token, ssl=ssl_context()).conversations_info(
+                channel=cfg.slack_channel_id)
             member = ch["channel"].get("is_member")
             report("channel", bool(member), ch["channel"].get("name", cfg.slack_channel_id) +
                    ("" if member else " — bot is not a member; /invite it"))

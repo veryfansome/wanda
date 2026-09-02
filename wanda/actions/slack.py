@@ -14,6 +14,7 @@ from slack_sdk.http_retry.builtin_handlers import RateLimitErrorRetryHandler
 
 from wanda.config import Config
 from wanda.store import Store
+from wanda.tls import ssl_context
 from wanda.triage import Verdict
 
 log = logging.getLogger(__name__)
@@ -56,6 +57,7 @@ class SlackActions:
         # The SDK default only retries connection errors; 429s raise immediately.
         self.web = WebClient(
             token=cfg.slack_bot_token,
+            ssl=ssl_context(),
             retry_handlers=default_retry_handlers() + [RateLimitErrorRetryHandler(max_retry_count=3)],
         )
         self._pace = asyncio.Lock()

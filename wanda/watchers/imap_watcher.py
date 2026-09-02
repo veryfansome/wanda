@@ -15,6 +15,7 @@ from imapclient.exceptions import CapabilityError
 
 from wanda.config import Config
 from wanda.store import Store, utcnow
+from wanda.tls import ssl_context
 
 log = logging.getLogger(__name__)
 
@@ -36,7 +37,9 @@ class DeadConnection(Exception):
 
 
 def connect(cfg: Config) -> IMAPClient:
-    client = IMAPClient(cfg.imap_host, port=cfg.imap_port, ssl=True, timeout=30)
+    client = IMAPClient(
+        cfg.imap_host, port=cfg.imap_port, ssl=True, ssl_context=ssl_context(), timeout=30
+    )
     client.login(cfg.icloud_email, cfg.icloud_app_password)
     return client
 
