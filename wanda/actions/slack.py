@@ -90,7 +90,7 @@ class SlackActions:
         )
         resp = await self._call(
             "chat_postMessage",
-            channel=self.cfg.slack_channel_id,
+            channel=self.cfg.email_triage_slack_channel_id,
             text=truncate_text(text),
             metadata={
                 "event_type": METADATA_EVENT_TYPE,
@@ -104,7 +104,7 @@ class SlackActions:
         try:
             resp = await self._call(
                 "conversations_history",
-                channel=self.cfg.slack_channel_id,
+                channel=self.cfg.email_triage_slack_channel_id,
                 limit=100,
                 include_all_metadata=True,
             )
@@ -126,7 +126,7 @@ class SlackActions:
         the conversation they came from."""
         await self._call(
             "chat_postMessage",
-            channel=channel or self.cfg.slack_channel_id,
+            channel=channel or self.cfg.email_triage_slack_channel_id,
             thread_ts=thread_ts,
             text=text[:39000],
         )
@@ -170,7 +170,7 @@ class SlackActions:
 
     async def alert(self, text: str) -> None:
         await self._call(
-            "chat_postMessage", channel=self.cfg.slack_channel_id,
+            "chat_postMessage", channel=self.cfg.email_triage_slack_channel_id,
             text=truncate_text(f"⚠️ wanda: {text}"),
         )
 
@@ -182,10 +182,10 @@ class SlackActions:
             return digest["thread_ts"]
         resp = await self._call(
             "chat_postMessage",
-            channel=self.cfg.slack_channel_id,
+            channel=self.cfg.email_triage_slack_channel_id,
             text=f"🧹 Triage digest — {local_date}",
         )
-        self.store.set_digest(local_date, self.cfg.slack_channel_id, resp["ts"])
+        self.store.set_digest(local_date, self.cfg.email_triage_slack_channel_id, resp["ts"])
         return resp["ts"]
 
     async def digest_entry(self, row: sqlite3.Row, verdict: Verdict, applied_action: str, note: str) -> None:
@@ -208,7 +208,7 @@ class SlackActions:
         line = truncate_text(line)
         try:
             await self._call(
-                "chat_postMessage", channel=self.cfg.slack_channel_id,
+                "chat_postMessage", channel=self.cfg.email_triage_slack_channel_id,
                 thread_ts=thread_ts, text=line,
             )
         except SlackApiError as e:
@@ -221,6 +221,6 @@ class SlackActions:
             self.store.clear_digest(local_date)
             fresh = await self._digest_thread(local_date)
             await self._call(
-                "chat_postMessage", channel=self.cfg.slack_channel_id,
+                "chat_postMessage", channel=self.cfg.email_triage_slack_channel_id,
                 thread_ts=fresh, text=line,
             )

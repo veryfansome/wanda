@@ -32,7 +32,7 @@ class Config(BaseSettings):
     # Slack
     slack_bot_token: str = ""
     slack_app_token: str = ""
-    slack_channel_id: str = ""
+    email_triage_slack_channel_id: str = ""
     # Empty = anyone in the workspace may talk to wanda. Set it to restrict
     # who can trigger agent sessions.
     slack_owner_user_ids: CsvList = Field(default_factory=list)

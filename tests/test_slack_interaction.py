@@ -27,7 +27,7 @@ def store(tmp_path):
 
 
 def cfg(**kw) -> Config:
-    return Config(_env_file=None, slack_channel_id="C_TRIAGE", **kw)
+    return Config(_env_file=None, email_triage_slack_channel_id="C_TRIAGE", **kw)
 
 
 class FakeReq:

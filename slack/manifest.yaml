@@ -4,7 +4,7 @@
 #   1. Basic Information -> App-Level Tokens -> generate one with scope
 #      connections:write  -> WANDA_SLACK_APP_TOKEN (xapp-...)
 #   2. Install App to workspace -> Bot User OAuth Token -> WANDA_SLACK_BOT_TOKEN (xoxb-...)
-#   3. Create/choose a channel, /invite @wanda, put its ID in WANDA_SLACK_CHANNEL_ID
+#   3. Create/choose a channel, /invite @wanda, put its ID in WANDA_EMAIL_TRIAGE_SLACK_CHANNEL_ID
 #   4. Leave WANDA_SLACK_OWNER_USER_IDS empty to let anyone in the workspace talk
 #      to wanda, or list member IDs to restrict it.
 #

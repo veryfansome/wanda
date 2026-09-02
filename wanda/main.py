@@ -371,7 +371,7 @@ class Processor:
                 ts = await self.slack.find_task_post(key) if recovery else None
                 if ts is None:
                     ts = await self.slack.post_task(row, v)
-                self.store.create_task(row["id"], self.cfg.slack_channel_id, ts)
+                self.store.create_task(row["id"], self.cfg.email_triage_slack_channel_id, ts)
             elif action == "trash":
                 self.store.set_message_status(key, "acting")
                 if row["moved_at"]:
@@ -763,7 +763,7 @@ async def run_daemon(cfg: Config) -> None:
     # workspace may talk to wanda.
     require_settings(cfg, [
         "icloud_email", "icloud_app_password",
-        "slack_bot_token", "slack_app_token", "slack_channel_id",
+        "slack_bot_token", "slack_app_token", "email_triage_slack_channel_id",
     ])
     claude_bin = cfg.resolve_claude_bin()
     if not claude_bin:
@@ -823,7 +823,7 @@ async def run_doctor(cfg: Config, smoke: bool) -> int:
 
     print("config:")
     for name in ("icloud_email", "icloud_app_password", "slack_bot_token", "slack_app_token",
-                 "slack_channel_id"):
+                 "email_triage_slack_channel_id"):
         report(name, bool(getattr(cfg, name)), "" if getattr(cfg, name) else "not set")
     report("enforcement", True, cfg.enforcement)
     report("who can talk to wanda", True,
@@ -914,9 +914,9 @@ async def run_doctor(cfg: Config, smoke: bool) -> int:
             from slack_sdk import WebClient
 
             ch = WebClient(token=cfg.slack_bot_token, ssl=ssl_context()).conversations_info(
-                channel=cfg.slack_channel_id)
+                channel=cfg.email_triage_slack_channel_id)
             member = ch["channel"].get("is_member")
-            report("channel", bool(member), ch["channel"].get("name", cfg.slack_channel_id) +
+            report("channel", bool(member), ch["channel"].get("name", cfg.email_triage_slack_channel_id) +
                    ("" if member else " — bot is not a member; /invite it"))
         except Exception as e:
             report("channel", False, str(e))

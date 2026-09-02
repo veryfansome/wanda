@@ -54,7 +54,7 @@ class FakeSlack:
 
 
 def cfg(**kw) -> Config:
-    return Config(_env_file=None, slack_channel_id="C1", **kw)
+    return Config(_env_file=None, email_triage_slack_channel_id="C1", **kw)
 
 
 def make(tmp_path, slack=None, **kw):
