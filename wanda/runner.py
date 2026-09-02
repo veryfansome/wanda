@@ -51,7 +51,9 @@ class RunnerService:
         allowed_tools: str | None = None,
         permission_mode: str | None = None,
         restricted: bool = False,
+        setting_sources: str | None = None,
         cwd: str | None = None,
+        env: dict[str, str] | None = None,
     ) -> RunResult:
         argv = [
             self.claude_bin,
@@ -81,6 +83,8 @@ class RunnerService:
             # tools, and ignores user/project settings — the containment that
             # matters when a prompt carries attacker-controlled email text.
             argv += ["--restricted", "--strict-mcp-config"]
+        if setting_sources:
+            argv += ["--setting-sources", setting_sources]
 
         # start_new_session so a timeout can kill the whole process group —
         # claude spawns children for shell tools that would otherwise orphan.
@@ -91,6 +95,7 @@ class RunnerService:
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
             cwd=cwd,
+            env={**os.environ, **env} if env else None,
         )
         try:
             stdout, stderr = await asyncio.wait_for(

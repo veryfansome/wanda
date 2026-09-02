@@ -62,6 +62,7 @@ class SlackActions:
         )
         self._pace = asyncio.Lock()
         self._last_call = 0.0
+        self._user_cache: dict[str, str] = {}
 
     async def _call(self, method: str, /, **kwargs):
         async with self._pace:
@@ -118,13 +119,45 @@ class SlackActions:
                 return m["ts"]
         return None
 
-    async def reply(self, thread_ts: str, text: str) -> None:
+    async def reply(self, thread_ts: str, text: str, channel: str | None = None) -> None:
+        """channel defaults to the triage channel; mention and DM sessions pass
+        the conversation they came from."""
         await self._call(
             "chat_postMessage",
-            channel=self.cfg.slack_channel_id,
+            channel=channel or self.cfg.slack_channel_id,
             thread_ts=thread_ts,
             text=text[:39000],
         )
+
+    # --- conversation context ---
+
+    async def fetch_context(self, channel: str, thread_ts: str | None, limit: int) -> list[dict]:
+        """Recent messages, oldest first. A thread reads its replies; a channel
+        or DM reads its history."""
+        if thread_ts:
+            resp = await self._call(
+                "conversations_replies", channel=channel, ts=thread_ts, limit=limit
+            )
+        else:
+            resp = await self._call("conversations_history", channel=channel, limit=limit)
+        msgs = list(resp.get("messages") or [])
+        if not thread_ts:
+            msgs.reverse()  # history returns newest first
+        return msgs
+
+    async def user_names(self, user_ids: set[str]) -> dict[str, str]:
+        """Resolve ids to display names, cached for the process lifetime."""
+        for uid in user_ids - self._user_cache.keys():
+            try:
+                resp = await self._call("users_info", user=uid)
+                u = resp.get("user") or {}
+                prof = u.get("profile") or {}
+                self._user_cache[uid] = (
+                    prof.get("display_name") or prof.get("real_name") or u.get("name") or uid
+                )
+            except Exception:
+                self._user_cache[uid] = uid  # deleted user, or missing users:read
+        return self._user_cache
 
     async def alert(self, text: str) -> None:
         await self._call(

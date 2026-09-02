@@ -2,7 +2,10 @@
 
 Wiki-Augmented Nodal Digital Assistant — a local macOS daemon that watches event sources (iCloud mail, Slack; more later) and dispatches headless `claude -p` sessions to handle them.
 
-**v1 behavior:** triages incoming iCloud mail. Messages needing your attention become Slack posts (each thread is a task — reply in it and wanda spawns an agentic claude session that resumes across replies). Unwanted mail is moved to Trash — but only after clearing harness-side guards, and only once you flip enforcement from `shadow` to `live`. Trash/ignore decisions are logged to a daily digest thread. wanda never sends email.
+**What it does:**
+
+- **Triages incoming iCloud mail.** Messages needing your attention become Slack posts (each thread is a task — reply in it and wanda spawns an agentic claude session that resumes across replies). Unwanted mail is moved to Trash, but only after clearing harness-side guards and only once you flip enforcement from `shadow` to `live`. Trash/ignore decisions land in a daily digest thread. wanda never sends email.
+- **Answers in Slack.** `@wanda` in a channel or thread, or just message it directly — wanda starts an agent session seeded with the recent conversation and replies in place. Sessions resume, so a thread stays a conversation rather than a series of one-shots.
 
 ## Architecture
 
@@ -19,13 +22,42 @@ Triage is a one-shot batched `claude -p` call with `--json-schema`-enforced verd
 
 1. **Install**: `uv sync`
 2. **iCloud**: create an app-specific password at appleid.apple.com → Sign-In and Security.
-3. **Slack**: create an app from `slack/manifest.yaml` (instructions in that file's header).
+3. **Slack**: create an app from `slack/manifest.yaml` (instructions in that file's header). If you created the app before mentions and DMs were supported, update its manifest and **reinstall** it — the new scopes and the Messages tab are what make `@wanda` and DMs work at all — then copy the fresh `xoxb-` token into `.env`.
 4. **Configure**: `cp .env.example .env` and fill it in.
 5. **Check**: `uv run wanda doctor` — verifies IMAP login, both Slack tokens, channel membership, the claude CLI (including a live smoke run), and the database.
 6. **Try it**: `uv run wanda triage --limit 10` — dry-run classification of recent inbox mail, prints what the daemon would do. No side effects, and it writes to a separate `dryrun.db` so a running daemon can never pick up and act on what it classified.
 7. **Run**: `uv run wanda run` — daemon in the foreground (shadow mode by default: trash verdicts are logged as "WOULD trash", nothing is moved).
 8. **Go live** once shadow digests look right: set `WANDA_ENFORCEMENT=live` in `.env`.
 9. **Install as LaunchAgent**: see the header of `launchd/com.wanda.agent.plist` (a template — it carries a `sed` line to fill in absolute paths, which launchd requires).
+
+## Talking to wanda
+
+| Where | How | Context the session gets |
+|---|---|---|
+| Channel | `@wanda <question>` | recent channel messages |
+| Thread | `@wanda <question>` in the thread | that thread's replies |
+| DM / group DM | just message it, no mention needed | recent messages in that conversation |
+| Email task thread | reply in the thread wanda opened | the email, plus the session's own history |
+
+Sessions answer with `wanda slack post`, so they can send progress updates or split a long answer. If a session fails without posting, the harness delivers its result instead, so a question never goes unanswered.
+
+`wanda slack` is a normal CLI you can use too:
+
+```
+wanda slack history --channel C0123 --limit 50   # recent messages
+wanda slack thread --channel C0123 --ts 1712345678.9012
+wanda slack post --channel C0123 --text "hello"
+wanda slack search "deploy failed"               # needs WANDA_SLACK_USER_TOKEN
+wanda slack channels | members | user U0123
+```
+
+Agent sessions get the skills in `skills/`, which are synced into the workspace on every run — edit them to change how wanda writes and behaves, no code change needed.
+
+## Trust assumption
+
+**wanda assumes its Slack workspace is trusted.** Agent sessions get `Bash`, because that is how they run `wanda slack`. A headless session cannot scope Bash to a single command — `--allowedTools "Bash(wanda slack:*)"` is not enforced under `--permission-mode dontAsk`, and every mode that would enforce it blocks on a permission prompt no one can answer. So anyone who can trigger a session can, in principle, reach arbitrary shell on this machine through prompt injection.
+
+That is a reasonable trade in a private workspace. It is not, if you ever invite people you don't trust, connect the app to a shared workspace, or let wanda read untrusted external content into a session. Before that, either run the daemon in a container, or set `WANDA_SLACK_OWNER_USER_IDS` to restrict who can trigger it and drop `Bash` from `WANDA_AGENT_ALLOWED_TOOLS` (the harness will then post replies itself).
 
 ## Safety model
 
