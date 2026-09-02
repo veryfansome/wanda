@@ -1,0 +1,38 @@
+name: tests
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    # macOS is the deployment target — wanda runs as a launchd LaunchAgent, and
+    # the runner tests exercise process groups, signals and subprocess teardown,
+    # which are worth running on the platform that will actually host them.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        # Pinned exactly: setup-uv publishes no floating major tag.
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        # --locked fails if uv.lock has drifted from pyproject.toml, so a
+        # dependency change that was never locked can't reach main.
+        run: uv sync --locked
+
+      - name: Run tests
+        # The suite is hermetic: no claude binary, no network, no credentials.
+        run: uv run pytest -q
