@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Wiki-Augmented Nodal Digital Assistant — event harness spawning headless claude -p sessions"
 requires-python = ">=3.12"
 dependencies = [
+    "certifi>=2024.2.2",
     "imapclient>=3.0",
     "slack-sdk>=3.31",
     "pydantic>=2.7",

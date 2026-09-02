@@ -11,6 +11,7 @@ from slack_sdk.socket_mode.response import SocketModeResponse
 from wanda.config import Config
 from wanda.events import Event
 from wanda.store import Store
+from wanda.tls import ssl_context
 
 log = logging.getLogger(__name__)
 
@@ -32,7 +33,8 @@ class SlackWatcher:
         self.client: SocketModeClient | None = None
 
     def start(self) -> None:
-        web = WebClient(token=self.cfg.slack_bot_token)
+        # SocketModeClient takes its websocket TLS context from this client.
+        web = WebClient(token=self.cfg.slack_bot_token, ssl=ssl_context())
         self.bot_user_id = web.auth_test()["user_id"]
         self.client = SocketModeClient(app_token=self.cfg.slack_app_token, web_client=web)
         self.client.socket_mode_request_listeners.append(self._handle)
