@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Template. launchd does not expand ~ or $HOME, so paths must be absolute:
+  substitute them when installing, from the repo root.
+
+  LaunchAgent, not LaunchDaemon — the claude CLI's auth lives in the user session.
+
+  Install:
+    mkdir -p ~/.wanda/logs
+    sed -e "s|__HOME__|$HOME|g" -e "s|__WANDA__|$PWD|g" \
+      launchd/com.wanda.agent.plist > ~/Library/LaunchAgents/com.wanda.agent.plist
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.wanda.agent.plist
+
+  Stop / restart:
+    launchctl bootout gui/$(id -u)/com.wanda.agent
+    launchctl kickstart -k gui/$(id -u)/com.wanda.agent
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.wanda.agent</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__WANDA__/.venv/bin/wanda</string>
+    <string>run</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__WANDA__</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+  <key>StandardOutPath</key>
+  <string>__HOME__/.wanda/logs/wanda.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/.wanda/logs/wanda.err.log</string>
+</dict>
+</plist>
