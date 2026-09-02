@@ -16,7 +16,7 @@ Wiki-Augmented Nodal Digital Assistant — a local macOS daemon that watches eve
                                     store.py (sqlite WAL — source of truth; Slack is the UI)
 ```
 
-Triage is a one-shot batched `claude -p` call with `--json-schema`-enforced verdicts and **no tools** — the harness executes all side effects. Agentic sessions exist only for task threads, created lazily on your first reply, resumed with `--resume`.
+Triage is a one-shot batched `claude -p` call with `--json-schema`-enforced verdicts and **no tools** — the harness executes all side effects. Agent sessions are separate: they run when you address wanda (a mention, a DM, or a reply in a thread it owns), are created lazily on first contact, and resume with `--resume` for the life of that conversation.
 
 ## Setup
 
@@ -39,7 +39,7 @@ Triage is a one-shot batched `claude -p` call with `--json-schema`-enforced verd
 | DM / group DM | just message it, no mention needed | recent messages in that conversation |
 | Email task thread | reply in the thread wanda opened | the email, plus the session's own history |
 
-Sessions answer with `wanda slack post`, so they can send progress updates or split a long answer. If a session fails without posting, the harness delivers its result instead, so a question never goes unanswered.
+Sessions answer with `wanda slack post`, and their last post to a conversation must be the complete answer — the harness treats a post there as the answer being delivered. If a session ends without answering, the harness delivers its result instead, so a question never goes unanswered; if it answered and then failed, you get a short note rather than the answer repeated.
 
 `wanda slack` is a normal CLI you can use too:
 

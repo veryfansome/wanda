@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import sqlite3
 import time
@@ -121,12 +120,13 @@ class SlackActions:
                 return m["ts"]
         return None
 
-    async def reply(self, thread_ts: str, text: str, channel: str | None = None) -> None:
-        """channel defaults to the triage channel; mention and DM sessions pass
-        the conversation they came from."""
+    async def reply(self, thread_ts: str | None, text: str, *, channel: str) -> None:
+        """Both arguments are required and neither defaults. A default channel
+        would silently publish a DM answer in the triage channel the one time a
+        caller forgot it — which is exactly what happened before."""
         await self._call(
             "chat_postMessage",
-            channel=channel or self.cfg.email_triage_slack_channel_id,
+            channel=channel,
             thread_ts=thread_ts,
             text=text[:39000],
         )

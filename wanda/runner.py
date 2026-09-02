@@ -52,7 +52,6 @@ class RunnerService:
         resume: str | None = None,
         allowed_tools: str | None = None,
         permission_mode: str | None = None,
-        restricted: bool = False,
         setting_sources: str | None = None,
         cwd: str | None = None,
         env: dict[str, str] | None = None,
@@ -80,11 +79,6 @@ class RunnerService:
             argv += ["--allowedTools", allowed_tools]
         if permission_mode:
             argv += ["--permission-mode", permission_mode]
-        if restricted:
-            # Confines file tools to the working directory, drops code-running
-            # tools, and ignores user/project settings — the containment that
-            # matters when a prompt carries attacker-controlled email text.
-            argv += ["--restricted", "--strict-mcp-config"]
         if setting_sources:
             argv += ["--setting-sources", setting_sources]
 

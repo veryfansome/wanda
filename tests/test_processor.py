@@ -488,3 +488,16 @@ def test_delivery_gives_up_and_stops_blocking(tmp_path):
         asyncio.run(p.deliver_pending())
     assert store.pending_deliveries() == [], "must stop retrying and free the queue"
     assert store.get_meta("abandoned_alert_pending") == "1", "and tell the owner"
+
+
+def test_reply_requires_an_explicit_channel():
+    """A defaulted channel published a DM answer in the triage channel the one
+    time a caller forgot it. Keyword-only and required makes that a TypeError."""
+    import inspect
+
+    from wanda.actions.slack import SlackActions
+
+    sig = inspect.signature(SlackActions.reply)
+    channel = sig.parameters["channel"]
+    assert channel.default is inspect.Parameter.empty, "channel must have no default"
+    assert channel.kind is inspect.Parameter.KEYWORD_ONLY, "and must be passed by name"

@@ -46,13 +46,6 @@ def watcher(store, **kw):
     return w, q, loop
 
 
-def Store_fresh(store):
-    """A second store so a dedupe key from one probe doesn't hide the other."""
-    import tempfile
-    from pathlib import Path as _P
-    return Store(_P(tempfile.mkdtemp()) / "w2.db")
-
-
 def fire(store, event, **kw):
     w, q, loop = watcher(store, **kw)
     w._handle(w.client, FakeReq(event))

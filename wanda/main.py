@@ -18,7 +18,7 @@ from typing import IO
 
 from wanda import slack_cli
 from wanda.actions.mailbox import MOVED, move_to_trash
-from wanda.actions.slack import SlackActions, esc_inline
+from wanda.actions.slack import SlackActions
 from wanda.config import Config, load_config
 from wanda.events import Event
 from wanda.runner import RunnerService, RunResult
@@ -500,10 +500,9 @@ class Processor:
         for run in self.store.pending_deliveries():
             if run["id"] in self._delivering:
                 continue  # a reply handler is posting this right now
+            # Cancelled runs carry no text; every other pending run does.
             text = run["result_text"] or (
                 "⏸ wanda restarted while working on this — reply again to retry."
-                if run["status"] == "cancelled"
-                else f"⚠️ agent run ended: {truncate(run['error'], 500)}"
             )
             try:
                 await self.slack.reply(run["reply_thread"], text, channel=run["slack_channel"])
@@ -549,17 +548,11 @@ class Processor:
                 task = self.store.get_task_by_thread(p["channel"], p["task_key"])
                 log.info("opened %s task %s in %s", p["kind"], task_id, p["channel"])
             else:
-                # A thread wanda owned but whose task row is missing (a crash
-                # between posting and committing it). Slack already deduped
-                # this event, so silence would lose the command outright.
-                log.warning("no task row for %s; asking the owner to resend", p["task_key"])
-                with contextlib.suppress(Exception):
-                    await self.slack.reply(
-                        p.get("reply_thread"),
-                        "⚠️ wanda is still starting up and doesn't have this task loaded yet — "
-                        "please send that again in a moment.",
-                        channel=p.get("channel"),
-                    )
+                # Defensive only: the watcher classifies 'task' from an existing
+                # row, so this needs the row to vanish mid-flight. Nothing
+                # deletes tasks, so it should never happen.
+                log.error("no task row for %s in %s; dropping trigger",
+                          p["task_key"], p["channel"])
                 return
         state: dict[str, bool] = {}
         try:
@@ -707,7 +700,7 @@ class Processor:
         try:
             msgs = await self.slack.fetch_context(
                 p["channel"],
-                p["task_key"] if p.get("in_thread") or p["kind"] == "task" else None,
+                p["task_key"] if p.get("in_thread") else None,
                 self.cfg.slack_context_limit,
             )
             names = await self.slack.user_names(user_ids_in(msgs))
@@ -732,8 +725,8 @@ class Processor:
             # dontAsk is the only headless-safe mode: every other mode blocks
             # on a permission prompt nobody can answer.
             permission_mode="dontAsk",
-            # Loads the workspace's .claude/skills. Not --restricted: that
-            # ignores settings sources, which would hide the skills.
+            # Loads the workspace's .claude/skills. Sessions are deliberately
+            # not sandboxed — see the README's trust assumption.
             setting_sources="project",
             cwd=str(sync_workspace(self.cfg)),
             env=env,

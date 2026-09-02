@@ -54,7 +54,9 @@ settings:
       - message.im
       - message.mpim
   interactivity:
-    is_enabled: true
+    # No buttons or modals: the watcher only handles events_api
+    # envelopes and discards interactive payloads.
+    is_enabled: false
   org_deploy_enabled: false
   socket_mode_enabled: true
   token_rotation_enabled: false
