@@ -31,6 +31,19 @@ def user_ids_in(messages: list[dict]) -> set[str]:
     return ids
 
 
+def trim_thread(messages: list[dict], limit: int) -> list[dict]:
+    """Keep the thread parent plus the NEWEST replies. Note `messages[-(n):]`
+    with n == 0 is the whole list, not an empty tail — so limits of 0 and 1
+    have to be handled before slicing."""
+    if limit <= 0:
+        return []
+    if len(messages) <= limit:
+        return messages
+    if limit == 1:
+        return messages[-1:]
+    return [messages[0]] + messages[-(limit - 1):]
+
+
 def render(messages: list[dict], names: dict[str, str]) -> str:
     """A plain-text transcript, oldest first. Untrusted content: the caller is
     responsible for fencing it and telling the model not to obey it."""

@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   claude_session_id TEXT,
   status            TEXT NOT NULL DEFAULT 'open',
   kind              TEXT NOT NULL DEFAULT 'email',
+  reply_thread      TEXT,
   created_at        TEXT NOT NULL,
   updated_at        TEXT NOT NULL,
   UNIQUE (slack_channel, thread_ts)
@@ -92,8 +93,11 @@ MIGRATIONS = (
     # already in the table was delivered before this column existed.
     ("runs", "notified", "INTEGER NOT NULL DEFAULT 1"),
     ("messages", "deferred_until", "TEXT"),
-    # 'email' | 'mention' | 'dm' — where the task came from.
+    # 'email' | 'mention' | 'mention_guest' | 'dm' — where the task came from.
     ("tasks", "kind", "TEXT NOT NULL DEFAULT 'email'"),
+    # Where replies are posted. Distinct from thread_ts, which is the task KEY
+    # and for a DM holds a sentinel that is not a Slack timestamp.
+    ("tasks", "reply_thread", "TEXT"),
 )
 
 
@@ -334,12 +338,15 @@ class Store:
     # --- tasks ---
 
     def create_task(self, message_pk: int | None, channel: str, thread_ts: str,
-                    kind: str = "email") -> int:
+                    kind: str = "email", reply_thread: str | None = None) -> int:
+        """thread_ts identifies the task; reply_thread is where answers go and
+        defaults to the same value (an email or channel thread)."""
         now = utcnow()
         cur = self._exec(
             "INSERT OR IGNORE INTO tasks(message_pk, slack_channel, thread_ts, status, kind, "
-            "created_at, updated_at) VALUES(?,?,?,'open',?,?,?)",
-            (message_pk, channel, thread_ts, kind, now, now),
+            "reply_thread, created_at, updated_at) VALUES(?,?,?,'open',?,?,?,?)",
+            (message_pk, channel, thread_ts, kind,
+             thread_ts if reply_thread is None and kind != "dm" else reply_thread, now, now),
         )
         if cur.rowcount:
             return cur.lastrowid
@@ -394,7 +401,7 @@ class Store:
         """Agent outcomes the owner never received: killed by a restart, or
         answered successfully but undeliverable at the time."""
         return self._query(
-            "SELECT r.*, t.thread_ts, t.slack_channel FROM runs r JOIN tasks t ON t.id = r.task_id "
+            "SELECT r.*, t.reply_thread, t.slack_channel FROM runs r JOIN tasks t ON t.id = r.task_id "
             "WHERE r.notified=0 ORDER BY r.id LIMIT ?",
             (limit,),
         )

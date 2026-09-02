@@ -15,6 +15,7 @@ from slack_sdk.http_retry.builtin_handlers import RateLimitErrorRetryHandler
 from wanda.config import Config
 from wanda.store import Store
 from wanda.tls import ssl_context
+from wanda.transcript import trim_thread
 from wanda.triage import Verdict
 
 log = logging.getLogger(__name__)
@@ -151,9 +152,7 @@ class SlackActions:
             cursor = ((resp.get("response_metadata") or {}).get("next_cursor") or "").strip()
             if not resp.get("has_more") or not cursor:
                 break
-        if len(msgs) <= limit:
-            return msgs
-        return [msgs[0]] + msgs[-(limit - 1):]  # keep the parent for context
+        return trim_thread(msgs, limit)  # keeps the parent plus the newest
 
     async def user_names(self, user_ids: set[str]) -> dict[str, str]:
         """Resolve ids to display names, cached for the process lifetime."""

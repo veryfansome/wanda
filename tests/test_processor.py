@@ -26,7 +26,7 @@ class FakeSlack:
     def __init__(self, fail=False):
         self.fail = fail
         self.tasks, self.digests, self.alerts, self.replies = [], [], [], []
-        self.channels = []
+        self.channels, self.threads = [], []
 
     async def post_task(self, row, v):
         if self.fail:
@@ -50,6 +50,7 @@ class FakeSlack:
     async def reply(self, thread_ts, text, channel=None):
         self.replies.append(text)
         self.channels.append(channel)
+        self.threads.append(thread_ts)
 
 
 def cfg(**kw) -> Config:
@@ -383,3 +384,34 @@ def test_reservation_released_on_exception(tmp_path):
         with p._reserve(2.0):
             raise ValueError("boom")
     assert p._inflight_usd == 0.0 and p._inflight_runs == 0
+
+
+def test_marker_matches_any_post_to_the_asker(tmp_path):
+    """Last-write-wins made suppression depend on the order the agent posted
+    in: answering the asker then copying to #eng duplicated the answer."""
+    p, _ = make(tmp_path)
+    m = tmp_path / "m.posted"
+
+    m.write_text("C_ASKED\t99.1\nC_ENG\t\n")          # answered, then copied elsewhere
+    assert p._answered_here(m, "C_ASKED", "99.1") is True
+    m.write_text("C_ENG\t\nC_ASKED\t99.1\n")          # other order, same outcome
+    assert p._answered_here(m, "C_ASKED", "99.1") is True
+
+    m.write_text("C_ASKED\t\n")                        # --no-thread in the right channel counts
+    assert p._answered_here(m, "C_ASKED", "99.1") is True
+
+    m.write_text("C_ENG\t\n")                          # only posted elsewhere
+    assert p._answered_here(m, "C_ASKED", "99.1") is False
+
+
+def test_dm_recovery_posts_untreaded(tmp_path):
+    """tasks.thread_ts holds a sentinel for DMs; sending it as a Slack thread
+    id made the delivery fail forever."""
+    slack = FakeSlack()
+    p, store = make(tmp_path, slack)
+    tid = store.create_task(None, "D5", "conversation", kind="dm", reply_thread=None)
+    store.record_run(kind="agent", task_id=tid, session_id="s", started_at=utcnow(),
+                     exit_code=0, cost_usd=0.4, status="ok", result_text="answer", notified=0)
+    asyncio.run(p.deliver_pending())
+    assert slack.threads == [None], "a DM answer must post untreaded, not to 'conversation'"
+    assert slack.channels == ["D5"]

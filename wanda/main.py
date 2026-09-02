@@ -192,7 +192,8 @@ class Processor:
             if pl.get("kind") in ("mention", "dm"):
                 # No task row yet (it is created during handling), so make one
                 # now — otherwise this acked, deduped trigger vanishes silently.
-                self.store.create_task(None, pl["channel"], pl["task_key"], kind=pl["kind"])
+                self.store.create_task(None, pl["channel"], pl["task_key"], kind=pl["kind"],
+                                       reply_thread=pl.get("reply_thread"))
             task = self.store.get_task_by_thread(pl["channel"], pl["task_key"])
             if task is None:
                 continue
@@ -500,7 +501,7 @@ class Processor:
                 else f"⚠️ agent run ended: {truncate(run['error'], 500)}"
             )
             try:
-                await self.slack.reply(run["thread_ts"], text, channel=run["slack_channel"])
+                await self.slack.reply(run["reply_thread"], text, channel=run["slack_channel"])
             except Exception:
                 log.warning("could not deliver run %s yet; will retry", run["id"])
                 continue
@@ -530,7 +531,8 @@ class Processor:
             if p.get("kind") in ("mention", "dm"):
                 # A new conversation: wanda was addressed somewhere it isn't
                 # already working, so open a task anchored to this thread.
-                task_id = self.store.create_task(None, p["channel"], p["task_key"], kind=p["kind"])
+                task_id = self.store.create_task(None, p["channel"], p["task_key"], kind=p["kind"],
+                                                 reply_thread=p.get("reply_thread"))
                 task = self.store.get_task_by_thread(p["channel"], p["task_key"])
                 log.info("opened %s task %s in %s", p["kind"], task_id, p["channel"])
             else:
@@ -645,12 +647,22 @@ class Processor:
 
     @staticmethod
     def _answered_here(marker: Path, channel: str, reply_thread: str | None) -> bool:
-        """The marker records where the agent's post landed."""
+        """True if ANY post the session made reached the triggering
+        conversation. Matching only the last one made suppression depend on the
+        order the agent happened to post in, which duplicated answers."""
         try:
-            posted_channel, _, posted_thread = marker.read_text().partition("\t")
+            lines = marker.read_text().splitlines()
         except OSError:
             return False
-        return posted_channel == channel and posted_thread == (reply_thread or "")
+        for line in lines:
+            posted_channel, _, posted_thread = line.partition("\t")
+            if posted_channel != channel:
+                continue
+            # A top-level post in the right channel is still an answer the
+            # asker can see, so `--no-thread` counts too.
+            if posted_thread in ((reply_thread or ""), ""):
+                return True
+        return False
 
     async def _seed_for(self, task, p: dict) -> str:
         """First turn of a session: email tasks get the email, conversation

@@ -8,7 +8,7 @@ import pytest
 
 from wanda.config import Config
 from wanda.store import Store
-from wanda.transcript import humanize, render, user_ids_in
+from wanda.transcript import humanize, render, trim_thread, user_ids_in
 from wanda.watchers.slack_watcher import SlackWatcher
 
 
@@ -46,6 +46,13 @@ def watcher(store, **kw):
     return w, q, loop
 
 
+def Store_fresh(store):
+    """A second store so a dedupe key from one probe doesn't hide the other."""
+    import tempfile
+    from pathlib import Path as _P
+    return Store(_P(tempfile.mkdtemp()) / "w2.db")
+
+
 def fire(store, event, **kw):
     w, q, loop = watcher(store, **kw)
     w._handle(w.client, FakeReq(event))
@@ -64,12 +71,37 @@ def test_channel_mention_triggers(store):
     assert ev.payload["in_thread"] is False
 
 
-def test_threaded_mention_keeps_thread(store):
+def test_threaded_mention_is_a_guest(store):
+    """A mention inside someone else's thread joins as a guest: wanda answers
+    it, but must not then treat the whole human conversation as its own."""
     ev = fire(store, {"type": "app_mention", "user": "U1", "channel": "C9", "ts": "100.9",
                       "thread_ts": "100.1", "text": "<@UBOT> and this?"})
-    assert ev.payload["kind"] == "mention"
+    assert ev.payload["kind"] == "mention_guest"
     assert ev.payload["task_key"] == "100.1" and ev.payload["reply_thread"] == "100.1"
     assert ev.payload["in_thread"] is True
+
+
+def test_guest_thread_does_not_capture_later_messages(store):
+    """One @wanda in a human thread used to make wanda answer every later
+    message there, forever, with no way to disengage."""
+    store.create_task(None, "C9", "100.1", kind="mention_guest")
+    assert fire(store, {"type": "message", "user": "U2", "channel": "C9", "channel_type": "channel",
+                        "ts": "100.9", "thread_ts": "100.1", "text": "yeah agreed"}) is None
+    # An explicit mention still gets an answer.
+    assert fire(store, {"type": "app_mention", "user": "U2", "channel": "C9", "ts": "101.0",
+                        "thread_ts": "100.1", "text": "<@UBOT> thoughts?"}) is not None
+
+
+def test_dm_twins_agree_regardless_of_order(store):
+    """Both deliveries of one DM mention must produce the same payload, or the
+    winner of the race decides whether the session resumes."""
+    common = {"user": "U1", "channel": "D5", "channel_type": "im", "ts": "7.7",
+              "text": "<@UBOT> hi"}
+    a = fire(store, {**common, "type": "app_mention"})
+    b = fire(Store_fresh(store), {**common, "type": "message"})
+    assert a.payload["kind"] == b.payload["kind"] == "dm"
+    assert a.payload["task_key"] == b.payload["task_key"] == "conversation"
+    assert a.payload["reply_thread"] is None and b.payload["reply_thread"] is None
 
 
 @pytest.mark.parametrize("ctype", ["im", "mpim"])
@@ -183,3 +215,18 @@ def test_same_thread_reuses_one_task(store):
     a = store.create_task(None, "C9", "100.1", kind="mention")
     b = store.create_task(None, "C9", "100.1", kind="mention")
     assert a == b, "a follow-up mention must resume the same session, not fork one"
+
+
+# --- thread trimming ---
+
+@pytest.mark.parametrize("limit,expected", [
+    (0, []),
+    (1, ["m5"]),                       # msgs[-0:] is the WHOLE list, not empty
+    (2, ["m0", "m5"]),                 # parent + newest
+    (3, ["m0", "m4", "m5"]),
+    (6, ["m0", "m1", "m2", "m3", "m4", "m5"]),
+    (99, ["m0", "m1", "m2", "m3", "m4", "m5"]),
+])
+def test_trim_thread_keeps_parent_and_newest(limit, expected):
+    msgs = [{"id": f"m{i}"} for i in range(6)]
+    assert [m["id"] for m in trim_thread(msgs, limit)] == expected

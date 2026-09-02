@@ -77,12 +77,22 @@ class SlackWatcher:
         thread_ts = event.get("thread_ts")
         ts = event.get("ts")
 
-        if etype == "app_mention":
-            kind = "mention"
-        elif channel_type in DM_TYPES:
+        # Conversation type decides first. Classifying on event type would let
+        # the app_mention/message twins of one DM produce different payloads,
+        # and whichever thread finished first would win the race.
+        if channel_type in DM_TYPES:
             kind = "dm"
-        elif thread_ts and self.store.get_task_by_thread(channel, thread_ts):
-            kind = "task"  # a reply in a thread wanda already owns
+        elif etype == "app_mention":
+            # A mention rooting its own thread makes that thread wanda's; a
+            # mention inside someone else's thread does not.
+            kind = "mention" if not thread_ts else "mention_guest"
+        elif thread_ts and (task := self.store.get_task_by_thread(channel, thread_ts)):
+            # Follow-ups without a mention are only for threads wanda owns —
+            # otherwise one @wanda would make it answer a human conversation
+            # forever.
+            if task["kind"] == "mention_guest":
+                return
+            kind = "task"
         else:
             return  # ordinary channel chatter wanda was not addressed in
 
@@ -96,7 +106,7 @@ class SlackWatcher:
         # Slack's redeliveries.
         if not self.store.slack_event_first_time(f"{channel}:{ts}"):
             return
-        if kind == "dm" and not thread_ts:
+        if kind == "dm" and not thread_ts:  # noqa: SIM108 — kept explicit
             # A DM is one ongoing conversation: every top-level message maps to
             # the same task and resumes the same session. Replies go untreaded,
             # which also keeps them visible in conversations.history — the very

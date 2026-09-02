@@ -14,7 +14,7 @@ from slack_sdk.http_retry.builtin_handlers import RateLimitErrorRetryHandler
 
 from wanda.config import Config
 from wanda.tls import ssl_context
-from wanda.transcript import render, user_ids_in
+from wanda.transcript import render, trim_thread, user_ids_in
 
 # Set by the harness for an agent session, so `post` can default to the
 # conversation that triggered it and record that a reply was sent.
@@ -84,6 +84,7 @@ def add_parser(sub: argparse._SubParsersAction) -> None:
 
     v = verbs.add_parser("members", help="list members of a channel")
     v.add_argument("--channel")
+    v.add_argument("--limit", type=int, default=200, help="max members to name (default 200)")
 
     v = verbs.add_parser("user", help="look up a user by id")
     v.add_argument("user_id")
@@ -103,7 +104,7 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
             _emit(msgs, web, args.json)
 
         elif verb == "thread":
-            ts = args.ts or os.environ.get(ENV_THREAD)
+            ts = args.ts or os.environ.get(ENV_THREAD) or None
             if not channel or not ts:
                 sys.exit("--channel and --ts are required")
             # replies pages forward from the parent, so a bare limit would
@@ -118,21 +119,26 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
                 cursor = ((resp.get("response_metadata") or {}).get("next_cursor") or "").strip()
                 if not resp.get("has_more") or not cursor:
                     break
-            if len(msgs) > args.limit:
-                msgs = [msgs[0]] + msgs[-(args.limit - 1):]
+            msgs = trim_thread(msgs, args.limit)
             _emit(msgs, web, args.json)
 
         elif verb == "post":
             if not channel:
                 sys.exit("--channel is required")
-            thread = None if args.no_thread else (args.thread or os.environ.get(ENV_THREAD))
+            # An empty env value means "post untreaded" (a DM), and the
+            # triggering thread only applies to the triggering channel.
+            env_thread = os.environ.get(ENV_THREAD) or None
+            if channel != os.environ.get(ENV_CHANNEL):
+                env_thread = None
+            thread = None if args.no_thread else (args.thread or env_thread)
             resp = web.chat_postMessage(channel=channel, thread_ts=thread, text=args.text[:39000])
             # Record WHERE this landed. The harness suppresses its own reply
             # only when the agent answered the conversation that triggered it —
             # a post to some other channel must not discharge that obligation.
             if marker := os.environ.get(ENV_MARKER):
                 with contextlib.suppress(OSError):
-                    Path(marker).write_text(f"{channel}\t{thread or ''}")
+                    with open(marker, "a") as fh:  # one line per post; never truncate
+                        fh.write(f"{channel}\t{thread or ''}\n")
             print(f"posted to {channel} ts={resp['ts']}")
 
         elif verb == "search":
@@ -160,10 +166,12 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
                 cursor = ((resp.get("response_metadata") or {}).get("next_cursor") or "").strip()
                 if not cursor:
                     break
-            for uid, name in _names(web, [{"user": i} for i in ids]).items():
+            total = len(ids)
+            shown = ids[:args.limit]  # one users.info call each; keep it bounded
+            for uid, name in _names(web, [{"user": i} for i in shown]).items():
                 print(f"{uid}\t{name}")
-            if cursor:
-                print(f"… truncated at {len(ids)} members; more remain")
+            if len(shown) < total or cursor:
+                print(f"… showing {len(shown)} of {total}{'+' if cursor else ''} members")
 
         elif verb == "user":
             u = web.users_info(user=args.user_id)["user"]
