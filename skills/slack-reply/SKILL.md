@@ -22,7 +22,7 @@ wanda slack post --text "..." --channel C0123 --thread 1712345678.9012   # somew
 wanda slack post --text "..." --no-thread                                # top level, not threaded
 ```
 
-Post exactly once for a normal answer. If a task takes a while, it is fine to post a short "looking into this" first and the answer when you have it — but don't narrate every step.
+**Your last post to this conversation must be your complete answer.** The harness treats a post here as the answer being delivered, so if you post "looking into this" and then stop, that holding message is all the person ever sees. Post once, when you have the answer. If a task genuinely takes several minutes and you post a holding message first, you must post the full answer afterwards.
 
 ## Writing
 

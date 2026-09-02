@@ -127,6 +127,14 @@ class Store:
             existing = {r["name"] for r in self._db.execute(f"PRAGMA table_info({table})")}
             if column not in existing:
                 self._db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+                if (table, column) == ("tasks", "reply_thread"):
+                    # Pre-existing tasks replied in their own thread; a bare
+                    # ADD COLUMN would leave NULL and post them at channel top
+                    # level. DM rows keep NULL — their key is a sentinel.
+                    self._db.execute(
+                        "UPDATE tasks SET reply_thread = thread_ts "
+                        "WHERE reply_thread IS NULL AND kind <> 'dm'"
+                    )
         # Repair databases migrated by the build that backfilled notified=0,
         # which would replay every historical answer into Slack on startup.
         marked = self._db.execute(

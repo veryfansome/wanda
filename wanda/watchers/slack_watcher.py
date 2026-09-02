@@ -63,8 +63,11 @@ class SlackWatcher:
         if req.type != "events_api":
             return
         event = req.payload.get("event", {})
-        etype = event.get("type")
-        if etype not in ("message", "app_mention"):
+        # app_mention is ignored on purpose: Slack sends it *alongside* a
+        # message.* event for the same text, and only the message event
+        # reliably carries channel_type. Working from one event type removes
+        # the twin entirely, rather than trying to reconcile two.
+        if event.get("type") != "message":
             return
         if event.get("bot_id") or event.get("subtype") not in HUMAN_SUBTYPES:
             return
@@ -77,12 +80,10 @@ class SlackWatcher:
         thread_ts = event.get("thread_ts")
         ts = event.get("ts")
 
-        # Conversation type decides first. Classifying on event type would let
-        # the app_mention/message twins of one DM produce different payloads,
-        # and whichever thread finished first would win the race.
+        mentioned = bool(self.bot_user_id) and f"<@{self.bot_user_id}>" in (event.get("text") or "")
         if channel_type in DM_TYPES:
-            kind = "dm"
-        elif etype == "app_mention":
+            kind = "dm"  # a DM needs no mention
+        elif mentioned:
             # A mention rooting its own thread makes that thread wanda's; a
             # mention inside someone else's thread does not.
             kind = "mention" if not thread_ts else "mention_guest"

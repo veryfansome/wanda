@@ -62,7 +62,7 @@ def fire(store, event, **kw):
 
 
 def test_channel_mention_triggers(store):
-    ev = fire(store, {"type": "app_mention", "user": "U1", "channel": "C9",
+    ev = fire(store, {"type": "message", "user": "U1", "channel": "C9",
                       "channel_type": "channel", "ts": "100.1", "text": "<@UBOT> hi"})
     assert ev is not None
     assert ev.payload["kind"] == "mention"
@@ -74,8 +74,8 @@ def test_channel_mention_triggers(store):
 def test_threaded_mention_is_a_guest(store):
     """A mention inside someone else's thread joins as a guest: wanda answers
     it, but must not then treat the whole human conversation as its own."""
-    ev = fire(store, {"type": "app_mention", "user": "U1", "channel": "C9", "ts": "100.9",
-                      "thread_ts": "100.1", "text": "<@UBOT> and this?"})
+    ev = fire(store, {"type": "message", "user": "U1", "channel": "C9", "channel_type": "channel",
+                      "ts": "100.9", "thread_ts": "100.1", "text": "<@UBOT> and this?"})
     assert ev.payload["kind"] == "mention_guest"
     assert ev.payload["task_key"] == "100.1" and ev.payload["reply_thread"] == "100.1"
     assert ev.payload["in_thread"] is True
@@ -88,20 +88,17 @@ def test_guest_thread_does_not_capture_later_messages(store):
     assert fire(store, {"type": "message", "user": "U2", "channel": "C9", "channel_type": "channel",
                         "ts": "100.9", "thread_ts": "100.1", "text": "yeah agreed"}) is None
     # An explicit mention still gets an answer.
-    assert fire(store, {"type": "app_mention", "user": "U2", "channel": "C9", "ts": "101.0",
-                        "thread_ts": "100.1", "text": "<@UBOT> thoughts?"}) is not None
+    assert fire(store, {"type": "message", "user": "U2", "channel": "C9", "channel_type": "channel",
+                        "ts": "101.0", "thread_ts": "100.1", "text": "<@UBOT> thoughts?"}) is not None
 
 
-def test_dm_twins_agree_regardless_of_order(store):
-    """Both deliveries of one DM mention must produce the same payload, or the
-    winner of the race decides whether the session resumes."""
-    common = {"user": "U1", "channel": "D5", "channel_type": "im", "ts": "7.7",
-              "text": "<@UBOT> hi"}
-    a = fire(store, {**common, "type": "app_mention"})
-    b = fire(Store_fresh(store), {**common, "type": "message"})
-    assert a.payload["kind"] == b.payload["kind"] == "dm"
-    assert a.payload["task_key"] == b.payload["task_key"] == "conversation"
-    assert a.payload["reply_thread"] is None and b.payload["reply_thread"] is None
+def test_dm_with_a_mention_is_still_a_dm(store):
+    """Conversation type wins over the presence of a mention, so a DM stays one
+    resumable conversation however the user phrases it."""
+    ev = fire(store, {"type": "message", "user": "U1", "channel": "D5", "channel_type": "im",
+                      "ts": "7.7", "text": "<@UBOT> hi"})
+    assert ev.payload["kind"] == "dm"
+    assert ev.payload["task_key"] == "conversation" and ev.payload["reply_thread"] is None
 
 
 @pytest.mark.parametrize("ctype", ["im", "mpim"])
@@ -133,15 +130,15 @@ def test_bot_and_self_messages_ignored(store):
 
 
 def test_owner_list_restricts_when_set(store):
-    ev = {"type": "app_mention", "user": "U_STRANGER", "channel": "C9", "ts": "1.1", "text": "hi"}
+    ev = {"type": "message", "user": "U_STRANGER", "channel": "C9", "channel_type": "channel",
+          "ts": "1.1", "text": "<@UBOT> hi"}
     assert fire(store, ev, slack_owner_user_ids=["U_ME"]) is None
     assert fire(store, ev) is not None  # empty list = anyone
 
 
-def test_mention_twin_events_trigger_once(store):
-    """One @-mention in an owned thread arrives as BOTH app_mention and
-    message.channels, with different event_ids. Dispatching both ran the agent
-    twice and posted two identical replies."""
+def test_app_mention_twin_is_ignored(store):
+    """Slack sends app_mention alongside message.* for the same text. Handling
+    both ran the agent twice; only the message event is used now."""
     store.create_task(None, "C_TRIAGE", "77.1", kind="email")
     w, q, loop = watcher(store)
     common = {"user": "U1", "channel": "C_TRIAGE", "ts": "77.5", "thread_ts": "77.1",
@@ -151,7 +148,7 @@ def test_mention_twin_events_trigger_once(store):
                                 event_id="Ev_B"))
     loop.run_until_complete(asyncio.sleep(0))
     loop.close()
-    assert q.qsize() == 1, "the app_mention/message twins must collapse to one trigger"
+    assert q.qsize() == 1, "one user message must produce exactly one trigger"
 
 
 def test_dm_conversation_is_one_resumable_task(store):
@@ -168,7 +165,8 @@ def test_dm_conversation_is_one_resumable_task(store):
 
 def test_duplicate_event_id_ignored(store):
     w, q, loop = watcher(store)
-    ev = {"type": "app_mention", "user": "U1", "channel": "C9", "ts": "1.1", "text": "hi"}
+    ev = {"type": "message", "user": "U1", "channel": "C9", "channel_type": "channel",
+          "ts": "1.1", "text": "<@UBOT> hi"}
     w._handle(w.client, FakeReq(ev))
     w._handle(w.client, FakeReq(ev))  # Slack redelivery
     loop.run_until_complete(asyncio.sleep(0))

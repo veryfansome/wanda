@@ -415,3 +415,47 @@ def test_dm_recovery_posts_untreaded(tmp_path):
     asyncio.run(p.deliver_pending())
     assert slack.threads == [None], "a DM answer must post untreaded, not to 'conversation'"
     assert slack.channels == ["D5"]
+
+
+def test_conversation_kinds_open_a_task():
+    """The watcher mints these kinds; every one must open a task, or the
+    trigger dead-ends in a false 'still starting up' reply."""
+    from wanda.main import CONVERSATION_KINDS
+    from wanda.watchers.slack_watcher import DM_TASK_KEY  # noqa: F401
+    assert set(CONVERSATION_KINDS) == {"mention", "mention_guest", "dm"}
+
+
+def test_answered_run_that_then_timed_out_is_not_double_posted(tmp_path):
+    """A session that posted its answer and was then killed by the timeout has
+    still answered; posting 'agent run failed' under it is noise."""
+    p, _ = make(tmp_path)
+    marker = tmp_path / "m.posted"
+    marker.write_text("C9\t100.1\n")
+    assert p._answered_here(marker, "C9", "100.1") is True
+
+
+def test_legacy_tasks_get_reply_thread_backfilled(tmp_path):
+    """A bare ADD COLUMN left NULL, which posts recovery answers at channel top
+    level instead of in the task's thread."""
+    import sqlite3
+    db = tmp_path / "legacy.db"
+    c = sqlite3.connect(db)
+    c.executescript("""
+      CREATE TABLE messages(id INTEGER PRIMARY KEY, dedupe_key TEXT NOT NULL UNIQUE,
+        folder TEXT NOT NULL, uidvalidity INTEGER NOT NULL, uid INTEGER NOT NULL,
+        status TEXT NOT NULL DEFAULT 'new', created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+      CREATE TABLE tasks(id INTEGER PRIMARY KEY, message_pk INTEGER REFERENCES messages(id),
+        slack_channel TEXT NOT NULL, thread_ts TEXT NOT NULL, claude_session_id TEXT,
+        status TEXT NOT NULL DEFAULT 'open', kind TEXT NOT NULL DEFAULT 'email',
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(slack_channel, thread_ts));
+      CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+      INSERT INTO tasks(slack_channel, thread_ts, kind, created_at, updated_at)
+        VALUES ('C1','111.1','email','t','t'), ('D5','conversation','dm','t','t');
+    """)
+    c.commit(); c.close()
+
+    s = Store(db)
+    assert s.get_task_by_thread("C1", "111.1")["reply_thread"] == "111.1"
+    assert s.get_task_by_thread("D5", "conversation")["reply_thread"] is None, \
+        "a DM key is a sentinel, not a thread id"
+    s.close()

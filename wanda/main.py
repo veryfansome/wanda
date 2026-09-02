@@ -51,6 +51,8 @@ MAX_APPLY_ATTEMPTS = 8
 RETRY_BASE_S = 60          # backoff 1, 2, 4, 8, 16, 30, 30, 30 minutes
 RETRY_MAX_S = 1800
 DEFER_S = 900  # how long a rate-capped trash waits before the cap is re-tested
+# Kinds that own their conversation and open a task on first contact.
+CONVERSATION_KINDS = ("mention", "mention_guest", "dm")
 BUDGET_REPLIES = {
     "breaker": "⚠️ daily budget breaker is tripped; try again after UTC midnight.",
     "busy": "⏳ wanda is at its concurrent-run budget right now — reply again in a few minutes.",
@@ -189,7 +191,7 @@ class Processor:
             except asyncio.QueueEmpty:
                 break
             pl = ev.payload
-            if pl.get("kind") in ("mention", "dm"):
+            if pl.get("kind") in CONVERSATION_KINDS:
                 # No task row yet (it is created during handling), so make one
                 # now — otherwise this acked, deduped trigger vanishes silently.
                 self.store.create_task(None, pl["channel"], pl["task_key"], kind=pl["kind"],
@@ -528,7 +530,7 @@ class Processor:
         p = ev.payload
         task = self.store.get_task_by_thread(p["channel"], p["task_key"])
         if task is None:
-            if p.get("kind") in ("mention", "dm"):
+            if p.get("kind") in CONVERSATION_KINDS:
                 # A new conversation: wanda was addressed somewhere it isn't
                 # already working, so open a task anchored to this thread.
                 task_id = self.store.create_task(None, p["channel"], p["task_key"], kind=p["kind"],
@@ -599,7 +601,10 @@ class Processor:
                         else:
                             seed = await self._seed_for(task, p)
                             rr = await self._agent_run(seed, session_id=sid, env=env)
-                            if rr.ok:
+                            # Persist whenever the CLI got far enough to have a
+                            # session, so a timeout does not discard it and make
+                            # the next reply re-seed with no memory.
+                            if rr.ok or rr.session_id or rr.timed_out:
                                 self.store.set_task_session(task["id"], rr.session_id or sid)
                 except asyncio.CancelledError:
                     # Shutdown mid-run: the subprocess was killed, but tokens
@@ -621,7 +626,9 @@ class Processor:
             # The agent posts its own answer via `wanda slack post`. Only a post
             # into the triggering conversation discharges the obligation — one
             # sent elsewhere ("put this in #eng") must not silence the asker.
-            self_posted = rr.ok and self._answered_here(posted, channel, p.get("reply_thread"))
+            # Checked regardless of rr.ok: a session that answered and then
+            # hit its timeout has still answered.
+            self_posted = self._answered_here(posted, channel, p.get("reply_thread"))
             posted.unlink(missing_ok=True)
             run_id = self.store.record_run(
                 kind="agent", task_id=task["id"], session_id=rr.session_id or sid, started_at=started,
