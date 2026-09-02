@@ -26,6 +26,7 @@ class FakeSlack:
     def __init__(self, fail=False):
         self.fail = fail
         self.tasks, self.digests, self.alerts, self.replies = [], [], [], []
+        self.channels = []
 
     async def post_task(self, row, v):
         if self.fail:
@@ -46,8 +47,9 @@ class FakeSlack:
     async def alert(self, text):
         self.alerts.append(text)
 
-    async def reply(self, thread_ts, text):
+    async def reply(self, thread_ts, text, channel=None):
         self.replies.append(text)
+        self.channels.append(channel)
 
 
 def cfg(**kw) -> Config:
@@ -266,7 +268,7 @@ def test_undeliverable_answer_stays_pending(tmp_path):
                      cost_usd=0.4, status="ok", result_text="answer", notified=0)
 
     class Boom(FakeSlack):
-        async def reply(self, thread_ts, text):
+        async def reply(self, thread_ts, text, channel=None):
             raise RuntimeError("slack down")
 
     p.slack = Boom()
@@ -342,6 +344,37 @@ def test_alert_is_not_suppressed_by_a_failed_post(tmp_path):
     assert len(slack.alerts) == 1
     asyncio.run(p._flush_alert("breaker"))
     assert len(slack.alerts) == 1, "delivered alert must not repeat"
+
+
+def test_answered_here_requires_the_triggering_conversation(tmp_path):
+    """The post marker records where the agent posted. A post elsewhere (e.g.
+    'put this in #eng') must not suppress the reply the asker is owed."""
+    p, _ = make(tmp_path)
+    marker = tmp_path / "m.posted"
+
+    marker.write_text("C_ASKED\t99.1")
+    assert p._answered_here(marker, "C_ASKED", "99.1") is True
+    assert p._answered_here(marker, "C_OTHER", "99.1") is False   # wrong channel
+    assert p._answered_here(marker, "C_ASKED", "77.7") is False   # wrong thread
+
+    marker.write_text("D5\t")                                     # untreaded DM reply
+    assert p._answered_here(marker, "D5", None) is True
+
+    marker.unlink()
+    assert p._answered_here(marker, "C_ASKED", "99.1") is False   # never posted
+
+
+def test_pending_delivery_goes_to_its_own_conversation(tmp_path):
+    """A DM answer that failed to post must not be replayed into the triage
+    channel."""
+    slack = FakeSlack()
+    p, store = make(tmp_path, slack)
+    tid = store.create_task(None, "D_PRIVATE", "conversation", kind="dm")
+    store.record_run(kind="agent", task_id=tid, session_id="s", started_at=utcnow(),
+                     exit_code=0, cost_usd=0.4, status="ok", result_text="private answer",
+                     notified=0)
+    asyncio.run(p.deliver_pending())
+    assert slack.channels == ["D_PRIVATE"], "must post back to the DM, not the triage channel"
 
 
 def test_reservation_released_on_exception(tmp_path):

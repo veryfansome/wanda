@@ -59,7 +59,8 @@ def test_channel_mention_triggers(store):
                       "channel_type": "channel", "ts": "100.1", "text": "<@UBOT> hi"})
     assert ev is not None
     assert ev.payload["kind"] == "mention"
-    assert ev.payload["thread_ts"] == "100.1"   # top-level mention starts a thread
+    # A top-level mention anchors its task and its replies to its own ts.
+    assert ev.payload["task_key"] == "100.1" and ev.payload["reply_thread"] == "100.1"
     assert ev.payload["in_thread"] is False
 
 
@@ -67,7 +68,8 @@ def test_threaded_mention_keeps_thread(store):
     ev = fire(store, {"type": "app_mention", "user": "U1", "channel": "C9", "ts": "100.9",
                       "thread_ts": "100.1", "text": "<@UBOT> and this?"})
     assert ev.payload["kind"] == "mention"
-    assert ev.payload["thread_ts"] == "100.1" and ev.payload["in_thread"] is True
+    assert ev.payload["task_key"] == "100.1" and ev.payload["reply_thread"] == "100.1"
+    assert ev.payload["in_thread"] is True
 
 
 @pytest.mark.parametrize("ctype", ["im", "mpim"])
@@ -102,6 +104,34 @@ def test_owner_list_restricts_when_set(store):
     ev = {"type": "app_mention", "user": "U_STRANGER", "channel": "C9", "ts": "1.1", "text": "hi"}
     assert fire(store, ev, slack_owner_user_ids=["U_ME"]) is None
     assert fire(store, ev) is not None  # empty list = anyone
+
+
+def test_mention_twin_events_trigger_once(store):
+    """One @-mention in an owned thread arrives as BOTH app_mention and
+    message.channels, with different event_ids. Dispatching both ran the agent
+    twice and posted two identical replies."""
+    store.create_task(None, "C_TRIAGE", "77.1", kind="email")
+    w, q, loop = watcher(store)
+    common = {"user": "U1", "channel": "C_TRIAGE", "ts": "77.5", "thread_ts": "77.1",
+              "text": "<@UBOT> go ahead"}
+    w._handle(w.client, FakeReq({**common, "type": "app_mention"}, event_id="Ev_A"))
+    w._handle(w.client, FakeReq({**common, "type": "message", "channel_type": "channel"},
+                                event_id="Ev_B"))
+    loop.run_until_complete(asyncio.sleep(0))
+    loop.close()
+    assert q.qsize() == 1, "the app_mention/message twins must collapse to one trigger"
+
+
+def test_dm_conversation_is_one_resumable_task(store):
+    """Every top-level DM message must map to the same task, so the session
+    resumes instead of starting fresh each time."""
+    first = fire(store, {"type": "message", "user": "U1", "channel": "D5",
+                         "channel_type": "im", "ts": "1.1", "text": "hi"})
+    second = fire(store, {"type": "message", "user": "U1", "channel": "D5",
+                          "channel_type": "im", "ts": "2.2", "text": "and another thing"})
+    assert first.payload["task_key"] == second.payload["task_key"]
+    # Unthreaded, so wanda's own replies stay visible in conversations.history.
+    assert first.payload["reply_thread"] is None and second.payload["reply_thread"] is None
 
 
 def test_duplicate_event_id_ignored(store):

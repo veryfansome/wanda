@@ -13,7 +13,11 @@ CsvList = Annotated[list[str], NoDecode]
 class Config(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="WANDA_",
-        env_file=".env",
+        # Anchored to the repo, not the cwd: agent sessions run `wanda slack`
+        # from ~/.wanda/workspace, where a relative ".env" resolves to nothing
+        # and every command would fail with "token is not set". A .env in the
+        # cwd still wins, for local overrides.
+        env_file=(Path(__file__).resolve().parent.parent / ".env", ".env"),
         env_file_encoding="utf-8",
         extra="ignore",
     )

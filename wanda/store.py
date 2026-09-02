@@ -141,8 +141,27 @@ class Store:
             return
         has_kind = any(c["name"] == "kind" for c in cols)
         kind_sel = "kind" if has_kind else "'email'"
+        # executescript() would COMMIT before each statement, leaving durable
+        # half-states: a crash between DROP and RENAME loses every task row,
+        # because SCHEMA then recreates tasks empty on the next start. Run the
+        # rebuild inside one explicit transaction instead. The PRAGMA must be
+        # outside it — SQLite ignores foreign_keys changes within one.
         self._db.execute("PRAGMA foreign_keys=OFF")
-        self._db.executescript(f"""
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            for stmt in self._rebuild_statements(kind_sel):
+                self._db.execute(stmt)
+            self._db.execute("COMMIT")
+        except Exception:
+            self._db.execute("ROLLBACK")
+            raise
+        finally:
+            self._db.execute("PRAGMA foreign_keys=ON")
+
+    @staticmethod
+    def _rebuild_statements(kind_sel: str) -> tuple[str, ...]:
+        return (
+            """
             CREATE TABLE tasks_new (
               id                INTEGER PRIMARY KEY,
               message_pk        INTEGER REFERENCES messages(id),
@@ -154,15 +173,17 @@ class Store:
               created_at        TEXT NOT NULL,
               updated_at        TEXT NOT NULL,
               UNIQUE (slack_channel, thread_ts)
-            );
+            )
+            """,
+            f"""
             INSERT INTO tasks_new (id, message_pk, slack_channel, thread_ts,
                                    claude_session_id, status, kind, created_at, updated_at)
               SELECT id, message_pk, slack_channel, thread_ts,
-                     claude_session_id, status, {kind_sel}, created_at, updated_at FROM tasks;
-            DROP TABLE tasks;
-            ALTER TABLE tasks_new RENAME TO tasks;
-        """)
-        self._db.execute("PRAGMA foreign_keys=ON")
+                     claude_session_id, status, {kind_sel}, created_at, updated_at FROM tasks
+            """,
+            "DROP TABLE tasks",
+            "ALTER TABLE tasks_new RENAME TO tasks",
+        )
 
     def close(self) -> None:
         with self._lock:

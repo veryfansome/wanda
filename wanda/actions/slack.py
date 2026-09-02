@@ -25,6 +25,7 @@ MIN_INTERVAL_S = 1.0  # chat.postMessage is ~1/s/channel
 SNIPPET_LIMIT = 1500
 TEXT_LIMIT = 3500  # well under Slack's 40k text cap, and headers can be huge
 MISSING_THREAD_ERRORS = {"thread_not_found", "message_not_found", "channel_not_found"}
+MAX_CONTEXT_PAGES = 10  # bounds a very long thread at ~2000 messages
 
 
 def truncate_text(text: str) -> str:
@@ -132,18 +133,27 @@ class SlackActions:
     # --- conversation context ---
 
     async def fetch_context(self, channel: str, thread_ts: str | None, limit: int) -> list[dict]:
-        """Recent messages, oldest first. A thread reads its replies; a channel
-        or DM reads its history."""
-        if thread_ts:
-            resp = await self._call(
-                "conversations_replies", channel=channel, ts=thread_ts, limit=limit
-            )
-        else:
-            resp = await self._call("conversations_history", channel=channel, limit=limit)
-        msgs = list(resp.get("messages") or [])
+        """The most RECENT messages, oldest first. A thread reads its replies;
+        a channel or DM reads its history."""
         if not thread_ts:
-            msgs.reverse()  # history returns newest first
-        return msgs
+            resp = await self._call("conversations_history", channel=channel, limit=limit)
+            return list(reversed(resp.get("messages") or []))  # history is newest first
+        # conversations.replies pages FORWARD from the parent, so a bare limit
+        # returns the start of a long thread and drops what was just said.
+        msgs: list[dict] = []
+        cursor = None
+        for _ in range(MAX_CONTEXT_PAGES):
+            kwargs = {"channel": channel, "ts": thread_ts, "limit": 200}
+            if cursor:
+                kwargs["cursor"] = cursor
+            resp = await self._call("conversations_replies", **kwargs)
+            msgs.extend(resp.get("messages") or [])
+            cursor = ((resp.get("response_metadata") or {}).get("next_cursor") or "").strip()
+            if not resp.get("has_more") or not cursor:
+                break
+        if len(msgs) <= limit:
+            return msgs
+        return [msgs[0]] + msgs[-(limit - 1):]  # keep the parent for context
 
     async def user_names(self, user_ids: set[str]) -> dict[str, str]:
         """Resolve ids to display names, cached for the process lifetime."""

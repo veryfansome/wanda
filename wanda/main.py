@@ -188,10 +188,15 @@ class Processor:
                 ev = self.slack_queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
-            task = self.store.get_task_by_thread(ev.payload["channel"], ev.payload["thread_ts"])
+            pl = ev.payload
+            if pl.get("kind") in ("mention", "dm"):
+                # No task row yet (it is created during handling), so make one
+                # now — otherwise this acked, deduped trigger vanishes silently.
+                self.store.create_task(None, pl["channel"], pl["task_key"], kind=pl["kind"])
+            task = self.store.get_task_by_thread(pl["channel"], pl["task_key"])
             if task is None:
                 continue
-            log.info("recording dropped owner reply on thread %s", ev.payload["thread_ts"])
+            log.info("recording dropped trigger in %s", pl["channel"])
             self.store.record_run(
                 kind="agent", task_id=task["id"], session_id=task["claude_session_id"],
                 started_at=utcnow(), exit_code=None, cost_usd=0.0,
@@ -495,7 +500,7 @@ class Processor:
                 else f"⚠️ agent run ended: {truncate(run['error'], 500)}"
             )
             try:
-                await self.slack.reply(run["thread_ts"], text)
+                await self.slack.reply(run["thread_ts"], text, channel=run["slack_channel"])
             except Exception:
                 log.warning("could not deliver run %s yet; will retry", run["id"])
                 continue
@@ -514,28 +519,28 @@ class Processor:
             log.exception("handling slack event %s failed", ev.dedupe_key)
             with contextlib.suppress(Exception):
                 await self.slack.reply(
-                    ev.payload["thread_ts"], "⚠️ wanda hit an internal error handling that reply.",
+                    ev.payload.get("reply_thread"), "⚠️ wanda hit an internal error handling that reply.",
                     channel=ev.payload.get("channel"),
                 )
 
     async def _handle_slack(self, ev: Event) -> None:
         p = ev.payload
-        task = self.store.get_task_by_thread(p["channel"], p["thread_ts"])
+        task = self.store.get_task_by_thread(p["channel"], p["task_key"])
         if task is None:
             if p.get("kind") in ("mention", "dm"):
                 # A new conversation: wanda was addressed somewhere it isn't
                 # already working, so open a task anchored to this thread.
-                task_id = self.store.create_task(None, p["channel"], p["thread_ts"], kind=p["kind"])
-                task = self.store.get_task_by_thread(p["channel"], p["thread_ts"])
+                task_id = self.store.create_task(None, p["channel"], p["task_key"], kind=p["kind"])
+                task = self.store.get_task_by_thread(p["channel"], p["task_key"])
                 log.info("opened %s task %s in %s", p["kind"], task_id, p["channel"])
             else:
                 # A thread wanda owned but whose task row is missing (a crash
                 # between posting and committing it). Slack already deduped
                 # this event, so silence would lose the command outright.
-                log.warning("no task row for thread %s; asking the owner to resend", p["thread_ts"])
+                log.warning("no task row for %s; asking the owner to resend", p["task_key"])
                 with contextlib.suppress(Exception):
                     await self.slack.reply(
-                        p["thread_ts"],
+                        p.get("reply_thread"),
                         "⚠️ wanda is still starting up and doesn't have this task loaded yet — "
                         "please send that again in a moment.",
                         channel=p.get("channel"),
@@ -562,15 +567,15 @@ class Processor:
             channel = p["channel"]
             reserve = self.cfg.agent_expected_usd
             if (verdict := await self.check_budget(reserve_usd=reserve)) != "ok":
-                await self.slack.reply(p["thread_ts"], BUDGET_REPLIES[verdict], channel=channel)
+                await self.slack.reply(p.get("reply_thread"), BUDGET_REPLIES[verdict], channel=channel)
                 return
-            task = self.store.get_task_by_thread(channel, p["thread_ts"])  # refresh under lock
+            task = self.store.get_task_by_thread(channel, p["task_key"])  # refresh under lock
             started = utcnow()
             async with self.runner.agent_sem:
                 # Re-check after queueing: the runs admitted ahead of us may
                 # have exhausted the cap while we waited for a slot.
                 if (verdict := await self.check_budget(reserve_usd=reserve)) != "ok":
-                    await self.slack.reply(p["thread_ts"], BUDGET_REPLIES[verdict], channel=channel)
+                    await self.slack.reply(p.get("reply_thread"), BUDGET_REPLIES[verdict], channel=channel)
                     return
                 sid = task["claude_session_id"] or str(uuid.uuid4())
                 t0 = time.monotonic()
@@ -579,7 +584,7 @@ class Processor:
                 posted.unlink(missing_ok=True)
                 env = {
                     "WANDA_SLACK_CONTEXT_CHANNEL": channel,
-                    "WANDA_SLACK_CONTEXT_THREAD": p["thread_ts"],
+                    "WANDA_SLACK_CONTEXT_THREAD": p.get("reply_thread") or "",
                     "WANDA_SLACK_POST_MARKER": str(posted),
                     # launchd gives the daemon a minimal PATH, so the session
                     # would not otherwise find the `wanda` it is told to run.
@@ -611,17 +616,18 @@ class Processor:
                     state["recorded"] = True
                     raise
             text = rr.result_text if rr.ok and rr.result_text else f"⚠️ agent run failed: {truncate(rr.error, 1000)}"
-            # The agent posts its own answer via `wanda slack post`. If it did,
-            # the harness must not post the same thing again — but a failed run
-            # that never posted still owes the owner a reply.
-            self_posted = posted.exists() and rr.ok
+            # The agent posts its own answer via `wanda slack post`. Only a post
+            # into the triggering conversation discharges the obligation — one
+            # sent elsewhere ("put this in #eng") must not silence the asker.
+            self_posted = rr.ok and self._answered_here(posted, channel, p.get("reply_thread"))
             posted.unlink(missing_ok=True)
             run_id = self.store.record_run(
                 kind="agent", task_id=task["id"], session_id=rr.session_id or sid, started_at=started,
                 exit_code=rr.exit_code, cost_usd=rr.cost_usd,
                 status="ok" if rr.ok else ("timeout" if rr.timed_out else "error"),
                 error=truncate(rr.error, 1000),
-                result_text=None if self_posted else text,
+                # Always kept, so a mis-detected self-post is still recoverable.
+                result_text=text,
                 notified=1 if self_posted else 0,
             )
             # The run is durable now, so a cancellation from here on must not
@@ -632,10 +638,19 @@ class Processor:
                 return
             self._delivering.add(run_id)  # keep deliver_pending off this row
             try:
-                await self.slack.reply(p["thread_ts"], text, channel=channel)
+                await self.slack.reply(p.get("reply_thread"), text, channel=channel)
                 self.store.mark_run_notified(run_id)
             finally:
                 self._delivering.discard(run_id)
+
+    @staticmethod
+    def _answered_here(marker: Path, channel: str, reply_thread: str | None) -> bool:
+        """The marker records where the agent's post landed."""
+        try:
+            posted_channel, _, posted_thread = marker.read_text().partition("\t")
+        except OSError:
+            return False
+        return posted_channel == channel and posted_thread == (reply_thread or "")
 
     async def _seed_for(self, task, p: dict) -> str:
         """First turn of a session: email tasks get the email, conversation
@@ -645,7 +660,7 @@ class Processor:
         try:
             msgs = await self.slack.fetch_context(
                 p["channel"],
-                p["thread_ts"] if p.get("in_thread") or p["kind"] == "task" else None,
+                p["task_key"] if p.get("in_thread") or p["kind"] == "task" else None,
                 self.cfg.slack_context_limit,
             )
             names = await self.slack.user_names(user_ids_in(msgs))

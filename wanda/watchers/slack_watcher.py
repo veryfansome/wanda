@@ -17,6 +17,8 @@ log = logging.getLogger(__name__)
 
 HUMAN_SUBTYPES = (None, "file_share", "thread_broadcast")
 DM_TYPES = ("im", "mpim")
+# Task key for a DM's ongoing (unthreaded) conversation.
+DM_TASK_KEY = "conversation"
 
 
 class SlackWatcher:
@@ -88,18 +90,29 @@ class SlackWatcher:
             log.warning("ignoring %s from non-allowed user %s", kind, user)
             return
 
-        event_id = req.payload.get("event_id") or f"{channel}:{ts}"
-        if not self.store.slack_event_first_time(event_id):
-            return  # Slack redelivery
+        # Keyed on the MESSAGE, not the envelope: one @-mention in a thread
+        # arrives as both app_mention and message.*, with different event_ids,
+        # and would otherwise run the agent twice. Same key also absorbs
+        # Slack's redeliveries.
+        if not self.store.slack_event_first_time(f"{channel}:{ts}"):
+            return
+        if kind == "dm" and not thread_ts:
+            # A DM is one ongoing conversation: every top-level message maps to
+            # the same task and resumes the same session. Replies go untreaded,
+            # which also keeps them visible in conversations.history — the very
+            # context the next message is seeded with.
+            task_key, reply_thread = DM_TASK_KEY, None
+        else:
+            task_key = reply_thread = thread_ts or ts
         ev = Event(
             source="slack",
-            dedupe_key=event_id,
+            dedupe_key=f"{channel}:{ts}",
             payload={
                 "kind": kind,
                 "channel": channel,
                 "channel_type": channel_type,
-                # Replies land in the thread; a top-level trigger starts one.
-                "thread_ts": thread_ts or ts,
+                "task_key": task_key,          # identifies the task and session
+                "reply_thread": reply_thread,  # where answers get posted
                 "in_thread": bool(thread_ts),
                 "user": user,
                 "text": event.get("text", ""),

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import sys
@@ -8,6 +9,8 @@ from pathlib import Path
 
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
+from slack_sdk.http_retry import default_retry_handlers
+from slack_sdk.http_retry.builtin_handlers import RateLimitErrorRetryHandler
 
 from wanda.config import Config
 from wanda.tls import ssl_context
@@ -18,14 +21,19 @@ from wanda.transcript import render, user_ids_in
 ENV_CHANNEL = "WANDA_SLACK_CONTEXT_CHANNEL"
 ENV_THREAD = "WANDA_SLACK_CONTEXT_THREAD"
 ENV_MARKER = "WANDA_SLACK_POST_MARKER"
+MAX_PAGES = 10
 
 
 def _client(cfg: Config, user_token: bool = False) -> WebClient:
     token = cfg.slack_user_token if user_token else cfg.slack_bot_token
     if not token:
         which = "WANDA_SLACK_USER_TOKEN" if user_token else "WANDA_SLACK_BOT_TOKEN"
-        sys.exit(f"{which} is not set")
-    return WebClient(token=token, ssl=ssl_context())
+        sys.exit(f"{which} is not set (looked for a .env beside the wanda package)")
+    # The SDK default retries connection errors only; 429s would raise.
+    return WebClient(
+        token=token, ssl=ssl_context(),
+        retry_handlers=default_retry_handlers() + [RateLimitErrorRetryHandler(max_retry_count=3)],
+    )
 
 
 def _names(web: WebClient, messages: list[dict]) -> dict[str, str]:
@@ -98,7 +106,20 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
             ts = args.ts or os.environ.get(ENV_THREAD)
             if not channel or not ts:
                 sys.exit("--channel and --ts are required")
-            msgs = list(web.conversations_replies(channel=channel, ts=ts, limit=args.limit)["messages"])
+            # replies pages forward from the parent, so a bare limit would
+            # return the START of a long thread, not what was just said.
+            msgs, cursor = [], None
+            for _ in range(MAX_PAGES):
+                kwargs = {"channel": channel, "ts": ts, "limit": 200}
+                if cursor:
+                    kwargs["cursor"] = cursor
+                resp = web.conversations_replies(**kwargs)
+                msgs.extend(resp["messages"])
+                cursor = ((resp.get("response_metadata") or {}).get("next_cursor") or "").strip()
+                if not resp.get("has_more") or not cursor:
+                    break
+            if len(msgs) > args.limit:
+                msgs = [msgs[0]] + msgs[-(args.limit - 1):]
             _emit(msgs, web, args.json)
 
         elif verb == "post":
@@ -106,10 +127,12 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
                 sys.exit("--channel is required")
             thread = None if args.no_thread else (args.thread or os.environ.get(ENV_THREAD))
             resp = web.chat_postMessage(channel=channel, thread_ts=thread, text=args.text[:39000])
-            # Tell the harness a reply was delivered, so it doesn't post the
-            # session's final text on top of what the agent already said.
+            # Record WHERE this landed. The harness suppresses its own reply
+            # only when the agent answered the conversation that triggered it —
+            # a post to some other channel must not discharge that obligation.
             if marker := os.environ.get(ENV_MARKER):
-                Path(marker).write_text("posted")
+                with contextlib.suppress(OSError):
+                    Path(marker).write_text(f"{channel}\t{thread or ''}")
             print(f"posted to {channel} ts={resp['ts']}")
 
         elif verb == "search":
@@ -127,9 +150,20 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
         elif verb == "members":
             if not channel:
                 sys.exit("--channel is required")
-            ids = web.conversations_members(channel=channel, limit=200)["members"]
+            ids, cursor = [], None
+            for _ in range(MAX_PAGES):
+                kwargs = {"channel": channel, "limit": 200}
+                if cursor:
+                    kwargs["cursor"] = cursor
+                resp = web.conversations_members(**kwargs)
+                ids.extend(resp["members"])
+                cursor = ((resp.get("response_metadata") or {}).get("next_cursor") or "").strip()
+                if not cursor:
+                    break
             for uid, name in _names(web, [{"user": i} for i in ids]).items():
                 print(f"{uid}\t{name}")
+            if cursor:
+                print(f"… truncated at {len(ids)} members; more remain")
 
         elif verb == "user":
             u = web.users_info(user=args.user_id)["user"]
