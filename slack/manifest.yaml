@@ -1,0 +1,38 @@
+# Slack app manifest for wanda.
+# Create at https://api.slack.com/apps -> Create New App -> From a manifest,
+# paste this file, then:
+#   1. Basic Information -> App-Level Tokens -> generate one with scope
+#      connections:write  -> WANDA_SLACK_APP_TOKEN (xapp-...)
+#   2. Install App to workspace -> Bot User OAuth Token -> WANDA_SLACK_BOT_TOKEN (xoxb-...)
+#   3. Create/choose a channel, /invite @wanda, put its ID in WANDA_SLACK_CHANNEL_ID
+#   4. Your own member ID (profile -> ... -> Copy member ID) -> WANDA_SLACK_OWNER_USER_IDS
+display_information:
+  name: wanda
+  description: Wiki-Augmented Nodal Digital Assistant
+  background_color: "#333333"
+features:
+  bot_user:
+    display_name: wanda
+    always_online: true
+oauth_config:
+  scopes:
+    bot:
+      - chat:write
+      - channels:history
+      - channels:read
+      - groups:history
+      - groups:read
+      - im:history
+      - users:read
+settings:
+  event_subscriptions:
+    bot_events:
+      - message.channels
+      - message.groups
+      - message.im
+  interactivity:
+    is_enabled: true
+  org_deploy_enabled: false
+  socket_mode_enabled: true
+  token_rotation_enabled: false
+  is_mcp_enabled: false
