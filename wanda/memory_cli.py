@@ -92,8 +92,16 @@ def _provenance() -> tuple[str, str]:
     return "harness", f"cli:{os.getpid()}"
 
 
-def _in_session() -> bool:
-    return bool(os.environ.get(ENV_TASK, "").strip())
+def _in_session(store: Store | None = None) -> bool:
+    """A session, not the owner at a terminal: WANDA_TASK_ID is set, or (since
+    a session could unset it) an agent run is in flight. Maintenance verbs
+    that could poison shared state are refused when this is true."""
+    if os.environ.get(ENV_TASK, "").strip():
+        return True
+    try:
+        return bool(store and store.open_windows())
+    except Exception:
+        return False
 
 
 def _append(cfg: Config, store: Store, vault: Vault, o: Observation) -> None:
@@ -273,7 +281,7 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
         store = _store(cfg)
         svc = passes.Services(cfg, store, vault)
         if verb == "retire":
-            if args.to and _in_session():
+            if args.to and _in_session(store):
                 sys.exit("merging notes (--to) is an identity decision for the owner, not for a session; retire without --to, or ask")
             try:
                 with passes.memory_lock(cfg.memory_lock_path):
@@ -289,6 +297,8 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
             print("restored" if ok else "nothing to restore")
             return 0 if ok else 1
         if verb == "reindex":
+            if _in_session(store):
+                sys.exit("reindex writes the shared index; leave it to the daemon's hourly pass while a session is running")
             try:
                 with passes.memory_lock(cfg.memory_lock_path):
                     conn = passes.open_conn(svc)
@@ -314,10 +324,8 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
             print(rep.summary())
             return 0
         if verb == "import-cowork":
-            if store.open_windows():
-                sys.exit("an agent session is running; import when wanda is idle so the imported lines are not mistaken for its work")
-            if _in_session():
-                sys.exit("import is for the owner at a terminal, not for a session")
+            if _in_session(store):
+                sys.exit("import is for the owner at a terminal, not while a session is running")
             try:
                 with passes.memory_lock(cfg.memory_lock_path):
                     rep = passes.import_cowork(svc, Path(args.dir).expanduser())

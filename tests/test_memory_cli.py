@@ -81,6 +81,7 @@ def test_open_from_an_email_task_is_email_tier(env, monkeypatch, capsys):
     monkeypatch.delenv("WANDA_TASK_ID", raising=False)  # unsetting it buys nothing
     assert run(cfg, verb="open", title="Wire the dues by Friday", check_by="2026-09-10", about="topic/dues") == 0
     assert "stays off the always-loaded list" in capsys.readouterr().out
+    store.close_run_window("s-email")  # the session ends; the window is recorded and still covers the line
     run(cfg, verb="reindex")
     conn = ix.open_readonly(cfg.memory_index_path)
     assert conn.execute("SELECT tier FROM docs WHERE type='open'").fetchone()["tier"] == "email"
