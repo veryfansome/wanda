@@ -13,7 +13,11 @@ CsvList = Annotated[list[str], NoDecode]
 class Config(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="WANDA_",
-        env_file=".env",
+        # Anchored to the repo, not the cwd: agent sessions run `wanda slack`
+        # from ~/.wanda/workspace, where a relative ".env" resolves to nothing
+        # and every command would fail with "token is not set". A .env in the
+        # cwd still wins, for local overrides.
+        env_file=(Path(__file__).resolve().parent.parent / ".env", ".env"),
         env_file_encoding="utf-8",
         extra="ignore",
     )
@@ -28,8 +32,13 @@ class Config(BaseSettings):
     # Slack
     slack_bot_token: str = ""
     slack_app_token: str = ""
-    slack_channel_id: str = ""
+    email_triage_slack_channel_id: str = ""
+    # Empty = anyone in the workspace may talk to wanda. Set it to restrict
+    # who can trigger agent sessions.
     slack_owner_user_ids: CsvList = Field(default_factory=list)
+    # User token (xoxp-), only needed for `wanda slack search`.
+    slack_user_token: str = ""
+    slack_context_limit: int = 50
 
     # Enforcement & trash guards
     enforcement: Literal["shadow", "live"] = "shadow"
@@ -52,10 +61,11 @@ class Config(BaseSettings):
     triage_expected_usd: float = 0.05
     agent_expected_usd: float = 0.40
     dryrun_max_limit: int = 200
-    # WebFetch is deliberately absent: an injected email could use it to
-    # exfiltrate whatever the agent read. Runs are also --restricted, which
-    # confines file tools to the workspace directory.
-    agent_allowed_tools: str = "Read,WebSearch"
+    # Bash is included so sessions can drive `wanda slack`. Note that a headless
+    # session cannot scope Bash to one command (--allowedTools is not enforced
+    # under --permission-mode dontAsk), so this grants a session real shell
+    # access — acceptable only in a trusted workspace. See README.
+    agent_allowed_tools: str = "Bash,Read,WebSearch,Skill"
     daily_run_cap: int = 200
     daily_cost_cap_usd: float = 5.0
 

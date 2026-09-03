@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import sqlite3
 import time
@@ -15,6 +14,7 @@ from slack_sdk.http_retry.builtin_handlers import RateLimitErrorRetryHandler
 from wanda.config import Config
 from wanda.store import Store
 from wanda.tls import ssl_context
+from wanda.transcript import trim_thread
 from wanda.triage import Verdict
 
 log = logging.getLogger(__name__)
@@ -25,6 +25,7 @@ MIN_INTERVAL_S = 1.0  # chat.postMessage is ~1/s/channel
 SNIPPET_LIMIT = 1500
 TEXT_LIMIT = 3500  # well under Slack's 40k text cap, and headers can be huge
 MISSING_THREAD_ERRORS = {"thread_not_found", "message_not_found", "channel_not_found"}
+MAX_CONTEXT_PAGES = 10  # bounds a very long thread at ~2000 messages
 
 
 def truncate_text(text: str) -> str:
@@ -62,6 +63,7 @@ class SlackActions:
         )
         self._pace = asyncio.Lock()
         self._last_call = 0.0
+        self._user_cache: dict[str, str] = {}
 
     async def _call(self, method: str, /, **kwargs):
         async with self._pace:
@@ -87,7 +89,7 @@ class SlackActions:
         )
         resp = await self._call(
             "chat_postMessage",
-            channel=self.cfg.slack_channel_id,
+            channel=self.cfg.email_triage_slack_channel_id,
             text=truncate_text(text),
             metadata={
                 "event_type": METADATA_EVENT_TYPE,
@@ -101,7 +103,7 @@ class SlackActions:
         try:
             resp = await self._call(
                 "conversations_history",
-                channel=self.cfg.slack_channel_id,
+                channel=self.cfg.email_triage_slack_channel_id,
                 limit=100,
                 include_all_metadata=True,
             )
@@ -118,17 +120,57 @@ class SlackActions:
                 return m["ts"]
         return None
 
-    async def reply(self, thread_ts: str, text: str) -> None:
+    async def reply(self, thread_ts: str | None, text: str, *, channel: str) -> None:
+        """Both arguments are required and neither defaults. A default channel
+        would silently publish a DM answer in the triage channel the one time a
+        caller forgot it — which is exactly what happened before."""
         await self._call(
             "chat_postMessage",
-            channel=self.cfg.slack_channel_id,
+            channel=channel,
             thread_ts=thread_ts,
             text=text[:39000],
         )
 
+    # --- conversation context ---
+
+    async def fetch_context(self, channel: str, thread_ts: str | None, limit: int) -> list[dict]:
+        """The most RECENT messages, oldest first. A thread reads its replies;
+        a channel or DM reads its history."""
+        if not thread_ts:
+            resp = await self._call("conversations_history", channel=channel, limit=limit)
+            return list(reversed(resp.get("messages") or []))  # history is newest first
+        # conversations.replies pages FORWARD from the parent, so a bare limit
+        # returns the start of a long thread and drops what was just said.
+        msgs: list[dict] = []
+        cursor = None
+        for _ in range(MAX_CONTEXT_PAGES):
+            kwargs = {"channel": channel, "ts": thread_ts, "limit": 200}
+            if cursor:
+                kwargs["cursor"] = cursor
+            resp = await self._call("conversations_replies", **kwargs)
+            msgs.extend(resp.get("messages") or [])
+            cursor = ((resp.get("response_metadata") or {}).get("next_cursor") or "").strip()
+            if not resp.get("has_more") or not cursor:
+                break
+        return trim_thread(msgs, limit)  # keeps the parent plus the newest
+
+    async def user_names(self, user_ids: set[str]) -> dict[str, str]:
+        """Resolve ids to display names, cached for the process lifetime."""
+        for uid in user_ids - self._user_cache.keys():
+            try:
+                resp = await self._call("users_info", user=uid)
+                u = resp.get("user") or {}
+                prof = u.get("profile") or {}
+                self._user_cache[uid] = (
+                    prof.get("display_name") or prof.get("real_name") or u.get("name") or uid
+                )
+            except Exception:
+                self._user_cache[uid] = uid  # deleted user, or missing users:read
+        return self._user_cache
+
     async def alert(self, text: str) -> None:
         await self._call(
-            "chat_postMessage", channel=self.cfg.slack_channel_id,
+            "chat_postMessage", channel=self.cfg.email_triage_slack_channel_id,
             text=truncate_text(f"⚠️ wanda: {text}"),
         )
 
@@ -140,10 +182,10 @@ class SlackActions:
             return digest["thread_ts"]
         resp = await self._call(
             "chat_postMessage",
-            channel=self.cfg.slack_channel_id,
+            channel=self.cfg.email_triage_slack_channel_id,
             text=f"🧹 Triage digest — {local_date}",
         )
-        self.store.set_digest(local_date, self.cfg.slack_channel_id, resp["ts"])
+        self.store.set_digest(local_date, self.cfg.email_triage_slack_channel_id, resp["ts"])
         return resp["ts"]
 
     async def digest_entry(self, row: sqlite3.Row, verdict: Verdict, applied_action: str, note: str) -> None:
@@ -166,7 +208,7 @@ class SlackActions:
         line = truncate_text(line)
         try:
             await self._call(
-                "chat_postMessage", channel=self.cfg.slack_channel_id,
+                "chat_postMessage", channel=self.cfg.email_triage_slack_channel_id,
                 thread_ts=thread_ts, text=line,
             )
         except SlackApiError as e:
@@ -179,6 +221,6 @@ class SlackActions:
             self.store.clear_digest(local_date)
             fresh = await self._digest_thread(local_date)
             await self._call(
-                "chat_postMessage", channel=self.cfg.slack_channel_id,
+                "chat_postMessage", channel=self.cfg.email_triage_slack_channel_id,
                 thread_ts=fresh, text=line,
             )

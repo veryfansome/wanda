@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -14,7 +14,3 @@ class Event:
     dedupe_key: str
     payload: dict[str, Any] = field(default_factory=dict)
 
-
-class Watcher(Protocol):
-    def start(self) -> None: ...
-    def stop(self) -> None: ...

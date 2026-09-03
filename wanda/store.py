@@ -39,11 +39,14 @@ CREATE INDEX IF NOT EXISTS idx_messages_status ON messages(status);
 
 CREATE TABLE IF NOT EXISTS tasks (
   id                INTEGER PRIMARY KEY,
-  message_pk        INTEGER NOT NULL REFERENCES messages(id),
+  -- NULL for mention/DM tasks: those have no email behind them.
+  message_pk        INTEGER REFERENCES messages(id),
   slack_channel     TEXT NOT NULL,
   thread_ts         TEXT NOT NULL,
   claude_session_id TEXT,
   status            TEXT NOT NULL DEFAULT 'open',
+  kind              TEXT NOT NULL DEFAULT 'email',
+  reply_thread      TEXT,
   created_at        TEXT NOT NULL,
   updated_at        TEXT NOT NULL,
   UNIQUE (slack_channel, thread_ts)
@@ -90,6 +93,12 @@ MIGRATIONS = (
     # already in the table was delivered before this column existed.
     ("runs", "notified", "INTEGER NOT NULL DEFAULT 1"),
     ("messages", "deferred_until", "TEXT"),
+    # 'email' | 'mention' | 'mention_guest' | 'dm' — where the task came from.
+    ("tasks", "kind", "TEXT NOT NULL DEFAULT 'email'"),
+    # Where replies are posted. Distinct from thread_ts, which is the task KEY
+    # and for a DM holds a sentinel that is not a Slack timestamp.
+    ("tasks", "reply_thread", "TEXT"),
+    ("runs", "deliver_attempts", "INTEGER NOT NULL DEFAULT 0"),
 )
 
 
@@ -114,10 +123,12 @@ class Store:
             self._db.commit()
 
     def _migrate(self) -> None:
+        self._relax_task_message_fk()
         for table, column, decl in MIGRATIONS:
             existing = {r["name"] for r in self._db.execute(f"PRAGMA table_info({table})")}
             if column not in existing:
                 self._db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+
         # Repair databases migrated by the build that backfilled notified=0,
         # which would replay every historical answer into Slack on startup.
         marked = self._db.execute(
@@ -126,6 +137,71 @@ class Store:
         if not marked:
             self._db.execute("UPDATE runs SET notified=1")
             self._db.execute("INSERT INTO meta(key, value) VALUES('notified_backfilled','1')")
+        # Pre-existing tasks reply in their own thread; without this they post
+        # at channel top level. Meta-guarded rather than tied to the ADD COLUMN,
+        # because an earlier build already added the column full of NULLs.
+        # DM rows keep NULL — their key is a sentinel, not a thread id.
+        if not self._db.execute(
+            "SELECT value FROM meta WHERE key='reply_thread_backfilled'"
+        ).fetchone():
+            self._db.execute(
+                "UPDATE tasks SET reply_thread = thread_ts "
+                "WHERE reply_thread IS NULL AND kind <> 'dm'"
+            )
+            self._db.execute("INSERT INTO meta(key, value) VALUES('reply_thread_backfilled','1')")
+
+    def _relax_task_message_fk(self) -> None:
+        """A task used to require an email row. Mention- and DM-driven tasks
+        have no email behind them, so message_pk must become nullable — which
+        SQLite can only do by rebuilding the table."""
+        cols = list(self._db.execute("PRAGMA table_info(tasks)"))
+        if not cols or not any(c["name"] == "message_pk" and c["notnull"] for c in cols):
+            return
+        has_kind = any(c["name"] == "kind" for c in cols)
+        kind_sel = "kind" if has_kind else "'email'"
+        # executescript() would COMMIT before each statement, leaving durable
+        # half-states: a crash between DROP and RENAME loses every task row,
+        # because SCHEMA then recreates tasks empty on the next start. Run the
+        # rebuild inside one explicit transaction instead. The PRAGMA must be
+        # outside it — SQLite ignores foreign_keys changes within one.
+        self._db.execute("PRAGMA foreign_keys=OFF")
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            for stmt in self._rebuild_statements(kind_sel):
+                self._db.execute(stmt)
+            self._db.execute("COMMIT")
+        except Exception:
+            self._db.execute("ROLLBACK")
+            raise
+        finally:
+            self._db.execute("PRAGMA foreign_keys=ON")
+
+    @staticmethod
+    def _rebuild_statements(kind_sel: str) -> tuple[str, ...]:
+        return (
+            """
+            CREATE TABLE tasks_new (
+              id                INTEGER PRIMARY KEY,
+              message_pk        INTEGER REFERENCES messages(id),
+              slack_channel     TEXT NOT NULL,
+              thread_ts         TEXT NOT NULL,
+              claude_session_id TEXT,
+              status            TEXT NOT NULL DEFAULT 'open',
+              kind              TEXT NOT NULL DEFAULT 'email',
+              created_at        TEXT NOT NULL,
+              updated_at        TEXT NOT NULL,
+              UNIQUE (slack_channel, thread_ts)
+            )
+            """,
+            f"""
+            INSERT INTO tasks_new (id, message_pk, slack_channel, thread_ts,
+                                   claude_session_id, status, kind, created_at, updated_at)
+              SELECT id, message_pk, slack_channel, thread_ts,
+                     claude_session_id, status, {kind_sel}, created_at, updated_at FROM tasks
+            """,
+            "DROP TABLE tasks",
+            "ALTER TABLE tasks_new RENAME TO tasks",
+        )
 
     def close(self) -> None:
         with self._lock:
@@ -275,12 +351,16 @@ class Store:
 
     # --- tasks ---
 
-    def create_task(self, message_pk: int, channel: str, thread_ts: str) -> int:
+    def create_task(self, message_pk: int | None, channel: str, thread_ts: str,
+                    kind: str = "email", reply_thread: str | None = None) -> int:
+        """thread_ts identifies the task; reply_thread is where answers go and
+        defaults to the same value (an email or channel thread)."""
         now = utcnow()
         cur = self._exec(
-            "INSERT OR IGNORE INTO tasks(message_pk, slack_channel, thread_ts, status, created_at, updated_at) "
-            "VALUES(?,?,?,'open',?,?)",
-            (message_pk, channel, thread_ts, now, now),
+            "INSERT OR IGNORE INTO tasks(message_pk, slack_channel, thread_ts, status, kind, "
+            "reply_thread, created_at, updated_at) VALUES(?,?,?,'open',?,?,?,?)",
+            (message_pk, channel, thread_ts, kind,
+             thread_ts if reply_thread is None and kind != "dm" else reply_thread, now, now),
         )
         if cur.rowcount:
             return cur.lastrowid
@@ -335,13 +415,26 @@ class Store:
         """Agent outcomes the owner never received: killed by a restart, or
         answered successfully but undeliverable at the time."""
         return self._query(
-            "SELECT r.*, t.thread_ts FROM runs r JOIN tasks t ON t.id = r.task_id "
+            "SELECT r.*, t.reply_thread, t.slack_channel FROM runs r JOIN tasks t ON t.id = r.task_id "
             "WHERE r.notified=0 ORDER BY r.id LIMIT ?",
             (limit,),
         )
 
     def mark_run_notified(self, run_id: int) -> None:
         self._exec("UPDATE runs SET notified=1 WHERE id=?", (run_id,))
+
+    def bump_delivery_attempt(self, run_id: int) -> int:
+        """Delivery cannot retry forever: an answer for a channel wanda was
+        removed from would block every later delivery behind it."""
+        with self._lock:
+            self._db.execute(
+                "UPDATE runs SET deliver_attempts = deliver_attempts + 1 WHERE id=?", (run_id,)
+            )
+            row = self._db.execute(
+                "SELECT deliver_attempts FROM runs WHERE id=?", (run_id,)
+            ).fetchone()
+            self._db.commit()
+        return row["deliver_attempts"] if row else 0
 
     def runs_today(self) -> tuple[int, float]:
         midnight_utc = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)

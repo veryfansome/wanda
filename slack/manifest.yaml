@@ -4,8 +4,17 @@
 #   1. Basic Information -> App-Level Tokens -> generate one with scope
 #      connections:write  -> WANDA_SLACK_APP_TOKEN (xapp-...)
 #   2. Install App to workspace -> Bot User OAuth Token -> WANDA_SLACK_BOT_TOKEN (xoxb-...)
-#   3. Create/choose a channel, /invite @wanda, put its ID in WANDA_SLACK_CHANNEL_ID
-#   4. Your own member ID (profile -> ... -> Copy member ID) -> WANDA_SLACK_OWNER_USER_IDS
+#   3. Create/choose a channel, /invite @wanda, put its ID in WANDA_EMAIL_TRIAGE_SLACK_CHANNEL_ID
+#   4. Leave WANDA_SLACK_OWNER_USER_IDS empty to let anyone in the workspace talk
+#      to wanda, or list member IDs to restrict it.
+#
+# Changing scopes requires REINSTALLING the app (Install App -> Reinstall) and
+# copying the new xoxb- token into .env.
+#
+# `wanda slack search` additionally needs a user token (xoxp-) with search:read,
+# which is a user scope: add it under oauth_config.scopes.user, reinstall, and
+# put the User OAuth Token in WANDA_SLACK_USER_TOKEN. Skip this if you don't
+# want wanda able to search everything you can see.
 display_information:
   name: wanda
   description: Wiki-Augmented Nodal Digital Assistant
@@ -14,15 +23,28 @@ features:
   bot_user:
     display_name: wanda
     always_online: true
+  app_home:
+    # Without this nobody can DM the bot at all.
+    messages_tab_enabled: true
+    messages_tab_read_only_enabled: false
+    home_tab_enabled: false
 oauth_config:
   scopes:
     bot:
+      # Mentions are detected from message text, so app_mentions:read and the
+      # app_mention event are deliberately absent: Slack would deliver a second
+      # envelope per mention that wanda discards.
       - chat:write
       - channels:history
       - channels:read
       - groups:history
       - groups:read
       - im:history
+      - im:read
+      - im:write
+      - mpim:history
+      - mpim:read
+      - mpim:write
       - users:read
 settings:
   event_subscriptions:
@@ -30,8 +52,11 @@ settings:
       - message.channels
       - message.groups
       - message.im
+      - message.mpim
   interactivity:
-    is_enabled: true
+    # No buttons or modals: the watcher only handles events_api
+    # envelopes and discards interactive payloads.
+    is_enabled: false
   org_deploy_enabled: false
   socket_mode_enabled: true
   token_rotation_enabled: false

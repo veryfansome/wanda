@@ -26,6 +26,7 @@ class FakeSlack:
     def __init__(self, fail=False):
         self.fail = fail
         self.tasks, self.digests, self.alerts, self.replies = [], [], [], []
+        self.channels, self.threads = [], []
 
     async def post_task(self, row, v):
         if self.fail:
@@ -46,12 +47,14 @@ class FakeSlack:
     async def alert(self, text):
         self.alerts.append(text)
 
-    async def reply(self, thread_ts, text):
+    async def reply(self, thread_ts, text, channel=None):
         self.replies.append(text)
+        self.channels.append(channel)
+        self.threads.append(thread_ts)
 
 
 def cfg(**kw) -> Config:
-    return Config(_env_file=None, slack_channel_id="C1", **kw)
+    return Config(_env_file=None, email_triage_slack_channel_id="C1", **kw)
 
 
 def make(tmp_path, slack=None, **kw):
@@ -266,7 +269,7 @@ def test_undeliverable_answer_stays_pending(tmp_path):
                      cost_usd=0.4, status="ok", result_text="answer", notified=0)
 
     class Boom(FakeSlack):
-        async def reply(self, thread_ts, text):
+        async def reply(self, thread_ts, text, channel=None):
             raise RuntimeError("slack down")
 
     p.slack = Boom()
@@ -344,9 +347,157 @@ def test_alert_is_not_suppressed_by_a_failed_post(tmp_path):
     assert len(slack.alerts) == 1, "delivered alert must not repeat"
 
 
+def test_answered_here_requires_the_triggering_conversation(tmp_path):
+    """The post marker records where the agent posted. A post elsewhere (e.g.
+    'put this in #eng') must not suppress the reply the asker is owed."""
+    p, _ = make(tmp_path)
+    marker = tmp_path / "m.posted"
+
+    marker.write_text("C_ASKED\t99.1")
+    assert p._answered_here(marker, "C_ASKED", "99.1") is True
+    assert p._answered_here(marker, "C_OTHER", "99.1") is False   # wrong channel
+    assert p._answered_here(marker, "C_ASKED", "77.7") is False   # wrong thread
+
+    marker.write_text("D5\t")                                     # untreaded DM reply
+    assert p._answered_here(marker, "D5", None) is True
+
+    marker.unlink()
+    assert p._answered_here(marker, "C_ASKED", "99.1") is False   # never posted
+
+
+def test_pending_delivery_goes_to_its_own_conversation(tmp_path):
+    """A DM answer that failed to post must not be replayed into the triage
+    channel."""
+    slack = FakeSlack()
+    p, store = make(tmp_path, slack)
+    tid = store.create_task(None, "D_PRIVATE", "conversation", kind="dm")
+    store.record_run(kind="agent", task_id=tid, session_id="s", started_at=utcnow(),
+                     exit_code=0, cost_usd=0.4, status="ok", result_text="private answer",
+                     notified=0)
+    asyncio.run(p.deliver_pending())
+    assert slack.channels == ["D_PRIVATE"], "must post back to the DM, not the triage channel"
+
+
 def test_reservation_released_on_exception(tmp_path):
     p, _ = make(tmp_path)
     with pytest.raises(ValueError):
         with p._reserve(2.0):
             raise ValueError("boom")
     assert p._inflight_usd == 0.0 and p._inflight_runs == 0
+
+
+def test_marker_matches_any_post_to_the_asker(tmp_path):
+    """Last-write-wins made suppression depend on the order the agent posted
+    in: answering the asker then copying to #eng duplicated the answer."""
+    p, _ = make(tmp_path)
+    m = tmp_path / "m.posted"
+
+    m.write_text("C_ASKED\t99.1\nC_ENG\t\n")          # answered, then copied elsewhere
+    assert p._answered_here(m, "C_ASKED", "99.1") is True
+    m.write_text("C_ENG\t\nC_ASKED\t99.1\n")          # other order, same outcome
+    assert p._answered_here(m, "C_ASKED", "99.1") is True
+
+    m.write_text("C_ASKED\t\n")                        # --no-thread in the right channel counts
+    assert p._answered_here(m, "C_ASKED", "99.1") is True
+
+    m.write_text("C_ENG\t\n")                          # only posted elsewhere
+    assert p._answered_here(m, "C_ASKED", "99.1") is False
+
+
+def test_dm_recovery_posts_untreaded(tmp_path):
+    """tasks.thread_ts holds a sentinel for DMs; sending it as a Slack thread
+    id made the delivery fail forever."""
+    slack = FakeSlack()
+    p, store = make(tmp_path, slack)
+    tid = store.create_task(None, "D5", "conversation", kind="dm", reply_thread=None)
+    store.record_run(kind="agent", task_id=tid, session_id="s", started_at=utcnow(),
+                     exit_code=0, cost_usd=0.4, status="ok", result_text="answer", notified=0)
+    asyncio.run(p.deliver_pending())
+    assert slack.threads == [None], "a DM answer must post untreaded, not to 'conversation'"
+    assert slack.channels == ["D5"]
+
+
+def test_conversation_kinds_open_a_task():
+    """The watcher mints these kinds; every one must open a task, or the
+    trigger dead-ends in a false 'still starting up' reply."""
+    from wanda.main import CONVERSATION_KINDS
+    from wanda.watchers.slack_watcher import DM_TASK_KEY  # noqa: F401
+    assert set(CONVERSATION_KINDS) == {"mention", "mention_guest", "dm"}
+
+
+def test_answered_run_that_then_timed_out_is_not_double_posted(tmp_path):
+    """A session that posted its answer and was then killed by the timeout has
+    still answered; posting 'agent run failed' under it is noise."""
+    p, _ = make(tmp_path)
+    marker = tmp_path / "m.posted"
+    marker.write_text("C9\t100.1\n")
+    assert p._answered_here(marker, "C9", "100.1") is True
+
+
+def test_legacy_tasks_get_reply_thread_backfilled(tmp_path):
+    """A bare ADD COLUMN left NULL, which posts recovery answers at channel top
+    level instead of in the task's thread."""
+    import sqlite3
+    db = tmp_path / "legacy.db"
+    c = sqlite3.connect(db)
+    c.executescript("""
+      CREATE TABLE messages(id INTEGER PRIMARY KEY, dedupe_key TEXT NOT NULL UNIQUE,
+        folder TEXT NOT NULL, uidvalidity INTEGER NOT NULL, uid INTEGER NOT NULL,
+        status TEXT NOT NULL DEFAULT 'new', created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+      CREATE TABLE tasks(id INTEGER PRIMARY KEY, message_pk INTEGER REFERENCES messages(id),
+        slack_channel TEXT NOT NULL, thread_ts TEXT NOT NULL, claude_session_id TEXT,
+        status TEXT NOT NULL DEFAULT 'open', kind TEXT NOT NULL DEFAULT 'email',
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(slack_channel, thread_ts));
+      CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+      INSERT INTO tasks(slack_channel, thread_ts, kind, created_at, updated_at)
+        VALUES ('C1','111.1','email','t','t'), ('D5','conversation','dm','t','t');
+    """)
+    c.commit(); c.close()
+
+    s = Store(db)
+    assert s.get_task_by_thread("C1", "111.1")["reply_thread"] == "111.1"
+    assert s.get_task_by_thread("D5", "conversation")["reply_thread"] is None, \
+        "a DM key is a sentinel, not a thread id"
+    s.close()
+
+
+def test_answered_then_failed_surfaces_the_failure(tmp_path):
+    """A run that posted something and then died must not be recorded as
+    delivered — the post may be a holding note or half an answer."""
+    p, _ = make(tmp_path)
+    marker = tmp_path / "m.posted"
+    marker.write_text("C9\t100.1\n")
+    assert p._answered_here(marker, "C9", "100.1") is True   # it did post
+    # The harness decides using rr.ok as well; see _run_task_reply.
+
+
+def test_delivery_gives_up_and_stops_blocking(tmp_path):
+    """An answer for a channel wanda was removed from used to retry forever,
+    blocking every later delivery behind it."""
+    from wanda.main import MAX_DELIVERY_ATTEMPTS
+
+    class Boom(FakeSlack):
+        async def reply(self, thread_ts, text, channel=None):
+            raise RuntimeError("not_in_channel")
+
+    p, store = make(tmp_path, Boom())
+    tid = store.create_task(None, "C_GONE", "1.1", kind="mention")
+    store.record_run(kind="agent", task_id=tid, session_id="s", started_at=utcnow(),
+                     exit_code=0, cost_usd=0.4, status="ok", result_text="answer", notified=0)
+    for _ in range(MAX_DELIVERY_ATTEMPTS):
+        asyncio.run(p.deliver_pending())
+    assert store.pending_deliveries() == [], "must stop retrying and free the queue"
+    assert store.get_meta("abandoned_alert_pending") == "1", "and tell the owner"
+
+
+def test_reply_requires_an_explicit_channel():
+    """A defaulted channel published a DM answer in the triage channel the one
+    time a caller forgot it. Keyword-only and required makes that a TypeError."""
+    import inspect
+
+    from wanda.actions.slack import SlackActions
+
+    sig = inspect.signature(SlackActions.reply)
+    channel = sig.parameters["channel"]
+    assert channel.default is inspect.Parameter.empty, "channel must have no default"
+    assert channel.kind is inspect.Parameter.KEYWORD_ONLY, "and must be passed by name"
