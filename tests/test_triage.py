@@ -163,3 +163,19 @@ def test_guards_cap_counts_executed_moves(store):
     gd = evaluate_guards(verdict(), "x@y.z", c, store)
     assert gd.applied_action == "shadow_trash"
     assert "cap" in gd.note
+
+
+def test_memo_is_optional_and_a_bad_memo_does_not_sink_the_verdict():
+    good = verdict().model_dump() | {"memo": {"facet": "mail-pattern", "text": "Sends closure notices."}}
+    bad = verdict().model_dump() | {"id": "e2", "memo": {"facet": "x" * 40, "text": "y"}}
+    batch = parse_verdicts({"verdicts": [good, bad]})
+    assert [v.id for v in batch.verdicts] == ["e1", "e2"]
+    assert batch.verdicts[0].memo.text == "Sends closure notices." and batch.verdicts[1].memo is None
+
+
+def test_memory_block_precedes_the_emails_in_the_user_message(store):
+    store.ingest_message(dedupe_key="k", message_id="<k>", folder="INBOX", uidvalidity=1, uid=1,
+                         from_addr="a@b.c", subject="s", date_hdr="d", snippet="body")
+    prompt, _ = build_batch_prompt(store.fetch_by_status("new"), memory="<memory>\nknown sender\n</memory>\n")
+    assert prompt.index("<memory>") < prompt.index('<email id="e1">')
+    assert prompt.count("<memory>") == 1

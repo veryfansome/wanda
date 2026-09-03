@@ -12,13 +12,6 @@ from wanda.transcript import humanize, render, trim_thread, user_ids_in
 from wanda.watchers.slack_watcher import SlackWatcher
 
 
-@pytest.fixture(autouse=True)
-def _scrub_env(monkeypatch):
-    for key in list(os.environ):
-        if key.startswith("WANDA_"):
-            monkeypatch.delenv(key, raising=False)
-
-
 @pytest.fixture
 def store(tmp_path):
     s = Store(tmp_path / "w.db")
@@ -86,12 +79,12 @@ def test_guest_thread_does_not_capture_later_messages(store):
 
 
 def test_dm_with_a_mention_is_still_a_dm(store):
-    """Conversation type wins over the presence of a mention, so a DM stays one
-    resumable conversation however the user phrases it."""
+    """Conversation type wins over the presence of a mention; like a channel
+    mention, a top-level DM roots its own thread and task."""
     ev = fire(store, {"type": "message", "user": "U1", "channel": "D5", "channel_type": "im",
                       "ts": "7.7", "text": "<@UBOT> hi"})
     assert ev.payload["kind"] == "dm"
-    assert ev.payload["task_key"] == "conversation" and ev.payload["reply_thread"] is None
+    assert ev.payload["task_key"] == "7.7" and ev.payload["reply_thread"] == "7.7"
 
 
 @pytest.mark.parametrize("ctype", ["im", "mpim"])
@@ -122,11 +115,16 @@ def test_bot_and_self_messages_ignored(store):
                         "channel_type": "im", "ts": "1.2", "text": "x"}) is None
 
 
-def test_owner_list_restricts_when_set(store):
+def test_allow_list_restricts_when_set(store):
     ev = {"type": "message", "user": "U_STRANGER", "channel": "C9", "channel_type": "channel",
           "ts": "1.1", "text": "<@UBOT> hi"}
-    assert fire(store, ev, slack_owner_user_ids=["U_ME"]) is None
+    assert fire(store, ev, slack_allowed_user_ids=["U_ME"]) is None
     assert fire(store, ev) is not None  # empty list = anyone
+
+
+def test_old_owner_env_name_still_reads(monkeypatch):
+    monkeypatch.setenv("WANDA_SLACK_OWNER_USER_IDS", "U_A,U_B")
+    assert Config(_env_file=None).slack_allowed_user_ids == ["U_A", "U_B"]
 
 
 def test_app_mention_twin_is_ignored(store):
@@ -144,16 +142,40 @@ def test_app_mention_twin_is_ignored(store):
     assert q.qsize() == 1, "one user message must produce exactly one trigger"
 
 
-def test_dm_conversation_is_one_resumable_task(store):
-    """Every top-level DM message must map to the same task, so the session
-    resumes instead of starting fresh each time."""
+def test_each_top_level_dm_is_its_own_thread_and_task(store):
+    """A DM behaves like a private channel: two top-level messages are two
+    tasks; a reply inside a DM thread wanda owns resumes that task."""
     first = fire(store, {"type": "message", "user": "U1", "channel": "D5",
                          "channel_type": "im", "ts": "1.1", "text": "hi"})
     second = fire(store, {"type": "message", "user": "U1", "channel": "D5",
                           "channel_type": "im", "ts": "2.2", "text": "and another thing"})
-    assert first.payload["task_key"] == second.payload["task_key"]
-    # Unthreaded, so wanda's own replies stay visible in conversations.history.
-    assert first.payload["reply_thread"] is None and second.payload["reply_thread"] is None
+    assert first.payload["task_key"] != second.payload["task_key"]
+    assert first.payload["reply_thread"] == "1.1" and second.payload["reply_thread"] == "2.2"
+    store.create_task(None, "D5", "1.1", kind="dm")
+    follow = fire(store, {"type": "message", "user": "U1", "channel": "D5", "channel_type": "im",
+                          "ts": "1.5", "thread_ts": "1.1", "text": "more on that"})
+    assert follow.payload["kind"] == "dm" and follow.payload["task_key"] == "1.1"
+
+
+def test_owner_command_never_opens_a_session(store):
+    """`rule …` from a memory owner is a command, even in a DM where every
+    message would otherwise start a paid session."""
+    ev = fire(store, {"type": "message", "user": "U_OWNER", "channel": "D5", "channel_type": "im",
+                      "ts": "3.3", "text": "rule priya.nash@example.org trash"}, memory_owner_user_ids=["U_OWNER"])
+    assert ev.payload["kind"] == "command" and ev.payload["reply_thread"] == "3.3"
+    # The same text from someone who is not an owner is just a DM.
+    ev2 = fire(store, {"type": "message", "user": "U_OTHER", "channel": "D5", "channel_type": "im",
+                       "ts": "3.4", "text": "rule priya.nash@example.org trash"}, memory_owner_user_ids=["U_OWNER"])
+    assert ev2.payload["kind"] == "dm"
+
+
+def test_digest_thread_replies_are_commands_for_owners_only(store):
+    store.set_digest("memory:2026-09-03", "C_TRIAGE", "500.1")
+    ev = fire(store, {"type": "message", "user": "U_OWNER", "channel": "C_TRIAGE", "channel_type": "channel",
+                      "ts": "500.2", "thread_ts": "500.1", "text": "k4"}, memory_owner_user_ids=["U_OWNER"])
+    assert ev.payload["kind"] == "command"
+    assert fire(store, {"type": "message", "user": "U_OTHER", "channel": "C_TRIAGE", "channel_type": "channel",
+                        "ts": "500.3", "thread_ts": "500.1", "text": "nice"}, memory_owner_user_ids=["U_OWNER"]) is None
 
 
 def test_duplicate_event_id_ignored(store):
