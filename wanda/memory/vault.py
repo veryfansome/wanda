@@ -65,6 +65,25 @@ class Vault:
     def rel(self, path: Path) -> str:
         return path.relative_to(self.root).as_posix()
 
+    def inside(self, rel: str) -> Path:
+        """Resolve a vault-relative path and refuse anything that escapes the
+        vault (`../`, absolute paths, symlinks out). Every CLI verb that takes
+        a path goes through here."""
+        if not rel or rel.startswith("/") or "\x00" in rel:
+            raise ValueError(f"not a vault path: {rel!r}")
+        root = self.root.resolve()
+        p = (self.root / rel).resolve()
+        try:
+            p.relative_to(root)
+        except ValueError:
+            raise ValueError(f"{rel!r} is outside the vault") from None
+        return p
+
+    def note_rel(self, subject: str) -> str:
+        """`person/x` -> `people/x.md` ('' for a type with no curated home)."""
+        p = self.note_path(subject)
+        return self.rel(p) if p else ""
+
     def l2_notes(self):
         for d in L2_DIRS:
             p = self.root / d
@@ -72,6 +91,9 @@ class Vault:
                 for f in sorted(p.glob("*.md")):
                     if f.name != "CLAUDE.md" and not f.name.startswith("_"):
                         yield f
+
+    def history_path(self, note_rel: str) -> Path:
+        return self.retired_dir / "history" / note_rel
 
     def writespecs(self):
         """Every CLAUDE.md in the vault, root first, then by depth."""
@@ -86,6 +108,8 @@ class Vault:
 # --- text hygiene -----------------------------------------------------------
 
 _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+LIVE_STATUSES = ("owner-stated", "corroborated", "provisional", "disputed")
+LIVE_SQL = "('owner-stated','corroborated','provisional','disputed')"
 
 
 def clean_text(text: str, cap_b: int = CLAIM_TEXT_CAP_B) -> str:
@@ -104,6 +128,19 @@ def clean_text(text: str, cap_b: int = CLAIM_TEXT_CAP_B) -> str:
     t = re.sub(r"^[#>*+\-\s]+", "", t)
     t = t.replace("<", "‹").replace(">", "›")  # no tag can form in stored text
     return truncate_bytes(t, cap_b)
+
+
+def clean_prose(text: str, cap_b: int = 4000) -> str:
+    """For multi-line prose wanda writes into a write-spec: control characters
+    and tag/marker forms out, markdown structure (bullets, headings) kept."""
+    t = unicodedata.normalize("NFC", text or "").replace("\r\n", "\n").replace("\r", "\n")
+    t = _CONTROL.sub(" ", t)
+    t = t.replace("<!--", "‹!--").replace("-->", "--›").replace("<", "‹").replace(">", "›")
+    t = t.replace("[[", "[").replace("]]", "]").replace("::", ":")
+    lines = [" ".join(ln.split()) for ln in t.split("\n")]
+    out = "\n".join(lines).strip()
+    out = re.sub(r"\n{3,}", "\n\n", out)
+    return truncate_bytes(out, cap_b)
 
 
 def truncate_words(text: str, cap_b: int) -> str:
@@ -238,10 +275,12 @@ class Doc:
 
 
 def parse_frontmatter(text: str) -> Doc:
-    """A small YAML subset: `key: scalar`, `key: [a, b]`, and
-    `key:\\n  - item` lists. Quoted scalars are unquoted. Enough for the
-    fields wanda writes, and anything else is kept as a raw string so a hand
-    edit is never destroyed by a round-trip."""
+    """A small YAML subset: `key: scalar`, `key: [a, b]`, and `key:` followed
+    by `- item` lines (indented or not). Quoted scalars are unquoted. Enough
+    for the fields wanda writes. Nested maps and block scalars are NOT
+    understood and would be flattened by a machine rewrite — wanda's notes
+    never carry them, and hand-written ones belong under `## Notes`."""
+    text = text.replace("\r\n", "\n")
     if not text.startswith("---\n"):
         return Doc({}, text)
     end = text.find("\n---", 4)
@@ -256,10 +295,10 @@ def parse_frontmatter(text: str) -> Doc:
     for raw in head.splitlines():
         if not raw.strip():
             continue
-        if raw.startswith("  - ") and key is not None:
+        if re.match(r"^\s*- ", raw) and key is not None:
             meta.setdefault(key, [])
             if isinstance(meta[key], list):
-                meta[key].append(_unquote(raw[4:].strip()))
+                meta[key].append(_unquote(raw.split("- ", 1)[1].strip()))
             continue
         m = re.match(r"^([A-Za-z_][\w-]*):\s*(.*)$", raw)
         if not m:

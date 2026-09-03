@@ -268,3 +268,22 @@ def test_owned_thread_replies_work_without_a_mention(store):
     ev = fire(store, {"type": "message", "user": "U1", "channel": "C9", "channel_type": "channel",
                       "ts": "100.5", "thread_ts": "100.1", "text": "and the other one?"})
     assert ev is not None and ev.payload["kind"] == "task"
+
+
+def test_channel_commands_need_a_mention_and_prose_is_not_a_command(store):
+    owner = {"memory_owner_user_ids": ["U_OWNER"]}
+    # In a channel, a bare `rule …` from the owner is ordinary chatter.
+    assert fire(store, {"type": "message", "user": "U_OWNER", "channel": "C9", "channel_type": "channel",
+                        "ts": "1.1", "text": "rule priya@x.example trash"}, **owner) is None
+    ev = fire(store, {"type": "message", "user": "U_OWNER", "channel": "C9", "channel_type": "channel",
+                      "ts": "1.2", "text": "<@UBOT> rule priya@x.example trash"}, **owner)
+    assert ev.payload["kind"] == "command"
+    # Prose that starts with a verb word is a DM like any other.
+    ev = fire(store, {"type": "message", "user": "U_OWNER", "channel": "D5", "channel_type": "im",
+                      "ts": "1.3", "text": "forget it, thanks — let's start over"}, **owner)
+    assert ev.payload["kind"] == "dm"
+    # A mention in the digest thread by a non-owner is a guest mention, not dropped.
+    store.set_digest("memory:2026-09-03", "C_TRIAGE", "500.1")
+    ev = fire(store, {"type": "message", "user": "U_OTHER", "channel": "C_TRIAGE", "channel_type": "channel",
+                      "ts": "500.4", "thread_ts": "500.1", "text": "<@UBOT> why was this trashed?"}, **owner)
+    assert ev.payload["kind"] == "mention_guest"

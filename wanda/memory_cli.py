@@ -6,22 +6,22 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 from wanda.config import Config
-from wanda.memory import index as ix
-from wanda.memory import passes, recall, render
+from wanda.memory import commands, index as ix, passes, recall
 from wanda.memory.ledger import Observation, append as ledger_append
 from wanda.memory.notes import new_note, parse_note
 from wanda.memory.render import TIER_TAG
 from wanda.memory.subjects import parse_subject, resolve, subject_from_address, subject_from_slack
-from wanda.memory.vault import Vault, clean_text, slugify, write_atomic
+from wanda.memory.vault import DIR_TO_TYPE, Vault, clean_text, slugify, write_atomic
 from wanda.store import Store
 
 ENV_TASK = "WANDA_TASK_ID"
-ENV_SESSION = "WANDA_SESSION_ID"
+SLACK_ID_RE = re.compile(r"^[uw][a-z0-9_]{2,}$", re.I)
 
 
 def add_parser(sub: argparse._SubParsersAction) -> None:
@@ -29,17 +29,17 @@ def add_parser(sub: argparse._SubParsersAction) -> None:
     verbs = p.add_subparsers(dest="verb", required=True)
 
     v = verbs.add_parser("who", help="a person or org by email address or Slack user id")
-    v.add_argument("ident")
+    v.add_argument("ident", help="an email address, or a Slack user id like U0123456789")
     v = verbs.add_parser("recall", help="free-text recall: notes, claims, recent observations")
     v.add_argument("text")
-    v.add_argument("--budget", type=int, default=3000)
+    v.add_argument("--budget", type=int, default=3000, help="max bytes of output (default 3000)")
     v = verbs.add_parser("walk", help="a note plus the filing guides above it")
-    v.add_argument("path", nargs="+")
+    v.add_argument("path", nargs="+", help="vault-relative note path, e.g. people/robin-vale.md")
     v = verbs.add_parser("search", help="full-text search over claims")
     v.add_argument("text")
     v.add_argument("--limit", type=int, default=10)
     v = verbs.add_parser("show", help="one note, claims first")
-    v.add_argument("path")
+    v.add_argument("path", help="vault-relative note path")
     verbs.add_parser("rules", help="every standing rule from the owner")
     v = verbs.add_parser("note", help="record one fact")
     v.add_argument("text")
@@ -48,23 +48,24 @@ def add_parser(sub: argparse._SubParsersAction) -> None:
     v.add_argument("--until", default="", help="YYYY-MM-DD when this stops being true")
     v = verbs.add_parser("open", help="record a commitment with a date")
     v.add_argument("title")
-    v.add_argument("--check-by", required=True)
-    v.add_argument("--about", required=True)
+    v.add_argument("--check-by", required=True, help="YYYY-MM-DD; the item lapses a week after this if nothing touches it")
+    v.add_argument("--about", required=True, help="subject key the commitment belongs to")
+    v = verbs.add_parser("pin", help="keep a claim as written: never rewritten, folded or dropped from the projection")
+    v.add_argument("ref", help="claim reference like people/robin-vale#c4")
     v = verbs.add_parser("forget", help="veto a claim and the pattern behind it (owner-stated claims need Slack)")
-    v.add_argument("ref")
-    v = verbs.add_parser("retire", help="retire a note, rewriting every link (optionally into a successor)")
-    v.add_argument("path")
-    v.add_argument("--to")
-    v = verbs.add_parser("unretire", help="restore a retired note")
-    v.add_argument("path")
-    v = verbs.add_parser("reindex", help="rebuild the derived index from the vault")
-    v.add_argument("--full", action="store_true")
+    v.add_argument("ref", help="claim reference like people/robin-vale#c4")
+    v = verbs.add_parser("retire", help="retire a note, rewriting every link (--to merges it into a successor; not from a session)")
+    v.add_argument("path", help="vault-relative note path")
+    v.add_argument("--to", help="successor note path, e.g. people/robin-vale.md")
+    v = verbs.add_parser("unretire", help="restore a retired or lapsed note")
+    v.add_argument("path", help="path under retired/, e.g. people/x.md or open/2026/2026-09-01-x.md")
+    verbs.add_parser("reindex", help="rebuild the derived index from the vault")
     verbs.add_parser("fsck", help="dangling links, duplicate ids, oversize notes, stray temps")
     verbs.add_parser("hourly", help="run the hourly pass now")
-    v = verbs.add_parser("import-cowork", help="one-time import of a .cowork-style vault")
-    v.add_argument("dir")
+    v = verbs.add_parser("import-cowork", help="one-time import of a .cowork-style vault (not while a session is running)")
+    v.add_argument("dir", help="the old vault directory")
     v = verbs.add_parser("digest", help="show pending digest lines")
-    v.add_argument("--all", action="store_true")
+    v.add_argument("--all", action="store_true", help="include lines already posted")
     verbs.add_parser("status", help="paths, counts, last passes")
 
 
@@ -81,15 +82,41 @@ def _conn(cfg: Config, create: bool = False):
     return conn
 
 
-def _provenance(store: Store) -> tuple[str, str]:
-    """src and cause for a write from this process. A session's identity is
-    what the harness put in its environment; the index later checks the task
-    kind and run window, so a session cannot launder email into session-tier
-    by editing these."""
-    task = os.environ.get(ENV_TASK, "")
-    if task:
+def _provenance() -> tuple[str, str]:
+    """src and cause for a write from this process. The index decides the
+    tier from the task's kind and the agent-run windows that were open at
+    the time — never from these fields alone."""
+    task = os.environ.get(ENV_TASK, "").strip()
+    if task.isdigit():
         return "agent", f"task:{task}"
     return "harness", f"cli:{os.getpid()}"
+
+
+def _in_session() -> bool:
+    return bool(os.environ.get(ENV_TASK, "").strip())
+
+
+def _append(cfg: Config, store: Store, vault: Vault, o: Observation) -> None:
+    """Ledger line first (the truth), then the index rows (zero-lag recall).
+    A busy or missing index is fine; the hourly pass reconciles."""
+    ledger_append(vault, o)
+    if not cfg.memory_index_path.exists():
+        return
+    try:
+        conn = ix.open_index(cfg.memory_index_path)
+        try:
+            ix.insert_observation(conn, o, ix.tier_for_obs(o, passes.StoreTrust(store)))
+        finally:
+            conn.close()
+    except Exception as e:  # never fail a write because the cache was busy
+        print(f"(index not updated now: {e}; the hourly pass will)", file=sys.stderr)
+
+
+def _iso_date(value: str, flag: str) -> str:
+    try:
+        return date.fromisoformat(value).isoformat()
+    except ValueError:
+        sys.exit(f"{flag} must be a date like 2026-09-15, got {value!r}")
 
 
 def run(cfg: Config, args: argparse.Namespace) -> int:
@@ -101,19 +128,19 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
         conn = _conn(cfg)
         if conn is None:
             return _no_index()
-        ident = args.ident.strip().lower()
-        key = f"slack:{ident}" if ident.startswith("u") and "@" not in ident else f"mailto:{ident}"
-        doc = ix.doc_for_id(conn, key) or ix.doc_for_id(conn, f"dom:{ident.rsplit('@', 1)[-1]}")
+        ident = args.ident.strip().lower().strip("<>").removeprefix("mailto:").split("|")[-1]
+        is_slack = "@" not in ident and SLACK_ID_RE.match(ident) is not None
+        key = f"slack:{ident}" if is_slack else f"mailto:{ident}"
+        doc = ix.doc_for_id(conn, key) or (None if is_slack else ix.doc_for_id(conn, f"dom:{ident.rsplit('@', 1)[-1]}"))
         if doc:
             print(recall.walk(vault, conn, [doc]), end="")
-        subj = subject_from_slack(args.ident) if key.startswith("slack:") else subject_from_address(ident)
-        if subj:
-            obs = ix.subject_observations(conn, subj, limit=10)
-            if obs:
-                print(f"Recent observations on {subj}:")
-                for o in obs:
-                    print(f"- {o['day']} {TIER_TAG.get(o['tier'], '')} {o['text']}")
-        if not doc and not (subj and obs):
+        subj = subject_from_slack(args.ident) if is_slack else subject_from_address(ident)
+        obs = ix.subject_observations(conn, ix.canonical_subject(conn, subj), limit=10) if subj else []
+        if obs:
+            print(f"Recent observations on {subj}:")
+            for o in obs:
+                print(f"- {o['day']} {TIER_TAG.get(o['tier'], '')} {o['text']}")
+        if not doc and not obs:
             print(f"nothing known about {args.ident}")
         return 0
 
@@ -127,7 +154,15 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
 
     if verb == "walk":
         conn = _conn(cfg)
-        print(recall.walk(vault, conn, [p if p.endswith(".md") else p + ".md" for p in args.path], cap_b=12000), end="")
+        paths = []
+        for p in args.path:
+            rel = p if p.endswith(".md") else p + ".md"
+            try:
+                vault.inside(rel)
+            except ValueError as e:
+                sys.exit(str(e))
+            paths.append(rel)
+        print(recall.walk(vault, conn, paths, cap_b=12000), end="")
         return 0
 
     if verb == "search":
@@ -139,7 +174,10 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
         return 0
 
     if verb == "show":
-        p = vault.root / args.path
+        try:
+            p = vault.inside(args.path)
+        except ValueError as e:
+            sys.exit(str(e))
         if not p.exists():
             sys.exit(f"no such note: {args.path}")
         note = parse_note(p)
@@ -154,7 +192,7 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
         conn = _conn(cfg)
         if conn is None:
             return _no_index()
-        for r in ix.standing_rules(conn, limit=200):
+        for r in ix.standing_rules(conn, limit=500):
             print(f"- {r['text']}  ({r['doc']}#^{r['block']})")
         return 0
 
@@ -167,13 +205,18 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
             if nearest:
                 print("nearest: " + ", ".join(nearest), file=sys.stderr)
             return 2
-        src, cause = _provenance(store)
-        facet = slugify(args.facet, 32) if args.facet else ""
-        o = Observation(subject=subj, facet=facet, text=clean_text(args.text), src=src, cause=cause, until=args.until)
-        ledger_append(vault, o)
+        until = _iso_date(args.until, "--until") if args.until else ""
+        src, cause = _provenance()
+        o = Observation(subject=subj, facet=slugify(args.facet, 32) if args.facet else "", text=clean_text(args.text),
+                        src=src, cause=cause, until=until)
+        try:
+            _append(cfg, store, vault, o)
+        except ValueError as e:
+            sys.exit(f"not recorded: {e}")
         if how == "near":
             print(f"filed under existing subject {subj} (close to {args.about})")
         elif how == "miss":
+            store.digest_add("mint", f"new subject {subj} (from `wanda memory note`)")
             print(f"noted on new subject {subj} (reported in the next digest)")
         else:
             print(f"noted on {subj}")
@@ -186,45 +229,46 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
         if subj is None:
             print(f"unknown subject {args.about!r}", file=sys.stderr)
             return 2
-        src, cause = _provenance(store)
+        check_by = _iso_date(args.check_by, "--check-by")
+        src, cause = _provenance()
         tier = "session"
-        task = os.environ.get(ENV_TASK, "")
-        if task:
-            t = store.get_task(int(task)) if task.isdigit() else None
+        task = os.environ.get(ENV_TASK, "").strip()
+        if task.isdigit():
+            t = store.get_task(int(task))
             tier = "session" if (t and t["kind"] in ix.CONVERSATION_KINDS) else "email"
-        slug = slugify(args.title, 40)
-        path = vault.root / "open" / f"{args.check_by}-{slug}.md"
+        slug = slugify(args.title, 40) or "item"
+        path = vault.root / "open" / f"{check_by}-{slug}.md"
         if path.exists():
             print(f"already open: {vault.rel(path)}")
             return 0
         n = new_note(path, "open", clean_text(args.title, 160), created=today)
-        n.meta.update({"check_by": args.check_by, "about": subj, "tier": tier})
+        n.meta.update({"check_by": check_by, "about": subj, "tier": tier})
         write_atomic(path, n.render())
-        ledger_append(vault, Observation(subject=subj, facet="commitment", text=clean_text(args.title, 240), src=src,
-                                         cause=cause, op="open", due=args.check_by, ref=vault.rel(path)))
+        _append(cfg, store, vault, Observation(subject=subj, facet="commitment", text=clean_text(args.title, 240), src=src,
+                                               cause=cause, op="open", due=check_by, ref=vault.rel(path)))
         print(f"opened {vault.rel(path)}" + (" (from an email task: stays off the always-loaded list)" if tier == "email" else ""))
         return 0
 
-    if verb == "forget":
-        from wanda.memory.commands import normalize_ref
+    if verb in ("pin", "forget"):
         store = _store(cfg)
         conn = _conn(cfg)
-        ref = normalize_ref(args.ref)
+        ref = commands.normalize_ref(args.ref)
         if not ref or conn is None:
-            sys.exit("expected a claim reference like people/robin-vale#c4")
+            sys.exit("expected a claim reference like people/robin-vale#c4" + ("" if ref else "") + (" (no index yet)" if ref and conn is None else ""))
         doc, _, block = ref.partition("#^")
         row = conn.execute("SELECT * FROM claims WHERE doc=? AND block=?", (doc, block)).fetchone()
         if row is None:
             sys.exit(f"no claim at {ref}")
+        subj = ix.subject_for_doc(doc) or "pref/general"
+        src, cause = _provenance()
+        if verb == "pin":
+            _append(cfg, store, vault, Observation(subject=subj, facet="pin", text=f"Pinned: {row['text']}", src=src, cause=cause, op="pin", ref=ref))
+            print(f"pinned on the next pass: {row['text']}")
+            return 0
         if row["owner_said"]:
             sys.exit("that is an owner-stated claim; only the owner can forget it, from Slack: `forget " + args.ref + "`")
-        keys = [r["key"] for r in conn.execute(
-            "SELECT DISTINCT k.key FROM edges e JOIN rkeys k ON k.ulid=e.dst_block WHERE e.src_doc=? AND e.src_block=? AND e.rel='derived-from'", (doc, block))]
-        subj = ix.subject_for_doc(doc) or "pref/general"
-        src, cause = _provenance(store)
-        ledger_append(vault, Observation(subject=subj, facet="retire", text=f"Forgotten: {row['text']}", src=src, cause=cause, op="retire", ref=ref))
-        ledger_append(vault, Observation(subject=subj, facet="veto", text="Vetoed the pattern behind a forgotten claim", src=src, cause=cause,
-                                         op="veto", ref=",".join(sorted(set(keys or [f'key:{subj}|'])))))
+        for o in commands.forget_observations(conn, doc, block, row["text"], subj, src=src, cause=cause):
+            _append(cfg, store, vault, o)
         print(f"forgotten on the next pass: {row['text']}")
         return 0
 
@@ -232,8 +276,15 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
         store = _store(cfg)
         svc = passes.Services(cfg, store, vault)
         if verb == "retire":
-            with passes.memory_lock(cfg.memory_lock_path):
-                r = passes.retire(svc, args.path, args.to)
+            if args.to and _in_session():
+                sys.exit("merging notes (--to) is an identity decision for the owner, not for a session; retire without --to, or ask")
+            try:
+                with passes.memory_lock(cfg.memory_lock_path):
+                    r = passes.retire(svc, args.path, args.to)
+            except (ValueError, FileNotFoundError) as e:
+                sys.exit(str(e))
+            except passes.Busy:
+                sys.exit("a memory pass is running; try again in a minute")
             print(json.dumps(r, indent=1))
             return 0
         if verb == "unretire":
@@ -241,8 +292,12 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
             print("restored" if ok else "nothing to restore")
             return 0 if ok else 1
         if verb == "reindex":
-            conn = passes.open_conn(svc)
-            rep = ix.rebuild(vault, conn, passes.StoreTrust(store))
+            try:
+                with passes.memory_lock(cfg.memory_lock_path):
+                    conn = passes.open_conn(svc)
+                    rep = ix.rebuild(vault, conn, passes.StoreTrust(store))
+            except passes.Busy:
+                sys.exit("a memory pass is running; it rebuilds the index itself")
             print(f"indexed {rep.docs} notes, {rep.claims} claims, {rep.obs} observations; {len(rep.rejected)} rejected lines, {len(rep.flags)} flags")
             return 0
         if verb == "fsck":
@@ -253,14 +308,22 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
             print("ok" if not issues else f"{len(issues)} issue(s)")
             return 0 if not issues else 1
         if verb == "hourly":
-            with passes.memory_lock(cfg.memory_lock_path):
-                conn = passes.open_conn(svc)
-                rep = passes.hourly(svc, conn, cfg.workspace_dir)
-            print(json.dumps(rep.__dict__, indent=1, default=str))
+            try:
+                with passes.memory_lock(cfg.memory_lock_path):
+                    conn = passes.open_conn(svc)
+                    rep = passes.hourly(svc, conn, cfg.workspace_dir)
+            except passes.Busy:
+                sys.exit("a memory pass is already running")
+            print(rep.summary())
             return 0
         if verb == "import-cowork":
-            with passes.memory_lock(cfg.memory_lock_path):
-                rep = passes.import_cowork(svc, Path(args.dir).expanduser())
+            if store.open_windows():
+                sys.exit("an agent session is running; import when wanda is idle so the imported lines are not mistaken for its work")
+            try:
+                with passes.memory_lock(cfg.memory_lock_path):
+                    rep = passes.import_cowork(svc, Path(args.dir).expanduser())
+            except passes.Busy:
+                sys.exit("a memory pass is running; try again in a minute")
             print(json.dumps(rep, indent=1))
             return 0
         if verb == "digest":
@@ -288,15 +351,14 @@ def _resolve_subject(about: str, conn):
     key = about.strip().lower()
     if key.endswith(".md"):
         key = key[:-3]
-    from wanda.memory.vault import DIR_TO_TYPE
     d, _, slug = key.partition("/")
     if d in DIR_TO_TYPE:
         key = f"{DIR_TO_TYPE[d]}/{slug}"
     if parse_subject(key) is None:
-        # A bare address or Slack id is a subject too.
+        # A bare address is a subject too.
         if "@" in key:
             s = subject_from_address(key)
-            return (s, "exact", []) if s else (None, "miss", [])
+            return (ix.canonical_subject(conn, s) if (s and conn is not None) else s, "exact", []) if s else (None, "miss", [])
         return None, "miss", []
     if conn is None:
         return key, "exact", []

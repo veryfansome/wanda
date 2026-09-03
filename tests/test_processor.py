@@ -347,7 +347,7 @@ def test_answered_here_requires_the_triggering_conversation(tmp_path):
     assert p._answered_here(marker, "C_OTHER", "99.1") is False   # wrong channel
     assert p._answered_here(marker, "C_ASKED", "77.7") is False   # wrong thread
 
-    marker.write_text("D5\t")                                     # untreaded DM reply
+    marker.write_text("D5\t")                                     # a top-level post in the right channel
     assert p._answered_here(marker, "D5", None) is True
 
     marker.unlink()

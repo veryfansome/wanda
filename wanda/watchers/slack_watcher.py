@@ -99,14 +99,17 @@ class SlackWatcher:
         )
         existing = self.store.get_task_by_thread(channel, thread_ts) if thread_ts else None
         text = event.get("text") or ""
+        is_dm = channel_type in DM_TYPES
         in_digest = bool(thread_ts) and self.store.get_digest_by_thread(channel, thread_ts) is not None
-        if self._is_owner(user) and (is_command(text) or in_digest):
-            # Checked first: an owner typing `rule …` in a DM must not open a
-            # paid session, and a reply in the digest thread has no mention.
+        # A command is an owner message with the SHAPE of a command (strictly
+        # parsed, so "forget it, thanks" is not one), addressed to wanda: in a
+        # DM, in a digest thread, or with a mention in a channel. Checked
+        # first, so `rule …` in a DM never opens a paid session.
+        if self._is_owner(user) and is_command(text) and (is_dm or in_digest or mentioned):
             kind = "command"
-        elif in_digest:
-            return  # someone else chatting in the digest thread
-        elif channel_type in DM_TYPES:
+        elif in_digest and not mentioned:
+            return  # chatter in a digest thread; a mention there is a guest mention
+        elif is_dm:
             kind = "dm"  # a DM needs no mention
         elif existing and existing["kind"] != "mention_guest":
             # A thread wanda owns: follow-ups count whether or not they mention

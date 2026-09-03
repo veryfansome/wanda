@@ -2,18 +2,32 @@
 oracle, seeding, the triage block, owner commands, and the two passes."""
 from __future__ import annotations
 
-import json
+import asyncio
 import logging
-import os
+import sqlite3
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 from wanda.memory import audit, commands, index as ix, passes, recall, render
 from wanda.memory.ledger import Observation, append as ledger_append
 from wanda.memory.subjects import subject_from_address
-from wanda.memory.vault import Vault, clean_text
+from wanda.memory.vault import Vault, clean_text, slugify, write_atomic
 
 log = logging.getLogger(__name__)
+
+MEMO_CAUSE_CAP = 5  # per (subject, facet): past this, without an owner edge, a memo is dropped
+
+
+def default_wanda_bin() -> str:
+    cand = Path(sys.executable).parent / "wanda"
+    return str(cand) if cand.exists() else "wanda"
+
+
+def write_settings(path: Path, wanda_bin: str) -> None:
+    """The hook registration, regenerated from the template every time."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_atomic(path, audit.settings_json(wanda_bin))
 
 
 class MemoryService:
@@ -22,7 +36,7 @@ class MemoryService:
         self.store = store
         self.slack = slack
         self.vault = Vault(cfg.memory_vault)
-        self.wanda_bin = wanda_bin or _default_wanda_bin()
+        self.wanda_bin = wanda_bin or default_wanda_bin()
 
     # --- setup ---
 
@@ -39,8 +53,7 @@ class MemoryService:
     def write_triage_settings(self) -> Path:
         """Outside the workspace, regenerated per batch: a session editing
         workspace settings must not change triage's hooks next batch."""
-        from wanda.memory.vault import write_atomic
-        write_atomic(self.cfg.triage_settings_path, audit.settings_json(self.wanda_bin))
+        write_settings(self.cfg.triage_settings_path, self.wanda_bin)
         return self.cfg.triage_settings_path
 
     def services(self) -> passes.Services:
@@ -55,10 +68,45 @@ class MemoryService:
         )
 
     def conn_ro(self):
+        """A read-only index connection. A missing index is built inline
+        (measured 5–53 ms); a corrupt one is renamed aside and rebuilt; if
+        that fails too, None — callers degrade to header-only / no block."""
+        path = self.cfg.memory_index_path
         try:
-            return ix.open_readonly(self.cfg.memory_index_path)
+            if not path.exists():
+                self._rebuild_inline()
+            conn = ix.open_readonly(path)
+            if conn is None:
+                return None
+            conn.execute("SELECT 1 FROM docs LIMIT 1")
+            return conn
+        except sqlite3.DatabaseError as e:
+            log.warning("memory index unreadable (%s); rebuilding", e)
+            try:
+                for suffix in ("", "-wal", "-shm"):
+                    p = Path(str(path) + suffix)
+                    if p.exists():
+                        p.rename(str(p) + ".corrupt")
+                self._rebuild_inline()
+                return ix.open_readonly(path)
+            except Exception:
+                log.exception("memory index could not be rebuilt")
+                return None
         except Exception:
+            log.exception("memory index unavailable")
             return None
+
+    def _rebuild_inline(self) -> None:
+        svc = self.services()
+        try:
+            with passes.memory_lock(self.cfg.memory_lock_path):
+                conn = passes.open_conn(svc)
+                try:
+                    ix.rebuild(self.vault, conn, passes.StoreTrust(self.store), self.today())
+                finally:
+                    conn.close()
+        except passes.Busy:
+            pass  # a pass is building it right now
 
     def today(self) -> str:
         return datetime.now(timezone.utc).date().isoformat()
@@ -66,11 +114,8 @@ class MemoryService:
     # --- workspace ---
 
     def prepare_workspace(self, workspace: Path) -> None:
-        """Composed projection + regenerated settings, before every agent run.
-        Never raises: a missing or broken index yields a header-only file."""
-        from wanda.memory.vault import write_atomic
-        (workspace / ".claude").mkdir(parents=True, exist_ok=True)
-        write_atomic(workspace / ".claude" / "settings.json", audit.settings_json(self.wanda_bin))
+        """The composed projection, before every agent run, resumed turns
+        included, because CLAUDE.md is re-read on every turn. Never raises."""
         conn = None
         try:
             conn = self.conn_ro()
@@ -139,7 +184,8 @@ class MemoryService:
         """Triage memos become email-tier ledger lines. The subject is bound
         by the harness from the real From header; the model never names it.
         At most one memo per verdict; dropped once a (subject, facet) has
-        five causes and no owner edge, so a newsletter cannot write forever."""
+        five causes and no owner-tier line, so a newsletter cannot write
+        forever. Drops are logged."""
         n = 0
         conn = self.conn_ro()
         try:
@@ -150,18 +196,24 @@ class MemoryService:
                     continue
                 subject = subject_from_address(row["from_addr"] or "")
                 if not subject:
+                    log.debug("memo dropped: no address in %r", row["from_addr"])
                     continue
+                if conn is not None:
+                    subject = ix.canonical_subject(conn, subject)
                 get = (lambda k: getattr(memo, k, None)) if not isinstance(memo, dict) else memo.get
-                facet = clean_text(str(get("facet") or "mail-pattern"), 32).lower().replace(" ", "-")[:32] or "mail-pattern"
+                facet = slugify(str(get("facet") or "mail-pattern"), 32) or "mail-pattern"
                 text = clean_text(str(get("text") or ""), 240)
                 if not text:
                     continue
-                if conn is not None:
-                    r = conn.execute("SELECT n_causes FROM subjects WHERE key=?", (subject,)).fetchone()
-                    if r and (r["n_causes"] or 0) >= 5:
-                        continue
-                ledger_append(self.vault, Observation(subject=subject, facet=facet, text=text, src="triage",
-                                                      cause=f"m:{key[:12]}"))
+                if conn is not None and self._memo_saturated(conn, subject, facet):
+                    log.debug("memo dropped: %s/%s has %d causes and no owner line", subject, facet, MEMO_CAUSE_CAP)
+                    continue
+                o = Observation(subject=subject, facet=facet, text=text, src="triage", cause=f"m:{key[:12]}")
+                try:
+                    ledger_append(self.vault, o)
+                except ValueError as e:
+                    log.warning("memo dropped: %s", e)
+                    continue
                 n += 1
         except Exception:
             log.exception("recording triage memos failed")
@@ -169,6 +221,14 @@ class MemoryService:
             if conn is not None:
                 conn.close()
         return n
+
+    @staticmethod
+    def _memo_saturated(conn, subject: str, facet: str) -> bool:
+        rows = conn.execute("SELECT src, cause, day, ulid, tier FROM obs WHERE subject=? AND facet=? AND op=''", (subject, facet)).fetchall()
+        if any(r["tier"] == "owner" for r in rows):
+            return False
+        causes = {ix.cause_key(r["src"], r["cause"], r["day"], r["ulid"]) for r in rows}
+        return len(causes) >= MEMO_CAUSE_CAP
 
     # --- owner commands ---
 
@@ -197,10 +257,12 @@ class MemoryService:
         for o in minted.observations:
             ledger_append(self.vault, o)
         if minted.observations:
-            # The harness itself saw this message from this author: verified.
-            self.store.set_owner_check(ctx.cause, True, "minted in-process")
+            # The harness itself saw this message from this author: verified
+            # now, and re-checked against Slack like any other line in a day.
+            self.store.set_owner_check(ctx.cause, True, passes.MINTED_IN_PROCESS)
+            stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
             for o in minted.observations:
-                self.store.memory_set(f"checked:{o.ulid}", "1")
+                self.store.memory_set(f"checked:{o.ulid}", stamp)
         return minted.reply
 
     # --- passes ---
@@ -208,9 +270,7 @@ class MemoryService:
     def run_hourly(self, workspace: Path | None) -> passes.HourlyReport:
         svc = self.services()
         if workspace is not None:
-            from wanda.memory.vault import write_atomic
-            (workspace / ".claude").mkdir(parents=True, exist_ok=True)
-            write_atomic(workspace / ".claude" / "settings.json", audit.settings_json(self.wanda_bin))
+            write_settings(workspace / ".claude" / "settings.json", self.wanda_bin)
         with passes.memory_lock(self.cfg.memory_lock_path):
             conn = passes.open_conn(svc)
             try:
@@ -219,24 +279,44 @@ class MemoryService:
                 conn.close()
 
     async def run_nightly(self, run_model, workspace: Path | None) -> passes.NightlyReport:
+        """Prepare and apply in worker threads under the lock; the model
+        calls in between hold nothing, so hourly ticks are never starved."""
         svc = self.services()
-        with passes.memory_lock(self.cfg.memory_lock_path):
-            conn = passes.open_conn(svc)
-            try:
-                return await passes.nightly(svc, conn, run_model, workspace)
-            finally:
-                conn.close()
 
+        def prepare():
+            with passes.memory_lock(self.cfg.memory_lock_path):
+                conn = passes.open_conn(svc)
+                try:
+                    return passes.nightly_prepare(svc, conn)
+                finally:
+                    conn.close()
 
-def _default_wanda_bin() -> str:
-    import sys
-    cand = Path(sys.executable).parent / "wanda"
-    return str(cand) if cand.exists() else "wanda"
+        prep = await asyncio.to_thread(prepare)
+        calls = 0
+        distill_out = writespec_out = None
+        if prep.ask or prep.contras:
+            distill_out = await run_model((passes.PROMPTS_DIR / "memory_distill.md").read_text(),
+                                          passes.distill_prompt(prep.ask, prep.contras), passes.RESOLUTION_SCHEMA)
+            calls += 1
+        if prep.writespec_prompt:
+            writespec_out = await run_model((passes.PROMPTS_DIR / "memory_writespec.md").read_text(),
+                                            prep.writespec_prompt, passes.WRITESPECS_SCHEMA)
+            calls += 1
 
+        def apply():
+            # Paid output is staged before the lock is even attempted, so a
+            # busy lock never loses it: the next pass drains staging.
+            staged = passes.stage(svc, prep.payload) if (distill_out or prep.payload["resolutions"]) else None
+            with passes.memory_lock(self.cfg.memory_lock_path):
+                conn = passes.open_conn(svc)
+                try:
+                    rep = passes.nightly_apply(svc, conn, prep, distill_out, writespec_out, workspace)
+                finally:
+                    conn.close()
+            if staged is not None and not rep.deferred:
+                staged.unlink(missing_ok=True)
+            return rep
 
-def provenance_env(task_id: int | None, session_id: str, user: str) -> dict[str, str]:
-    return {
-        "WANDA_TASK_ID": str(task_id) if task_id else "",
-        "WANDA_SESSION_ID": session_id or "",
-        "WANDA_SLACK_USER": user or "",
-    }
+        rep = await asyncio.to_thread(apply)
+        rep.model_calls = calls
+        return rep

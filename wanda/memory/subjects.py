@@ -98,10 +98,12 @@ def resolve(candidate: str, existing: set[str], aliases: dict[str, str]) -> Reso
     with what exists; a near miss returns the existing key and says so, so a
     session cannot mint `topic/hoa-election` beside `topic/hoa-board-election`.
     Only a real miss mints — and the caller reports every mint in the digest."""
-    if candidate in existing:
-        return Resolution(candidate, "exact", [])
+    # Aliases first: a retired or merged key may still appear in `existing`
+    # (the ledger remembers it), and must resolve to its successor.
     if candidate in aliases:
         return Resolution(aliases[candidate], "alias", [])
+    if candidate in existing:
+        return Resolution(candidate, "exact", [])
     parsed = parse_subject(candidate)
     if parsed is None:
         return Resolution(candidate, "miss", [])
@@ -125,10 +127,6 @@ def resolve(candidate: str, existing: set[str], aliases: dict[str, str]) -> Reso
     if scored and scored[0][1] >= threshold:
         return Resolution(scored[0][0], "near", scored[:10])
     return Resolution(candidate, "miss", scored[:10])
-
-
-def mint_topic(title: str) -> str:
-    return f"topic/{slugify(title)}"
 
 
 # --- recurrence keys ----------------------------------------------------------------

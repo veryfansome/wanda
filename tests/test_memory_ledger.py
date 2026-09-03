@@ -109,3 +109,27 @@ def test_rejected_are_reported_once(tmp_path):
     assert report_rejected(v, bad) == 0
     text = (tmp_path / "belt/ledger/rejected.md").read_text()
     assert "belt/ledger/2026-09-02.md:8" in text
+
+
+def test_append_refuses_a_line_that_would_not_parse(tmp_path):
+    """A fact the reader rejects is a fact lost; the writer must fail loudly."""
+    v = Vault(tmp_path)
+    with pytest.raises(ValueError):
+        append(v, obs(subject="person/Robin Vale"))
+    # A facet with case and spaces is normalised, a cause with spaces is quoted, and both read back.
+    o = obs(facet="Sender Type", cause="m:<a b@c>")
+    append(v, o)
+    back = [r for r in iter_observations(v) if isinstance(r, Observation)][0]
+    assert back.facet == "sender-type" and back.cause == "m:<a b@c>"
+
+
+def test_torn_final_line_is_not_reported_as_rejected(tmp_path):
+    """A writer mid-append leaves a last line without a newline; a reader
+    that lists it in rejected.md forever would be reporting a race."""
+    v = Vault(tmp_path)
+    p = append(v, obs())
+    with open(p, "ab") as fh:
+        fh.write(b"- 15:00Z `person/x` `f` src=triage cause=m:1 \xe2\x80\x94 half a")
+    recs = list(iter_observations(v))
+    assert sum(isinstance(r, ledger.Rejected) for r in recs) == 0
+    assert sum(isinstance(r, Observation) for r in recs) == 1

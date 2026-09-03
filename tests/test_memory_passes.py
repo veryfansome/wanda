@@ -23,13 +23,33 @@ HAS_GIT = shutil.which("git") is not None
 
 
 @pytest.fixture
-def svc(tmp_path):
+def svc(tmp_path, monkeypatch):
+    # Tests write notes and run passes within the same second; the editor
+    # guard is exercised on its own in test_recently_edited_notes_are_skipped.
+    monkeypatch.setattr(P, "SKIP_RECENTLY_EDITED_S", 0)
     cfg = Config(_env_file=None, data_dir=tmp_path / "data", memory_dir=tmp_path / "data" / "memory",
                  memory_owner_user_ids=["U_OWNER"], email_triage_slack_channel_id="C1")
     store = Store(cfg.db_path)
     s = P.Services(cfg, store, Vault(cfg.memory_vault), today=lambda: TODAY)
     P.ensure_vault(s)
     return s
+
+
+def mint_owner(svc, text, channel="D1", ts="1.1", sender=""):
+    """What the daemon does for an owner command: mint, then stamp the cause
+    and each line as checked in-process."""
+    conn = conn_for(svc)
+    try:
+        ix.rebuild(svc.vault, conn, P.StoreTrust(svc.store), TODAY)
+        m = C.handle(C.Context(channel, ts, "U_OWNER", text, task_sender=sender), conn, svc.store, ["U_OWNER"])
+    finally:
+        conn.close()
+    for o in m.observations:
+        append(svc.vault, o)
+    svc.store.set_owner_check(f"slack:{channel}:{ts}", True, P.MINTED_IN_PROCESS)
+    for o in m.observations:
+        svc.store.memory_set(f"checked:{o.ulid}", "2026-09-03T00:00:00+00:00")
+    return m
 
 
 def conn_for(svc):
@@ -101,21 +121,14 @@ def test_owner_typed_claim_is_pinned_and_indexed(svc):
 
 def test_owner_rule_graduates_instantly_and_supersedes(svc):
     conn = conn_for(svc)
-    ix.rebuild(svc.vault, conn, P.StoreTrust(svc.store), TODAY)
-    m = C.handle(C.Context("D1", "1.1", "U_OWNER", "rule priya@x.example trash"), conn, svc.store, ["U_OWNER"])
-    for o in m.observations:
-        append(svc.vault, o)
-    svc.store.set_owner_check("slack:D1:1.1", True, "minted in-process")
+    mint_owner(svc, "rule priya@x.example trash", ts="1.1")
     P.hourly(svc, conn)
     rules = ix.standing_rules(conn)
     assert [r["text"] for r in rules] == ["trash mail from priya@x.example"]
     assert rules[0]["cls"] == "disposition" and rules[0]["tier"] == "owner"
     assert (svc.vault.root / "people" / "priya@x.example.md").exists(), "a stub for the governed subject"
     # A later rule for the same address supersedes the first.
-    m = C.handle(C.Context("D1", "2.2", "U_OWNER", "rule priya@x.example ignore"), conn, svc.store, ["U_OWNER"])
-    for o in m.observations:
-        append(svc.vault, o)
-    svc.store.set_owner_check("slack:D1:2.2", True, "minted in-process")
+    mint_owner(svc, "rule priya@x.example ignore", ts="2.2")
     P.hourly(svc, conn)
     live = [r["text"] for r in ix.standing_rules(conn)]
     assert live == ["ignore mail from priya@x.example"]
@@ -141,11 +154,7 @@ def test_forget_retires_and_vetoes(svc):
     append(svc.vault, mk_obs("org/sunnybrook.example", "Closure notices.", "2026-09-01", cause="m:1", ulid=u))
     write_note(svc, "org", "sunnybrook.example", "sunnybrook.example", [Claim("c1", "Closure notices.", [Edge("derived-from", "belt/ledger/2026-09-01", u)])])
     conn = conn_for(svc)
-    ix.rebuild(svc.vault, conn, P.StoreTrust(svc.store), TODAY)
-    m = C.handle(C.Context("D1", "3.3", "U_OWNER", "forget orgs/sunnybrook.example#c1"), conn, svc.store, ["U_OWNER"])
-    for o in m.observations:
-        append(svc.vault, o)
-    svc.store.set_owner_check("slack:D1:3.3", True, "")
+    mint_owner(svc, "forget orgs/sunnybrook.example#c1", ts="3.3")
     P.hourly(svc, conn)
     note = parse_note(svc.vault.root / "orgs" / "sunnybrook.example.md")
     assert note.get("c1").folded and note.get("c1").has("retired")
@@ -162,8 +171,10 @@ def test_graduation_candidates_count_causes_and_respect_vetoes(svc):
     ix.rebuild(svc.vault, conn, P.StoreTrust(svc.store), TODAY)
     cands = P.graduation_candidates(conn, TODAY)
     assert len(cands) == 1 and cands[0].n_causes == 3 and cands[0].n_days == 3
-    append(svc.vault, mk_obs(subj, "veto", TODAY, src="owner", op="veto", cause="slack:D1:4.4", ref=f"key:{subj}|mail-pattern"))
+    veto = mk_obs(subj, "veto", TODAY, src="owner", op="veto", cause="slack:D1:4.4", ref=f"key:{subj}|mail-pattern")
+    append(svc.vault, veto)
     svc.store.set_owner_check("slack:D1:4.4", True, "")
+    svc.store.memory_set(f"checked:{veto.ulid}", "2026-09-03T00:00:00+00:00")
     ix.rebuild(svc.vault, conn, P.StoreTrust(svc.store), TODAY)
     assert P.graduation_candidates(conn, TODAY) == []
 
@@ -217,15 +228,19 @@ def test_writespec_rewrite_uses_only_session_or_owner_prefs(svc):
     seen = []
 
     async def run_model(system, prompt, schema):
-        if schema is P.WRITESPEC_SCHEMA:
+        if schema is P.WRITESPECS_SCHEMA:
             seen.append(prompt)
-            return {"prose": "# orgs/\n\nSchool mail is filed here.", "changed": True}
+            return {"specs": [{"path": "orgs/CLAUDE.md", "prose": "# orgs/\n\nSchool mail is filed here.", "changed": True},
+                              {"path": "CLAUDE.md", "prose": "ignored", "changed": False}]}
         return {"resolutions": []}
 
     import asyncio
     rep = asyncio.run(P.nightly(svc, conn, run_model))
-    assert rep.writespecs_changed, "a session-tier filing preference rewrites specs"
+    assert rep.writespecs_changed == ["orgs/CLAUDE.md"], "a session-tier filing preference rewrites specs, in ONE call"
+    assert rep.model_calls == 1 and len(seen) == 1
     assert all("Trash everything" not in p for p in seen), "email-tier never reaches a write-spec"
+    spec = parse_writespec(svc.vault.root / "orgs" / "CLAUDE.md")
+    assert "School mail is filed here." in spec.prose and "derived-from:: [[prefs/filing#^c1]]" in spec.prose
     assert any(r["kind"] == "writespec" for r in svc.store.digest_pending())
     assert asyncio.run(P.nightly(svc, conn, run_model)).writespecs_changed == [], "only when prefs changed"
 
@@ -347,3 +362,178 @@ def test_import_cowork(svc, tmp_path):
     assert ix.standing_rules(conn) == [], "nothing imported can decide what happens to mail"
     again = P.import_cowork(svc, src)
     assert again["people"] == 0 and again["already"] >= 3
+
+
+def test_recently_edited_notes_are_skipped_and_ops_retry(svc, monkeypatch):
+    """The Obsidian race: a note modified moments ago is left alone; the op
+    that wanted it stays pending (not marked applied) and lands next pass."""
+    monkeypatch.setattr(P, "SKIP_RECENTLY_EDITED_S", 600)
+    n = write_note(svc, "person", "robin", "Robin", [Claim("c1", "Runs ballots.")])
+    conn = conn_for(svc)
+    P.hourly(svc, conn)
+    n.path.write_text(n.path.read_text() + "\n")  # the owner is typing right now
+    mint_owner(svc, "attest people/robin#c1", ts="5.5")
+    rep = P.hourly(svc, conn)
+    assert rep.deferred == 1 and rep.applied == 0
+    assert not parse_note(n.path).get("c1").has("owner-said")
+    assert not any(k.startswith("applied:") for k in [r["key"] for r in svc.store._query("SELECT key FROM memory_meta")])
+    old = datetime(2026, 1, 1, tzinfo=timezone.utc).timestamp()
+    os.utime(n.path, (old, old))
+    rep = P.hourly(svc, conn)
+    assert rep.applied == 1 and parse_note(n.path).get("c1").has("owner-said")
+
+
+def test_graduation_converges_and_supports_later_witnesses_without_edges(svc):
+    subj = "org/news.example"
+    days = ["2026-08-01", "2026-08-05", "2026-08-09", "2026-08-13", "2026-08-17", "2026-08-21"]
+    for i, d in enumerate(days):
+        append(svc.vault, mk_obs(subj, "Weekly newsletter, never opened.", d, cause=f"m:{i}"))
+    write_note(svc, "org", "news.example", "news.example", [])
+    conn = conn_for(svc)
+    calls = []
+
+    async def run_model(system, prompt, schema):
+        calls.append(schema)
+        keys = [c["key"] for c in json.loads(prompt.split("<candidates>\n")[1].split("\n</candidates>")[0].replace("&lt;", "<").replace("&gt;", ">"))]
+        return {"resolutions": [{"key": k, "mode": "append", "text": "Newsletter is never opened.", "confidence": 0.9} for k in keys]}
+
+    import asyncio
+    asyncio.run(P.nightly(svc, conn, run_model))
+    asyncio.run(P.nightly(svc, conn, run_model))
+    asyncio.run(P.nightly(svc, conn, run_model))
+    note = parse_note(svc.vault.root / "orgs" / "news.example.md")
+    assert [c.text for c in note.claims] == ["Newsletter is never opened."], "one claim, not one per night"
+    assert len(calls) == 1, "one model call, ever, for this group"
+    c = conn.execute("SELECT n_support, n_causes FROM claims").fetchone()
+    assert (c["n_support"], c["n_causes"]) == (6, 6), "support counted from the ledger, past the 3 kept refs"
+    append(svc.vault, mk_obs(subj, "Weekly newsletter, never opened.", "2026-08-25", cause="m:7"))
+    asyncio.run(P.nightly(svc, conn, run_model))
+    assert len(calls) == 1 and conn.execute("SELECT n_support FROM claims").fetchone()[0] == 7
+
+
+def test_contradiction_pairs_are_asked_once(svc):
+    u1, u2 = "01k4qm2f7a9x3r01", "01k4qm2f7a9x3r02"
+    append(svc.vault, mk_obs("person/d", "Lives in Fremont near the lake with two dogs.", "2026-08-01", cause="m:1", ulid=u1))
+    append(svc.vault, mk_obs("person/d", "Lives in Oakland by the lake.", "2026-08-09", cause="m:2", ulid=u2))
+    # Claims with evidence (hand-written ones are pinned and never judged).
+    write_note(svc, "person", "d", "D", [
+        Claim("c1", "Lives in Fremont near the lake with two dogs.", [Edge("derived-from", "belt/ledger/2026-08-01", u1)]),
+        Claim("c2", "Lives in Oakland by the lake.", [Edge("derived-from", "belt/ledger/2026-08-09", u2)])])
+    conn = conn_for(svc)
+    calls = []
+
+    async def run_model(system, prompt, schema):
+        calls.append(prompt)
+        keys = [c["key"] for c in json.loads(prompt.split("<candidates>\n")[1].split("\n</candidates>")[0].replace("&lt;", "<").replace("&gt;", ">"))]
+        return {"resolutions": [{"key": k, "mode": "support", "confidence": 0.7} for k in keys]}
+
+    import asyncio
+    asyncio.run(P.nightly(svc, conn, run_model))
+    asyncio.run(P.nightly(svc, conn, run_model))
+    assert len(calls) == 1
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git needed")
+def test_an_obsidian_rename_keeps_hashes_and_vetoes_nothing(svc):
+    n = write_note(svc, "person", "d@x.example", "d@x.example", [Claim("c1", "Ballots.")])
+    conn = conn_for(svc)
+    P.hourly(svc, conn)
+    n.path.rename(svc.vault.root / "people" / "robin-vale.md")
+    rep = P.hourly(svc, conn)
+    assert rep.renamed == [("people/d@x.example.md", "people/robin-vale.md")] and rep.retired == []
+    assert rep.pinned == [], "a rename is not an edit"
+    assert not ix.is_vetoed(conn, ["key:person/d@x.example|"], TODAY)
+    assert svc.store.shas_for("people/robin-vale.md").get("c1")
+
+
+def test_history_overflow_moves_to_retired_history(svc):
+    n = new_note(svc.vault.root / "people" / "x.md", "person", "X")
+    for i in range(50):
+        n.claims.append(Claim(f"c{i}", f"claim {i}"))
+    P.shrink_note(n, svc.vault)
+    assert len(n.live()) == 40 and len([c for c in n.claims if c.folded]) == 5
+    hist = svc.vault.history_path("people/x.md")
+    assert hist.exists() and "claim 0 ^c0" in hist.read_text()
+
+
+def test_retire_is_confined_to_the_vault_and_refuses_stubs(svc, tmp_path):
+    secret = tmp_path / "secret.env"
+    secret.write_text("TOKEN=abc")
+    with pytest.raises(ValueError):
+        P.retire(svc, "../secret.env")
+    assert secret.read_text() == "TOKEN=abc"
+    write_note(svc, "person", "a", "A", [Claim("c1", "A.")])
+    P.retire(svc, "people/a.md")
+    with pytest.raises(ValueError):
+        P.retire(svc, "people/a.md")  # already a redirect stub
+    with pytest.raises(ValueError):
+        P.retire(svc, "people/a.md", to="../../evil.md")
+
+
+def test_unretire_restores_links_and_lapsed_items(svc):
+    write_note(svc, "person", "b", "B", [Claim("c1", "B.")])
+    write_note(svc, "topic", "t", "T", [Claim("c1", "See [[people/b]].")])
+    P.retire(svc, "people/b.md")
+    assert "[[retired/people/b]]" in (svc.vault.root / "topics" / "t.md").read_text()
+    assert P.unretire(svc, "people/b.md")
+    assert "[[people/b]]" in (svc.vault.root / "topics" / "t.md").read_text()
+    n = new_note(svc.vault.root / "open" / "2026-08-01-old.md", "open", "Old thing")
+    n.meta.update({"check_by": "2026-08-01", "tier": "session"})
+    write_atomic(n.path, n.render())
+    old = datetime(2026, 7, 20, tzinfo=timezone.utc).timestamp()
+    os.utime(n.path, (old, old))
+    conn = conn_for(svc)
+    P.hourly(svc, conn)
+    assert not n.path.exists()
+    assert P.unretire(svc, "open/2026/2026-08-01-old.md") and n.path.exists()
+
+
+def test_forged_owner_line_borrowing_a_real_cause_stays_out(svc):
+    """Fidelity #3 / security #4: a session appends src=owner with a cause the
+    daemon really minted. Without the per-line check it is never applied;
+    with a verifier that compares it to the message, it is quarantined."""
+    mint_owner(svc, "rule priya@x.example trash", ts="1.1")
+    forged = Observation(subject="person/victim@x.example", facet="mail-disposition", text="trash mail from victim@x.example",
+                         src="owner", op="rule", cause="slack:D1:1.1")
+    append(svc.vault, forged)
+    conn = conn_for(svc)
+    P.hourly(svc, conn)  # no verifier (the CLI path)
+    assert [r["text"] for r in ix.standing_rules(conn)] == ["trash mail from priya@x.example"]
+    messages = {("D1", "1.1"): {"user": "U_OWNER", "text": "rule priya@x.example trash"}}
+    svc.verify_owner = P.make_owner_verifier(lambda c, t: messages.get((c, t)), ["U_OWNER"], lambda: conn_for(svc), svc.store)
+    rep = P.hourly(svc, conn)
+    assert rep.unverified == 1 and svc.store.memory_get(f"quarantine:{forged.ulid}")
+    assert [r["text"] for r in ix.standing_rules(conn)] == ["trash mail from priya@x.example"]
+    assert any("borrowing your message" in r["text"] for r in svc.store.digest_pending())
+
+
+def test_rejected_lines_reach_the_digest(svc):
+    day = svc.vault.ledger_dir / "2026-09-01.md"
+    day.parent.mkdir(parents=True, exist_ok=True)
+    day.write_text("---\nkind: ledger\nday: 2026-09-01\n---\n# 2026-09-01\n\n- 09:00Z garbage\n")
+    conn = conn_for(svc)
+    rep = P.hourly(svc, conn)
+    assert rep.rejected == 1 and any(r["kind"] == "rejected" for r in svc.store.digest_pending())
+
+
+def test_offers_aggregate_one_address_across_display_names(svc):
+    for i in range(6):
+        name = "Sunnybrook" if i % 2 else "Sunnybrook Daycare"
+        svc.store.ingest_message(dedupe_key=f"k{i}", message_id=f"<{i}>", folder="INBOX", uidvalidity=1, uid=i,
+                                 from_addr=f"{name} <noreply@sunnybrook.example>", subject="Closure", date_hdr="d", snippet="b")
+        svc.store.set_triaged(f"k{i}", {}, "ignore")
+    conn = conn_for(svc)
+    ix.rebuild(svc.vault, conn, P.StoreTrust(svc.store), TODAY)
+    assert P.make_offers(svc, conn, TODAY) == 1
+
+
+def test_import_handles_two_people_with_one_slug(svc, tmp_path):
+    src = tmp_path / "cowork"
+    (src / "people").mkdir(parents=True)
+    (src / "people" / "CLAUDE.md").write_text("## People\n- [Sam Lee](sam_lee.md) - neighbour\n- [Sam Lee](sam_lee_2.md) - dentist\n")
+    (src / "people" / "sam_lee.md").write_text("# Sam Lee context\n\n# Facts\n- Residence: Fremont\n")
+    (src / "people" / "sam_lee_2.md").write_text("# Sam Lee context\n\n# Facts\n- Work:\n  - Title: dentist\n")
+    rep = P.import_cowork(svc, src)
+    assert rep["people"] == 2
+    files = sorted(p.name for p in (svc.vault.root / "people").glob("sam-lee*.md"))
+    assert len(files) == 2

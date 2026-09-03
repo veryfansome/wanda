@@ -19,9 +19,13 @@ def ctx(text, user="U_OWNER", channel="D1", ts="10.1", sender=""):
 def test_parse_command():
     assert C.parse_command("rule priya@x.example trash").verb == "rule"
     assert C.parse_command("<@UBOT> Rule k4").args == ["k4"]
+    assert C.parse_command("k7").args == ["k7"], "a bare offer ref in the digest thread"
+    assert C.parse_command("rule <mailto:a@b.example|a@b.example> ignore").args[0].startswith("<mailto:")
     assert C.parse_command("ruler of the world") is None
     assert C.parse_command("hi wanda, rule this") is None
+    assert C.parse_command("rule trash").args == ["trash"], "email-thread shorthand parses; handle() needs a sender"
     assert C.is_command("attest people/x#c1")
+    assert not C.is_command("attest people/../../etc/passwd#c1")
 
 
 def test_rule_forms(tmp_path, vault):
@@ -53,8 +57,10 @@ def test_refusals(tmp_path, vault):
     ix.rebuild(vault, conn, ix.DictTrust(), TODAY)
     assert not C.handle(ctx("rule x@y.example trash"), conn, store, []).ok
     assert "Only the configured owners" in C.handle(ctx("rule x@y.example trash", user="U_KID"), conn, store, ["U_OWNER"]).reply
-    m = C.handle(ctx("rule nonsense-target trash"), conn, store, ["U_OWNER"])
-    assert not m.ok and "don't know" in m.reply
+    # Prose that merely starts with a verb word is not a command at all.
+    for text in ("rule nonsense-target trash", "forget it, thanks", "rule of thumb: keep it simple", "pin down a time", "attest to that!"):
+        assert C.parse_command(text) is None, text
+    assert not C.handle(ctx("forget it, thanks"), conn, store, ["U_OWNER"]).ok
     # A well-formed subject the owner names may be new: their word mints it.
     m = C.handle(ctx("rule topic/kitchen-remodel keep receipts in the topic note"), conn, store, ["U_OWNER"])
     assert m.ok and m.observations[0].subject == "topic/kitchen-remodel"

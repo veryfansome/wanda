@@ -15,6 +15,7 @@ from wanda.memory.vault import (
     Vault,
     clean_text,
     sha_text,
+    slugify,
     ulid as new_ulid,
 )
 
@@ -58,11 +59,15 @@ class Observation:
 
 
 def format_line(o: Observation) -> str:
+    """Normalises what a writer may have got slightly wrong (facet case and
+    spaces, an unquoted cause) and leaves the rest to `append`'s check."""
+    o.facet = slugify(o.facet, 32) if o.facet else ""
+    o.subject = o.subject.strip().lower()
     fields = [f"src={o.src}"]
     if o.op:
         fields.append(f"op={o.op}")
     if o.cause:
-        fields.append(f"cause={o.cause}")
+        fields.append(f"cause={quote(o.cause, safe=':/|,@#^.-_=+')}")
     if o.due:
         fields.append(f"due={o.due}")
     if o.until:
@@ -104,12 +109,22 @@ def parse_line(line: str, day: str = "", path: str = "", lineno: int = 0) -> Obs
             raise Malformed(f"bad {k}")
     hm = m.group("hm")
     when = datetime.strptime(f"{day or '1970-01-01'} {hm}", "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
+    return _unquote_fields(obs_from(m, fields, when, day, path, lineno))
+
+
+def obs_from(m, fields, when, day, path, lineno) -> Observation:
     return Observation(
         subject=m.group("subject"), facet=m.group("facet"), text=m.group("text"),
-        src=src, op=op, cause=fields.get("cause", ""), due=fields.get("due", ""),
-        until=fields.get("until", ""), ref=unquote(fields.get("ref", "")), ulid=m.group("ulid"),
-        when=when, day=day or when.strftime("%Y-%m-%d"), path=path, lineno=lineno,
+        src=fields.get("src", ""), op=fields.get("op", ""), cause=fields.get("cause", ""),
+        due=fields.get("due", ""), until=fields.get("until", ""), ref=fields.get("ref", ""),
+        ulid=m.group("ulid"), when=when, day=day or when.strftime("%Y-%m-%d"), path=path, lineno=lineno,
     )
+
+
+def _unquote_fields(o: Observation) -> Observation:
+    o.cause = unquote(o.cause)
+    o.ref = unquote(o.ref)
+    return o
 
 
 def day_header(day: str) -> str:
@@ -120,13 +135,19 @@ def append(vault: Vault, o: Observation, lock_timeout_s: float = 5.0) -> Path:
     """One line, one O_APPEND write, under flock. The day file's header is
     written under the same lock on first use, and a file whose last byte is
     not a newline (a crashed writer) gets one first so two records can never
-    fuse."""
+    fuse. A line that would not parse back is refused, never written: a
+    fact the reader rejects is a fact lost."""
     if not o.subject or not ULID_RE.match(o.ulid):
         raise ValueError("observation needs a subject and a 16-char ulid")
+    line = format_line(o)
+    try:
+        parse_line(line, day=o.day)
+    except Malformed as e:
+        raise ValueError(f"observation would not parse back: {e}") from None
     vault.ledger_dir.mkdir(parents=True, exist_ok=True)
     lock_path = vault.ledger_dir / ".lock"
     path = vault.ledger_dir / f"{o.day}.md"
-    line = format_line(o) + "\n"
+    line = line + "\n"
     with open(lock_path, "w") as lock:
         _flock_blocking(lock, lock_timeout_s)
         fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
@@ -188,12 +209,16 @@ def iter_observations(vault: Vault, days: list[Path] | None = None) -> Iterator[
             text = p.read_text(encoding="utf-8")
         except OSError:
             continue
-        for n, raw in enumerate(text.splitlines(), 1):
+        lines = text.splitlines()
+        torn_tail = bool(text) and not text.endswith("\n")
+        for n, raw in enumerate(lines, 1):
             if not raw.startswith("- "):
                 continue  # header, headings, blank lines
             try:
                 yield parse_line(raw, day=day, path=vault.rel(p), lineno=n)
             except Malformed as e:
+                if torn_tail and n == len(lines):
+                    continue  # a writer is mid-append; it will finish or be repaired
                 yield Rejected(vault.rel(p), n, raw[:300], str(e)[:120])
 
 

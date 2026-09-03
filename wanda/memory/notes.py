@@ -8,8 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from wanda.memory.vault import (
-    BEGIN, END, INDEX_BEGIN, INDEX_END, WRITESPEC_PROSE_CAP_B, Doc, parse_frontmatter,
-    render_frontmatter, sha_text, truncate_bytes,
+    BEGIN, END, INDEX_BEGIN, INDEX_END, parse_frontmatter, render_frontmatter, sha_text,
 )
 
 EDGE_RELS = ("derived-from", "owner-said", "owner-edited", "supersedes", "superseded-by",
@@ -93,6 +92,12 @@ class Note:
     post: str           # everything after the region (## Notes, owner prose)
     had_region: bool
     raw: str = ""
+
+    @property
+    def kind(self) -> str:
+        """'' for a curated note; 'redirect' / 'tombstone' for the stubs the
+        retire ritual leaves, which no reader should treat as a live note."""
+        return str(self.meta.get("kind") or "")
 
     @property
     def title(self) -> str:
@@ -232,7 +237,9 @@ class WriteSpec:
     index: list[str]
 
     def render(self) -> str:
-        prose = truncate_bytes(self.prose.strip("\n"), WRITESPEC_PROSE_CAP_B)
+        """Prose is preserved byte for byte — the cap applies where it is
+        loaded (projection, walk), never where the owner's text is stored."""
+        prose = self.prose.strip("\n")
         block = "\n".join([INDEX_BEGIN, *self.index, INDEX_END])
         meta = {"kind": "write-spec", **{k: v for k, v in self.meta.items() if k != "kind"}}
         return render_frontmatter(meta) + prose + "\n\n" + block + "\n"

@@ -10,7 +10,6 @@ import os
 import signal
 import subprocess
 import sys
-import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -25,7 +24,7 @@ from wanda.memory import audit
 from wanda.memory.digest import post_digest
 from wanda.memory.passes import Busy
 from wanda.memory.recall import MEMORY_NOTE
-from wanda.memory.service import MemoryService, provenance_env
+from wanda.memory.service import MemoryService, default_wanda_bin, write_settings
 from wanda.runner import RunnerService, RunResult
 from wanda.slack_cli import POST_LOG_SUFFIX
 from wanda.store import Store, utcnow
@@ -90,6 +89,12 @@ def sync_workspace(cfg: Config) -> Path:
                 text = src.read_text()
                 if not target.exists() or target.read_text() != text:
                     target.write_text(text)
+    # The audit hook, regenerated from the template every run — with or
+    # without memory — so a hook a session removed comes back.
+    try:
+        write_settings(workspace / ".claude" / "settings.json", default_wanda_bin())
+    except OSError:
+        log.exception("could not write workspace settings")
     return workspace
 
 
@@ -268,9 +273,11 @@ class Processor:
             return False
         try:
             oldest = datetime.fromisoformat(rows[0]["created_at"])
+            if oldest.tzinfo is None:
+                oldest = oldest.replace(tzinfo=timezone.utc)
+            return datetime.now(timezone.utc) - oldest < timedelta(seconds=self.cfg.triage_debounce_s)
         except (TypeError, ValueError):
             return False
-        return datetime.now(timezone.utc) - oldest < timedelta(seconds=self.cfg.triage_debounce_s)
 
     async def apply_pending(self) -> None:
         done_this_pass: set[str] = set()
@@ -663,12 +670,16 @@ class Processor:
                     # launchd gives the daemon a minimal PATH, so the session
                     # would not otherwise find the `wanda` it is told to run.
                     "PATH": f"{Path(sys.executable).parent}:{os.environ.get('PATH', '')}",
-                    # Provenance for `wanda memory note`: the index later checks
-                    # this task's kind and run window, so a session cannot
-                    # launder email content into session-tier by editing it.
-                    **provenance_env(task["id"], sid, p.get("user", "")),
+                    # Provenance for `wanda memory note`: the index decides the
+                    # tier from this task's kind and the run window recorded
+                    # below, so a session cannot launder email content into
+                    # session-tier by editing its environment.
+                    "WANDA_TASK_ID": str(task["id"]),
+                    "WANDA_SESSION_ID": sid,
+                    "WANDA_SLACK_USER": p.get("user", ""),
                     "WANDA_LANE": "agent",
                 }
+                self.store.open_run_window(sid, task["id"], task["kind"])
                 try:
                     with self._inflight():
                         if task["claude_session_id"]:
@@ -699,6 +710,8 @@ class Processor:
                     )
                     state["recorded"] = True
                     raise
+                finally:
+                    self.store.close_run_window(sid)
             text = rr.result_text if rr.ok and rr.result_text else f"⚠️ agent run failed: {truncate(rr.error, 1000)}"
             # The agent posts its own answer via `wanda slack post`. Only a post
             # into the triggering conversation discharges the obligation — one
@@ -855,8 +868,10 @@ class Processor:
         if due:
             try:
                 rep = await asyncio.to_thread(self.memory.run_hourly, self.cfg.workspace_dir)
-                log.info("memory hourly: %d obs verified, %d pinned, %d L1 written, %d candidates, projection %dB",
-                         rep.verified, len(rep.pinned), rep.l1_written, rep.candidates, rep.projection_bytes)
+                log.info("memory hourly: %s", rep.summary())
+                if rep.conflicts or rep.retired or rep.broken or rep.unverified:
+                    log.warning("memory hourly attention: conflicts=%s retired=%s broken=%s unverified=%d",
+                                rep.conflicts, rep.retired, rep.broken, rep.unverified)
                 self.store.memory_set("hourly_failures", "0")
             except Busy:
                 log.info("memory hourly skipped: another pass holds the lock")
@@ -864,31 +879,33 @@ class Processor:
                 n = int(self.store.memory_get("hourly_failures") or 0) + 1
                 self.store.memory_set("hourly_failures", str(n))
                 log.exception("memory hourly failed (%d in a row)", n)
-                if n == 3:
-                    await self._alert_once("memory_hourly", "the memory hourly pass has failed 3 times in a row; memory is stale — see the log")
+                if n >= 3:
+                    await self._alert_once("memory_hourly", f"the memory hourly pass has failed {n} times in a row; memory is stale — see the log")
                 # Do not retry every minute against the same fault.
                 self.store.memory_set("hourly_at", now.isoformat(timespec="seconds"))
         if self._nightly_due(now):
             await self._run_nightly()
-            with contextlib.suppress(Exception):
+            try:
                 await post_digest(self.slack, self.store, self.cfg)
+            except Exception:
+                log.exception("memory digest could not be posted; lines stay queued")
 
     def _nightly_due(self, now_utc: datetime) -> bool:
+        """Once a local day at memory_nightly_local_time by default; with
+        memory_distill_hours below 24, every that-many hours regardless of
+        the time of day."""
+        hours = max(1, self.cfg.memory_distill_hours)
+        if hours < 24:
+            last_at = self.store.memory_get("nightly_at")
+            try:
+                return not last_at or now_utc - datetime.fromisoformat(last_at) >= timedelta(hours=hours)
+            except ValueError:
+                return True
         local = now_utc.astimezone()
         hh, mm = (self.cfg.memory_nightly_local_time.split(":") + ["0"])[:2]
         if (local.hour, local.minute) < (int(hh), int(mm)):
             return False
-        last = self.store.memory_get("nightly_date")
-        if not last:
-            return True
-        hours = max(1, self.cfg.memory_distill_hours)
-        if hours >= 24:
-            return last != local.date().isoformat()
-        last_at = self.store.memory_get("nightly_at")
-        try:
-            return not last_at or now_utc - datetime.fromisoformat(last_at) >= timedelta(hours=hours)
-        except ValueError:
-            return True
+        return self.store.memory_get("nightly_date") != local.date().isoformat()
 
     async def _run_nightly(self) -> None:
         async def run_model(system: str, prompt: str, schema: dict):
@@ -909,20 +926,21 @@ class Processor:
 
         try:
             rep = await self.memory.run_nightly(run_model, self.cfg.workspace_dir)
-            log.info("memory nightly: %d candidates, %d applied, %d model calls, %d offers",
-                     rep.candidates, rep.applied, rep.model_calls, rep.offers)
+            log.info("memory nightly: %d candidates, %d applied, %d deferred, %d model calls, %d offers, specs %s",
+                     rep.candidates, rep.applied, rep.deferred, rep.model_calls, rep.offers, rep.writespecs_changed)
             self.store.memory_set("nightly_failures", "0")
         except Busy:
-            log.info("memory nightly skipped: another pass holds the lock")
+            # A CLI pass holds the lock: not a failure and not tonight's run — try again next tick.
+            log.info("memory nightly waiting: another pass holds the lock")
+            return
         except Exception:
             n = int(self.store.memory_get("nightly_failures") or 0) + 1
             self.store.memory_set("nightly_failures", str(n))
             log.exception("memory nightly failed (%d in a row)", n)
             if n >= 3:
                 await self._alert_once("memory_nightly", f"the memory nightly pass has failed {n} nights in a row — see the log")
-        finally:
-            self.store.memory_set("nightly_date", datetime.now().astimezone().date().isoformat())
-            self.store.memory_set("nightly_at", utcnow())
+        self.store.memory_set("nightly_date", datetime.now().astimezone().date().isoformat())
+        self.store.memory_set("nightly_at", utcnow())
 
 
 # --- daemon ---
@@ -1062,8 +1080,9 @@ async def run_doctor(cfg: Config, smoke: bool) -> int:
         try:
             summary = audit.summarize(cfg.logs_dir, days=1, allowed_roots=[str(cfg.memory_vault), str(cfg.memory_export_dir), str(cfg.workspace_dir)])
             detail = f"{summary['calls']} tool calls today across {summary['sessions']} sessions"
-            odd = len(summary["reads_outside"]) + len(summary["shell_other"])
-            report("tool audit log", True, detail + (f"; {odd} outside the expected roots/commands" if odd else ""))
+            odd = summary["reads_outside"][:3] + summary["shell_other"][:3]
+            more = len(summary["reads_outside"]) + len(summary["shell_other"]) - len(odd)
+            report("tool audit log", True, detail + (f"; outside the expected roots/commands: {odd}" + (f" (+{more})" if more > 0 else "") if odd else ""))
         except Exception as e:
             report("tool audit log", False, str(e))
 

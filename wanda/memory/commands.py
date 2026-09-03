@@ -1,7 +1,10 @@
 """Owner commands from Slack: the one path by which anything becomes
 owner-tier memory. Parsed by the harness before any session runs, minted
 in-process with `cause=slack:<channel>:<ts>`, and re-verified against Slack
-by the hourly pass — a session can post as the bot, never as the owner."""
+by the hourly pass — a session can post as the bot, never as the owner.
+
+Parsing is strict on purpose: "forget it, thanks" or "rule of thumb: …"
+must never be swallowed as a command."""
 from __future__ import annotations
 
 import re
@@ -11,14 +14,18 @@ from datetime import datetime, timezone
 from wanda.memory import index as ix
 from wanda.memory.ledger import Observation
 from wanda.memory.subjects import parse_subject, registrable_domain, resolve, subject_from_address
-from wanda.memory.vault import DIR_TO_TYPE, TYPE_TO_DIR, clean_text
+from wanda.memory.vault import DIR_TO_TYPE, clean_text
 from wanda.triage import addresses_in
 
 VERBS = ("rule", "attest", "forget", "pin", "unretire")
 ACTIONS = ("trash", "ignore", "attention")
-COMMAND_RE = re.compile(r"^\s*(?:<@[A-Z0-9]+(?:\|[^>]*)?>\s*)?(rule|attest|forget|pin|unretire)\b(.*)$", re.I | re.S)
-REF_RE = re.compile(r"^(?P<doc>[a-z]+/[^#\s]+?)(?:\.md)?#\^?(?P<block>[a-z0-9]{1,24})$")
-OFFER_RE = re.compile(r"^k\d+$")
+MENTION_PREFIX = r"^\s*(?:<@[A-Z0-9]+(?:\|[^>]*)?>\s*)?"
+COMMAND_RE = re.compile(MENTION_PREFIX + r"(rule|attest|forget|pin|unretire)\b(.*)$", re.I | re.S)
+OFFER_ONLY_RE = re.compile(MENTION_PREFIX + r"(k\d+)\s*$", re.I)
+REF_RE = re.compile(r"^(?P<doc>(people|orgs|topics|prefs|open)/[^#\s/]+?)(?:\.md)?#\^?(?P<block>[a-z0-9]{1,24})$")
+OFFER_RE = re.compile(r"^k\d+$", re.I)
+DOMAIN_RE = re.compile(r"^[a-z0-9.-]+\.[a-z]{2,}$")
+PATH_RE = re.compile(r"^(people|orgs|topics|prefs|open)/[^\s/]+(\.md)?$")
 DISPOSITION_FACET = "mail-disposition"
 PREFERENCE_FACET = "preference"
 
@@ -27,15 +34,60 @@ PREFERENCE_FACET = "preference"
 class Parsed:
     verb: str
     args: list[str]
-    rest: str
+
+
+def _clean_token(tok: str) -> str:
+    """Slack wraps addresses as <mailto:a@b|a@b> and links as <http://x|x>."""
+    t = tok.strip().strip("`").strip()
+    if t.startswith("<") and t.endswith(">"):
+        t = t[1:-1]
+        if "|" in t:
+            t = t.split("|", 1)[-1]
+        t = t.removeprefix("mailto:")
+    return t
+
+
+def target_like(tok: str) -> bool:
+    """Does this token name something a rule can be about: an address, a
+    domain, a subject key, or a note path?"""
+    t = _clean_token(tok).lower()
+    if "@" in t:
+        return bool(addresses_in(t))
+    if "/" in t:
+        d, _, slug = t.partition("/")
+        if d in DIR_TO_TYPE:
+            t = f"{DIR_TO_TYPE[d]}/{slug[:-3] if slug.endswith('.md') else slug}"
+        return parse_subject(t) is not None
+    return bool(DOMAIN_RE.match(t))
 
 
 def parse_command(text: str) -> Parsed | None:
+    """Return a Parsed command only for a message that has the shape of one.
+    Ordinary prose that happens to start with a verb word returns None and
+    goes to a session like any other message."""
+    m = OFFER_ONLY_RE.match(text or "")
+    if m:
+        return Parsed("rule", [m.group(1).lower()])
     m = COMMAND_RE.match(text or "")
     if not m:
         return None
-    rest = m.group(2).strip()
-    return Parsed(m.group(1).lower(), rest.split(), rest)
+    verb = m.group(1).lower()
+    args = m.group(2).split()
+    if verb == "rule":
+        if not args:
+            return None
+        if OFFER_RE.match(args[0]) and len(args) == 1:
+            return Parsed(verb, [args[0].lower()])
+        if args[0].lower() in ACTIONS:
+            return Parsed(verb, args)  # `rule trash` inside an email thread
+        if len(args) >= 2 and target_like(args[0]):
+            return Parsed(verb, args)
+        return None
+    if verb in ("attest", "forget", "pin"):
+        return Parsed(verb, args) if len(args) == 1 and normalize_ref(args[0]) else None
+    if verb == "unretire":
+        return Parsed(verb, args) if len(args) == 1 and PATH_RE.match(args[0]) else None
+    return None
 
 
 def is_command(text: str) -> bool:
@@ -43,9 +95,10 @@ def is_command(text: str) -> bool:
 
 
 def normalize_ref(ref: str) -> str | None:
-    """`people/x#c4`, `people/x.md#^c4` -> `people/x.md#^c4`."""
-    m = REF_RE.match(ref.strip())
-    if not m:
+    """`people/x#c4`, `people/x.md#^c4` -> `people/x.md#^c4`. Rejects
+    anything that could leave the vault."""
+    m = REF_RE.match(_clean_token(ref))
+    if not m or ".." in m.group("doc"):
         return None
     return f"{m.group('doc')}.md#^{m.group('block')}"
 
@@ -81,24 +134,16 @@ class Context:
         return f"slack:{self.channel}:{self.ts}"
 
 
-def _key_to_note(key: str) -> str:
-    t, _, slug = key.partition("/")
-    return f"{TYPE_TO_DIR.get(t, t)}/{slug}.md"
-
-
-def _target_to_subject(token: str, conn, store) -> tuple[str | None, str, list[str]]:
-    """Resolve the second token of `rule`: an offer ref, an address, a domain,
-    a subject key or a note path. Returns (subject, display, nearest)."""
-    tok = token.strip().strip("<>").lower()
-    if "|" in tok:  # Slack mailto markup <mailto:a@b|a@b>
-        tok = tok.split("|", 1)[-1]
-    tok = tok.removeprefix("mailto:")
+def _target_to_subject(token: str, conn) -> tuple[str | None, str, list[str]]:
+    """Resolve a rule's target: an address, a domain, a subject key or a note
+    path. Returns (subject, display, nearest-existing-keys-if-new)."""
+    tok = _clean_token(token).lower()
     if "@" in tok and addresses_in(tok):
         addr = addresses_in(tok)[0]
         doc = ix.doc_for_id(conn, f"mailto:{addr}") if conn is not None else None
         subj = ix.subject_for_doc(doc) if doc else subject_from_address(addr)
         return subj, addr, []
-    if "." in tok and "/" not in tok and re.fullmatch(r"[a-z0-9.-]+\.[a-z]{2,}", tok):
+    if "/" not in tok and DOMAIN_RE.match(tok):
         dom = registrable_domain(tok)
         doc = ix.doc_for_id(conn, f"dom:{dom}") if conn is not None else None
         return (ix.subject_for_doc(doc) if doc else f"org/{dom}"), dom, []
@@ -108,9 +153,9 @@ def _target_to_subject(token: str, conn, store) -> tuple[str | None, str, list[s
         key = f"{DIR_TO_TYPE[d]}/{slug}"
     if parse_subject(key) is None:
         return None, tok, []
-    existing = ix.all_subjects(conn) if conn is not None else set()
-    aliases = ix.subject_aliases(conn) if conn is not None else {}
-    r = resolve(key, existing, aliases)
+    if conn is None:
+        return key, key, []
+    r = resolve(key, ix.all_subjects(conn), ix.subject_aliases(conn))
     # An owner utterance is one of the ways a subject may come into being,
     # so a well-formed but unknown key mints; the reply names near misses.
     return r.key, r.key, [k for k, _ in r.nearest] if r.how == "miss" else []
@@ -126,20 +171,18 @@ def expected_for_message(text: str, conn, store, task_sender: str = "") -> list[
         return []
     out: list[tuple[str, str, str, str]] = []
     if p.verb == "rule":
-        if not p.args:
-            return []
-        if OFFER_RE.match(p.args[0]) and store is not None:
-            offer = store.get_offer(p.args[0])
+        if OFFER_RE.match(p.args[0]) and len(p.args) == 1:
+            offer = store.get_offer(p.args[0]) if store is not None else None
             if offer:
                 facet = DISPOSITION_FACET if offer["kind"] == "disposition" else PREFERENCE_FACET
                 out.append(("rule", offer["subject"], facet, offer["text"]))
             return out
         args = list(p.args)
-        if args[0].lower() in ACTIONS and task_sender:
+        if args[0].lower() in ACTIONS:
+            if not task_sender:
+                return []
             args = [task_sender, *args]
-        if len(args) < 2:
-            return []
-        subj, display, _ = _target_to_subject(args[0], conn, store)
+        subj, display, _ = _target_to_subject(args[0], conn)
         if subj is None:
             return []
         if args[1].lower() in ACTIONS:
@@ -147,16 +190,31 @@ def expected_for_message(text: str, conn, store, task_sender: str = "") -> list[
         else:
             out.append(("rule", subj, PREFERENCE_FACET, clean_text(" ".join(args[1:]), 300)))
     elif p.verb in ("attest", "forget", "pin"):
-        if p.args:
-            ref = normalize_ref(p.args[0])
-            if ref:
-                op = {"attest": "attest", "forget": "retire", "pin": "pin"}[p.verb]
-                out.append((op, "", "", ref))
-                if p.verb == "forget":
-                    out.append(("veto", "", "", ref))
-    elif p.verb == "unretire" and p.args:
+        ref = normalize_ref(p.args[0])
+        if ref:
+            op = {"attest": "attest", "forget": "retire", "pin": "pin"}[p.verb]
+            out.append((op, "", "", ref))
+            if p.verb == "forget":
+                out.append(("veto", "", "", ref))
+    elif p.verb == "unretire":
         out.append(("unretire", "", "", p.args[0]))
     return out
+
+
+def forget_observations(conn, doc: str, block: str, text: str, subject: str, **base) -> list[Observation]:
+    """Retire a claim AND veto every recurrence key that produced it — a veto
+    suppresses the cause, not just the symptom. Shared by Slack and the CLI."""
+    ref = f"{doc}#^{block}"
+    keys = [r["key"] for r in conn.execute(
+        "SELECT DISTINCT k.key FROM edges e JOIN rkeys k ON k.ulid=e.dst_block "
+        "WHERE e.src_doc=? AND e.src_block=? AND e.rel='derived-from'", (doc, block))] if conn is not None else []
+    keys = keys or [f"key:{subject}|"]
+    # The veto ref must carry keys with the claim identity too, so a forged
+    # claim cannot be "forgotten" into a veto of an unrelated key set.
+    retire = Observation(subject=subject, facet="retire", text=f"Forgotten: {text}", op="retire", ref=ref, **base)
+    veto = Observation(subject=subject, facet="veto", text="Vetoed the pattern behind a forgotten claim", op="veto",
+                       ref=",".join(sorted(set(keys))), **base)
+    return [retire, veto]
 
 
 def handle(ctx: Context, conn, store, owner_ids: list[str]) -> Minted:
@@ -169,29 +227,25 @@ def handle(ctx: Context, conn, store, owner_ids: list[str]) -> Minted:
     p = parse_command(ctx.text)
     if p is None:
         return Minted(reply="", ok=False)
-    verb = p.verb
     base = dict(src="owner", cause=ctx.cause, when=ctx.when)
-    if verb == "rule":
-        if not p.args:
-            return Minted(reply="Usage: `rule <address|domain|subject> trash|ignore|attention [note]`, `rule <subject> <preference>`, or `rule k4` to accept an offer.", ok=False)
-        if OFFER_RE.match(p.args[0]):
+    if p.verb == "rule":
+        if OFFER_RE.match(p.args[0]) and len(p.args) == 1:
             offer = store.get_offer(p.args[0])
             if not offer:
                 return Minted(reply=f"No offer {p.args[0]}.", ok=False)
             facet = DISPOSITION_FACET if offer["kind"] == "disposition" else PREFERENCE_FACET
             o = Observation(subject=offer["subject"], facet=facet, text=offer["text"], op="rule", **base)
             store.take_offer(p.args[0])
-            return Minted([o], f"Rule recorded: _{offer['text']}_")
+            return Minted([o], f"Recorded as your word: _{offer['text']}_")
         args = list(p.args)
-        if args[0].lower() in ACTIONS and ctx.task_sender:
+        if args[0].lower() in ACTIONS:
+            if not ctx.task_sender:
+                return Minted(reply="Say who the rule is about: `rule <address|domain|subject> trash|ignore|attention`.", ok=False)
             args = [ctx.task_sender, *args]
-        if len(args) < 2:
-            return Minted(reply="Say what the rule is: `rule <who> trash|ignore|attention` or `rule <who> <preference>`.", ok=False)
-        subj, display, nearest = _target_to_subject(args[0], conn, store)
+        subj, display, nearest = _target_to_subject(args[0], conn)
         if subj is None:
-            hint = ("Nearest: " + ", ".join(nearest[:10])) if nearest else "Use an email address, a domain, or an existing subject like `person/robin-vale`."
-            return Minted(reply=f"I don't know `{args[0]}`. {hint}", ok=False)
-        near = f" (note: `{subj}` is new; nearest existing: {', '.join(nearest[:3])})" if nearest else ""
+            return Minted(reply=f"I don't know `{args[0]}`. Use an email address, a domain, or a subject like `person/robin-vale`.", ok=False)
+        near = f" (`{subj}` is new; nearest existing: {', '.join(nearest[:3])})" if nearest else ""
         if args[1].lower() in ACTIONS:
             text = rule_text(args[1].lower(), display, " ".join(args[2:]))
             o = Observation(subject=subj, facet=DISPOSITION_FACET, text=text, op="rule", **base)
@@ -199,36 +253,23 @@ def handle(ctx: Context, conn, store, owner_ids: list[str]) -> Minted:
         text = clean_text(" ".join(args[1:]), 300)
         o = Observation(subject=subj, facet=PREFERENCE_FACET, text=text, op="rule", **base)
         return Minted([o], f"Preference recorded for `{subj}`: _{text}_{near}")
-    if verb in ("attest", "forget", "pin"):
-        if not p.args:
-            return Minted(reply=f"Usage: `{verb} people/<note>#c4`", ok=False)
+    if p.verb in ("attest", "forget", "pin"):
         ref = normalize_ref(p.args[0])
-        if not ref:
-            return Minted(reply=f"`{p.args[0]}` is not a claim reference (expected `people/<note>#c4`).", ok=False)
         doc, _, block = ref.partition("#^")
         row = conn.execute("SELECT * FROM claims WHERE doc=? AND block=?", (doc, block)).fetchone() if conn is not None else None
         if row is None:
             return Minted(reply=f"No claim at `{ref}`.", ok=False)
         subj = ix.subject_for_doc(doc) or "pref/general"
-        if verb == "attest":
-            o = Observation(subject=subj, facet="attest", text=f"Alex confirmed: {row['text']}", op="attest", ref=ref, **base)
+        if p.verb == "attest":
+            o = Observation(subject=subj, facet="attest", text=f"Confirmed by the owner: {row['text']}", op="attest", ref=ref, **base)
             return Minted([o], f"Confirmed as your word: _{row['text']}_")
-        if verb == "pin":
+        if p.verb == "pin":
             o = Observation(subject=subj, facet="pin", text=f"Pinned: {row['text']}", op="pin", ref=ref, **base)
             return Minted([o], f"Pinned: _{row['text']}_ — wanda will not rewrite or fold it.")
-        # forget: retire the claim AND veto every recurrence key that produced it.
-        keys = [r["key"] for r in conn.execute(
-            "SELECT DISTINCT k.key FROM edges e JOIN rkeys k ON k.ulid=e.dst_block "
-            "WHERE e.src_doc=? AND e.src_block=? AND e.rel='derived-from'", (doc, block))]
-        keys = keys or [f"key:{subj}|"]
-        retire = Observation(subject=subj, facet="retire", text=f"Forgotten: {row['text']}", op="retire", ref=ref, **base)
-        veto = Observation(subject=subj, facet="veto", text="Vetoed the pattern behind a forgotten claim", op="veto",
-                           ref=",".join(sorted(set(keys))), **base)
-        return Minted([retire, veto], f"Forgotten, and the pattern behind it is suppressed for a year: _{row['text']}_")
-    if verb == "unretire":
-        if not p.args:
-            return Minted(reply="Usage: `unretire people/<note>.md`", ok=False)
-        path = p.args[0].strip()
+        obs = forget_observations(conn, doc, block, row["text"], subj, **base)
+        return Minted(obs, f"Forgotten, and the pattern behind it is suppressed for a year: _{row['text']}_")
+    if p.verb == "unretire":
+        path = p.args[0]
         o = Observation(subject="pref/general", facet="unretire", text=f"Restore {path}", op="unretire", ref=path, **base)
         return Minted([o], f"Restoring `{path}` on the next pass.")
     return Minted(reply="", ok=False)

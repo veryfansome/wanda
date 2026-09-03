@@ -168,3 +168,47 @@ def test_workspace_settings_are_regenerated_every_run(tmp_path):
     prepare_workspace(cfg, memory)
     assert "tool-log" in settings.read_text()
     assert (ws / "CLAUDE.md").read_text().startswith("# What wanda knows")
+
+
+def test_nightly_due_windows_and_busy_does_not_consume_the_night(tmp_path):
+    from wanda.memory.passes import Busy
+    p, store, cfg, memory = make(tmp_path)
+    local_now = datetime.now().astimezone()
+    early = local_now.replace(hour=1, minute=0).astimezone(timezone.utc)
+    late = local_now.replace(hour=4, minute=0).astimezone(timezone.utc)
+    assert p._nightly_due(early) is False and p._nightly_due(late) is True
+    store.memory_set("nightly_date", local_now.date().isoformat())
+    assert p._nightly_due(late) is False
+    p.cfg = cfg.model_copy(update={"memory_distill_hours": 2})
+    store.memory_set("nightly_at", (early - timedelta(hours=3)).isoformat(timespec="seconds"))
+    assert p._nightly_due(early) is True, "sub-daily cadence ignores the time-of-day gate"
+    store.memory_set("nightly_at", (late - timedelta(minutes=30)).isoformat(timespec="seconds"))
+    assert p._nightly_due(late) is False
+    p.cfg = cfg
+
+    async def busy(run_model, workspace):
+        raise Busy("lock")
+
+    store.memory_set("nightly_date", "2000-01-01")
+    p.memory.run_nightly = busy
+    asyncio.run(p._run_nightly())
+    assert store.memory_get("nightly_date") == "2000-01-01", "a busy lock is not tonight's run"
+
+
+def test_agent_runs_leave_a_window_for_provenance(tmp_path):
+    fake = make_fake_claude(tmp_path, "cat > /dev/null\nprintf '{\"type\":\"result\",\"is_error\":false,\"result\":\"ok\",\"session_id\":\"s9\"}'")
+    p, store, cfg, memory = make(tmp_path, claude=fake)
+    tid = store.create_task(None, "D5", "1.1", kind="dm")
+    payload = {"kind": "dm", "channel": "D5", "task_key": "1.1", "reply_thread": "1.1", "in_thread": False, "user": "U1",
+               "text": "hi", "ts": "1.1", "channel_type": "im"}
+    asyncio.run(p._run_task_reply(store.get_task(tid), payload, {}))
+    rows = store._query("SELECT * FROM memory_run_windows")
+    assert len(rows) == 1 and rows[0]["task_id"] == tid and rows[0]["kind"] == "dm" and rows[0]["ended_at"]
+    assert store.open_windows() == []
+
+
+def test_workspace_settings_regenerated_even_without_memory(tmp_path):
+    from wanda.main import sync_workspace
+    cfg = Config(_env_file=None, email_triage_slack_channel_id="C1", data_dir=tmp_path / "data", memory_enabled=False)
+    ws = sync_workspace(cfg)
+    assert "tool-log" in (ws / ".claude" / "settings.json").read_text()

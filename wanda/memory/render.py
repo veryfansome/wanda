@@ -11,9 +11,9 @@ from datetime import date, timedelta
 from pathlib import Path
 
 from wanda.memory import index as ix
-from wanda.memory.notes import parse_note, parse_writespec
+from wanda.memory.notes import parse_writespec
 from wanda.memory.vault import (
-    L2_DIRS, PROJECTION_CAP_B, WRITESPEC_PROSE_CAP_B, Vault, nbytes, truncate_bytes, write_atomic,
+    L2_DIRS, LIVE_SQL, PROJECTION_CAP_B, WRITESPEC_PROSE_CAP_B, Vault, nbytes, truncate_bytes, write_atomic,
 )
 
 L1_MIN_OBS = 3
@@ -42,15 +42,12 @@ def l1_groups(conn: sqlite3.Connection, subject: str) -> list[Group]:
     semantic: false misses are free, false merges are irreversible."""
     rows = conn.execute(
         "SELECT * FROM obs WHERE subject=? AND op IN ('', 'rule', 'attest') ORDER BY ts ASC", (subject,)).fetchall()
-    retracted = {r["ref"] for r in conn.execute("SELECT ref FROM obs WHERE subject=? AND op='retract'", (subject,))}
     groups: dict[tuple[str, str], Group] = {}
     causes: dict[tuple[str, str], set[str]] = {}
     days: dict[tuple[str, str], set[str]] = {}
     for r in rows:
-        if r["ulid"] in retracted:
-            continue
         k = (r["facet"], r["norm"])
-        ck = f"triage-day:{r['day']}" if r["src"] == "triage" else (r["cause"] or f"line:{r['ulid']}")
+        ck = ix.cause_key(r["src"], r["cause"], r["day"], r["ulid"])
         if k not in groups:
             groups[k] = Group(r["facet"], r["text"], 0, 0, 0, r["day"], r["day"], r["until"] or "", r["ulid"], r["tier"])
             causes[k], days[k] = set(), set()
@@ -101,8 +98,9 @@ def render_subject_file(subject: str, note_rel: str | None, groups: list[Group],
 
 
 def regenerate_subject_files(vault: Vault, conn: sqlite3.Connection, today: str) -> tuple[int, int]:
-    """Write an L1 file for every subject with >= 3 observations; remove
-    files for subjects gone cold. Returns (written, removed). Files are
+    """Write an L1 file for every subject with >= L1_MIN_OBS observations
+    that has not gone cold (no observation in L1_COLD_DAYS and fewer than
+    three causes); remove the rest. Returns (written, removed). Files are
     0444 so an editor shows a save error instead of a silently lost edit."""
     written = removed = 0
     wanted: set[Path] = set()
@@ -111,7 +109,7 @@ def regenerate_subject_files(vault: Vault, conn: sqlite3.Connection, today: str)
         groups = l1_groups(conn, s["key"])
         n_obs = sum(g.n for g in groups)
         path = vault.subject_file(s["key"])
-        cold = (s["last_seen"] or "") < cutoff and s["n_causes"] < 3
+        cold = (s["last_seen"] or "") < cutoff and s["n_causes"] < L1_MIN_OBS
         if n_obs < L1_MIN_OBS or cold:
             continue
         wanted.add(path)
@@ -185,7 +183,8 @@ def update_writespec_indexes(vault: Vault, conn: sqlite3.Connection) -> int:
 def render_export(vault: Vault, conn: sqlite3.Connection, export_dir: Path) -> int:
     """A read-only copy of what a classifier of untrusted mail may see: claim
     regions (never `## Notes`), L1 subject files, and a listing per directory.
-    Notes with `export: false` are absent. Stale files are removed."""
+    Notes with `export: false` are absent — and so are their belt files and
+    their Slack ids; only mail identifiers travel. Stale files are removed."""
     export_dir.mkdir(parents=True, exist_ok=True)
     wanted: set[Path] = set()
     n = 0
@@ -213,9 +212,10 @@ def render_export(vault: Vault, conn: sqlite3.Connection, export_dir: Path) -> i
         listing = []
         for r in rows:
             claims = conn.execute(
-                "SELECT * FROM claims WHERE doc=? AND folded=0 AND status IN ('owner-stated','corroborated','provisional') "
+                f"SELECT * FROM claims WHERE doc=? AND folded=0 AND status IN {LIVE_SQL} "
                 "ORDER BY score DESC, first_seen ASC", (r["path"],)).fetchall()
-            ids = [i["id"] for i in conn.execute("SELECT id FROM ids WHERE doc=?", (r["path"],))]
+            ids = [i["id"] for i in conn.execute("SELECT id FROM ids WHERE doc=?", (r["path"],))
+                   if not i["id"].startswith("slack:")]
             body = [f"# {r['title']}", ""]
             if ids:
                 body.append("ids: " + ", ".join(ids))
@@ -229,11 +229,15 @@ def render_export(vault: Vault, conn: sqlite3.Connection, export_dir: Path) -> i
             top = claims[0]["text"] if claims else ""
             listing.append(f"- {r['path']} — {r['title']}" + (f" — {truncate_bytes(top, 100)}" if top else ""))
         put(f"{d}/_index.md", f"# {d}/\n\n" + ("\n".join(listing) if listing else "(empty)") + "\n")
-    # L1 subject files, verbatim.
+    # L1 subject files, verbatim — except for subjects whose note is held back.
+    hidden = {r["path"] for r in conn.execute("SELECT path FROM docs WHERE export=0")}
     sub_listing = []
     if vault.subjects_dir.is_dir():
         for p in sorted(vault.subjects_dir.rglob("*.md")):
             rel = p.relative_to(vault.subjects_dir).as_posix()
+            subject = f"{p.parent.name}/{p.stem}"
+            if ix.note_for_subject(subject) in hidden:
+                continue
             try:
                 put(f"subjects/{rel}", p.read_text(encoding="utf-8"))
                 sub_listing.append(f"- subjects/{rel}")
@@ -258,7 +262,7 @@ def header_text(vault_path: str) -> str:
         "that touches a person, an organization, a rule, or a commitment, look it up first:\n"
         "  wanda memory who <email|slack-id>      wanda memory recall \"<words>\"\n"
         "  wanda memory walk <note path>          wanda memory note \"<fact>\" --about <subject>\n"
-        "Write what you learn with `wanda memory note` before you finish. Lines below marked [rule] are Alex's word.\n\n"
+        "Write what you learn with `wanda memory note` before you finish. Lines below marked [rule] are the owner's word.\n\n"
     )
 
 
@@ -312,7 +316,7 @@ def compose_projection(vault: Vault, conn: sqlite3.Connection | None, today: str
 
     rules = ix.standing_rules(conn, limit=40)
     if rules:
-        add("## Standing rules from Alex\n")
+        add("## Standing rules from the owner\n")
         add_list([f"- {truncate_bytes(r['text'], 220)}  ({r['doc']})\n" for r in rules],
                  "- ({n} more — `wanda memory rules`)\n", min(cap_b - used, 2000))
         add("\n")
@@ -324,17 +328,21 @@ def compose_projection(vault: Vault, conn: sqlite3.Connection | None, today: str
             add(f"- {r['due']} {truncate_bytes(r['title'], 120)}  ({r['path']})\n")
         add("\n")
 
-    ros = ix.roster(conn, today, limit=40)
+    ros = ix.roster(conn, today, limit=200)
     if ros:
-        add("## People and orgs in play\n")
+        add("## People, orgs and topics in play\n")
         lines = []
         for r in ros:
+            # Title and path only; a claim's text rides along solely when the
+            # owner said it. This file is the instruction layer: no prose a
+            # model or a conversation wrote reaches it.
             top = ix.top_claim(conn, r["path"])
-            tail = f" — {truncate_bytes(top['text'], 90)}" if top else ""
+            tail = f" — {truncate_bytes(top['text'], 90)}" if top and top["owner_said"] else ""
             lines.append(f"- {truncate_bytes(r['title'], 60)}{tail}  ({r['path']})\n")
         add_list(lines, "- ({n} more — `wanda memory recall`)\n", cap_b - used)
     out = "".join(parts)
-    assert nbytes(out) <= cap_b, nbytes(out)
+    if nbytes(out) > cap_b:  # belt and braces: never ship an oversize file
+        out = truncate_bytes(out, cap_b).rsplit("\n", 1)[0] + "\n"
     return out
 
 

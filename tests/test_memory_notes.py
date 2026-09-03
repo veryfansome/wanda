@@ -114,6 +114,6 @@ def test_writespec_parse_and_render(tmp_path):
     p.write_text(ws.render())
     again = parse_writespec(p)
     assert again.prose == ws.prose and again.index == ["- c"] and again.meta.get("kind") == "write-spec"
-    # Prose is capped by the renderer, never by the writer.
+    # The owner's prose is preserved byte for byte; caps apply where it is loaded.
     ws.prose = "x" * 5000
-    assert len(parse_writespec(p, ws.render()).prose.encode()) <= 1200
+    assert parse_writespec(p, ws.render()).prose == "x" * 5000

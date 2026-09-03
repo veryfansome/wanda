@@ -6,7 +6,7 @@ Wiki-Augmented Nodal Digital Assistant — a local macOS daemon that watches eve
 
 - **Triages incoming iCloud mail.** Messages needing your attention become Slack posts (each thread is a task — reply in it and wanda spawns an agentic claude session that resumes across replies). Unwanted mail is moved to Trash, but only after clearing harness-side guards and only once you flip enforcement from `shadow` to `live`. Trash/ignore decisions land in a daily digest thread. wanda never sends email.
 - **Answers in Slack.** `@wanda` in a channel or thread, or just message it directly — wanda starts an agent session seeded with the recent conversation and replies in a thread. Sessions resume, so a thread stays a conversation rather than a series of one-shots.
-- **Remembers.** A markdown vault at `~/.wanda/memory` (open it in Obsidian) holds what wanda learns about people, organisations, ongoing topics and your preferences. Sessions look things up and write what they learn; triage reads a confined extract; a free hourly pass keeps the derived index fresh and one model call a night distils recurring observations into curated notes. See [Memory](#memory).
+- **Remembers.** A markdown vault at `~/.wanda/memory` (open it in Obsidian) holds what wanda learns about people, organisations, ongoing topics and your preferences. Sessions look things up and write what they learn; triage reads a confined extract; a free hourly pass keeps the derived index fresh and one model call a night distils recurring observations into curated notes (plus one call to revise the filing guides on nights your preferences changed). See [Memory](#memory).
 
 ## Architecture
 
@@ -77,7 +77,7 @@ attest people/robin-vale#c4            # raise a claim to your word
 forget people/robin-vale#c4            # retire it and suppress the pattern behind it
 ```
 
-Only Slack users listed in `WANDA_MEMORY_OWNER_USER_IDS` can do this; a session cannot (it posts as the bot). Editing a note in Obsidian counts as your word too: a changed claim line is pinned and never rewritten; a deleted note is retired with its patterns suppressed (`unretire` undoes it).
+Only Slack users listed in `WANDA_MEMORY_OWNER_USER_IDS` can do this; a session cannot (it posts as the bot). In a channel the command needs an `@wanda` mention; in a DM or the digest thread it does not. Editing a note in Obsidian counts as your word too: a changed claim line is pinned and never rewritten; a renamed note keeps its history; a deleted note is retired and the patterns behind its claims are suppressed for a year (`unretire` brings the note back; the suppression stays until you `attest` or re-state what you want).
 
 A daily `🧠 wanda memory` thread in the triage channel reports what changed: new subjects, write-spec rewrites, your hand edits, rules that went live, templated rule offers (`rule kN`), and anything that failed verification.
 
@@ -92,7 +92,7 @@ wanda memory import-cowork ~/.cowork        # one-time import of a previous vaul
 wanda memory hourly | reindex | fsck | digest | status
 ```
 
-Every tool call a session or the classifier makes is logged to `~/.wanda/logs/tools-YYYY-MM-DD.jsonl` (90 days) by a `PostToolUse` hook, and mirrored to the unified log; `wanda doctor` summarises it and flags reads outside the granted roots or shell commands that are not `wanda …`.
+Every tool call a session or the classifier makes is logged to `~/.wanda/logs/tools-YYYY-MM-DD.jsonl` (90 days) by a `PostToolUse` hook, and mirrored to the unified log; `wanda doctor` counts them and shows the first few reads outside the granted roots or shell commands that are not `wanda …`. The log records Bash command lines as typed, so whatever a session puts on a command line ends up in it and in the system log.
 
 ## Trust assumption
 
@@ -100,7 +100,7 @@ Every tool call a session or the classifier makes is logged to `~/.wanda/logs/to
 
 That is a reasonable trade in a private workspace. It is not, if you ever invite people you don't trust, connect the app to a shared workspace, or let wanda read untrusted external content into a session. Before that, either run the daemon in a container, or set `WANDA_SLACK_ALLOWED_USER_IDS` to restrict who can trigger it and drop `Bash` from `WANDA_AGENT_ALLOWED_TOOLS` (the harness will then post replies itself).
 
-Memory does not widen this, and its own integrity does not rest on tool scoping: a session can write anything into the vault, but it cannot make that writing count as your word. Owner-tier lines must point at a Slack message the hourly pass fetches and checks (author, and that the line is one that message could have minted); a line from a session that worked an email task is email-tier no matter what it claims; and only owner-tier evidence can tell triage what to do. The tool-call log is tamper-evident rather than tamper-proof — a session can edit its own log, which is why lines are mirrored to the unified log.
+Memory does not widen this, and its own integrity does not rest on tool scoping: a session can write anything into the vault, but it cannot make that writing count as your word. Owner-tier lines must point at a Slack message the hourly pass fetches and checks (author, and that the line is one that message could have minted) — checked when first seen and again once a day, so a verification marker forged straight into `wanda.db` is caught within a day; a line written while an email-task session was running is email-tier no matter what it claims; and only owner-tier evidence can tell triage what to do. The tool-call log is tamper-evident rather than tamper-proof — a session can edit its own log, which is why lines are mirrored to the unified log.
 
 ## Safety model
 

@@ -39,8 +39,8 @@ def test_projection_is_capped_composed_and_rules_first(vault, tmp_path):
     rules = [Claim("c1", "trash mail from priya.nash@example.org", [Edge("owner-said", "belt/ledger/2025-01-01", rule_u)])]
     note(vault, "pref", "mail-dispositions", "Mail dispositions", rules)
     # Many people with multibyte titles, to push the roster past the cap.
-    for i in range(80):
-        u = f"01k4qm2f7a9x3b{i:02d}"
+    for i in range(150):
+        u = f"01k4qm2f7a9x{i:04d}"
         append(vault, mk_obs(f"person/p{i}@x.example", f"Fact {i} about person {i} with some words. ééé", "2026-09-01", src="agent", cause="task:1", ulid=u))
         note(vault, "person", f"p{i}@x.example", f"Pérsön {i} Ñame", [Claim("c1", f"Fact {i} about person {i} with some words. ééé",
              [Edge("derived-from", "belt/ledger/2026-09-01", u)])], ids=[f"mailto:p{i}@x.example"])
@@ -50,10 +50,12 @@ def test_projection_is_capped_composed_and_rules_first(vault, tmp_path):
     assert text.startswith("# What wanda knows")
     assert "How wanda files things" in text, "the root write-spec prose is composed in, not regenerated away"
     rules_at = text.index("## Standing rules")
-    roster_at = text.index("## People and orgs in play")
+    roster_at = text.index("## People, orgs and topics in play")
     assert rules_at < roster_at and "trash mail from priya.nash@example.org" in text
     assert "more — `wanda memory recall`" in text
     assert "[[" not in text, "paths, never wikilinks, so a session can act on a line"
+    assert "Fact 3 about person" not in text, "no session or model prose in the instruction layer; titles and paths only"
+    assert render.compose_projection(vault, conn, TODAY) == text, "deterministic: the same set on every turn"
     # A write-spec edit survives regeneration.
     spec = vault.root / "CLAUDE.md"
     ws = parse_writespec(spec)
@@ -161,3 +163,34 @@ def test_for_triage_is_structured_and_names_rules_for_these_senders(vault, tmp_p
     assert "memory.export/people/d@x.example.md" in out
     assert "Unseen senders: 1" in out
     assert nbytes(out) <= 1200
+
+
+def test_export_hides_belt_files_of_hidden_notes_and_slack_ids(vault, tmp_path):
+    """Security review #2: `export: false` must hold for the subject's L1
+    file too, and Slack ids never travel to the classifier."""
+    seed(vault)
+    for i in range(3):
+        append(vault, mk_obs("person/alex-romero", "Born on a date.", f"2026-08-0{i + 1}", src="agent", cause="task:1", ulid=f"01k4qm2f7a9x3q{i:02d}"))
+    note(vault, "person", "alex-romero", "Alex Romero", [Claim("c1", "Born on a date.")], ids=["mailto:alex@x.example", "slack:U_FAN"], export=False)
+    note(vault, "person", "robin", "Robin", [Claim("c1", "Secretary.")], ids=["mailto:d@x.example", "slack:U_DEV"])
+    conn = build(vault, tmp_path, ix.DictTrust(task_kinds={1: "dm"}))
+    render.regenerate_subject_files(vault, conn, TODAY)
+    assert vault.subject_file("person/alex-romero").exists()
+    out = tmp_path / "export"
+    render.render_export(vault, conn, out)
+    assert not (out / "subjects" / "person" / "alex-romero.md").exists()
+    assert not (out / "people" / "alex-romero.md").exists()
+    robin = (out / "people" / "robin.md").read_text()
+    assert "mailto:d@x.example" in robin and "slack:" not in robin
+
+
+def test_triage_rules_match_by_registrable_domain(vault, tmp_path):
+    seed(vault)
+    u = "01k4qs81bdk3m9h1"
+    append(vault, mk_obs("org/sunnybrook.example", "trash mail from sunnybrook.example", "2026-09-01", src="owner", op="rule",
+                         facet="mail-disposition", cause="slack:C1:1.1", ulid=u))
+    note(vault, "pref", "mail-dispositions", "Mail dispositions",
+         [Claim("c1", "trash mail from sunnybrook.example", [Edge("owner-said", "belt/ledger/2026-09-01", u)])])
+    conn = build(vault, tmp_path, ix.DictTrust(verified_causes={"slack:C1:1.1"}))
+    out = recall.for_triage(conn, [{"from_addr": "noreply@mail.sunnybrook.example"}], None, tmp_path / "memory.export")
+    assert "trash mail from sunnybrook.example [rule]" in out and "Unseen senders" not in out

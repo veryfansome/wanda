@@ -112,6 +112,16 @@ CREATE TABLE IF NOT EXISTS memory_offers (
   created_at TEXT NOT NULL,
   taken_at   TEXT
 );
+-- Agent-run windows: which task kind was running when. Provenance of a
+-- ledger line written from a shell is decided against these, not against
+-- anything the writer says about itself.
+CREATE TABLE IF NOT EXISTS memory_run_windows (
+  session_id TEXT PRIMARY KEY,
+  task_id    INTEGER,
+  kind       TEXT NOT NULL,
+  started_at TEXT NOT NULL,
+  ended_at   TEXT
+);
 -- Digest lines waiting for the daily post.
 CREATE TABLE IF NOT EXISTS memory_digest (
   id         INTEGER PRIMARY KEY,
@@ -439,9 +449,44 @@ class Store:
         )
         return list(reversed(rows))
 
-    def task_had_run_near(self, task_id: int, when_iso: str, slack_s: int = 1800) -> bool:
-        """Was a run for this task in flight around `when`? Used to check that
-        a ledger line claiming `cause=task:N` was written while N was running."""
+    # --- memory: agent-run windows ---
+
+    def open_run_window(self, session_id: str, task_id: int | None, kind: str) -> None:
+        self._exec(
+            "INSERT INTO memory_run_windows(session_id, task_id, kind, started_at, ended_at) VALUES(?,?,?,?,NULL) "
+            "ON CONFLICT(session_id) DO UPDATE SET started_at=excluded.started_at, ended_at=NULL, kind=excluded.kind",
+            (session_id, task_id, kind, utcnow()),
+        )
+
+    def close_run_window(self, session_id: str) -> None:
+        self._exec("UPDATE memory_run_windows SET ended_at=? WHERE session_id=? AND ended_at IS NULL", (utcnow(), session_id))
+
+    def windows_at(self, when_iso: str, slack_s: int = 300) -> list[sqlite3.Row]:
+        """Every agent run in flight at `when` (a small grace after the end,
+        since a session's last CLI call can land just after its envelope)."""
+        rows = self._query("SELECT * FROM memory_run_windows WHERE started_at <= ?", (when_iso,))
+        out = []
+        try:
+            w = datetime.fromisoformat(when_iso)
+        except (TypeError, ValueError):
+            return out
+        for r in rows:
+            try:
+                end = datetime.fromisoformat(r["ended_at"]) if r["ended_at"] else None
+            except (TypeError, ValueError):
+                end = None
+            if end is None or w <= end + timedelta(seconds=slack_s):
+                out.append(r)
+        return out
+
+    def open_windows(self) -> list[sqlite3.Row]:
+        return self._query("SELECT * FROM memory_run_windows WHERE ended_at IS NULL")
+
+    def task_had_run_near(self, task_id: int, when_iso: str, slack_s: int = 300) -> bool:
+        """Was a run for this task in flight around `when`? Windows first;
+        the runs ledger (written at run end) as a fallback for old rows."""
+        if any(r["task_id"] == task_id for r in self.windows_at(when_iso, slack_s)):
+            return True
         rows = self._query(
             "SELECT started_at, ended_at FROM runs WHERE task_id=? AND started_at <= ? ORDER BY id DESC LIMIT 5",
             (task_id, when_iso),
@@ -584,9 +629,6 @@ class Store:
     def move_shas(self, old: str, new: str) -> None:
         self._exec("UPDATE OR REPLACE memory_shas SET path=? WHERE path=?", (new, old))
 
-    def all_sha_paths(self) -> list[str]:
-        return [r["path"] for r in self._query("SELECT DISTINCT path FROM memory_shas")]
-
     def owner_check(self, cause: str) -> sqlite3.Row | None:
         rows = self._query("SELECT * FROM memory_owner_checks WHERE cause=?", (cause,))
         return rows[0] if rows else None
@@ -597,9 +639,6 @@ class Store:
             "ON CONFLICT(cause) DO UPDATE SET verified=excluded.verified, checked_at=excluded.checked_at, detail=excluded.detail",
             (cause, 1 if verified else 0, utcnow(), detail[:300]),
         )
-
-    def verified_causes(self) -> set[str]:
-        return {r["cause"] for r in self._query("SELECT cause FROM memory_owner_checks WHERE verified=1")}
 
     def add_offer(self, kind: str, subject: str, action: str | None, text: str) -> str:
         with self._lock:
@@ -657,9 +696,11 @@ class Store:
         return out
 
     def senders_since(self, since_iso: str) -> list[sqlite3.Row]:
+        """Raw From headers seen since `since`; callers aggregate by address,
+        since one address arrives under several display names."""
         return self._query(
             "SELECT from_addr, COUNT(*) AS n, MAX(created_at) AS last FROM messages WHERE created_at >= ? "
-            "GROUP BY from_addr ORDER BY n DESC LIMIT 500", (since_iso,),
+            "GROUP BY from_addr ORDER BY n DESC LIMIT 2000", (since_iso,),
         )
 
     # --- meta ---
