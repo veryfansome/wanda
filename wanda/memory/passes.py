@@ -106,6 +106,11 @@ class Busy(Exception):
     """Another pass holds the memory lock."""
 
 
+class BudgetReached(Exception):
+    """The run cap stopped the nightly's model call; the free graduations
+    still apply, and the night counts toward the skipped-nights alert."""
+
+
 class Deferred(Exception):
     """A note is being edited right now; try again next pass."""
 
@@ -117,10 +122,14 @@ class Authority:
     in wanda.db can cache this, never grant it."""
     minted: set[str] = field(default_factory=set)
     verified: set[str] = field(default_factory=set)
-    windows: list[dict] | None = None   # agent-run windows as the daemon saw them
+    authored: set[str] = field(default_factory=set)   # harness lines a pass wrote itself (e.g. a deletion veto)
+    windows: list[dict] | None = None                 # agent-run windows as the daemon saw them
 
     def holds(self, ulid_: str) -> bool:
         return ulid_ in self.minted or ulid_ in self.verified
+
+    def wrote(self, ulid_: str) -> bool:
+        return ulid_ in self.authored
 
 
 @dataclass
@@ -157,10 +166,13 @@ class StoreTrust:
         return bool(r and r["verified"])
 
     def line_checked(self, ulid_: str) -> bool:
-        if self.authority is not None:
-            return self.authority.holds(ulid_)
-        v = self.store.memory_get(f"checked:{ulid_}")
-        return bool(v) and v != "0"
+        # Only the daemon, holding authority in memory, can confirm an owner
+        # line. A process without authority (the CLI) never grants owner tier,
+        # whatever rows sit in the session-writable database.
+        return self.authority is not None and self.authority.holds(ulid_)
+
+    def line_authored(self, ulid_: str) -> bool:
+        return self.authority is not None and self.authority.wrote(ulid_)
 
     def windows(self) -> list[dict]:
         if self.authority is not None and self.authority.windows is not None:
@@ -169,18 +181,12 @@ class StoreTrust:
             self._windows = self.store.all_windows()
         return self._windows
 
-    def line_tier(self, pg: str, when: datetime) -> str:
-        """The run that wrote the line, by process group; a shell that left
-        its group (setsid) or a hand at a terminal has no match and gets the
-        conservative answer: email if any email-task run was in flight."""
-        covering = windows_covering(self.windows(), when.isoformat(timespec="seconds"))
-        if pg.isdigit():
-            mine = [w for w in covering if str(w.get("pgid") or "") == pg]
-            if mine:
-                return "session" if all(w["kind"] in ix.CONVERSATION_KINDS for w in mine) else "email"
-        return "email" if any(w["kind"] not in ix.CONVERSATION_KINDS for w in covering) else "session"
-
     def window_tier(self, when: datetime) -> str:
+        """Attributed by the agent-run windows the harness recorded, never by
+        anything in the line: email if any email-task run was in flight when
+        the line was written, else session. A session cannot forge which run
+        the harness saw, and a concurrent email run makes the answer email —
+        the safe direction."""
         covering = windows_covering(self.windows(), when.isoformat(timespec="seconds"))
         return "email" if any(w["kind"] not in ix.CONVERSATION_KINDS for w in covering) else "session"
 
@@ -819,8 +825,13 @@ def _veto_note_claims(svc: Services, rel: str, body: str, today: str, cause: str
                 keys.add(f"line:{u}")
     except Exception:
         log.warning("could not parse deleted note %s; vetoing its subject key only", rel)
-    L.append(vault, L.Observation(subject=subject, facet="veto", text=f"Note {rel} deleted by owner", src="harness",
-                                  op="veto", cause=cause, ref=",".join(sorted(keys))))
+    o = L.Observation(subject=subject, facet="veto", text=f"Note {rel} deleted by owner", src="harness",
+                      op="veto", cause=cause, ref=",".join(sorted(keys)))
+    L.append(vault, o)
+    if svc.authority is not None:
+        # The pass wrote this veto itself, under the lock, reacting to a git
+        # deletion — trusted regardless of what session happened to be running.
+        svc.authority.authored.add(o.ulid)
 
 
 TOMBSTONE_MARKER = "<!-- original content follows, for unretire -->\n\n"
@@ -1176,8 +1187,10 @@ def _cap_derived_from(c: Claim, group_of: dict | None = None) -> None:
     if len(refs) <= DERIVED_FROM_KEEP:
         return
     if not group_of:
-        drop = refs[: len(refs) - DERIVED_FROM_KEEP]
-        c.edges = [e for e in c.edges if e not in drop]
+        # Without the witness-group map we cannot tell which ref is the last
+        # of its group; dropping one blindly would let that group re-graduate.
+        # Keep all — refs only grow past three on the graduation write, which
+        # always supplies the map and caps there.
         return
     keep: list[Edge] = []
     seen_groups: set = set()
@@ -1806,6 +1819,7 @@ def _import_writespecs(svc: Services, src: Path, ctx: dict) -> None:
                 store.memory_set(f"filesha:{target}", sha_file(spec))
                 rep["writespecs"] += 1
         dispositions = _cowork_dispositions(text)
+        pending: list[tuple[str, str]] = []  # (disposition, ledger ulid) — offered only after the write lands
         if dispositions:
             note = _prefs_note(vault, DISPOSITION_FACET, today)
             for disp in dispositions:
@@ -1814,14 +1828,16 @@ def _import_writespecs(svc: Services, src: Path, ctx: dict) -> None:
                 o = L.Observation(subject="pref/mail-dispositions", facet="import-disposition", text=disp, src="import", cause=f"import:{sha}")
                 L.append(vault, o)
                 note.claims.append(Claim(note.next_block(), disp, [Edge("derived-from", f"belt/ledger/{o.day}", o.ulid), Edge("tier", value="session")]))
-                rep["prefs"] += 1
-                ref = store.add_offer("preference", "pref/mail-dispositions", None, disp)
-                store.digest_add("offer", f"imported from the old vault, not yet your word: “{disp[:100]}” → `rule {ref}` confirms it as a preference; `rule <address> trash` makes it a triage rule")
+                pending.append((disp, o.ulid))
             try:
                 _write_note(svc, note)
             except Deferred as e:
                 rep["deferred"].append(f"{rel}: {e}")
-                continue
+                continue  # sha unmarked: retried next run, no duplicate offers
+            for disp, _u in pending:
+                rep["prefs"] += 1
+                ref = store.add_offer("preference", "pref/mail-dispositions", None, disp)
+                store.digest_add("offer", f"imported from the old vault, not yet your word: “{disp[:100]}” → `rule {ref}` confirms it as a preference; `rule <address> trash` makes it a triage rule")
         _mark_imported(svc, ctx, sha)
 
 

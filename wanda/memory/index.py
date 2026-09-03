@@ -48,6 +48,8 @@ CREATE INDEX IF NOT EXISTS ix_rkeys ON rkeys(key, ulid);
 CREATE TABLE IF NOT EXISTS vetoes (key TEXT PRIMARY KEY, until TEXT, ulid TEXT);
 CREATE TABLE IF NOT EXISTS subjects (key TEXT PRIMARY KEY, doc TEXT, n_obs INTEGER, n_causes INTEGER, n_days INTEGER,
   first_seen TEXT, last_seen TEXT, untrusted INTEGER, has_file INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS rules (subject TEXT, facet TEXT, target TEXT, action TEXT, text TEXT, ledger_ref TEXT,
+  created TEXT, doc TEXT, block TEXT);
 CREATE TABLE IF NOT EXISTS writespecs (path TEXT PRIMARY KEY, prose TEXT, sha TEXT);
 CREATE TABLE IF NOT EXISTS flags (path TEXT, block TEXT, kind TEXT, detail TEXT);
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
@@ -66,8 +68,8 @@ class TrustOracle(Protocol):
 
     def owner_verified(self, cause: str) -> bool: ...
     def line_checked(self, ulid: str) -> bool: ...
-    def line_tier(self, pg: str, when: datetime) -> str: ...
     def window_tier(self, when: datetime) -> str: ...
+    def line_authored(self, ulid: str) -> bool: ...
 
 
 def tier_for_obs(o: L.Observation, trust: TrustOracle) -> str:
@@ -88,7 +90,12 @@ def tier_for_obs(o: L.Observation, trust: TrustOracle) -> str:
         return trust.window_tier(o.when)
     if o.src == "triage":
         return "email"
-    return trust.line_tier(o.pg, o.when)
+    if getattr(trust, "line_authored", lambda u: False)(o.ulid):
+        return "session"  # the daemon wrote this line itself during a pass
+    # Any other shell-written line (agent, harness, import): attributed by the
+    # agent-run windows the HARNESS recorded, never by anything in the line —
+    # a session cannot forge which run was in flight when it wrote.
+    return trust.window_tier(o.when)
 
 
 def open_index(path: Path) -> sqlite3.Connection:
@@ -201,13 +208,14 @@ def rebuild(vault: Vault, conn: sqlite3.Connection, trust: TrustOracle, today: s
     conn.execute("BEGIN IMMEDIATE")
     try:
         for t in ("docs", "ids", "aliases", "subject_alias", "claims", "edges", "obs", "rkeys",
-                  "vetoes", "subjects", "writespecs", "flags"):
+                  "vetoes", "subjects", "writespecs", "rules", "flags"):
             conn.execute(f"DELETE FROM {t}")
         _load_ledger(vault, conn, trust, rep)
         obs_by_ulid = {r["ulid"]: r for r in conn.execute("SELECT * FROM obs")}
         _load_notes(vault, conn, trust, rep, obs_by_ulid, today)
         _finish_status(conn, today)
         _load_writespecs(vault, conn)
+        _derive_owner_rules(conn)
         _aggregate_subjects(conn)
         for f in rep.flags:
             conn.execute("INSERT INTO flags(path, block, kind, detail) VALUES(?,?,?,?)", f)
@@ -478,6 +486,27 @@ def _finish_status(conn, today: str) -> None:
                          (score_for(False, c["n_causes"] or 0, c["last_seen"] or "", "disputed", today), c["id"]))
 
 
+def _derive_owner_rules(conn) -> None:
+    """The live owner rule set, computed from owner-tier `op=rule` ledger
+    lines directly — newest per (facet, target) wins. Triage reads this, not
+    the prefs note, so editing the note's claims or edges cannot enable or
+    disable a rule; only a verified owner Slack message can."""
+    seen: dict[tuple[str, str], sqlite3.Row] = {}
+    for o in conn.execute("SELECT * FROM obs WHERE op='rule' AND tier='owner' ORDER BY ts ASC"):
+        m = DISPOSITION_RE.match(o["text"])
+        target = m.group(2) if m else o["subject"]
+        seen[(o["facet"], target)] = o  # later line wins
+    for (facet, target), o in seen.items():
+        m = DISPOSITION_RE.match(o["text"])
+        action = m.group(1) if m else None
+        # The prefs claim that renders this rule, for reference/attest.
+        cl = conn.execute("SELECT doc, block FROM claims WHERE owner_said=1 AND text=? LIMIT 1", (o["text"],)).fetchone()
+        conn.execute("INSERT INTO rules(subject, facet, target, action, text, ledger_ref, created, doc, block) "
+                     "VALUES(?,?,?,?,?,?,?,?,?)",
+                     (o["subject"], facet, target, action, o["text"], f"belt/ledger/{o['day']}#^{o['ulid']}", o["day"],
+                      cl["doc"] if cl else None, cl["block"] if cl else None))
+
+
 def _load_writespecs(vault: Vault, conn) -> None:
     for p in vault.writespecs():
         try:
@@ -522,24 +551,18 @@ def live_claims(conn, doc: str, limit: int = 20) -> list[sqlite3.Row]:
 
 
 def standing_rules(conn, limit: int = 8) -> list[sqlite3.Row]:
-    """Owner rules do not decay and tie-break on when they were first said,
-    so the oldest, most fundamental rules are never the first to fall out of
-    the projection."""
-    return conn.execute(
-        "SELECT c.*, d.title FROM claims c JOIN docs d ON d.path=c.doc "
-        "WHERE c.folded=0 AND c.owner_said=1 AND c.status='owner-stated' AND c.cls IN ('disposition','pref') "
-        "ORDER BY c.pinned DESC, c.first_seen ASC, c.doc ASC, c.lineno ASC LIMIT ?", (limit,)).fetchall()
+    """The live owner rules, derived from owner-tier ledger lines (see
+    `_derive_owner_rules`) — immune to any edit of the prefs note. Oldest
+    first, so the most fundamental rules are never the first dropped."""
+    return conn.execute("SELECT * FROM rules ORDER BY created ASC, target ASC LIMIT ?", (limit,)).fetchall()
 
 
 def dispositions_for(conn, addrs: list[str], domains: list[str]) -> list[tuple[sqlite3.Row, str]]:
     """Every live owner disposition that names one of these addresses or
-    registrable domains — however many rules exist. Returns (row, target)."""
+    registrable domains. From the derived rules table, not the note."""
     out = []
-    for r in conn.execute("SELECT * FROM claims WHERE cls='disposition' AND folded=0 AND status='owner-stated' ORDER BY first_seen ASC, lineno ASC"):
-        m = DISPOSITION_RE.match(r["text"])
-        if not m:
-            continue
-        target = m.group(2)
+    for r in conn.execute("SELECT * FROM rules WHERE facet='mail-disposition' ORDER BY created ASC, target ASC"):
+        target = r["target"]
         if target in addrs or target in domains:
             out.append((r, target))
     return out

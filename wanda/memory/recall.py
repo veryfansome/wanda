@@ -1,5 +1,5 @@
 """Retrieval. Deterministic throughout: fixed slices, byte budgets, no model.
-Two fences: <memory> for what wanda concluded or Alex said, and
+Two fences: <memory> for what wanda concluded or the owner said, and
 <memory trust="unverified"> for claims that rest on email content alone."""
 from __future__ import annotations
 

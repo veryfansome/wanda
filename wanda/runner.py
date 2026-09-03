@@ -57,7 +57,6 @@ class RunnerService:
         setting_sources: str | None = None,
         cwd: str | None = None,
         env: dict[str, str] | None = None,
-        on_start=None,
     ) -> RunResult:
         """`no_tools` is sugar for tools="" plus no session persistence — the
         shape of a one-shot classifier. `restricted` confines file tools to
@@ -111,11 +110,6 @@ class RunnerService:
             cwd=cwd,
             env={**os.environ, **env} if env else None,
         )
-        if on_start is not None:
-            try:
-                on_start(proc.pid)  # its own process group (start_new_session)
-            except Exception:
-                log.exception("on_start callback failed")
         try:
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(prompt.encode()), timeout=timeout_s

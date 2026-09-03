@@ -22,7 +22,7 @@ from wanda.config import Config, load_config
 from wanda.events import Event
 from wanda.memory import audit
 from wanda.memory.digest import post_digest
-from wanda.memory.passes import Busy
+from wanda.memory.passes import BudgetReached as MemoryBudgetReached, Busy
 from wanda.memory.recall import MEMORY_NOTE
 from wanda.memory.service import MemoryService, default_wanda_bin, write_settings
 from wanda.runner import RunnerService, RunResult
@@ -681,7 +681,6 @@ class Processor:
                     "WANDA_SLACK_USER": p.get("user", ""),
                     "WANDA_LANE": "agent",
                 }
-                on_start = (lambda pid: self.memory.set_window_pgid(sid, pid)) if self.memory else None
                 if self.memory is not None:
                     self.memory.open_window(sid, task["id"], task["kind"])
                 else:
@@ -689,10 +688,10 @@ class Processor:
                 try:
                     with self._inflight():
                         if task["claude_session_id"]:
-                            rr = await self._agent_run(p["text"], resume=sid, env=env, on_start=on_start)
+                            rr = await self._agent_run(p["text"], resume=sid, env=env)
                         else:
                             seed = await self._seed_for(task, p)
-                            rr = await self._agent_run(seed, session_id=sid, env=env, on_start=on_start)
+                            rr = await self._agent_run(seed, session_id=sid, env=env)
                             # Persist whenever the CLI got far enough to have a
                             # session, so a timeout does not discard it and make
                             # the next reply re-seed with no memory.
@@ -828,10 +827,9 @@ class Processor:
         return conversation_seed_prompt(p, transcript, asker, memory=memory, prior=prior, memory_on=use_memory)
 
     async def _agent_run(self, prompt: str, session_id: str | None = None,
-                         resume: str | None = None, env: dict[str, str] | None = None, on_start=None):
+                         resume: str | None = None, env: dict[str, str] | None = None):
         return await self.runner.run(
             prompt,
-            on_start=on_start,
             model=self.cfg.agent_model,
             max_budget_usd=self.cfg.agent_max_budget_usd,
             timeout_s=self.cfg.agent_timeout_s,
@@ -920,7 +918,7 @@ class Processor:
     async def _run_nightly(self) -> None:
         async def run_model(system: str, prompt: str, schema: dict):
             if await self.check_budget() != "ok":
-                return None
+                raise MemoryBudgetReached()
             started = utcnow()
             async with self.runner.triage_sem:
                 with self._inflight():
@@ -940,7 +938,7 @@ class Processor:
                      rep.candidates, rep.applied, rep.deferred, rep.model_calls, rep.offers, rep.writespecs_changed,
                      f" (skipped: {rep.skipped_reason})" if rep.skipped_reason else "")
             if rep.skipped_reason == "budget":
-                # The run cap stopped tonight's call: a skipped night counts like a failed one.
+                # The run cap stopped tonight's paid call: a skipped night counts like a failed one.
                 n = int(self.store.memory_get("nightly_failures") or 0) + 1
                 self.store.memory_set("nightly_failures", str(n))
                 if n >= 3:

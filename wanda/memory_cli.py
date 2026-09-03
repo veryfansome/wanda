@@ -82,23 +82,14 @@ def _conn(cfg: Config, create: bool = False):
     return conn
 
 
-def _provenance() -> tuple[str, str, str]:
-    """(src, cause, pg) for a write from this process. The process group is
-    the claude subprocess the harness started (its own group leader), which
-    a session cannot change to another session's; the index decides the
-    tier from the run window that group belongs to — never from the task id
-    in the environment, which is informational."""
+def _provenance() -> tuple[str, str]:
+    """(src, cause) for a write from this process. The tier is decided by the
+    harness from the agent-run windows it recorded around this line's time —
+    never from the task id in the environment, which is only informational."""
     task = os.environ.get(ENV_TASK, "").strip()
-    pg = str(os.getpgrp())
     if task.isdigit():
-        return "agent", f"task:{task}", pg
-    return "harness", f"cli:{os.getpid()}", pg
-
-
-def _line_tier(store: Store, pg: str) -> str:
-    """What the index will decide for a line written right now."""
-    from datetime import datetime as _dt
-    return passes.StoreTrust(store).line_tier(pg, _dt.now(timezone.utc))
+        return "agent", f"task:{task}"
+    return "harness", f"cli:{os.getpid()}"
 
 
 def _in_session() -> bool:
@@ -215,9 +206,9 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
                 print("nearest: " + ", ".join(nearest), file=sys.stderr)
             return 2
         until = _iso_date(args.until, "--until") if args.until else ""
-        src, cause, pg = _provenance()
+        src, cause = _provenance()
         o = Observation(subject=subj, facet=slugify(args.facet, 32) if args.facet else "", text=clean_text(args.text),
-                        src=src, cause=cause, until=until, pg=pg)
+                        src=src, cause=cause, until=until)
         try:
             _append(cfg, store, vault, o)
         except ValueError as e:
@@ -239,8 +230,7 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
             print(f"unknown subject {args.about!r}", file=sys.stderr)
             return 2
         check_by = _iso_date(args.check_by, "--check-by")
-        src, cause, pg = _provenance()
-        tier = _line_tier(store, pg)  # derived the same way the index derives it, never defaulted
+        src, cause = _provenance()
         slug = slugify(args.title, 40) or "item"
         path = vault.root / "open" / f"{check_by}-{slug}.md"
         if path.exists():
@@ -249,9 +239,11 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
         n = new_note(path, "open", clean_text(args.title, 160), created=today)
         n.meta.update({"check_by": check_by, "about": subj})
         write_atomic(path, n.render())
+        # The item's tier is derived by the index from this op=open line (by
+        # the run window it was written in), not declared here.
         _append(cfg, store, vault, Observation(subject=subj, facet="commitment", text=clean_text(args.title, 240), src=src,
-                                               cause=cause, op="open", due=check_by, ref=vault.rel(path), pg=pg))
-        print(f"opened {vault.rel(path)}" + (" (from an email task: stays off the always-loaded list)" if tier == "email" else ""))
+                                               cause=cause, op="open", due=check_by, ref=vault.rel(path)))
+        print(f"opened {vault.rel(path)} (an email-task item stays off the always-loaded list)")
         return 0
 
     if verb in ("pin", "forget"):
@@ -265,14 +257,14 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
         if row is None:
             sys.exit(f"no claim at {ref}")
         subj = ix.subject_for_doc(doc) or passes.GENERAL_PREF_SUBJECT
-        src, cause, pg = _provenance()
+        src, cause = _provenance()
         if verb == "pin":
-            _append(cfg, store, vault, Observation(subject=subj, facet="pin", text=f"Pinned: {row['text']}", src=src, cause=cause, op="pin", ref=ref, pg=pg))
+            _append(cfg, store, vault, Observation(subject=subj, facet="pin", text=f"Pinned: {row['text']}", src=src, cause=cause, op="pin", ref=ref))
             print(f"pinned on the next pass: {row['text']}")
             return 0
         if row["owner_said"] or row["pinned"]:
             sys.exit("that claim is the owner's word; only the owner can forget it, from Slack: `forget " + args.ref + "`")
-        for o in commands.forget_observations(conn, doc, block, row["text"], subj, src=src, cause=cause, pg=pg):
+        for o in commands.forget_observations(conn, doc, block, row["text"], subj, src=src, cause=cause):
             _append(cfg, store, vault, o)
         print(f"forgotten on the next pass: {row['text']}")
         return 0

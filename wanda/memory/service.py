@@ -81,12 +81,6 @@ class MemoryService:
         w = self.store.open_run_window(session_id, task_id, kind)
         self.authority.windows = [x for x in self.authority.windows if x["session_id"] != session_id] + [w]
 
-    def set_window_pgid(self, session_id: str, pgid: int) -> None:
-        self.store.set_run_window_pgid(session_id, pgid)
-        for w in self.authority.windows:
-            if w["session_id"] == session_id:
-                w["pgid"] = pgid
-
     def close_window(self, session_id: str) -> None:
         ended = self.store.close_run_window(session_id)
         for w in self.authority.windows:
@@ -343,15 +337,21 @@ class MemoryService:
 
         prep = await asyncio.to_thread(prepare)
         calls = 0
+        budget = False
         distill_out = writespec_out = None
-        if prep.ask or prep.contras:
-            distill_out = await run_model((passes.PROMPTS_DIR / "memory_distill.md").read_text(),
-                                          passes.distill_prompt(prep.ask, prep.contras), passes.RESOLUTION_SCHEMA)
-            calls += 1
-        if prep.writespec_prompt:
-            writespec_out = await run_model((passes.PROMPTS_DIR / "memory_writespec.md").read_text(),
-                                            prep.writespec_prompt, passes.WRITESPECS_SCHEMA)
-            calls += 1
+        try:
+            if prep.ask or prep.contras:
+                distill_out = await run_model((passes.PROMPTS_DIR / "memory_distill.md").read_text(),
+                                              passes.distill_prompt(prep.ask, prep.contras), passes.RESOLUTION_SCHEMA)
+                calls += 1
+            if prep.writespec_prompt:
+                writespec_out = await run_model((passes.PROMPTS_DIR / "memory_writespec.md").read_text(),
+                                                prep.writespec_prompt, passes.WRITESPECS_SCHEMA)
+                calls += 1
+        except passes.BudgetReached:
+            # The run cap stopped the paid call. Apply the free graduations and
+            # offers, leave the model candidates to retry, and report a skip.
+            budget = True
         payload = passes.merge_model_output(prep, distill_out, writespec_out)
         staged = passes.stage(svc, payload) if (payload.get("resolutions") or payload.get("writespecs")) else None
 
@@ -368,5 +368,6 @@ class MemoryService:
 
         rep = await asyncio.to_thread(apply)
         rep.model_calls = calls
-        rep.skipped_reason = rep.skipped_reason or ("budget" if calls == 0 and (prep.ask or prep.contras) else "")
+        if budget:
+            rep.skipped_reason = "budget"
         return rep

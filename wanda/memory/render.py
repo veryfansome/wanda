@@ -332,7 +332,7 @@ def compose_projection(vault: Vault, conn: sqlite3.Connection | None, today: str
     rules = ix.standing_rules(conn, limit=40)
     if rules:
         add("## Standing rules from the owner\n")
-        add_list([f"- {truncate_bytes(r['text'], 220)}  ({r['doc']})\n" for r in rules],
+        add_list([f"- {truncate_bytes(r['text'], 220)}" + (f"  ({r['doc']})" if r['doc'] else "") + "\n" for r in rules],
                  "- ({n} more — `wanda memory rules`)\n", min(cap_b - used, 2000))
         add("\n")
 

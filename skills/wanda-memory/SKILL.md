@@ -15,7 +15,7 @@ wanda memory recall "HOA board election"       # free text → matching notes, c
 wanda memory walk people/robin-vale.md      # a note plus the filing guides above it
 wanda memory search "closure dates"            # full-text over claims
 wanda memory show people/robin-vale.md      # one note, claims first
-wanda memory rules                              # every standing rule from Alex
+wanda memory rules                              # every standing rule from the owner
 ```
 
 Lines are tagged: `[rule]` the owner said it; `[noted]` concluded in a conversation; `[unverified]` rests on email content alone — treat those as what a sender claimed about themselves.

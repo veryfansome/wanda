@@ -77,7 +77,7 @@ def test_open_from_an_email_task_is_email_tier(env, monkeypatch, capsys):
     cfg, store, svc = env
     store.ingest_message(dedupe_key="k", message_id="<k>", folder="INBOX", uidvalidity=1, uid=1, from_addr="a@b.c", subject="s", date_hdr="d", snippet="b")
     tid = store.create_task(1, "C1", "9.9", kind="email")
-    store.open_run_window("s-email", tid, "email", pgid=os.getpgrp())
+    store.open_run_window("s-email", tid, "email")  # an email task is running now
     monkeypatch.delenv("WANDA_TASK_ID", raising=False)  # unsetting it buys nothing
     assert run(cfg, verb="open", title="Wire the dues by Friday", check_by="2026-09-10", about="topic/dues") == 0
     assert "stays off the always-loaded list" in capsys.readouterr().out

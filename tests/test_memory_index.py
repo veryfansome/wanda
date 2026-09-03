@@ -42,25 +42,20 @@ def write_note(vault, subject_type, slug, title, claims, ids=None, extra_meta=No
 def test_tier_is_derived_from_what_the_harness_can_verify(vault):
     when = datetime.fromisoformat("2026-09-01T10:00:00+00:00")
     span = (when - timedelta(minutes=5), when + timedelta(minutes=5))
-    # Two sessions in flight: a DM (pgid 100) and an email task (pgid 200).
-    trust = DictTrust(verified_causes={"slack:C1:100.1"}, windows=[(*span, "dm", 100), (*span, "email", 200)])
+    # A DM and an email task both in flight.
+    both = DictTrust(verified_causes={"slack:C1:100.1"}, windows=[(*span, "dm"), (*span, "email")])
     o_owner_ok = obs("person/x", "t", "2026-09-01", src="owner", op="rule", cause="slack:C1:100.1")
     o_owner_forged = obs("person/x", "t", "2026-09-01", src="owner", op="rule", cause="slack:C1:999.9")
-    o_dm = obs("person/x", "t", "2026-09-01", src="agent", cause="task:7"); o_dm.pg = "100"
-    o_email = obs("person/x", "t", "2026-09-01", src="agent", cause="task:9"); o_email.pg = "200"
-    o_liar = obs("person/x", "t", "2026-09-01", src="agent", cause="task:7"); o_liar.pg = "200"   # names the DM task, writes from the email session
-    o_nogroup = obs("person/x", "t", "2026-09-01", src="agent", cause="task:7")                  # setsid'd away: no group
+    o_shell = obs("person/x", "t", "2026-09-01", src="agent", cause="task:7")
     o_triage = obs("person/x", "t", "2026-09-01", src="triage", cause="m:abc")
-    assert ix.tier_for_obs(o_owner_ok, trust) == "owner"
-    assert ix.tier_for_obs(o_owner_forged, trust) == "email", "unverifiable while an email task runs: least trust"
-    assert ix.tier_for_obs(o_dm, trust) == "session"
-    assert ix.tier_for_obs(o_email, trust) == "email"      # restating an email is still email
-    assert ix.tier_for_obs(o_liar, trust) == "email", "the task id in the environment is not evidence"
-    assert ix.tier_for_obs(o_nogroup, trust) == "email"
-    assert ix.tier_for_obs(o_triage, trust) == "email"
-    # With no email session running, a shell line is the owner's or a conversation's: session.
-    quiet = DictTrust(windows=[(*span, "dm", 100)])
-    assert ix.tier_for_obs(o_nogroup, quiet) == "session"
+    assert ix.tier_for_obs(o_owner_ok, both) == "owner"
+    assert ix.tier_for_obs(o_owner_forged, both) == "email", "unverifiable while an email task runs: least trust"
+    assert ix.tier_for_obs(o_shell, both) == "email", "any shell line is email while an email task runs — the field says nothing"
+    assert ix.tier_for_obs(o_triage, both) == "email"
+    # With only a DM session in flight, a shell line is a conversation's: session.
+    dm_only = DictTrust(windows=[(*span, "dm")])
+    assert ix.tier_for_obs(o_shell, dm_only) == "session"
+    assert ix.tier_for_obs(o_owner_forged, dm_only) == "session"
 
 
 def test_rebuild_counts_causes_days_and_status(vault, tmp_path):

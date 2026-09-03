@@ -29,17 +29,13 @@ class DictTrust:
     def line_checked(self, ulid: str) -> bool:
         return True if self.checked_lines is None else ulid in self.checked_lines
 
-    def _covering(self, when):
-        out = [(s, e, k, pg) for s, e, k, pg in self.windows if s <= when <= e]
-        out += [(s, e, "email", None) for s, e in self.email_windows if s <= when <= e]
-        return out
+    def line_authored(self, ulid: str) -> bool:
+        return False
 
-    def line_tier(self, pg: str, when: datetime) -> str:
-        cov = self._covering(when)
-        mine = [w for w in cov if str(w[3]) == pg]
-        if mine:
-            return "session" if all(w[2] in CONVERSATION_KINDS for w in mine) else "email"
-        return "email" if any(w[2] not in CONVERSATION_KINDS for w in cov) else "session"
+    def _covering(self, when):
+        out = [(s, e, k) for s, e, k, *_ in self.windows if s <= when <= e]
+        out += [(s, e, "email") for s, e in self.email_windows if s <= when <= e]
+        return out
 
     def window_tier(self, when: datetime) -> str:
         return "email" if any(w[2] not in CONVERSATION_KINDS for w in self._covering(when)) else "session"

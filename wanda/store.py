@@ -455,17 +455,14 @@ class Store:
 
     # --- memory: agent-run windows ---
 
-    def open_run_window(self, session_id: str, task_id: int | None, kind: str, pgid: int | None = None) -> dict:
+    def open_run_window(self, session_id: str, task_id: int | None, kind: str) -> dict:
         started = utcnow()
         self._exec(
-            "INSERT INTO memory_run_windows(session_id, task_id, kind, started_at, ended_at, pgid) VALUES(?,?,?,?,NULL,?) "
-            "ON CONFLICT(session_id) DO UPDATE SET started_at=excluded.started_at, ended_at=NULL, kind=excluded.kind, pgid=excluded.pgid",
-            (session_id, task_id, kind, started, pgid),
+            "INSERT INTO memory_run_windows(session_id, task_id, kind, started_at, ended_at) VALUES(?,?,?,?,NULL) "
+            "ON CONFLICT(session_id) DO UPDATE SET started_at=excluded.started_at, ended_at=NULL, kind=excluded.kind",
+            (session_id, task_id, kind, started),
         )
-        return {"session_id": session_id, "task_id": task_id, "kind": kind, "started_at": started, "ended_at": None, "pgid": pgid}
-
-    def set_run_window_pgid(self, session_id: str, pgid: int) -> None:
-        self._exec("UPDATE memory_run_windows SET pgid=? WHERE session_id=?", (pgid, session_id))
+        return {"session_id": session_id, "task_id": task_id, "kind": kind, "started_at": started, "ended_at": None}
 
     def close_run_window(self, session_id: str) -> str:
         ended = utcnow()

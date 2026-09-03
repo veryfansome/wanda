@@ -55,7 +55,7 @@ class Claim:
 
     @property
     def sha(self) -> str:
-        return claim_sha(self.text)
+        return claim_sha(self.text, self.edges)
 
     def render(self) -> str:
         lines = [f"{self.text} ^{self.block}"]
@@ -75,12 +75,22 @@ class Claim:
         return "\n".join(lines)
 
 
-def claim_sha(text: str) -> str:
-    """Hash with wikilink targets canonicalised, so an Obsidian rename that
-    rewrites `[[old]]` to `[[new]]` in every referrer changes no hash and
-    pins nothing."""
+TRUST_RELS = ("owner-said", "owner-edited", "superseded-by", "supersedes", "retired", "contradicts", "tier")
+
+
+def claim_sha(text: str, edges: "list[Edge] | None" = None) -> str:
+    """Hash the claim text plus the SHAPE of its trust-bearing edges, with
+    wikilink targets blanked so an Obsidian rename (which rewrites `[[old]]`
+    to `[[new]]`) changes no hash. Including the edge shape means a session
+    that tampers with an owner claim's status (adding `superseded-by::` or
+    `retired::`) changes the hash and is caught as drift."""
     canon = WIKILINK_RE.sub("[[]]", text)
-    return sha_text(" ".join(canon.split()))
+    parts = [" ".join(canon.split())]
+    for e in edges or []:
+        if e.rel in TRUST_RELS:
+            val = "" if e.dst_doc else (e.value or "")
+            parts.append(f"{e.rel}:{val}")
+    return sha_text("|".join(parts))
 
 
 @dataclass
