@@ -122,8 +122,8 @@ def test_allow_list_restricts_when_set(store):
     assert fire(store, ev) is not None  # empty list = anyone
 
 
-def test_old_owner_env_name_still_reads(monkeypatch):
-    monkeypatch.setenv("WANDA_SLACK_OWNER_USER_IDS", "U_A,U_B")
+def test_allowed_user_ids_read_from_env(monkeypatch):
+    monkeypatch.setenv("WANDA_SLACK_ALLOWED_USER_IDS", "U_A,U_B")
     assert Config(_env_file=None).slack_allowed_user_ids == ["U_A", "U_B"]
 
 

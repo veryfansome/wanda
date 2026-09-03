@@ -4,7 +4,7 @@ import shutil
 from pathlib import Path
 from typing import Annotated, Literal
 
-from pydantic import AliasChoices, Field, field_validator
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 CsvList = Annotated[list[str], NoDecode]
@@ -20,7 +20,6 @@ class Config(BaseSettings):
         env_file=(Path(__file__).resolve().parent.parent / ".env", ".env"),
         env_file_encoding="utf-8",
         extra="ignore",
-        populate_by_name=True,
     )
 
     # iCloud IMAP
@@ -34,13 +33,9 @@ class Config(BaseSettings):
     slack_bot_token: str = ""
     slack_app_token: str = ""
     email_triage_slack_channel_id: str = ""
-    # Who may TALK to wanda. Empty = anyone in the workspace. (The old name,
-    # WANDA_SLACK_OWNER_USER_IDS, is still read.) Distinct from
+    # Who may TALK to wanda. Empty = anyone in the workspace. Distinct from
     # memory_owner_user_ids, whose word mints owner-tier memory.
-    slack_allowed_user_ids: CsvList = Field(
-        default_factory=list,
-        validation_alias=AliasChoices("WANDA_SLACK_ALLOWED_USER_IDS", "WANDA_SLACK_OWNER_USER_IDS"),
-    )
+    slack_allowed_user_ids: CsvList = Field(default_factory=list)
     # User token (xoxp-), only needed for `wanda slack search`.
     slack_user_token: str = ""
     slack_context_limit: int = 50
