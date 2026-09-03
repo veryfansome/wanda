@@ -435,8 +435,14 @@ def _verify_owner_lines(svc: Services, rep: HourlyReport) -> None:
     again once a day."""
     store, auth = svc.store, svc.authority
     now = datetime.now(timezone.utc)
+    seen: set[str] = set()
     for rec in L.iter_observations(svc.vault):
-        if isinstance(rec, L.Rejected) or rec.src != "owner" or not rec.cause.startswith("slack:"):
+        if isinstance(rec, L.Rejected):
+            continue
+        if rec.ulid in seen:
+            continue  # a duplicate ULID is rejected at index time; never verify or quarantine it
+        seen.add(rec.ulid)
+        if rec.src != "owner" or not rec.cause.startswith("slack:"):
             continue
         fp = L.line_fingerprint(rec)
         mark = store.memory_get(f"checked:{rec.ulid}")
@@ -667,8 +673,14 @@ def _bump_attempts(svc: Services, o: L.Observation, why: str) -> None:
 def _pending_ops(svc: Services, only: set[str] | None = None) -> list[L.Observation]:
     out = []
     store, auth = svc.store, svc.authority
+    seen: set[str] = set()
     for rec in L.iter_observations(svc.vault):
-        if isinstance(rec, L.Rejected) or rec.op not in OWNER_OPS:
+        if isinstance(rec, L.Rejected):
+            continue
+        if rec.ulid in seen:
+            continue  # first-wins, matching the index: a duplicate ULID applies nothing
+        seen.add(rec.ulid)
+        if rec.op not in OWNER_OPS:
             continue
         if only is not None and rec.ulid not in only:
             continue

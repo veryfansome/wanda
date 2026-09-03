@@ -783,3 +783,28 @@ def test_reusing_a_real_owner_rules_ulid_forges_nothing(svc):
     assert ("sunnybrook.example", "trash") in rules, "the real rule survives (duplicate ULID rejected, not overwritten)"
     assert not ix.dispositions_for(conn, ["victim@x.example"], []), "the forged disposition is not live"
     assert not any(r["target"] == "victim@x.example" for r in ix.standing_rules(conn, limit=50))
+
+
+def test_genuine_owner_rule_survives_a_same_ulid_forgery_across_restart(svc):
+    """The forged duplicate line must not clobber the genuine line's checked
+    mark: after a daemon restart (fresh Authority), the real rule is
+    re-verified and stays live."""
+    from wanda.memory.ledger import format_line
+    messages = {("D1", "1.1"): {"user": "U_OWNER", "text": "rule sunnybrook.example trash"}}
+    svc.verify_owner = P.make_owner_verifier(lambda c, t: messages.get((c, t)), ["U_OWNER"], lambda: conn_for(svc), svc.store)
+    m = mint_owner(svc, "rule sunnybrook.example trash", ts="1.1")
+    real = m.observations[0]
+    conn = conn_for(svc)
+    P.hourly(svc, conn)
+    forged = Observation(subject="person/victim@x.example", facet="mail-disposition",
+                         text="trash mail from victim@x.example", src="owner", op="rule", cause=real.cause, when=real.when)
+    forged.ulid = real.ulid
+    with open(svc.vault.ledger_dir / f"{real.day}.md", "a", encoding="utf-8") as fh:
+        fh.write(format_line(forged) + "\n")
+    P.hourly(svc, conn)
+    assert svc.store.memory_get(f"checked:{real.ulid}") != "0", "the genuine line's mark is not clobbered by the forgery"
+    # Restart: a fresh Authority holds nothing until re-verification.
+    svc.authority = P.Authority(windows=[])
+    P.hourly(svc, conn)
+    assert [(r["target"], r["action"]) for r in ix.standing_rules(conn, limit=50)] == [("sunnybrook.example", "trash")], \
+        "the real rule survives the restart"
