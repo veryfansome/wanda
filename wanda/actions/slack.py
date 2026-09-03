@@ -168,6 +168,26 @@ class SlackActions:
                 self._user_cache[uid] = uid  # deleted user, or missing users:read
         return self._user_cache
 
+    def fetch_message_sync(self, channel: str, ts: str) -> dict | None:
+        """One message by (channel, ts), for the memory pass's owner check.
+        Synchronous: it runs in the pass's worker thread. Tries history (a
+        top-level message) then replies (a message inside a thread)."""
+        try:
+            resp = self.web.conversations_history(channel=channel, latest=ts, oldest=ts, inclusive=True, limit=1)
+            for m in resp.get("messages") or []:
+                if m.get("ts") == ts:
+                    return m
+        except SlackApiError:
+            pass
+        try:
+            resp = self.web.conversations_replies(channel=channel, ts=ts, limit=1)
+            for m in resp.get("messages") or []:
+                if m.get("ts") == ts:
+                    return m
+        except SlackApiError:
+            return None
+        return None
+
     async def alert(self, text: str) -> None:
         await self._call(
             "chat_postMessage", channel=self.cfg.email_triage_slack_channel_id,

@@ -1,17 +1,10 @@
 import asyncio
 import contextlib
 import json
-import stat
 import time
 
+from tests.conftest import make_fake_claude
 from wanda.runner import RunnerService
-
-
-def make_fake_claude(tmp_path, script: str) -> str:
-    path = tmp_path / "fake-claude"
-    path.write_text(f"#!/bin/sh\n{script}\n")
-    path.chmod(path.stat().st_mode | stat.S_IEXEC)
-    return str(path)
 
 
 def run(coro):
@@ -57,19 +50,34 @@ def test_timeout_kills_process_group(tmp_path):
     assert time.monotonic() - start < 15  # killed, not waited out
 
 
-def test_timeout_charges_pessimistic_cost(tmp_path):
-    """A killed run's envelope is lost; charging $0 would blind the breaker."""
+def test_timeout_reports_unknown_cost_as_zero(tmp_path):
+    """A killed run's envelope is lost. Nothing gates on cost any more (wanda
+    runs on a subscription), so the honest value is 0, not a pessimistic guess."""
     fake = make_fake_claude(tmp_path, "cat > /dev/null\nsleep 30")
     rr = run(RunnerService(fake).run("x", model="m", max_budget_usd=0.25, timeout_s=1))
-    assert rr.timed_out and rr.cost_usd == 0.25
+    assert rr.timed_out and rr.cost_usd == 0.0
 
 
-def test_fast_unparseable_failure_is_not_billed(tmp_path):
-    """A run that dies immediately (bad flag, missing binary) bought no tokens.
-    Billing it the ceiling tripped the daily breaker after a few failures."""
-    fake = make_fake_claude(tmp_path, "cat > /dev/null\necho 'not json'")
-    rr = run(RunnerService(fake).run("x", model="m", max_budget_usd=0.25, timeout_s=10))
-    assert not rr.ok and rr.cost_usd == 0.0
+def test_argv_composition(tmp_path):
+    fake = make_fake_claude(tmp_path, 'cat > /dev/null\nprintf \'%s\\n\' "$@" > "$(dirname "$0")/argv"\n'
+                                      'printf \'{"type":"result","is_error":false,"result":"ok","session_id":"s"}\'')
+    rr = run(RunnerService(fake).run(
+        "x", model="m", max_budget_usd=1, timeout_s=10, tools="Read", session_persistence=False,
+        restricted=True, add_dirs=["/tmp/a", "/tmp/b"], settings="/tmp/s.json", cwd=str(tmp_path)))
+    assert rr.ok
+    argv = (tmp_path / "argv").read_text().splitlines()
+    assert argv[argv.index("--tools") + 1] == "Read"
+    assert "--no-session-persistence" in argv and "--restricted" in argv
+    assert argv[argv.index("--settings") + 1] == "/tmp/s.json"
+    assert argv[-3:] == ["--add-dir", "/tmp/a", "/tmp/b"], "variadic flag goes last so nothing is swallowed"
+
+
+def test_no_tools_is_sugar_for_empty_tools_and_no_persistence(tmp_path):
+    fake = make_fake_claude(tmp_path, 'cat > /dev/null\nprintf \'%s\\n\' "$@" > "$(dirname "$0")/argv"\n'
+                                      'printf \'{"type":"result","is_error":false,"result":"ok"}\'')
+    run(RunnerService(fake).run("x", model="m", max_budget_usd=1, timeout_s=10, no_tools=True))
+    argv = (tmp_path / "argv").read_text().splitlines()
+    assert argv[argv.index("--tools") + 1] == "" and "--no-session-persistence" in argv
 
 
 def test_cancellation_kills_the_process_group(tmp_path):

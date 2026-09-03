@@ -33,9 +33,9 @@ class Config(BaseSettings):
     slack_bot_token: str = ""
     slack_app_token: str = ""
     email_triage_slack_channel_id: str = ""
-    # Empty = anyone in the workspace may talk to wanda. Set it to restrict
-    # who can trigger agent sessions.
-    slack_owner_user_ids: CsvList = Field(default_factory=list)
+    # Who may TALK to wanda. Empty = anyone in the workspace. Distinct from
+    # memory_owner_user_ids, whose word mints owner-tier memory.
+    slack_allowed_user_ids: CsvList = Field(default_factory=list)
     # User token (xoxp-), only needed for `wanda slack search`.
     slack_user_token: str = ""
     slack_context_limit: int = 50
@@ -52,22 +52,40 @@ class Config(BaseSettings):
     email_triage_model: str = "claude-haiku-4-5-20251001"
     agent_model: str = "sonnet"
     triage_batch_size: int = 10
+    # Wait for a batch to form before triaging: under IMAP IDLE every arrival
+    # wakes the processor, and email is not latency-critical.
+    triage_debounce_s: int = 150
     triage_timeout_s: int = 120
     agent_timeout_s: int = 900
+    # Per-run ceilings. A size limit on one session that loops (there is no
+    # --max-turns), not a bill: wanda runs on a subscription plan.
     triage_max_budget_usd: float = 0.25
     agent_max_budget_usd: float = 2.0
-    # What an in-flight run is expected to cost. Reserving the *ceiling*
-    # instead would let two queued replies exhaust a $5 day at $0 real spend.
-    triage_expected_usd: float = 0.05
-    agent_expected_usd: float = 0.40
     dryrun_max_limit: int = 200
-    # Bash is included so sessions can drive `wanda slack`. Note that a headless
-    # session cannot scope Bash to one command (--allowedTools is not enforced
-    # under --permission-mode dontAsk), so this grants a session real shell
-    # access — acceptable only in a trusted workspace. See README.
+    # Bash is included so sessions can drive `wanda slack` and `wanda memory`.
+    # A headless session cannot scope Bash to one command (--allowedTools is
+    # not enforced under --permission-mode dontAsk), so this grants a session
+    # real shell access — acceptable only in a trusted workspace. See README.
     agent_allowed_tools: str = "Bash,Read,WebSearch,Skill"
-    daily_run_cap: int = 200
-    daily_cost_cap_usd: float = 5.0
+    # The only breaker: stops a runaway loop. Set high first, lower with data.
+    daily_run_cap: int = 1000
+
+    # memory
+    memory_enabled: bool = True
+    memory_dir: Path = Path("~/.wanda/memory")
+    # Whose Slack messages mint owner-tier memory (rules that decide what
+    # happens to mail). Empty = owner-tier minting disabled.
+    memory_owner_user_ids: CsvList = Field(default_factory=list)
+    memory_model: str = "claude-haiku-4-5-20251001"
+    memory_max_budget_usd: float = 0.50
+    memory_timeout_s: int = 180
+    # Hours between paid distillation passes. The free hourly pass always
+    # runs hourly; 24 = once a night at memory_nightly_local_time.
+    memory_distill_hours: int = 24
+    memory_nightly_local_time: str = "03:30"
+    # Reinstate the v3 guard: only owner-said preferences may rewrite a
+    # write-spec. Off by default — wanda files autonomously and reports diffs.
+    memory_writespec_owner_only: bool = False
 
     # daemon
     data_dir: Path = Path("~/.wanda")
@@ -76,7 +94,7 @@ class Config(BaseSettings):
     snippet_bytes: int = 4096
     log_level: str = "INFO"
 
-    @field_validator("slack_owner_user_ids", "never_trash", mode="before")
+    @field_validator("slack_allowed_user_ids", "never_trash", "memory_owner_user_ids", mode="before")
     @classmethod
     def _split_csv(cls, v: object) -> object:
         if isinstance(v, str):
@@ -99,6 +117,51 @@ class Config(BaseSettings):
     @property
     def lock_path(self) -> Path:
         return self.expanded_data_dir / "wanda.lock"
+
+    @property
+    def workspace_dir(self) -> Path:
+        return self.expanded_data_dir / "workspace"
+
+    @property
+    def logs_dir(self) -> Path:
+        return self.expanded_data_dir / "logs"
+
+    # --- memory paths ---
+
+    @property
+    def memory_vault(self) -> Path:
+        return self.memory_dir.expanduser()
+
+    @property
+    def memory_index_path(self) -> Path:
+        return self.expanded_data_dir / "memory.idx"
+
+    @property
+    def memory_export_dir(self) -> Path:
+        return self.expanded_data_dir / "memory.export"
+
+    @property
+    def memory_staging_dir(self) -> Path:
+        return self.expanded_data_dir / "memory.staging"
+
+    @property
+    def memory_lock_path(self) -> Path:
+        return self.expanded_data_dir / "memory.lock"
+
+    @property
+    def retire_journal_path(self) -> Path:
+        return self.expanded_data_dir / "memory.retire.journal"
+
+    @property
+    def triage_cwd(self) -> Path:
+        """An empty, harness-owned working directory for the classifier —
+        never the daemon's cwd, which under launchd is the repo root with
+        .env in it, and --restricted confines file tools to cwd + add-dirs."""
+        return self.expanded_data_dir / "triage-cwd"
+
+    @property
+    def triage_settings_path(self) -> Path:
+        return self.expanded_data_dir / "triage.settings.json"
 
     def resolve_claude_bin(self) -> str | None:
         return self.claude_bin or shutil.which("claude")

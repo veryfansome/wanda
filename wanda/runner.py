@@ -5,14 +5,12 @@ import json
 import logging
 import os
 import signal
-import time
 from dataclasses import dataclass, field
 from typing import Any
 
 log = logging.getLogger(__name__)
 
 KILL_GRACE_S = 10
-MIN_BILLABLE_S = 10  # below this, a failed run bought no tokens
 
 
 @dataclass
@@ -47,6 +45,10 @@ class RunnerService:
         output_schema: dict | None = None,
         no_tools: bool = False,
         tools: str | None = None,
+        session_persistence: bool = True,
+        restricted: bool = False,
+        add_dirs: list[str] | None = None,
+        settings: str | None = None,
         system_prompt: str | None = None,
         session_id: str | None = None,
         resume: str | None = None,
@@ -56,6 +58,11 @@ class RunnerService:
         cwd: str | None = None,
         env: dict[str, str] | None = None,
     ) -> RunResult:
+        """`no_tools` is sugar for tools="" plus no session persistence — the
+        shape of a one-shot classifier. `restricted` confines file tools to
+        cwd and `add_dirs` (and ignores setting sources, so a hook must come
+        via `settings`). The per-run --max-budget-usd is a size limit on a
+        single session that loops, not a bill: wanda runs on a subscription."""
         argv = [
             self.claude_bin,
             "-p",
@@ -66,9 +73,15 @@ class RunnerService:
         if output_schema is not None:
             argv += ["--json-schema", json.dumps(output_schema)]
         if no_tools:
-            argv += ["--tools", "", "--no-session-persistence"]
-        elif tools:
+            tools, session_persistence = "", False
+        if tools is not None:
             argv += ["--tools", tools]
+        if not session_persistence:
+            argv += ["--no-session-persistence"]
+        if restricted:
+            argv += ["--restricted"]
+        if settings:
+            argv += ["--settings", settings]
         if system_prompt:
             argv += ["--system-prompt", system_prompt]
         if session_id:
@@ -81,10 +94,13 @@ class RunnerService:
             argv += ["--permission-mode", permission_mode]
         if setting_sources:
             argv += ["--setting-sources", setting_sources]
+        if add_dirs:
+            # Variadic: it swallows everything after it, so it goes last. The
+            # prompt travels on stdin and is never a positional.
+            argv += ["--add-dir", *add_dirs]
 
         # start_new_session so a timeout can kill the whole process group —
         # claude spawns children for shell tools that would otherwise orphan.
-        t0 = time.monotonic()
         proc = await asyncio.create_subprocess_exec(
             *argv,
             stdin=asyncio.subprocess.PIPE,  # prompt goes via stdin: no ARG_MAX/quoting limits
@@ -100,26 +116,16 @@ class RunnerService:
             )
         except TimeoutError:
             await self._kill_group(proc)
-            # The envelope (and the true cost) is lost, so charge the budget
-            # pessimistically rather than letting a killed run look free.
-            return RunResult(
-                ok=False, timed_out=True, cost_usd=max_budget_usd,
-                error=f"timed out after {timeout_s}s",
-            )
+            # The envelope (and with it the usage figure) is lost. Nothing
+            # gates on cost, so report the honest value: unknown, recorded as 0.
+            return RunResult(ok=False, timed_out=True, error=f"timed out after {timeout_s}s")
         except asyncio.CancelledError:
             # Daemon shutdown. Without this the subprocess survives in its own
             # session (start_new_session), outliving even launchd's cleanup.
             self._kill_group_now(proc)
             raise
 
-        rr = self._parse(proc.returncode, stdout, stderr)
-        if rr.envelope is None:
-            # No envelope means the true cost is unknown, so charge the ceiling
-            # — unless it exited too fast to have bought anything (a bad flag,
-            # a missing binary), where billing $2 a time would trip the daily
-            # breaker after a few failures.
-            rr.cost_usd = max_budget_usd if time.monotonic() - t0 > MIN_BILLABLE_S else 0.0
-        return rr
+        return self._parse(proc.returncode, stdout, stderr)
 
     @staticmethod
     def _kill_group_now(proc: asyncio.subprocess.Process) -> None:

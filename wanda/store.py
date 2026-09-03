@@ -81,7 +81,64 @@ CREATE TABLE IF NOT EXISTS meta (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
+
+-- Memory: durable state that is NOT derivable from the vault lives here,
+-- never in the disposable memory.idx.
+CREATE TABLE IF NOT EXISTS memory_meta (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+-- Hash of every claim line wanda wrote, for drift (hand-edit) detection.
+CREATE TABLE IF NOT EXISTS memory_shas (
+  path  TEXT NOT NULL,
+  block TEXT NOT NULL,
+  sha   TEXT NOT NULL,
+  PRIMARY KEY (path, block)
+);
+-- Whether an owner-tier ledger line's Slack message checked out.
+CREATE TABLE IF NOT EXISTS memory_owner_checks (
+  cause      TEXT PRIMARY KEY,
+  verified   INTEGER NOT NULL,
+  checked_at TEXT NOT NULL,
+  detail     TEXT
+);
+-- Templated rule offers the digest made (`reply rule k4`).
+CREATE TABLE IF NOT EXISTS memory_offers (
+  ref        TEXT PRIMARY KEY,
+  kind       TEXT NOT NULL,
+  subject    TEXT NOT NULL,
+  action     TEXT,
+  text       TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  taken_at   TEXT
+);
+-- Agent-run windows: which task kind was running when. Provenance of a
+-- ledger line written from a shell is decided against these, not against
+-- anything the writer says about itself.
+CREATE TABLE IF NOT EXISTS memory_run_windows (
+  session_id TEXT PRIMARY KEY,
+  task_id    INTEGER,
+  kind       TEXT NOT NULL,
+  started_at TEXT NOT NULL,
+  ended_at   TEXT,
+  pgid       INTEGER
+);
+-- Digest lines waiting for the daily post.
+CREATE TABLE IF NOT EXISTS memory_digest (
+  id         INTEGER PRIMARY KEY,
+  created_at TEXT NOT NULL,
+  kind       TEXT NOT NULL,
+  text       TEXT NOT NULL,
+  posted_at  TEXT
+);
 """
+
+# Indexes on pre-existing tables: applied after migrations, tolerantly, so a
+# database that predates a column never fails to open.
+INDEXES = (
+    "CREATE INDEX IF NOT EXISTS idx_messages_from ON messages(from_addr)",
+    "CREATE INDEX IF NOT EXISTS idx_runs_started ON runs(started_at)",
+)
 
 # Columns added after the first schema; CREATE TABLE IF NOT EXISTS won't add
 # them to a database that already exists, so they are applied explicitly.
@@ -99,6 +156,9 @@ MIGRATIONS = (
     # and for a DM holds a sentinel that is not a Slack timestamp.
     ("tasks", "reply_thread", "TEXT"),
     ("runs", "deliver_attempts", "INTEGER NOT NULL DEFAULT 0"),
+    # The claude subprocess's process group: the one identity a session's
+    # shell children carry that another session cannot forge.
+    ("memory_run_windows", "pgid", "INTEGER"),
 )
 
 
@@ -149,6 +209,11 @@ class Store:
                 "WHERE reply_thread IS NULL AND kind <> 'dm'"
             )
             self._db.execute("INSERT INTO meta(key, value) VALUES('reply_thread_backfilled','1')")
+        for stmt in INDEXES:
+            try:
+                self._db.execute(stmt)
+            except sqlite3.OperationalError:
+                pass
 
     def _relax_task_message_fk(self) -> None:
         """A task used to require an email row. Mention- and DM-driven tasks
@@ -354,13 +419,14 @@ class Store:
     def create_task(self, message_pk: int | None, channel: str, thread_ts: str,
                     kind: str = "email", reply_thread: str | None = None) -> int:
         """thread_ts identifies the task; reply_thread is where answers go and
-        defaults to the same value (an email or channel thread)."""
+        defaults to the same value. A DM is no exception: every top-level
+        DM message roots its own thread, exactly like a channel mention."""
         now = utcnow()
         cur = self._exec(
             "INSERT OR IGNORE INTO tasks(message_pk, slack_channel, thread_ts, status, kind, "
             "reply_thread, created_at, updated_at) VALUES(?,?,?,'open',?,?,?,?)",
             (message_pk, channel, thread_ts, kind,
-             thread_ts if reply_thread is None and kind != "dm" else reply_thread, now, now),
+             thread_ts if reply_thread is None else reply_thread, now, now),
         )
         if cur.rowcount:
             return cur.lastrowid
@@ -371,6 +437,58 @@ class Store:
             "SELECT * FROM tasks WHERE slack_channel=? AND thread_ts=?", (channel, thread_ts)
         )
         return rows[0] if rows else None
+
+    def get_task(self, task_id: int) -> sqlite3.Row | None:
+        rows = self._query("SELECT * FROM tasks WHERE id=?", (task_id,))
+        return rows[0] if rows else None
+
+    def recent_answers(self, channel: str, limit: int = 3) -> list[sqlite3.Row]:
+        """wanda's latest delivered answers in a conversation, newest last.
+        conversations.history omits thread replies, so a new DM's seed would
+        otherwise show the asker's questions and none of wanda's answers."""
+        rows = self._query(
+            "SELECT r.result_text, r.started_at FROM runs r JOIN tasks t ON t.id=r.task_id "
+            "WHERE t.slack_channel=? AND r.kind='agent' AND r.status='ok' AND r.result_text IS NOT NULL "
+            "ORDER BY r.id DESC LIMIT ?", (channel, limit),
+        )
+        return list(reversed(rows))
+
+    # --- memory: agent-run windows ---
+
+    def open_run_window(self, session_id: str, task_id: int | None, kind: str) -> dict:
+        started = utcnow()
+        self._exec(
+            "INSERT INTO memory_run_windows(session_id, task_id, kind, started_at, ended_at) VALUES(?,?,?,?,NULL) "
+            "ON CONFLICT(session_id) DO UPDATE SET started_at=excluded.started_at, ended_at=NULL, kind=excluded.kind",
+            (session_id, task_id, kind, started),
+        )
+        return {"session_id": session_id, "task_id": task_id, "kind": kind, "started_at": started, "ended_at": None}
+
+    def close_run_window(self, session_id: str) -> str:
+        ended = utcnow()
+        self._exec("UPDATE memory_run_windows SET ended_at=? WHERE session_id=? AND ended_at IS NULL", (ended, session_id))
+        return ended
+
+    def close_orphan_windows(self) -> int:
+        """At startup: a window still open belongs to a run the previous
+        daemon never finished. Left open it would make every later line
+        look like it was written during that run."""
+        cur = self._exec("UPDATE memory_run_windows SET ended_at=? WHERE ended_at IS NULL", (utcnow(),))
+        return cur.rowcount
+
+    def all_windows(self, since_days: int = 400) -> list[dict]:
+        since = (datetime.now(timezone.utc) - timedelta(days=since_days)).isoformat(timespec="seconds")
+        return [dict(r) for r in self._query("SELECT * FROM memory_run_windows WHERE started_at >= ?", (since,))]
+
+    def open_windows(self) -> list[sqlite3.Row]:
+        return self._query("SELECT * FROM memory_run_windows WHERE ended_at IS NULL")
+
+    def windows_at(self, when_iso: str, slack_s: int = 300) -> list[dict]:
+        return windows_covering(self.all_windows(), when_iso, slack_s)
+
+    def task_had_run_near(self, task_id: int, when_iso: str, slack_s: int = 300) -> bool:
+        return any(r["task_id"] == task_id for r in self.windows_at(when_iso, slack_s))
+
 
     def set_task_session(self, task_id: int, session_id: str) -> None:
         self._exec(
@@ -471,6 +589,109 @@ class Store:
             (local_date, channel, thread_ts),
         )
 
+    def get_digest_by_thread(self, channel: str, thread_ts: str) -> sqlite3.Row | None:
+        rows = self._query("SELECT * FROM digests WHERE channel=? AND thread_ts=?", (channel, thread_ts))
+        return rows[0] if rows else None
+
+    # --- memory: durable state the vault cannot hold ---
+
+    def memory_get(self, key: str) -> str | None:
+        rows = self._query("SELECT value FROM memory_meta WHERE key=?", (key,))
+        return rows[0]["value"] if rows else None
+
+    def memory_set(self, key: str, value: str) -> None:
+        self._exec(
+            "INSERT INTO memory_meta(key, value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, value),
+        )
+
+    def shas_for(self, path: str) -> dict[str, str]:
+        return {r["block"]: r["sha"] for r in self._query("SELECT block, sha FROM memory_shas WHERE path=?", (path,))}
+
+    def set_shas(self, path: str, shas: dict[str, str]) -> None:
+        with self._lock:
+            self._db.execute("DELETE FROM memory_shas WHERE path=?", (path,))
+            self._db.executemany("INSERT INTO memory_shas(path, block, sha) VALUES(?,?,?)",
+                                 [(path, b, h) for b, h in shas.items()])
+            self._db.commit()
+
+    def move_shas(self, old: str, new: str) -> None:
+        self._exec("UPDATE OR REPLACE memory_shas SET path=? WHERE path=?", (new, old))
+
+    def owner_check(self, cause: str) -> sqlite3.Row | None:
+        rows = self._query("SELECT * FROM memory_owner_checks WHERE cause=?", (cause,))
+        return rows[0] if rows else None
+
+    def set_owner_check(self, cause: str, verified: bool, detail: str = "") -> None:
+        self._exec(
+            "INSERT INTO memory_owner_checks(cause, verified, checked_at, detail) VALUES(?,?,?,?) "
+            "ON CONFLICT(cause) DO UPDATE SET verified=excluded.verified, checked_at=excluded.checked_at, detail=excluded.detail",
+            (cause, 1 if verified else 0, utcnow(), detail[:300]),
+        )
+
+    def add_offer(self, kind: str, subject: str, action: str | None, text: str) -> str:
+        with self._lock:
+            n = self._db.execute("SELECT COUNT(*) AS n FROM memory_offers").fetchone()["n"]
+            ref = f"k{n + 1}"
+            self._db.execute(
+                "INSERT INTO memory_offers(ref, kind, subject, action, text, created_at) VALUES(?,?,?,?,?,?)",
+                (ref, kind, subject, action, text, utcnow()),
+            )
+            self._db.commit()
+        return ref
+
+    def get_offer(self, ref: str) -> sqlite3.Row | None:
+        rows = self._query("SELECT * FROM memory_offers WHERE ref=?", (ref,))
+        return rows[0] if rows else None
+
+    def find_offer(self, subject: str, text: str) -> sqlite3.Row | None:
+        rows = self._query("SELECT * FROM memory_offers WHERE subject=? AND text=?", (subject, text))
+        return rows[0] if rows else None
+
+    def take_offer(self, ref: str) -> None:
+        self._exec("UPDATE memory_offers SET taken_at=? WHERE ref=?", (utcnow(), ref))
+
+    def digest_add(self, kind: str, text: str) -> None:
+        self._exec("INSERT INTO memory_digest(created_at, kind, text) VALUES(?,?,?)", (utcnow(), kind, text[:1500]))
+
+    def digest_pending(self) -> list[sqlite3.Row]:
+        return self._query("SELECT * FROM memory_digest WHERE posted_at IS NULL ORDER BY id")
+
+    def digest_mark_posted(self, ids: list[int]) -> None:
+        if not ids:
+            return
+        q = ",".join("?" * len(ids))
+        self._exec(f"UPDATE memory_digest SET posted_at=? WHERE id IN ({q})", (utcnow(), *ids))
+
+    def sender_stats(self, addr: str) -> dict:
+        """Verdict history for one address, from the messages table."""
+        rows = self._query(
+            "SELECT applied_action, COUNT(*) AS n, MAX(created_at) AS last FROM messages "
+            "WHERE lower(from_addr) LIKE ? GROUP BY applied_action", (f"%{addr.lower()}%",),
+        )
+        out = {"seen": 0, "ignored": 0, "trashed": 0, "attention": 0, "last": ""}
+        for r in rows:
+            out["seen"] += r["n"]
+            a = r["applied_action"] or ""
+            if a == "ignore":
+                out["ignored"] += r["n"]
+            elif a in ("trash", "shadow_trash"):
+                out["trashed"] += r["n"]
+            elif a == "attention":
+                out["attention"] += r["n"]
+            if r["last"] and r["last"] > out["last"]:
+                out["last"] = r["last"]
+        out["last"] = out["last"][:10]
+        return out
+
+    def senders_since(self, since_iso: str) -> list[sqlite3.Row]:
+        """Raw From headers seen since `since`; callers aggregate by address,
+        since one address arrives under several display names."""
+        return self._query(
+            "SELECT from_addr, COUNT(*) AS n, MAX(created_at) AS last FROM messages WHERE created_at >= ? "
+            "GROUP BY from_addr ORDER BY n DESC LIMIT 2000", (since_iso,),
+        )
+
     # --- meta ---
 
     def get_meta(self, key: str) -> str | None:
@@ -483,3 +704,25 @@ class Store:
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (key, value),
         )
+
+
+
+def windows_covering(windows: list[dict], when_iso: str, slack_s: int = 300) -> list[dict]:
+    """The agent runs in flight at `when`. Ledger times are minute-truncated,
+    so both ends are compared at minute precision, with a small grace after
+    the end (a session's last CLI call can land just after its envelope)."""
+    try:
+        w = datetime.fromisoformat(when_iso).replace(second=0, microsecond=0)
+    except (TypeError, ValueError):
+        return []
+    out = []
+    for r in windows:
+        try:
+            start = datetime.fromisoformat(r["started_at"]).replace(second=0, microsecond=0)
+            end = datetime.fromisoformat(r["ended_at"]) if r["ended_at"] else None
+        except (TypeError, ValueError):
+            continue
+        if start <= w and (end is None or w <= (end + timedelta(seconds=slack_s)).replace(second=0, microsecond=0)):
+            out.append(r)
+    return out
+

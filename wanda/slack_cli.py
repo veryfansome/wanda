@@ -20,6 +20,7 @@ from wanda.transcript import render, trim_thread, user_ids_in
 ENV_CHANNEL = "WANDA_SLACK_CONTEXT_CHANNEL"
 ENV_THREAD = "WANDA_SLACK_CONTEXT_THREAD"
 ENV_MARKER = "WANDA_SLACK_POST_MARKER"
+POST_LOG_SUFFIX = ".posts.jsonl"  # beside the marker: what was posted, for the run record
 MAX_PAGES = 10
 
 
@@ -124,8 +125,8 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
         elif verb == "post":
             if not channel:
                 sys.exit("--channel is required")
-            # An empty env value means "post untreaded" (a DM), and the
-            # triggering thread only applies to the triggering channel.
+            # The triggering thread only applies to the triggering channel.
+            # (A DM is threaded too: wanda always answers in a thread.)
             env_thread = os.environ.get(ENV_THREAD) or None
             if channel != os.environ.get(ENV_CHANNEL):
                 env_thread = None
@@ -138,6 +139,9 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
                 with contextlib.suppress(OSError):
                     with open(marker, "a") as fh:  # one line per post; never truncate
                         fh.write(f"{channel}\t{thread or ''}\n")
+                with contextlib.suppress(OSError):
+                    with open(marker + POST_LOG_SUFFIX, "a") as fh:
+                        fh.write(json.dumps({"channel": channel, "thread": thread or "", "text": args.text[:4000]}) + "\n")
             print(f"posted to {channel} ts={resp['ts']}")
 
         elif verb == "search":

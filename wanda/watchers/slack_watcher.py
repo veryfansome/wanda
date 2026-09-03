@@ -10,6 +10,7 @@ from slack_sdk.socket_mode.response import SocketModeResponse
 
 from wanda.config import Config
 from wanda.events import Event
+from wanda.memory.commands import is_command
 from wanda.store import Store
 from wanda.transcript import MENTION_RE
 from wanda.tls import ssl_context
@@ -18,15 +19,18 @@ log = logging.getLogger(__name__)
 
 HUMAN_SUBTYPES = (None, "file_share", "thread_broadcast")
 DM_TYPES = ("im", "mpim")
-# Task key for a DM's ongoing (unthreaded) conversation.
-DM_TASK_KEY = "conversation"
 
 
 class SlackWatcher:
     """Socket Mode listener. Acks every envelope immediately (Slack retries
-    past ~3s), then classifies it into one of four triggers:
+    past ~3s), then classifies it into one of five triggers:
 
-      dm            — any message in a DM or group DM; no mention needed
+      command       — an owner's `rule|attest|forget|pin|unretire …`, or any
+                      owner message in a digest thread; handled in-process,
+                      never opens a session
+      dm            — any message in a DM or group DM; no mention needed.
+                      A DM behaves like a private channel: every top-level
+                      message roots its own thread and task
       task          — a message in a thread wanda owns (e.g. an email task)
       mention       — @wanda rooting its own thread in a channel
       mention_guest — @wanda inside a thread wanda does not own; it answers,
@@ -60,8 +64,11 @@ class SlackWatcher:
             self.client.close()
 
     def _allowed(self, user: str) -> bool:
-        """An empty owner list means anyone in the workspace may talk to wanda."""
-        return not self.cfg.slack_owner_user_ids or user in self.cfg.slack_owner_user_ids
+        """An empty allow-list means anyone in the workspace may talk to wanda."""
+        return not self.cfg.slack_allowed_user_ids or user in self.cfg.slack_allowed_user_ids
+
+    def _is_owner(self, user: str) -> bool:
+        return user in self.cfg.memory_owner_user_ids
 
     def _handle(self, client: SocketModeClient, req: SocketModeRequest) -> None:
         client.send_socket_mode_response(SocketModeResponse(envelope_id=req.envelope_id))
@@ -91,7 +98,18 @@ class SlackWatcher:
             event.get("text") or ""
         )
         existing = self.store.get_task_by_thread(channel, thread_ts) if thread_ts else None
-        if channel_type in DM_TYPES:
+        text = event.get("text") or ""
+        is_dm = channel_type in DM_TYPES
+        in_digest = bool(thread_ts) and self.store.get_digest_by_thread(channel, thread_ts) is not None
+        # A command is an owner message with the SHAPE of a command (strictly
+        # parsed, so "forget it, thanks" is not one), addressed to wanda: in a
+        # DM, in a digest thread, or with a mention in a channel. Checked
+        # first, so `rule …` in a DM never opens a paid session.
+        if self._is_owner(user) and is_command(text) and (is_dm or in_digest or mentioned):
+            kind = "command"
+        elif in_digest and not mentioned:
+            return  # chatter in a digest thread; a mention there is a guest mention
+        elif is_dm:
             kind = "dm"  # a DM needs no mention
         elif existing and existing["kind"] != "mention_guest":
             # A thread wanda owns: follow-ups count whether or not they mention
@@ -116,14 +134,9 @@ class SlackWatcher:
         # Slack's redeliveries.
         if not self.store.slack_event_first_time(f"{channel}:{ts}"):
             return
-        if kind == "dm" and not thread_ts:  # noqa: SIM108 — kept explicit
-            # A DM is one ongoing conversation: every top-level message maps to
-            # the same task and resumes the same session. Replies go untreaded,
-            # which also keeps them visible in conversations.history — the very
-            # context the next message is seeded with.
-            task_key, reply_thread = DM_TASK_KEY, None
-        else:
-            task_key = reply_thread = thread_ts or ts
+        # Every kind, DMs included: the thread this message is in, or the
+        # thread it roots. wanda always answers in a thread.
+        task_key = reply_thread = thread_ts or ts
         ev = Event(
             source="slack",
             dedupe_key=f"{channel}:{ts}",
@@ -134,8 +147,9 @@ class SlackWatcher:
                 "task_key": task_key,          # identifies the task and session
                 "reply_thread": reply_thread,  # where answers get posted
                 "in_thread": bool(thread_ts),
+                "thread_ts": thread_ts,
                 "user": user,
-                "text": event.get("text", ""),
+                "text": text,
                 "ts": ts,
             },
         )

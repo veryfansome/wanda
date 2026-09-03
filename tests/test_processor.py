@@ -15,13 +15,6 @@ from wanda.store import Store, utcnow
 from wanda.triage import Verdict
 
 
-@pytest.fixture(autouse=True)
-def _scrub_env(monkeypatch):
-    for key in list(os.environ):
-        if key.startswith("WANDA_"):
-            monkeypatch.delenv(key, raising=False)
-
-
 class FakeSlack:
     def __init__(self, fail=False):
         self.fail = fail
@@ -59,7 +52,7 @@ def cfg(**kw) -> Config:
 
 def make(tmp_path, slack=None, **kw):
     store = Store(tmp_path / "p.db")
-    c = cfg(**kw)
+    c = cfg(data_dir=tmp_path / "data", memory_dir=tmp_path / "data" / "memory", **kw)
     p = Processor(c, store, asyncio.Queue(), slack or FakeSlack(), RunnerService("/bin/true"))
     return p, store
 
@@ -213,33 +206,29 @@ def test_malformed_verdict_does_not_wedge_the_pipeline(tmp_path):
     assert store.get_message_by_key("bad")["attempts"] == 1
 
 
-def test_budget_distinguishes_busy_from_breaker(tmp_path):
+def test_run_cap_distinguishes_busy_from_breaker(tmp_path):
+    """The only breaker is the run count: it stops a runaway loop, not a bill.
+    In-flight runs that would cross it are 'busy' (transient, no alert);
+    recorded runs at the cap are the breaker (alerted once)."""
     slack = FakeSlack()
-    p, store = make(tmp_path, slack, daily_cost_cap_usd=5.0, agent_expected_usd=0.4)
-
-    assert asyncio.run(p.check_budget(0.4)) == "ok"
-
-    # In-flight reservations alone must not trip the breaker or burn its alert.
-    with p._reserve(2.0), p._reserve(2.0):
-        assert asyncio.run(p.check_budget(2.0)) == "busy"
+    p, store = make(tmp_path, slack, daily_run_cap=3)
+    assert asyncio.run(p.check_budget()) == "ok"
+    store.record_run(kind="agent", task_id=None, session_id=None, started_at=utcnow(), exit_code=0, cost_usd=0, status="ok")
+    store.record_run(kind="agent", task_id=None, session_id=None, started_at=utcnow(), exit_code=0, cost_usd=0, status="ok")
+    with p._inflight():
+        assert asyncio.run(p.check_budget()) == "busy"
     assert slack.alerts == []
-
-    store.record_run(kind="agent", task_id=None, session_id=None, started_at=utcnow(),
-                     exit_code=0, cost_usd=6.0, status="ok")
-    assert asyncio.run(p.check_budget(0.4)) == "breaker"
-    assert len(slack.alerts) == 1
+    store.record_run(kind="agent", task_id=None, session_id=None, started_at=utcnow(), exit_code=0, cost_usd=0, status="ok")
+    assert asyncio.run(p.check_budget()) == "breaker"
+    assert len(slack.alerts) == 1 and "run cap" in slack.alerts[0]
 
 
-def test_no_silent_busy_dead_band(tmp_path):
-    """Recorded spend that leaves no room is the breaker (alerted), not 'busy'
-    — reporting busy stalled triage silently until UTC midnight."""
-    slack = FakeSlack()
-    p, store = make(tmp_path, slack, daily_cost_cap_usd=5.0)
-    store.record_run(kind="triage", task_id=None, session_id=None, started_at=utcnow(),
-                     exit_code=0, cost_usd=4.90, status="ok")
-    assert p._inflight_runs == 0
-    assert asyncio.run(p.check_budget(0.40)) == "breaker"
-    assert len(slack.alerts) == 1
+def test_cost_never_gates_anything(tmp_path):
+    """wanda runs on a subscription: a huge notional cost figure changes nothing."""
+    p, store = make(tmp_path, daily_run_cap=10)
+    store.record_run(kind="agent", task_id=None, session_id=None, started_at=utcnow(), exit_code=0, cost_usd=999.0, status="ok")
+    assert asyncio.run(p.check_budget()) == "ok"
+    assert not hasattr(Config(_env_file=None), "daily_cost_cap_usd")
 
 
 def test_undelivered_agent_answer_is_replayed(tmp_path):
@@ -335,9 +324,9 @@ def test_alert_is_not_suppressed_by_a_failed_post(tmp_path):
             self.alerts.append(text)
 
     slack = Flaky()
-    p, store = make(tmp_path, slack, daily_cost_cap_usd=1.0)
+    p, store = make(tmp_path, slack, daily_run_cap=1)
     store.record_run(kind="agent", task_id=None, session_id=None, started_at=utcnow(),
-                     exit_code=0, cost_usd=2.0, status="ok")
+                     exit_code=0, cost_usd=0.0, status="ok")
     assert asyncio.run(p.check_budget()) == "breaker"
     assert slack.alerts == []
     slack.up = True
@@ -358,7 +347,7 @@ def test_answered_here_requires_the_triggering_conversation(tmp_path):
     assert p._answered_here(marker, "C_OTHER", "99.1") is False   # wrong channel
     assert p._answered_here(marker, "C_ASKED", "77.7") is False   # wrong thread
 
-    marker.write_text("D5\t")                                     # untreaded DM reply
+    marker.write_text("D5\t")                                     # a top-level post in the right channel
     assert p._answered_here(marker, "D5", None) is True
 
     marker.unlink()
@@ -370,7 +359,7 @@ def test_pending_delivery_goes_to_its_own_conversation(tmp_path):
     channel."""
     slack = FakeSlack()
     p, store = make(tmp_path, slack)
-    tid = store.create_task(None, "D_PRIVATE", "conversation", kind="dm")
+    tid = store.create_task(None, "D_PRIVATE", "1.1", kind="dm")
     store.record_run(kind="agent", task_id=tid, session_id="s", started_at=utcnow(),
                      exit_code=0, cost_usd=0.4, status="ok", result_text="private answer",
                      notified=0)
@@ -378,12 +367,12 @@ def test_pending_delivery_goes_to_its_own_conversation(tmp_path):
     assert slack.channels == ["D_PRIVATE"], "must post back to the DM, not the triage channel"
 
 
-def test_reservation_released_on_exception(tmp_path):
+def test_inflight_released_on_exception(tmp_path):
     p, _ = make(tmp_path)
     with pytest.raises(ValueError):
-        with p._reserve(2.0):
+        with p._inflight():
             raise ValueError("boom")
-    assert p._inflight_usd == 0.0 and p._inflight_runs == 0
+    assert p._inflight_runs == 0
 
 
 def test_marker_matches_any_post_to_the_asker(tmp_path):
@@ -404,25 +393,26 @@ def test_marker_matches_any_post_to_the_asker(tmp_path):
     assert p._answered_here(m, "C_ASKED", "99.1") is False
 
 
-def test_dm_recovery_posts_untreaded(tmp_path):
-    """tasks.thread_ts holds a sentinel for DMs; sending it as a Slack thread
-    id made the delivery fail forever."""
+def test_dm_recovery_posts_in_the_dm_thread(tmp_path):
+    """A DM behaves like a private channel: the task key is the root message
+    and the answer goes in its thread."""
     slack = FakeSlack()
     p, store = make(tmp_path, slack)
-    tid = store.create_task(None, "D5", "conversation", kind="dm", reply_thread=None)
+    tid = store.create_task(None, "D5", "7.7", kind="dm")
+    assert store.get_task(tid)["reply_thread"] == "7.7"
     store.record_run(kind="agent", task_id=tid, session_id="s", started_at=utcnow(),
                      exit_code=0, cost_usd=0.4, status="ok", result_text="answer", notified=0)
     asyncio.run(p.deliver_pending())
-    assert slack.threads == [None], "a DM answer must post untreaded, not to 'conversation'"
-    assert slack.channels == ["D5"]
+    assert slack.threads == ["7.7"] and slack.channels == ["D5"]
 
 
 def test_conversation_kinds_open_a_task():
     """The watcher mints these kinds; every one must open a task, or the
     trigger dead-ends in a false 'still starting up' reply."""
     from wanda.main import CONVERSATION_KINDS
-    from wanda.watchers.slack_watcher import DM_TASK_KEY  # noqa: F401
+    import wanda.watchers.slack_watcher as w
     assert set(CONVERSATION_KINDS) == {"mention", "mention_guest", "dm"}
+    assert not hasattr(w, "DM_TASK_KEY"), "the single-conversation DM sentinel is gone"
 
 
 def test_answered_run_that_then_timed_out_is_not_double_posted(tmp_path):
@@ -456,8 +446,8 @@ def test_legacy_tasks_get_reply_thread_backfilled(tmp_path):
 
     s = Store(db)
     assert s.get_task_by_thread("C1", "111.1")["reply_thread"] == "111.1"
-    assert s.get_task_by_thread("D5", "conversation")["reply_thread"] is None, \
-        "a DM key is a sentinel, not a thread id"
+    # A pre-existing DM sentinel row stays inert (no event ever looks it up).
+    assert s.get_task_by_thread("D5", "conversation")["reply_thread"] is None
     s.close()
 
 
