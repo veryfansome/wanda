@@ -690,19 +690,15 @@ def test_owner_rule_survives_note_edge_tampering(svc):
     doc = "prefs/mail-dispositions.md"
     note = parse_note(svc.vault.root / doc)
     c = note.live()[0]
+    block = c.block
     c.edges.append(Edge("superseded-by", doc[:-3], "c99"))
     c.edges.append(Edge("retired", value="2026-09-03"))
     write_atomic(svc.vault.root / doc, note.render())
-    svc.store.set_shas(doc, {})  # pretend a session wrote it, drift will see a change
-    P.hourly(svc, conn)
+    rep = P.hourly(svc, conn)  # shas were recorded by _apply_rule; drift compares against them
     assert [r["text"] for r in ix.standing_rules(conn)] == ["trash mail from sunnybrook.example"], "the rule is not disabled by note edits"
     assert ix.dispositions_for(conn, ["a@sunnybrook.example"], ["sunnybrook.example"]), "triage still sees it"
-    # And the tamper is caught as drift on the owner claim (edge shape is in the sha).
-    assert any("prefs/mail-dispositions.md#^" in ref for ref in P.HourlyReport().pinned or []) or True  # drift pins/reports; see below
-    conn2 = conn_for(svc)
-    ix.rebuild(svc.vault, conn2, svc.trust(), TODAY)
-    tampered = conn2.execute("SELECT pinned FROM claims WHERE doc=? AND owner_said=1", (doc,)).fetchone()
-    assert tampered is not None
+    # The edge tamper changed the claim sha (trust-edge shape is hashed), so drift caught it.
+    assert f"{doc}#^{block}" in rep.pinned, "adding a superseded-by/retired edge is caught as drift"
 
 
 def test_cli_without_authority_never_grants_owner_tier(svc):
@@ -741,3 +737,22 @@ def test_drift_pin_does_not_relabel_a_hand_claims_tier(svc):
     assert abs(_os.stat(note.path).st_mtime - when.timestamp()) < 2, "the pin preserved the owner's save time"
     tier = conn.execute("SELECT tier FROM claims WHERE block='c1'").fetchone()["tier"]
     assert tier == "email", "a hand claim written during an email window stays email after the pin"
+
+
+
+def test_distinct_owner_preferences_about_one_subject_all_survive(svc):
+    """B2: two different preferences about the same subject must both stay in
+    the standing rules; only an identical re-statement collapses. A newer
+    disposition for the same address, by contrast, supersedes the older."""
+    mint_owner(svc, "rule person/robin-vale always CC me on ballots", ts="1.1")
+    mint_owner(svc, "rule person/robin-vale texts are better than email", ts="2.2")
+    conn = conn_for(svc)
+    P.hourly(svc, conn)
+    texts = {r["text"] for r in ix.standing_rules(conn, limit=50)}
+    assert "always CC me on ballots" in texts and "texts are better than email" in texts
+    # A second disposition for one address replaces the first.
+    mint_owner(svc, "rule priya@x.example trash", ts="3.3")
+    mint_owner(svc, "rule priya@x.example ignore", ts="4.4")
+    P.hourly(svc, conn)
+    disp = [r["text"] for r in ix.standing_rules(conn, limit=50) if r["facet"] == "mail-disposition"]
+    assert disp == ["ignore mail from priya@x.example"]

@@ -42,6 +42,10 @@ log = logging.getLogger(__name__)
 GRADUATE_WINDOW_DAYS = 60
 LIVE_CLAIM_CAP = 40
 HISTORY_KEEP = 5
+# The plan caps derived-from at 3 refs per claim for size; we keep instead one
+# ref per witness group (>=3), so capping never strands a group and re-triggers
+# graduation (round-3 N1). Group count is small in practice (distinct wordings
+# in the 60-day window), and the 8 KB note cap + fsck flag remain the real bound.
 DERIVED_FROM_KEEP = 3
 OPEN_LAPSE_DAYS = 7
 JACCARD_COVERED = 0.6

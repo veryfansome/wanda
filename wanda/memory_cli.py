@@ -201,7 +201,8 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
         if conn is None:
             return _no_index()
         for r in ix.standing_rules(conn, limit=500):
-            print(f"- {r['text']}  ({r['doc']}#^{r['block']})")
+            where = f"  ({r['doc']}#^{r['block']})" if r["doc"] else ""
+            print(f"- {r['text']}{where}")
         return 0
 
     if verb == "note":

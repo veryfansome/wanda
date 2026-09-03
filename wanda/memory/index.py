@@ -491,12 +491,18 @@ def _derive_owner_rules(conn) -> None:
     lines directly — newest per (facet, target) wins. Triage reads this, not
     the prefs note, so editing the note's claims or edges cannot enable or
     disable a rule; only a verified owner Slack message can."""
-    seen: dict[tuple[str, str], sqlite3.Row] = {}
+    # A disposition for an address supersedes an older one for the same
+    # address (you want one verdict per sender). A preference does not
+    # supersede a different preference about the same subject — distinct
+    # preferences each keep a row; only an identical re-statement collapses.
+    seen: dict[tuple, sqlite3.Row] = {}
     for o in conn.execute("SELECT * FROM obs WHERE op='rule' AND tier='owner' ORDER BY ts ASC"):
         m = DISPOSITION_RE.match(o["text"])
         target = m.group(2) if m else o["subject"]
-        seen[(o["facet"], target)] = o  # later line wins
-    for (facet, target), o in seen.items():
+        key = (o["facet"], target) if o["facet"] == "mail-disposition" else (o["facet"], target, o["norm"])
+        seen[key] = o  # later line wins (same address for a disposition, same text for a preference)
+    for key, o in seen.items():
+        facet, target = key[0], key[1]
         m = DISPOSITION_RE.match(o["text"])
         action = m.group(1) if m else None
         # The prefs claim that renders this rule, for reference/attest.
