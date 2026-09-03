@@ -26,10 +26,10 @@ class DictTrust:
     def owner_verified(self, cause: str) -> bool:
         return cause in self.verified_causes
 
-    def line_checked(self, ulid: str) -> bool:
+    def line_checked(self, ulid: str, fp: str = "") -> bool:
         return True if self.checked_lines is None else ulid in self.checked_lines
 
-    def line_authored(self, ulid: str) -> bool:
+    def line_authored(self, ulid: str, fp: str = "") -> bool:
         return False
 
     def _covering(self, when):

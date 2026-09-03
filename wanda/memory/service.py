@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from wanda.memory import audit, commands, index as ix, passes, recall, render
-from wanda.memory.ledger import Observation, append as ledger_append
+from wanda.memory.ledger import Observation, append as ledger_append, line_fingerprint
 from wanda.memory.subjects import subject_from_address
 from wanda.memory.vault import Vault, clean_text, slugify, write_atomic
 from wanda.triage import addresses_in, sanitize
@@ -281,7 +281,7 @@ class MemoryService:
         self.store.set_owner_check(ctx.cause, True, passes.MINTED_IN_PROCESS)
         for o in minted.observations:
             ledger_append(self.vault, o)
-            self.authority.minted.add(o.ulid)
+            self.authority.minted[o.ulid] = line_fingerprint(o)
             self.store.memory_set(f"checked:{o.ulid}", stamp)
         try:
             self.apply_now({o.ulid for o in minted.observations})

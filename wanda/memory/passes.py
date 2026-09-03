@@ -124,16 +124,16 @@ class Authority:
     """Owner authority the daemon holds in its own memory: lines it minted
     from Slack events it received, and lines it fetched and verified. A row
     in wanda.db can cache this, never grant it."""
-    minted: set[str] = field(default_factory=set)
-    verified: set[str] = field(default_factory=set)
-    authored: set[str] = field(default_factory=set)   # harness lines a pass wrote itself (e.g. a deletion veto)
-    windows: list[dict] | None = None                 # agent-run windows as the daemon saw them
+    minted: dict[str, str] = field(default_factory=dict)    # ulid -> content fingerprint
+    verified: dict[str, str] = field(default_factory=dict)  # ulid -> content fingerprint
+    authored: dict[str, str] = field(default_factory=dict)  # harness lines a pass wrote itself (e.g. a deletion veto)
+    windows: list[dict] | None = None                       # agent-run windows as the daemon saw them
 
-    def holds(self, ulid_: str) -> bool:
-        return ulid_ in self.minted or ulid_ in self.verified
+    def holds(self, ulid_: str, fp: str) -> bool:
+        return self.minted.get(ulid_) == fp or self.verified.get(ulid_) == fp
 
-    def wrote(self, ulid_: str) -> bool:
-        return ulid_ in self.authored
+    def wrote(self, ulid_: str, fp: str) -> bool:
+        return self.authored.get(ulid_) == fp
 
 
 @dataclass
@@ -169,14 +169,15 @@ class StoreTrust:
         r = self.store.owner_check(cause)
         return bool(r and r["verified"])
 
-    def line_checked(self, ulid_: str) -> bool:
+    def line_checked(self, ulid_: str, fp: str) -> bool:
         # Only the daemon, holding authority in memory, can confirm an owner
-        # line. A process without authority (the CLI) never grants owner tier,
-        # whatever rows sit in the session-writable database.
-        return self.authority is not None and self.authority.holds(ulid_)
+        # line — and it is bound to the line's content, so reusing a real
+        # line's ULID with different content grants nothing. A process without
+        # authority (the CLI) never grants owner tier.
+        return self.authority is not None and self.authority.holds(ulid_, fp)
 
-    def line_authored(self, ulid_: str) -> bool:
-        return self.authority is not None and self.authority.wrote(ulid_)
+    def line_authored(self, ulid_: str, fp: str) -> bool:
+        return self.authority is not None and self.authority.wrote(ulid_, fp)
 
     def windows(self) -> list[dict]:
         if self.authority is not None and self.authority.windows is not None:
@@ -437,12 +438,15 @@ def _verify_owner_lines(svc: Services, rep: HourlyReport) -> None:
     for rec in L.iter_observations(svc.vault):
         if isinstance(rec, L.Rejected) or rec.src != "owner" or not rec.cause.startswith("slack:"):
             continue
+        fp = L.line_fingerprint(rec)
         mark = store.memory_get(f"checked:{rec.ulid}")
         if mark == "0":
             continue  # quarantined; a human decides
-        if auth is not None and rec.ulid in auth.minted:
+        # Authority is bound to content: a line reusing a held ULID with
+        # different content is NOT held, and falls through to verification.
+        if auth is not None and auth.minted.get(rec.ulid) == fp:
             continue
-        if auth is not None and rec.ulid in auth.verified and not _stale_check(mark, now):
+        if auth is not None and auth.verified.get(rec.ulid) == fp and not _stale_check(mark, now):
             continue
         if svc.verify_owner is None:
             continue  # nothing to check against; stays pending, never assumed
@@ -457,12 +461,12 @@ def _verify_owner_lines(svc: Services, rep: HourlyReport) -> None:
             store.set_owner_check(rec.cause, True, detail)
             store.memory_set(f"checked:{rec.ulid}", now.isoformat(timespec="seconds"))
             if auth is not None:
-                auth.verified.add(rec.ulid)
+                auth.verified[rec.ulid] = fp
             rep.verified += 1
             continue
         rep.unverified += 1
         if auth is not None:
-            auth.verified.discard(rec.ulid)
+            auth.verified.pop(rec.ulid, None)
         if prior is not None and prior["verified"] and detail == "line does not match the message":
             # The cause is genuine for its own line; this line is a stowaway.
             store.memory_set(f"checked:{rec.ulid}", "0")
@@ -670,8 +674,8 @@ def _pending_ops(svc: Services, only: set[str] | None = None) -> list[L.Observat
             continue
         if int(store.memory_get(f"attempts:{rec.ulid}") or 0) >= OP_MAX_ATTEMPTS:
             continue
-        if rec.src == "owner" and (auth is None or not auth.holds(rec.ulid)):
-            continue  # only a daemon that verified (or minted) the line applies it
+        if rec.src == "owner" and (auth is None or not auth.holds(rec.ulid, L.line_fingerprint(rec))):
+            continue  # only a daemon that verified (or minted) this exact line applies it
         if _op_applied(svc.vault, rec):
             continue
         out.append(rec)
@@ -839,7 +843,7 @@ def _veto_note_claims(svc: Services, rel: str, body: str, today: str, cause: str
     if svc.authority is not None:
         # The pass wrote this veto itself, under the lock, reacting to a git
         # deletion — trusted regardless of what session happened to be running.
-        svc.authority.authored.add(o.ulid)
+        svc.authority.authored[o.ulid] = L.line_fingerprint(o)
 
 
 TOMBSTONE_MARKER = "<!-- original content follows, for unretire -->\n\n"

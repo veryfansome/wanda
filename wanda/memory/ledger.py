@@ -125,6 +125,13 @@ def _unquote_fields(o: Observation) -> Observation:
     return o
 
 
+def line_fingerprint(o: "Observation") -> str:
+    """A content hash of the trust-bearing parts of a line. Owner authority
+    is bound to this, not to the ULID alone, so a session cannot reuse a
+    genuinely-minted owner line's ULID and cause with attacker content."""
+    return sha_text("|".join((o.op, o.subject, o.facet, o.text, o.ref)))
+
+
 def day_header(day: str) -> str:
     return f"---\nkind: ledger\nday: {day}\n---\n# {day}\n\n"
 

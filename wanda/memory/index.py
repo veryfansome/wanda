@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Protocol
 
 from wanda.memory import ledger as L
+from wanda.memory.ledger import line_fingerprint
 from wanda.memory.notes import Claim, Note, parse_note, parse_writespec
 from wanda.memory.subjects import keys_for, parse_subject, registrable_domain
 from wanda.memory.vault import (
@@ -67,9 +68,9 @@ class TrustOracle(Protocol):
     wanda.db, the daemon's memory and Slack in the daemon; a dict in tests."""
 
     def owner_verified(self, cause: str) -> bool: ...
-    def line_checked(self, ulid: str) -> bool: ...
+    def line_checked(self, ulid: str, fp: str) -> bool: ...
     def window_tier(self, when: datetime) -> str: ...
-    def line_authored(self, ulid: str) -> bool: ...
+    def line_authored(self, ulid: str, fp: str) -> bool: ...
 
 
 def tier_for_obs(o: L.Observation, trust: TrustOracle) -> str:
@@ -84,13 +85,14 @@ def tier_for_obs(o: L.Observation, trust: TrustOracle) -> str:
       another session's group — so the tier is that run's kind. A line with
       no recognisable group is email-tier whenever an email-task session was
       running at the time, since it could have been that session."""
+    fp = line_fingerprint(o)
     if o.src == "owner":
-        if o.cause.startswith("slack:") and trust.owner_verified(o.cause) and trust.line_checked(o.ulid):
+        if o.cause.startswith("slack:") and trust.owner_verified(o.cause) and trust.line_checked(o.ulid, fp):
             return "owner"
         return trust.window_tier(o.when)
     if o.src == "triage":
         return "email"
-    if getattr(trust, "line_authored", lambda u: False)(o.ulid):
+    if getattr(trust, "line_authored", lambda u, f: False)(o.ulid, fp):
         return "session"  # the daemon wrote this line itself during a pass
     # Any other shell-written line (agent, harness, import): attributed by the
     # agent-run windows the HARNESS recorded, never by anything in the line —
@@ -234,10 +236,18 @@ _OBS_INSERT = ("INSERT OR REPLACE INTO obs(ulid, day, ts, subject, facet, text, 
 
 
 def _load_ledger(vault: Vault, conn, trust, rep: RebuildReport) -> None:
+    seen_ulids: set[str] = set()
     for rec in L.iter_observations(vault):
         if isinstance(rec, L.Rejected):
             rep.rejected.append(rec)
             continue
+        if rec.ulid in seen_ulids:
+            # A ULID is unique by construction; a second line reusing one is a
+            # forgery or corruption. Keep the first, reject the rest — never
+            # let a later line overwrite an earlier one's obs row.
+            rep.rejected.append(L.Rejected(rec.path, rec.lineno, f"duplicate block id ^{rec.ulid}", "duplicate ulid"))
+            continue
+        seen_ulids.add(rec.ulid)
         _insert_obs(conn, rec, tier_for_obs(rec, trust))
         rep.obs += 1
 
