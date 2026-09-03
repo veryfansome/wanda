@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-from wanda.memory.vault import SUBJECT_TYPES, slugify
+from wanda.memory.vault import SUBJECT_TYPES
 from wanda.triage import addresses_in
 
 # Local parts that mean "the organisation is the sender", not a person.

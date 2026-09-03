@@ -3,7 +3,7 @@ kind: write-spec
 ---
 # people/
 
-One note per human. The file name is the slug of the full name (`robin-vale.md`). A person known only by an address keeps the address as the file name until Alex or a conversation supplies the name; then rename with `wanda memory retire --to`, which rewrites every link.
+One note per human. The file name is the slug of the full name (`robin-vale.md`). A person known only by an address keeps the address as the file name until the owner supplies the name; the owner then merges with `wanda memory retire --to` (a session cannot: say so in your reply if two notes are the same person), which rewrites every link and carries the address over as an id.
 
 `ids:` in the frontmatter lists the identifiers that resolve to this person (`mailto:`, `slack:`). Attaching an address to an existing person takes the owner's word, never an inbound header.
 

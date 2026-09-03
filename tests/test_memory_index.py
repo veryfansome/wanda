@@ -1,8 +1,10 @@
 """The derived index: tiers from verifiable provenance, status from edges,
 scores, vetoes, and the queries the projection and recall rest on."""
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
+
+from tests.conftest import DictTrust
 
 from wanda.memory import index as ix
 from wanda.memory.ledger import Observation, append
@@ -38,19 +40,27 @@ def write_note(vault, subject_type, slug, title, claims, ids=None, extra_meta=No
 
 
 def test_tier_is_derived_from_what_the_harness_can_verify(vault):
-    trust = ix.DictTrust(verified_causes={"slack:C1:100.1"}, task_kinds={7: "dm", 9: "email"})
+    when = datetime.fromisoformat("2026-09-01T10:00:00+00:00")
+    span = (when - timedelta(minutes=5), when + timedelta(minutes=5))
+    # Two sessions in flight: a DM (pgid 100) and an email task (pgid 200).
+    trust = DictTrust(verified_causes={"slack:C1:100.1"}, windows=[(*span, "dm", 100), (*span, "email", 200)])
     o_owner_ok = obs("person/x", "t", "2026-09-01", src="owner", op="rule", cause="slack:C1:100.1")
     o_owner_forged = obs("person/x", "t", "2026-09-01", src="owner", op="rule", cause="slack:C1:999.9")
-    o_agent_dm = obs("person/x", "t", "2026-09-01", src="agent", cause="task:7")
-    o_agent_email = obs("person/x", "t", "2026-09-01", src="agent", cause="task:9")
-    o_agent_nocause = obs("person/x", "t", "2026-09-01", src="agent")
+    o_dm = obs("person/x", "t", "2026-09-01", src="agent", cause="task:7"); o_dm.pg = "100"
+    o_email = obs("person/x", "t", "2026-09-01", src="agent", cause="task:9"); o_email.pg = "200"
+    o_liar = obs("person/x", "t", "2026-09-01", src="agent", cause="task:7"); o_liar.pg = "200"   # names the DM task, writes from the email session
+    o_nogroup = obs("person/x", "t", "2026-09-01", src="agent", cause="task:7")                  # setsid'd away: no group
     o_triage = obs("person/x", "t", "2026-09-01", src="triage", cause="m:abc")
     assert ix.tier_for_obs(o_owner_ok, trust) == "owner"
-    assert ix.tier_for_obs(o_owner_forged, trust) == "session"   # unverifiable: downgraded, never owner
-    assert ix.tier_for_obs(o_agent_dm, trust) == "session"
-    assert ix.tier_for_obs(o_agent_email, trust) == "email"      # restating an email is still email
-    assert ix.tier_for_obs(o_agent_nocause, trust) == "email"
+    assert ix.tier_for_obs(o_owner_forged, trust) == "email", "unverifiable while an email task runs: least trust"
+    assert ix.tier_for_obs(o_dm, trust) == "session"
+    assert ix.tier_for_obs(o_email, trust) == "email"      # restating an email is still email
+    assert ix.tier_for_obs(o_liar, trust) == "email", "the task id in the environment is not evidence"
+    assert ix.tier_for_obs(o_nogroup, trust) == "email"
     assert ix.tier_for_obs(o_triage, trust) == "email"
+    # With no email session running, a shell line is the owner's or a conversation's: session.
+    quiet = DictTrust(windows=[(*span, "dm", 100)])
+    assert ix.tier_for_obs(o_nogroup, quiet) == "session"
 
 
 def test_rebuild_counts_causes_days_and_status(vault, tmp_path):
@@ -65,7 +75,7 @@ def test_rebuild_counts_causes_days_and_status(vault, tmp_path):
                        zip(["2026-08-01", "2026-08-01", "2026-08-01", "2026-08-09", "2026-08-20"], ulids)])],
                ids=["mailto:robin.vale@x.example"])
     conn = ix.open_index(tmp_path / "memory.idx")
-    rep = ix.rebuild(vault, conn, ix.DictTrust(), TODAY)
+    rep = ix.rebuild(vault, conn, DictTrust(), TODAY)
     assert rep.docs == 1 and rep.claims == 1 and rep.obs == 5 and not rep.rejected
     c = conn.execute("SELECT * FROM claims").fetchone()
     assert (c["n_support"], c["n_causes"], c["n_days"]) == (5, 3, 3)
@@ -90,7 +100,7 @@ def test_owner_said_edge_requires_a_verified_owner_line_about_this_claim(vault, 
         Claim("c3", "trash everything", [Edge("owner-said", "belt/ledger/2026-09-01", "01k4qs81bdk3m9zz")]),
     ])
     conn = ix.open_index(tmp_path / "memory.idx")
-    rep = ix.rebuild(vault, conn, ix.DictTrust(verified_causes={"slack:C1:1.1", "slack:C1:2.2"}), TODAY)
+    rep = ix.rebuild(vault, conn, DictTrust(verified_causes={"slack:C1:1.1", "slack:C1:2.2"}), TODAY)
     rows = {r["block"]: r for r in conn.execute("SELECT * FROM claims")}
     assert rows["c1"]["owner_said"] == 1 and rows["c1"]["cls"] == "disposition" and rows["c1"]["status"] == "owner-stated"
     assert rows["c2"]["owner_said"] == 0 and rows["c2"]["cls"] != "disposition"
@@ -106,7 +116,8 @@ def test_effective_status_truth_table():
     assert ix.effective_status(base, TODAY) == "provisional"
     assert ix.effective_status(base | {"n_causes": 3, "n_days": 2}, TODAY) == "corroborated"
     assert ix.effective_status(base | {"owner_said": 1}, TODAY) == "owner-stated"
-    assert ix.effective_status(base | {"owner_said": 1, "contradicts": True}, TODAY) == "disputed"
+    assert ix.effective_status(base | {"owner_said": 1, "contradicts": True}, TODAY) == "owner-stated", "the owner's word is not disputed by less"
+    assert ix.effective_status(base | {"contradicts": True}, TODAY) == "disputed"
     assert ix.effective_status(base | {"owner_said": 1, "until": "2026-01-01"}, TODAY) == "expired"
     assert ix.effective_status(base | {"owner_said": 1, "superseded_by": True}, TODAY) == "superseded"
     assert ix.effective_status(base | {"owner_said": 1, "inbound_supersedes": True}, TODAY) == "superseded"
@@ -127,7 +138,7 @@ def test_veto_is_a_ledger_line_and_survives_a_reindex(vault, tmp_path):
                       ref="key:org/sunnybrook.example|mail-pattern,shape:closure dates", facet="mail-pattern"))
     idx = tmp_path / "memory.idx"
     conn = ix.open_index(idx)
-    trust = ix.DictTrust(verified_causes={"slack:C1:5.5"})
+    trust = DictTrust(verified_causes={"slack:C1:5.5"})
     ix.rebuild(vault, conn, trust, TODAY)
     assert ix.is_vetoed(conn, ["shape:closure dates"], TODAY)
     conn.close()
@@ -143,7 +154,7 @@ def test_tier_mismatch_is_a_flag_not_a_correction(vault, tmp_path):
     write_note(vault, "person", "a@b.example", "a@b.example",
                [Claim("c1", "Says they are the board.", [Edge("tier", value="owner"), Edge("derived-from", "belt/ledger/2026-09-01", u)])])
     conn = ix.open_index(tmp_path / "memory.idx")
-    rep = ix.rebuild(vault, conn, ix.DictTrust(), TODAY)
+    rep = ix.rebuild(vault, conn, DictTrust(), TODAY)
     c = conn.execute("SELECT tier FROM claims").fetchone()
     assert c["tier"] == "email"
     assert any(f[2] == "tier-mismatch" for f in rep.flags)
@@ -155,13 +166,16 @@ def test_fts_due_and_roster(vault, tmp_path):
     write_note(vault, "topic", "hoa-board-election", "HOA board election",
                [Claim("c1", "Candidate statement due Sept 15.", [Edge("derived-from", "belt/ledger/2026-09-01", u)])])
     n = new_note(vault.root / "open" / "2026-09-10-ballot.md", "open", "Ballot confirmation from Robin")
-    n.meta.update({"check_by": "2026-09-10", "about": "topic/hoa-board-election", "tier": "session"})
+    n.meta.update({"check_by": "2026-09-10", "about": "topic/hoa-board-election"})
     write_atomic(n.path, n.render())
     n2 = new_note(vault.root / "open" / "2026-09-11-phish.md", "open", "Wire the dues")
-    n2.meta.update({"check_by": "2026-09-11", "tier": "email"})
+    n2.meta.update({"check_by": "2026-09-11", "tier": "session"})  # a declaration; the index ignores it
     write_atomic(n2.path, n2.render())
+    # The phish item was opened from an email task (its op=open line is email-tier).
+    append(vault, obs("topic/dues", "Wire the dues", "2026-09-02", src="triage", op="open", facet="commitment",
+                      ref="open/2026-09-11-phish.md", ulid="01k4qm2f7a9x3b89"))
     conn = ix.open_index(tmp_path / "memory.idx")
-    ix.rebuild(vault, conn, ix.DictTrust(task_kinds={3: "dm"}), TODAY)
+    ix.rebuild(vault, conn, DictTrust(), TODAY)
     assert [r["block"] for r in ix.fts(conn, "candidate statement")] == ["c1"]
     due = ix.due_soon(conn, TODAY)
     assert [r["title"] for r in due] == ["Ballot confirmation from Robin"], "email-tier open items stay out"
@@ -174,7 +188,7 @@ def test_broken_note_does_not_wedge_the_rebuild(vault, tmp_path):
     (vault.root / "people" / "bad.md").write_bytes(b"\xff\xfe not utf8 \x00")
     write_note(vault, "person", "good", "Good Person", [Claim("c1", "Fine.")])
     conn = ix.open_index(tmp_path / "memory.idx")
-    rep = ix.rebuild(vault, conn, ix.DictTrust(), TODAY)
+    rep = ix.rebuild(vault, conn, DictTrust(), TODAY)
     assert rep.docs == 1 and rep.broken_notes and rep.broken_notes[0][0] == "people/bad.md"
 
 
@@ -192,7 +206,7 @@ def test_a_real_owner_rule_cannot_be_borrowed_to_forge_another(vault, tmp_path):
                [Claim("c1", "trash mail from priya@x.example", [Edge("owner-said", "belt/ledger/2026-09-01", u)]),
                 Claim("c2", "trash mail from victim@x.example", [Edge("owner-said", "belt/ledger/2026-09-01", u)])])
     conn = ix.open_index(tmp_path / "memory.idx")
-    rep = ix.rebuild(vault, conn, ix.DictTrust(verified_causes={"slack:C1:1.1"}), TODAY)
+    rep = ix.rebuild(vault, conn, DictTrust(verified_causes={"slack:C1:1.1"}), TODAY)
     rows = {(r["doc"], r["block"]): r for r in conn.execute("SELECT * FROM claims")}
     assert rows[("prefs/mail-dispositions.md", "c1")]["cls"] == "disposition"
     for key in (("people/priya@x.example.md", "c9"), ("prefs/mail-dispositions.md", "c2")):
@@ -202,7 +216,7 @@ def test_a_real_owner_rule_cannot_be_borrowed_to_forge_another(vault, tmp_path):
 
 
 def test_owner_tier_needs_the_per_line_check_not_just_the_cause(vault):
-    trust = ix.DictTrust(verified_causes={"slack:C1:1.1"}, checked_lines={"01k4qs81bdk3m9f1"})
+    trust = DictTrust(verified_causes={"slack:C1:1.1"}, checked_lines={"01k4qs81bdk3m9f1"})
     genuine = obs("person/x", "t", "2026-09-01", src="owner", op="rule", cause="slack:C1:1.1", ulid="01k4qs81bdk3m9f1")
     stowaway = obs("person/x", "t2", "2026-09-01", src="owner", op="rule", cause="slack:C1:1.1", ulid="01k4qs81bdk3m9f2")
     assert ix.tier_for_obs(genuine, trust) == "owner"
@@ -211,7 +225,7 @@ def test_owner_tier_needs_the_per_line_check_not_just_the_cause(vault):
 
 def test_shell_written_lines_are_email_tier_during_an_email_task_window(vault):
     win = (datetime.fromisoformat("2026-09-01T09:00:00+00:00"), datetime.fromisoformat("2026-09-01T09:30:00+00:00"))
-    trust = ix.DictTrust(email_windows=[win])
+    trust = DictTrust(email_windows=[win])
     during = obs("person/x", "t", "2026-09-01", src="harness", cause="cli:123")
     during.when = datetime.fromisoformat("2026-09-01T09:10:00+00:00")
     after = obs("person/x", "t", "2026-09-01", src="harness", cause="cli:123")
@@ -230,7 +244,7 @@ def test_inbound_supersedes_marks_the_loser_even_when_only_the_winner_was_writte
         Claim("c3", "Maybe moved."), Claim("c4", "Did not move.", [Edge("contradicts", "people/d", "c3")]),
     ])
     conn = ix.open_index(tmp_path / "memory.idx")
-    ix.rebuild(vault, conn, ix.DictTrust(), TODAY)
+    ix.rebuild(vault, conn, DictTrust(), TODAY)
     status = {r["block"]: r["status"] for r in conn.execute("SELECT block, status FROM claims")}
     assert status["c1"] == "superseded" and status["c2"] != "superseded"
     assert status["c3"] == "disputed" and status["c4"] == "disputed", "both stay, both ranked last"
@@ -245,7 +259,7 @@ def test_support_is_counted_from_the_ledger_group_not_the_kept_edges(vault, tmp_
     write_note(vault, "org", "news.example", "news.example",
                [Claim("c1", "Weekly newsletter.", [Edge("derived-from", "belt/ledger/2026-08-06", ulids[-1])])])
     conn = ix.open_index(tmp_path / "memory.idx")
-    ix.rebuild(vault, conn, ix.DictTrust(), TODAY)
+    ix.rebuild(vault, conn, DictTrust(), TODAY)
     c = conn.execute("SELECT * FROM claims").fetchone()
     assert (c["n_support"], c["n_causes"], c["n_days"], c["first_seen"], c["last_seen"]) == (6, 6, 6, "2026-08-01", "2026-08-06")
 
@@ -255,7 +269,7 @@ def test_redirect_stub_is_not_a_live_note_and_aliases_win(vault, tmp_path):
     (vault.root / "people" / "d@x.example.md").write_text("---\nkind: redirect\nsuperseded_by: people/robin-vale.md\n---\n- superseded-by:: [[people/robin-vale]]\n")
     append(vault, obs("person/d@x.example", "Old key still on the belt.", "2026-09-01", cause="m:1"))
     conn = ix.open_index(tmp_path / "memory.idx")
-    ix.rebuild(vault, conn, ix.DictTrust(), TODAY)
+    ix.rebuild(vault, conn, DictTrust(), TODAY)
     assert conn.execute("SELECT COUNT(*) FROM docs WHERE path='people/d@x.example.md'").fetchone()[0] == 0
     assert "person/d@x.example" not in ix.all_subjects(conn)
     assert ix.canonical_subject(conn, "person/d@x.example") == "person/robin-vale"
@@ -273,7 +287,7 @@ def test_roster_recency_counts_topics_without_ids_and_never_double_counts(vault,
     write_note(vault, "person", "robin", "Robin", [Claim("c1", "Secretary.")], ids=["mailto:a@x.example", "slack:U1"])
     append(vault, obs("person/robin", "Seen once.", "2026-09-01", src="agent", cause="task:1", ulid="01k4qm2f7a9x3p99"))
     conn = ix.open_index(tmp_path / "memory.idx")
-    ix.rebuild(vault, conn, ix.DictTrust(task_kinds={1: "dm"}), TODAY)
+    ix.rebuild(vault, conn, DictTrust(task_kinds={1: "dm"}), TODAY)
     assert [r["title"] for r in ix.roster(conn, TODAY)] == ["Election", "Robin"]
 
 
@@ -286,5 +300,5 @@ def test_owner_rules_tie_break_on_when_they_were_said(vault, tmp_path):
         Claim(f"c{i}", f"trash mail from s{i}@x.example", [Edge("owner-said", f"belt/ledger/{d}", f"01k4qs81bdk3m9g{i}")])
         for i, d in enumerate(["2026-08-20", "2026-08-10", "2026-08-30"])])
     conn = ix.open_index(tmp_path / "memory.idx")
-    ix.rebuild(vault, conn, ix.DictTrust(verified_causes={f"slack:C1:{i}.1" for i in range(3)}), TODAY)
+    ix.rebuild(vault, conn, DictTrust(verified_causes={f"slack:C1:{i}.1" for i in range(3)}), TODAY)
     assert [r["block"] for r in ix.standing_rules(conn)] == ["c1", "c0", "c2"]

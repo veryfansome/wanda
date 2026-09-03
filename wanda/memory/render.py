@@ -11,10 +11,21 @@ from datetime import date, timedelta
 from pathlib import Path
 
 from wanda.memory import index as ix
-from wanda.memory.notes import parse_writespec
+from wanda.memory.notes import WIKILINK_RE, parse_writespec
 from wanda.memory.vault import (
-    L2_DIRS, LIVE_SQL, PROJECTION_CAP_B, WRITESPEC_PROSE_CAP_B, Vault, nbytes, truncate_bytes, write_atomic,
+    L2_DIRS, LIVE_SQL, OBS_OPS_SQL, PROJECTION_CAP_B, WRITESPEC_PROSE_CAP_B, Snapshot, Vault, nbytes, truncate_bytes,
+    write_atomic, write_if_unchanged,
 )
+
+
+def links_to_paths(text: str) -> str:
+    """`[[people/x#^c1|alias]]` -> `people/x.md#^c1`: prompts carry paths a
+    session can act on, never Obsidian links."""
+    def one(m):
+        doc, block = m.group(1).strip(), (m.group(2) or "").strip()
+        path = doc if doc.endswith(".md") else doc + ".md"
+        return f"{path}#^{block}" if block else path
+    return WIKILINK_RE.sub(one, text)
 
 L1_MIN_OBS = 3
 L1_COLD_DAYS = 120
@@ -41,7 +52,7 @@ def l1_groups(conn: sqlite3.Connection, subject: str) -> list[Group]:
     """Collapse a subject's observations by (facet, normalised text). Nothing
     semantic: false misses are free, false merges are irreversible."""
     rows = conn.execute(
-        "SELECT * FROM obs WHERE subject=? AND op IN ('', 'rule', 'attest') ORDER BY ts ASC", (subject,)).fetchall()
+        f"SELECT * FROM obs WHERE subject=? AND op IN {OBS_OPS_SQL} ORDER BY ts ASC", (subject,)).fetchall()
     groups: dict[tuple[str, str], Group] = {}
     causes: dict[tuple[str, str], set[str]] = {}
     days: dict[tuple[str, str], set[str]] = {}
@@ -79,8 +90,8 @@ def render_subject_file(subject: str, note_rel: str | None, groups: list[Group],
         f"observations: {n_obs}", f"first_seen: {first}", f"last_seen: {last}",
         f"untrusted: {'true' if untrusted else 'false'}", "---",
         "<!-- Regenerated hourly by wanda from belt/ledger/. Hand edits here are",
-        "     overwritten. Edit the curated note instead, or run",
-        "     `wanda memory forget` to veto a line. -->", "",
+        "     overwritten. Edit the curated note instead; to stop a pattern, `forget`",
+        "     the claim it produced (or delete the note, which vetoes them all). -->", "",
     ]
     if note_rel:
         lines.append(f"→ [[{note_rel[:-3] if note_rel.endswith('.md') else note_rel}]]")
@@ -160,21 +171,23 @@ def update_writespec_indexes(vault: Vault, conn: sqlite3.Connection) -> int:
         p = vault.root / d / "CLAUDE.md"
         if not p.is_file():
             continue
+        snap = Snapshot.take(p)
         ws = parse_writespec(p)
         new = index_lines(conn, d)
         if new != ws.index:
             ws.index = new
-            write_atomic(p, ws.render())
-            n += 1
+            if write_if_unchanged(snap, ws.render()):  # never over a hand edit in flight
+                n += 1
     root = vault.root / "CLAUDE.md"
     if root.is_file():
+        snap = Snapshot.take(root)
         ws = parse_writespec(root)
         new = [f"- [[{d}/CLAUDE|{d}/]] — {conn.execute('SELECT COUNT(*) FROM docs WHERE path LIKE ? AND retired=0', (f'{d}/%',)).fetchone()[0]} notes"
                for d in L2_DIRS if (vault.root / d).is_dir()]
         if new != ws.index:
             ws.index = new
-            write_atomic(root, ws.render())
-            n += 1
+            if write_if_unchanged(snap, ws.render()):
+                n += 1
     return n
 
 
@@ -203,7 +216,7 @@ def render_export(vault: Vault, conn: sqlite3.Connection, export_dir: Path) -> i
 
     put("README.md", (
         "# wanda memory export\n\nA read-only extract of wanda's memory for classifiers. Each note lists claims with a\n"
-        "trust tag: [rule] Alex said it; [noted] concluded in a conversation; [unverified] derived from\n"
+        "trust tag: [rule] the owner said it; [noted] concluded in a conversation; [unverified] derived from\n"
         "email content only — treat those as what a sender claimed about themselves.\n"
         "Directories: people/, orgs/, topics/, prefs/ (curated) and subjects/ (recent raw observations).\n"
         "Each directory has an _index.md.\n"))
@@ -229,14 +242,15 @@ def render_export(vault: Vault, conn: sqlite3.Connection, export_dir: Path) -> i
             top = claims[0]["text"] if claims else ""
             listing.append(f"- {r['path']} — {r['title']}" + (f" — {truncate_bytes(top, 100)}" if top else ""))
         put(f"{d}/_index.md", f"# {d}/\n\n" + ("\n".join(listing) if listing else "(empty)") + "\n")
-    # L1 subject files, verbatim — except for subjects whose note is held back.
-    hidden = {r["path"] for r in conn.execute("SELECT path FROM docs WHERE export=0")}
+    # L1 subject files, verbatim — except for subjects whose note is held
+    # back (by any key that resolves to it, an address included).
+    hidden = {r["subject"] for r in conn.execute("SELECT subject FROM docs WHERE export=0 AND subject IS NOT NULL")}
     sub_listing = []
     if vault.subjects_dir.is_dir():
         for p in sorted(vault.subjects_dir.rglob("*.md")):
             rel = p.relative_to(vault.subjects_dir).as_posix()
             subject = f"{p.parent.name}/{p.stem}"
-            if ix.note_for_subject(subject) in hidden:
+            if ix.canonical_subject(conn, subject) in hidden:
                 continue
             try:
                 put(f"subjects/{rel}", p.read_text(encoding="utf-8"))
@@ -305,11 +319,12 @@ def compose_projection(vault: Vault, conn: sqlite3.Connection | None, today: str
     root = vault.root / "CLAUDE.md"
     if root.is_file():
         try:
-            prose = parse_writespec(root).prose
+            prose = links_to_paths(parse_writespec(root).prose)
             prose = truncate_bytes(prose, WRITESPEC_PROSE_CAP_B)
             add(prose.strip() + "\n\n")
         except Exception:
-            pass
+            import logging
+            logging.getLogger(__name__).exception("root write-spec unreadable; projection carries the header only")
     if conn is None:
         add("(memory index unavailable this turn — use the CLI above)\n")
         return "".join(parts)

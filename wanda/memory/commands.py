@@ -15,6 +15,26 @@ from wanda.memory import index as ix
 from wanda.memory.ledger import Observation
 from wanda.memory.subjects import parse_subject, registrable_domain, resolve, subject_from_address
 from wanda.memory.vault import DIR_TO_TYPE, clean_text
+
+def _subjects_for_target(token: str, conn) -> set[str]:
+    """Every subject key a target may legitimately have resolved to, now or
+    when it was minted: the address-derived key, the note it belongs to now,
+    and whatever aliases join them. The verifier accepts any of these, so a
+    rule minted before the sender got a note is not quarantined after."""
+    tok = _clean_token(token).lower()
+    out: set[str] = set()
+    if "@" in tok and addresses_in(tok):
+        addr = addresses_in(tok)[0]
+        out.add(subject_from_address(addr) or f"person/{addr}")
+    elif "/" not in tok and DOMAIN_RE.match(tok):
+        out.add(f"org/{registrable_domain(tok)}")
+    subj, _, _ = _target_to_subject(token, conn)
+    if subj:
+        out.add(subj)
+    if conn is not None:
+        for s in list(out):
+            out.add(ix.canonical_subject(conn, s))
+    return out
 from wanda.triage import addresses_in
 
 VERBS = ("rule", "attest", "forget", "pin", "unretire")
@@ -116,7 +136,10 @@ def rule_text(action: str, target: str, note: str = "") -> str:
 class Minted:
     observations: list[Observation] = field(default_factory=list)
     reply: str = ""
-    ok: bool = True
+
+    @property
+    def ok(self) -> bool:
+        return bool(self.observations)
 
 
 @dataclass
@@ -163,9 +186,11 @@ def _target_to_subject(token: str, conn) -> tuple[str | None, str, list[str]]:
 
 def expected_for_message(text: str, conn, store, task_sender: str = "") -> list[tuple[str, str, str, str]]:
     """What ledger lines a given owner message may legitimately have minted:
-    (op, subject, facet, text-or-ref). The verifier recomputes this from the
-    fetched Slack message and requires the ledger line to match one of them,
-    so a forged line cannot borrow a real owner message it did not come from."""
+    (op, subject, facet, text-or-ref) — one entry per acceptable subject.
+    The verifier recomputes this from the fetched Slack message and requires
+    the ledger line to match one of them, so a forged line cannot borrow a
+    real owner message it did not come from. Text comes from the message
+    (harness-templated), never from anything a session could have edited."""
     p = parse_command(text)
     if p is None:
         return []
@@ -173,9 +198,21 @@ def expected_for_message(text: str, conn, store, task_sender: str = "") -> list[
     if p.verb == "rule":
         if OFFER_RE.match(p.args[0]) and len(p.args) == 1:
             offer = store.get_offer(p.args[0]) if store is not None else None
-            if offer:
-                facet = DISPOSITION_FACET if offer["kind"] == "disposition" else PREFERENCE_FACET
-                out.append(("rule", offer["subject"], facet, offer["text"]))
+            if not offer:
+                return out
+            if offer["kind"] == "disposition":
+                # Re-derive the templated text from the offer's own fields; a
+                # forged offer row cannot smuggle prose into a disposition.
+                t, _, slug = str(offer["subject"]).partition("/")
+                target = slug
+                if offer["action"] not in ACTIONS or rule_text(offer["action"], target) != offer["text"]:
+                    return out
+                if subject_from_address(target) != offer["subject"] and f"org/{target}" != offer["subject"]:
+                    return out
+                for subj in ({offer["subject"]} | ({ix.canonical_subject(conn, offer["subject"])} if conn is not None else set())):
+                    out.append(("rule", subj, DISPOSITION_FACET, offer["text"]))
+            else:
+                out.append(("rule", offer["subject"], PREFERENCE_FACET, offer["text"]))
             return out
         args = list(p.args)
         if args[0].lower() in ACTIONS:
@@ -185,10 +222,11 @@ def expected_for_message(text: str, conn, store, task_sender: str = "") -> list[
         subj, display, _ = _target_to_subject(args[0], conn)
         if subj is None:
             return []
-        if args[1].lower() in ACTIONS:
-            out.append(("rule", subj, DISPOSITION_FACET, rule_text(args[1].lower(), display, " ".join(args[2:]))))
-        else:
-            out.append(("rule", subj, PREFERENCE_FACET, clean_text(" ".join(args[1:]), 300)))
+        for s in _subjects_for_target(args[0], conn) | {subj}:
+            if args[1].lower() in ACTIONS:
+                out.append(("rule", s, DISPOSITION_FACET, rule_text(args[1].lower(), display, " ".join(args[2:]))))
+            else:
+                out.append(("rule", s, PREFERENCE_FACET, clean_text(" ".join(args[1:]), 300)))
     elif p.verb in ("attest", "forget", "pin"):
         ref = normalize_ref(p.args[0])
         if ref:
@@ -221,18 +259,18 @@ def handle(ctx: Context, conn, store, owner_ids: list[str]) -> Minted:
     """Turn an owner command into ledger lines and a reply. Never opens a
     session, never costs a run."""
     if not owner_ids:
-        return Minted(reply="Memory rules are off: set WANDA_MEMORY_OWNER_USER_IDS to the people whose word should count.", ok=False)
+        return Minted(reply="Memory rules are off: set WANDA_MEMORY_OWNER_USER_IDS to the people whose word should count.")
     if ctx.user not in owner_ids:
-        return Minted(reply="Only the configured owners can set memory rules.", ok=False)
+        return Minted(reply="Only the configured owners can set memory rules.")
     p = parse_command(ctx.text)
     if p is None:
-        return Minted(reply="", ok=False)
+        return Minted(reply="")
     base = dict(src="owner", cause=ctx.cause, when=ctx.when)
     if p.verb == "rule":
         if OFFER_RE.match(p.args[0]) and len(p.args) == 1:
             offer = store.get_offer(p.args[0])
             if not offer:
-                return Minted(reply=f"No offer {p.args[0]}.", ok=False)
+                return Minted(reply=f"No offer {p.args[0]}.")
             facet = DISPOSITION_FACET if offer["kind"] == "disposition" else PREFERENCE_FACET
             o = Observation(subject=offer["subject"], facet=facet, text=offer["text"], op="rule", **base)
             store.take_offer(p.args[0])
@@ -240,11 +278,11 @@ def handle(ctx: Context, conn, store, owner_ids: list[str]) -> Minted:
         args = list(p.args)
         if args[0].lower() in ACTIONS:
             if not ctx.task_sender:
-                return Minted(reply="Say who the rule is about: `rule <address|domain|subject> trash|ignore|attention`.", ok=False)
+                return Minted(reply="Say who the rule is about: `rule <address|domain|subject> trash|ignore|attention`.")
             args = [ctx.task_sender, *args]
         subj, display, nearest = _target_to_subject(args[0], conn)
         if subj is None:
-            return Minted(reply=f"I don't know `{args[0]}`. Use an email address, a domain, or a subject like `person/robin-vale`.", ok=False)
+            return Minted(reply=f"I don't know `{args[0]}`. Use an email address, a domain, or a subject like `person/robin-vale`.")
         near = f" (`{subj}` is new; nearest existing: {', '.join(nearest[:3])})" if nearest else ""
         if args[1].lower() in ACTIONS:
             text = rule_text(args[1].lower(), display, " ".join(args[2:]))
@@ -258,7 +296,7 @@ def handle(ctx: Context, conn, store, owner_ids: list[str]) -> Minted:
         doc, _, block = ref.partition("#^")
         row = conn.execute("SELECT * FROM claims WHERE doc=? AND block=?", (doc, block)).fetchone() if conn is not None else None
         if row is None:
-            return Minted(reply=f"No claim at `{ref}`.", ok=False)
+            return Minted(reply=f"No claim at `{ref}`.")
         subj = ix.subject_for_doc(doc) or "pref/general"
         if p.verb == "attest":
             o = Observation(subject=subj, facet="attest", text=f"Confirmed by the owner: {row['text']}", op="attest", ref=ref, **base)
@@ -272,4 +310,4 @@ def handle(ctx: Context, conn, store, owner_ids: list[str]) -> Minted:
         path = p.args[0]
         o = Observation(subject="pref/general", facet="unretire", text=f"Restore {path}", op="unretire", ref=path, **base)
         return Minted([o], f"Restoring `{path}` on the next pass.")
-    return Minted(reply="", ok=False)
+    return Minted(reply="")

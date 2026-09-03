@@ -14,13 +14,16 @@ from typing import Protocol
 
 from wanda.memory import ledger as L
 from wanda.memory.notes import Claim, Note, parse_note, parse_writespec
-from wanda.memory.subjects import keys_for, parse_subject
-from wanda.memory.vault import DIR_TO_TYPE, LIVE_SQL, TYPE_TO_DIR, Vault, sha_text, slugify
+from wanda.memory.subjects import keys_for, parse_subject, registrable_domain
+from wanda.memory.vault import (
+    DIR_TO_TYPE, GRADUATE_CAUSES, GRADUATE_DAYS, LIVE_SQL, OBS_OPS_SQL, TYPE_TO_DIR, Vault, sha_text, slugify,
+)
 
 SCHEMA = """
-CREATE TABLE IF NOT EXISTS docs (path TEXT PRIMARY KEY, type TEXT, title TEXT, mtime REAL, sha TEXT,
+CREATE TABLE IF NOT EXISTS docs (path TEXT PRIMARY KEY, subject TEXT, type TEXT, title TEXT, mtime REAL, sha TEXT,
   due TEXT, export INTEGER NOT NULL DEFAULT 1, created TEXT, retired INTEGER NOT NULL DEFAULT 0,
   about TEXT, tier TEXT, nbytes INTEGER);
+CREATE INDEX IF NOT EXISTS ix_docs_subject ON docs(subject);
 CREATE TABLE IF NOT EXISTS ids (id TEXT PRIMARY KEY, doc TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS aliases (alias TEXT NOT NULL, doc TEXT NOT NULL, PRIMARY KEY(alias, doc));
 CREATE TABLE IF NOT EXISTS subject_alias (from_subject TEXT PRIMARY KEY, to_subject TEXT NOT NULL);
@@ -53,62 +56,39 @@ CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
 TIERS = ("email", "session", "owner")
 TIER_RANK = {"email": 0, "session": 1, "owner": 2}
 CONVERSATION_KINDS = ("mention", "mention_guest", "dm")
-OBS_OPS = ("", "rule", "attest")  # lines that carry content, as opposed to bookkeeping ops
 STUB_KINDS = ("redirect", "tombstone")
+DISPOSITION_RE = re.compile(r"^(trash|ignore|attention) mail from (\S+?)(:|$)")
 
 
 class TrustOracle(Protocol):
     """What the harness can verify about a ledger line's origin. Backed by
-    wanda.db and Slack in the daemon; a dict in tests."""
+    wanda.db, the daemon's memory and Slack in the daemon; a dict in tests."""
 
     def owner_verified(self, cause: str) -> bool: ...
     def line_checked(self, ulid: str) -> bool: ...
-    def task_tier(self, task_id: int, when: datetime) -> str: ...
+    def line_tier(self, pg: str, when: datetime) -> str: ...
     def window_tier(self, when: datetime) -> str: ...
 
 
-@dataclass
-class DictTrust:
-    verified_causes: set[str] = field(default_factory=set)
-    task_kinds: dict[int, str] = field(default_factory=dict)
-    checked_lines: set[str] | None = None      # None = every line under a verified cause counts
-    email_windows: list[tuple[datetime, datetime]] = field(default_factory=list)
-
-    def owner_verified(self, cause: str) -> bool:
-        return cause in self.verified_causes
-
-    def line_checked(self, ulid: str) -> bool:
-        return True if self.checked_lines is None else ulid in self.checked_lines
-
-    def task_tier(self, task_id: int, when: datetime) -> str:
-        kind = self.task_kinds.get(task_id)
-        return "session" if kind in CONVERSATION_KINDS else "email"
-
-    def window_tier(self, when: datetime) -> str:
-        return "email" if any(a <= when <= b for a, b in self.email_windows) else "session"
-
-
 def tier_for_obs(o: L.Observation, trust: TrustOracle) -> str:
-    """Provenance is assigned from what can be checked, not from `src=`:
-    an owner line must point at a Slack message the owner really wrote AND
-    have passed the per-line check against that message; an agent line is
-    session-tier only if its task was a conversation with a run in flight;
-    a shell-written line (cli:, import:, hand:) is email-tier whenever an
-    email-task session was running at the time — the writer could have been
-    that session, whatever it says about itself."""
+    """Provenance is assigned from what can be checked, not from `src=`.
+
+    - owner: the line must point at a Slack message the owner really wrote
+      AND have passed the per-line check against that message; otherwise it
+      is treated like any shell-written line.
+    - triage: email, always.
+    - anything written from a shell (agent, harness, import): the writer's
+      process group names the session that wrote it — a session cannot join
+      another session's group — so the tier is that run's kind. A line with
+      no recognisable group is email-tier whenever an email-task session was
+      running at the time, since it could have been that session."""
     if o.src == "owner":
-        ok = o.cause.startswith("slack:") and trust.owner_verified(o.cause) and trust.line_checked(o.ulid)
-        return "owner" if ok else "session"
-    if o.src == "agent":
-        if o.cause.startswith("task:"):
-            try:
-                return trust.task_tier(int(o.cause[5:]), o.when)
-            except ValueError:
-                return "email"
-        return "email"
+        if o.cause.startswith("slack:") and trust.owner_verified(o.cause) and trust.line_checked(o.ulid):
+            return "owner"
+        return trust.window_tier(o.when)
     if o.src == "triage":
         return "email"
-    return trust.window_tier(o.when)  # harness, import
+    return trust.line_tier(o.pg, o.when)
 
 
 def open_index(path: Path) -> sqlite3.Connection:
@@ -161,20 +141,30 @@ def subject_for_doc(path: str) -> str:
     return key if parse_subject(key) else ""
 
 
+def doc_for_subject(conn, subject: str) -> str | None:
+    """The live note for a subject, hand-named files included (`docs.subject`
+    is derived from the path), following aliases."""
+    subject = canonical_subject(conn, subject)
+    r = conn.execute("SELECT path FROM docs WHERE subject=? AND retired=0", (subject,)).fetchone()
+    return r["path"] if r else None
+
+
 def effective_status(c: dict, today: str) -> str:
     """`c` carries the claim's own flags plus `inbound_supersedes` and
-    `inbound_contradicts`, resolved after every claim is loaded."""
+    `inbound_contradicts`, resolved after every claim is loaded. The owner's
+    word cannot be disputed by anything less than the owner's word: a
+    contradiction only marks non-owner claims."""
     if c.get("retired"):
         return "retired"
     if c.get("superseded_by") or c.get("inbound_supersedes"):
         return "superseded"
     if c.get("until") and c["until"] < today:
         return "expired"
-    if c.get("contradicts") or c.get("inbound_contradicts"):
-        return "disputed"
     if c.get("owner_said"):
         return "owner-stated"
-    if (c.get("n_causes") or 0) >= 3 and (c.get("n_days") or 0) >= 2:
+    if c.get("contradicts") or c.get("inbound_contradicts"):
+        return "disputed"
+    if (c.get("n_causes") or 0) >= GRADUATE_CAUSES and (c.get("n_days") or 0) >= GRADUATE_DAYS:
         return "corroborated"
     return "provisional"
 
@@ -215,7 +205,7 @@ def rebuild(vault: Vault, conn: sqlite3.Connection, trust: TrustOracle, today: s
             conn.execute(f"DELETE FROM {t}")
         _load_ledger(vault, conn, trust, rep)
         obs_by_ulid = {r["ulid"]: r for r in conn.execute("SELECT * FROM obs")}
-        _load_notes(vault, conn, rep, obs_by_ulid, today)
+        _load_notes(vault, conn, trust, rep, obs_by_ulid, today)
         _finish_status(conn, today)
         _load_writespecs(vault, conn)
         _aggregate_subjects(conn)
@@ -229,11 +219,6 @@ def rebuild(vault: Vault, conn: sqlite3.Connection, trust: TrustOracle, today: s
         conn.execute("ROLLBACK")
         raise
     return rep
-
-
-def _obs_row(o: L.Observation, tier: str) -> tuple:
-    return (o.ulid, o.day, o.when.isoformat(timespec="minutes"), o.subject, o.facet, o.text, norm_text(o.text),
-            o.src, o.op, o.cause, o.ref, o.due, o.until, tier, o.path, o.lineno)
 
 
 _OBS_INSERT = ("INSERT OR REPLACE INTO obs(ulid, day, ts, subject, facet, text, norm, src, op, cause, ref, due, until, tier, path, lineno) "
@@ -250,7 +235,8 @@ def _load_ledger(vault: Vault, conn, trust, rep: RebuildReport) -> None:
 
 
 def _insert_obs(conn, o: L.Observation, tier: str) -> None:
-    conn.execute(_OBS_INSERT, _obs_row(o, tier))
+    conn.execute(_OBS_INSERT, (o.ulid, o.day, o.when.isoformat(timespec="minutes"), o.subject, o.facet, o.text,
+                               norm_text(o.text), o.src, o.op, o.cause, o.ref, o.due, o.until, tier, o.path, o.lineno))
     conn.execute("DELETE FROM rkeys WHERE ulid=?", (o.ulid,))
     for k in keys_for(o.subject, o.facet):
         conn.execute("INSERT INTO rkeys(ulid, key) VALUES(?,?)", (o.ulid, k))
@@ -282,8 +268,9 @@ def _plus_days(day: str, n: int) -> str:
         return day
 
 
-def _load_notes(vault: Vault, conn, rep, obs_by_ulid, today: str) -> None:
+def _load_notes(vault: Vault, conn, trust, rep, obs_by_ulid, today: str) -> None:
     seen_ids: dict[str, str] = {}
+    open_lines = {r["ref"]: r for r in conn.execute("SELECT ref, tier FROM obs WHERE op='open'")}
     for path in vault.l2_notes():
         rel = vault.rel(path)
         try:
@@ -298,16 +285,17 @@ def _load_notes(vault: Vault, conn, rep, obs_by_ulid, today: str) -> None:
             if frm and dst:
                 conn.execute("INSERT OR REPLACE INTO subject_alias(from_subject, to_subject) VALUES(?,?)", (frm, dst))
             continue
-        _index_note(conn, rep, note, rel, obs_by_ulid, today, seen_ids)
+        _index_note(conn, trust, rep, note, rel, obs_by_ulid, today, seen_ids, open_lines)
         rep.docs += 1
     # Retired tombstones: subject renames and retired flags.
     if vault.retired_dir.is_dir():
         for path in sorted(vault.retired_dir.rglob("*.md")):
-            if "history" in path.relative_to(vault.retired_dir).parts[:1]:
+            if path.relative_to(vault.retired_dir).parts[:1] == ("history",):
                 continue
             try:
                 doc = parse_note(path)
-            except Exception:
+            except Exception as e:
+                rep.broken_notes.append((vault.rel(path), str(e)[:200]))
                 continue
             frm, to = doc.meta.get("subject"), doc.meta.get("superseded_by")
             if frm and to:
@@ -318,17 +306,26 @@ def _load_notes(vault: Vault, conn, rep, obs_by_ulid, today: str) -> None:
             )
 
 
-def _index_note(conn, rep, note: Note, rel: str, obs_by_ulid, today: str, seen_ids: dict[str, str]) -> None:
+def _index_note(conn, trust, rep, note: Note, rel: str, obs_by_ulid, today: str, seen_ids: dict[str, str], open_lines) -> None:
     d = rel.split("/", 1)[0]
     ntype = str(note.meta.get("type") or DIR_TO_TYPE.get(d) or d)
     export = 0 if note.meta.get("export") is False else 1
     due = str(note.meta.get("check_by") or note.meta.get("due") or "") or None
     about = str(note.meta.get("about") or "") or None
-    doc_tier = str(note.meta.get("tier") or "") or None
+    mtime = note.path.stat().st_mtime
+    when = datetime.fromtimestamp(mtime, tz=timezone.utc)
+    subject = subject_for_doc(rel)
+    doc_tier = None
+    if ntype == "open":
+        # Derived, not declared: the tier of the `op=open` ledger line that
+        # created it, or — for a hand-written item — what was running when
+        # the file was last written.
+        line = open_lines.get(rel)
+        doc_tier = line["tier"] if line else trust.window_tier(when)
     conn.execute(
-        "INSERT OR REPLACE INTO docs(path, type, title, mtime, sha, due, export, created, about, tier, nbytes) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-        (rel, ntype, note.title, note.path.stat().st_mtime, sha_text(note.raw), due, export,
+        "INSERT OR REPLACE INTO docs(path, subject, type, title, mtime, sha, due, export, created, about, tier, nbytes) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        (rel, subject or None, ntype, note.title, mtime, sha_text(note.raw), due, export,
          str(note.meta.get("created") or "") or None, about, doc_tier, len(note.raw.encode())),
     )
     for i in note.meta.get("ids") or []:
@@ -337,22 +334,30 @@ def _index_note(conn, rep, note: Note, rel: str, obs_by_ulid, today: str, seen_i
             rep.flags.append((rel, "", "duplicate-id", f"{ident} also on {seen_ids[ident]}"))
         seen_ids[ident] = rel
         conn.execute("INSERT OR REPLACE INTO ids(id, doc) VALUES(?,?)", (ident, rel))
-    subject = subject_for_doc(rel)
+        # An identifier on a note is also the address-keyed subject the belt
+        # files under: person/<addr> → this note's subject.
+        if subject:
+            kind, _, value = ident.partition(":")
+            if kind == "mailto" and value and value != subject.partition("/")[2]:
+                conn.execute("INSERT OR IGNORE INTO subject_alias(from_subject, to_subject) VALUES(?,?)", (f"person/{value}", subject))
+            elif kind in ("dom", "list") and value:
+                conn.execute("INSERT OR IGNORE INTO subject_alias(from_subject, to_subject) VALUES(?,?)",
+                             (f"org/{registrable_domain(value)}", subject))
     for a in note.meta.get("aliases") or []:
         alias = str(a).strip().lower()
         conn.execute("INSERT OR IGNORE INTO aliases(alias, doc) VALUES(?,?)", (alias, rel))
         # `aliases: [RLA]` on orgs/riverside-language-academy also makes the
         # subject key org/rla resolve there.
         t = subject.partition("/")[0]
-        if t and slugify(alias):
+        if t and slugify(alias) and f"{t}/{slugify(alias)}" != subject:
             conn.execute("INSERT OR IGNORE INTO subject_alias(from_subject, to_subject) VALUES(?,?)",
                          (f"{t}/{slugify(alias)}", subject))
     conn.execute("INSERT OR IGNORE INTO aliases(alias, doc) VALUES(?,?)", (note.title.lower(), rel))
     for c in note.claims:
-        _index_claim(conn, rep, c, rel, obs_by_ulid, today, ntype)
+        _index_claim(conn, trust, rep, c, rel, obs_by_ulid, today, ntype, when)
 
 
-def _index_claim(conn, rep, c: Claim, doc: str, obs_by_ulid, today: str, ntype: str) -> None:
+def _index_claim(conn, trust, rep, c: Claim, doc: str, obs_by_ulid, today: str, ntype: str, file_when: datetime) -> None:
     # Evidence: which ledger lines back this claim, and at what tier.
     witness_groups: set[tuple[str, str, str]] = set()
     tiers: list[int] = []
@@ -396,12 +401,13 @@ def _index_claim(conn, rep, c: Claim, doc: str, obs_by_ulid, today: str, ntype: 
     # Support is counted from the ledger groups the witnesses belong to, so
     # capping derived-from at three refs loses nothing.
     n_support, causes, days, first_seen, last_seen = _group_support(conn, witness_groups)
-    if c.has("owner-edited"):
-        tiers.append(1)  # the owner touched it: at least session-tier, pinned
     hand_written = n_support == 0 and not owner_said
+    if c.has("owner-edited") or hand_written:
+        # The owner's own words in their own vault — unless an email-task
+        # session was running when the file was written, in which case a
+        # shell could have typed them.
+        tiers.append(TIER_RANK[trust.window_tier(file_when)])
     tier = TIERS[max(tiers)] if tiers else "session"
-    if hand_written:
-        tier = "session"  # the owner's own words in their own vault
     declared = c.value("tier")
     if declared and declared != tier:
         rep.flags.append((doc, c.block, "tier-mismatch", f"declared {declared}, derived {tier}"))
@@ -433,7 +439,7 @@ def _group_support(conn, groups: set[tuple[str, str, str]]):
     n = 0
     first = last = None
     for subject, facet, norm in groups:
-        for o in conn.execute("SELECT src, cause, day, ulid FROM obs WHERE subject=? AND facet=? AND norm=? AND op IN ('', 'rule', 'attest')",
+        for o in conn.execute(f"SELECT src, cause, day, ulid FROM obs WHERE subject=? AND facet=? AND norm=? AND op IN {OBS_OPS_SQL}",
                               (subject, facet, norm)):
             n += 1
             causes.add(cause_key(o["src"], o["cause"], o["day"], o["ulid"]))
@@ -464,12 +470,12 @@ def _finish_status(conn, today: str) -> None:
         if status != c["status"]:
             conn.execute("UPDATE claims SET status=?, score=? WHERE id=?",
                          (status, score_for(bool(c["owner_said"]), c["n_causes"] or 0, c["last_seen"] or "", status, today), c["id"]))
-    # Marking the loser disputed also marks the winner disputed (both stay, both ranked last).
+    # Marking the loser disputed also marks the (non-owner) winner disputed: both stay, both ranked last.
     for e in conn.execute("SELECT src_doc, src_block FROM edges WHERE rel='contradicts'"):
         c = conn.execute("SELECT * FROM claims WHERE doc=? AND block=?", (e["src_doc"], e["src_block"])).fetchone()
-        if c is not None and c["status"] in ("provisional", "corroborated", "owner-stated"):
+        if c is not None and c["status"] in ("provisional", "corroborated"):
             conn.execute("UPDATE claims SET status='disputed', score=? WHERE id=?",
-                         (score_for(bool(c["owner_said"]), c["n_causes"] or 0, c["last_seen"] or "", "disputed", today), c["id"]))
+                         (score_for(False, c["n_causes"] or 0, c["last_seen"] or "", "disputed", today), c["id"]))
 
 
 def _load_writespecs(vault: Vault, conn) -> None:
@@ -487,19 +493,18 @@ def _aggregate_subjects(conn) -> None:
 
 
 def _aggregate_subject(conn, subject: str) -> None:
-    rows = conn.execute("SELECT src, cause, day, ulid, tier FROM obs WHERE subject=? AND op IN ('', 'rule', 'attest')", (subject,)).fetchall()
+    rows = conn.execute(f"SELECT src, cause, day, ulid, tier FROM obs WHERE subject=? AND op IN {OBS_OPS_SQL}", (subject,)).fetchall()
     if not rows:
         conn.execute("DELETE FROM subjects WHERE key=?", (subject,))
         return
     causes = {cause_key(o["src"], o["cause"], o["day"], o["ulid"]) for o in rows}
     days = {o["day"] for o in rows}
     trusted = any(o["tier"] != "email" for o in rows)
-    doc = note_for_subject(subject)
-    exists = conn.execute("SELECT 1 FROM docs WHERE path=? AND retired=0", (doc,)).fetchone() is not None
+    doc = doc_for_subject(conn, subject)
     conn.execute(
         "INSERT OR REPLACE INTO subjects(key, doc, n_obs, n_causes, n_days, first_seen, last_seen, untrusted) "
         "VALUES(?,?,?,?,?,?,?,?)",
-        (subject, doc if exists else None, len(rows), len(causes), len(days), min(days), max(days), 0 if trusted else 1),
+        (subject, doc, len(rows), len(causes), len(days), min(days), max(days), 0 if trusted else 1),
     )
 
 
@@ -526,17 +531,17 @@ def standing_rules(conn, limit: int = 8) -> list[sqlite3.Row]:
         "ORDER BY c.pinned DESC, c.first_seen ASC, c.doc ASC, c.lineno ASC LIMIT ?", (limit,)).fetchall()
 
 
-def dispositions_for(conn, addrs: list[str], domains: list[str]) -> list[sqlite3.Row]:
+def dispositions_for(conn, addrs: list[str], domains: list[str]) -> list[tuple[sqlite3.Row, str]]:
     """Every live owner disposition that names one of these addresses or
-    registrable domains — however many rules exist."""
+    registrable domains — however many rules exist. Returns (row, target)."""
     out = []
     for r in conn.execute("SELECT * FROM claims WHERE cls='disposition' AND folded=0 AND status='owner-stated' ORDER BY first_seen ASC, lineno ASC"):
-        m = re.match(r"^(trash|ignore|attention) mail from (\S+?)(:|$)", r["text"])
+        m = DISPOSITION_RE.match(r["text"])
         if not m:
             continue
         target = m.group(2)
         if target in addrs or target in domains:
-            out.append(r)
+            out.append((r, target))
     return out
 
 
@@ -550,19 +555,25 @@ def due_soon(conn, today: str, limit: int = 5, horizon_days: int = 14, overdue_d
 
 
 def roster(conn, today: str, limit: int = 12, window_days: int = 60) -> list[sqlite3.Row]:
-    """Entities recently in play: ranked by observations on their subject in
-    the window, then by best claim score, then title. Titles come from closed
-    sources (the note's title)."""
+    """Entities recently in play: ranked by observations on their subject
+    (aliases included) in the window, then by best claim score, then title.
+    Titles come from closed sources (the note's title)."""
     since = (date.fromisoformat(today) - timedelta(days=window_days)).isoformat()
+    aliases: dict[str, set[str]] = {}
+    for r in conn.execute("SELECT from_subject, to_subject FROM subject_alias"):
+        aliases.setdefault(r["to_subject"], set()).add(r["from_subject"])
     docs = conn.execute(
-        "SELECT d.path, d.title, d.type, "
+        "SELECT d.path, d.subject, d.title, d.type, "
         " (SELECT MAX(score) FROM claims c WHERE c.doc=d.path AND c.folded=0 AND c.tier <> 'email') AS best "
         "FROM docs d WHERE d.type IN ('person','org','topic') AND d.retired=0 AND d.export=1").fetchall()
     scored = []
     for d in docs:
-        subj = subject_for_doc(d["path"])
-        recent = conn.execute("SELECT COUNT(*) FROM obs WHERE subject=? AND day >= ? AND op IN ('', 'rule', 'attest')",
-                              (subj, since)).fetchone()[0] if subj else 0
+        keys = [d["subject"]] + sorted(aliases.get(d["subject"], ())) if d["subject"] else []
+        recent = 0
+        if keys:
+            q = ",".join("?" * len(keys))
+            recent = conn.execute(f"SELECT COUNT(*) FROM obs WHERE subject IN ({q}) AND day >= ? AND op IN {OBS_OPS_SQL}",
+                                  (*keys, since)).fetchone()[0]
         scored.append((recent, d["best"] or 0.0, d["title"].lower(), d))
     scored.sort(key=lambda x: (-x[0], -x[1], x[2]))
     return [x[3] for x in scored[:limit]]
@@ -595,20 +606,20 @@ def fts(conn, query: str, limit: int = 10) -> list[sqlite3.Row]:
 
 
 def subject_observations(conn, subject: str, since_day: str = "", limit: int = 20) -> list[sqlite3.Row]:
+    keys = [subject] + [r["from_subject"] for r in conn.execute("SELECT from_subject FROM subject_alias WHERE to_subject=?", (subject,))]
+    q = ",".join("?" * len(keys))
     return conn.execute(
-        "SELECT * FROM obs WHERE subject=? AND op IN ('', 'rule', 'attest') AND day >= ? ORDER BY ts DESC LIMIT ?",
-        (subject, since_day, limit)).fetchall()
+        f"SELECT * FROM obs WHERE subject IN ({q}) AND op IN {OBS_OPS_SQL} AND day >= ? ORDER BY ts DESC LIMIT ?",
+        (*keys, since_day, limit)).fetchall()
 
 
 def all_subjects(conn) -> set[str]:
     """Keys that exist: notes and belt subjects, minus keys that now alias
-    to another (retired or merged)."""
+    to another (retired, merged, or an address that belongs to a note)."""
     aliased = {r["from_subject"] for r in conn.execute("SELECT from_subject FROM subject_alias")}
     out = {r["key"] for r in conn.execute("SELECT key FROM subjects")}
-    for r in conn.execute("SELECT path FROM docs WHERE retired=0"):
-        s = subject_for_doc(r["path"])
-        if s:
-            out.add(s)
+    for r in conn.execute("SELECT subject FROM docs WHERE retired=0 AND subject IS NOT NULL"):
+        out.add(r["subject"])
     return out - aliased
 
 
@@ -617,8 +628,8 @@ def subject_aliases(conn) -> dict[str, str]:
 
 
 def canonical_subject(conn, subject: str) -> str:
-    """Follow aliases (bounded), so a memo about a retired key files under
-    its successor."""
+    """Follow aliases (bounded), so a memo about a retired key or a bare
+    address files under the note it belongs to."""
     seen = set()
     while subject not in seen:
         seen.add(subject)

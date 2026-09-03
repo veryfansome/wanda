@@ -2,12 +2,47 @@
 seeded memory vault."""
 import os
 import stat
+from dataclasses import dataclass, field
 from datetime import datetime
 
 import pytest
 
 from wanda.memory.ledger import Observation
 from wanda.memory.vault import Vault
+
+CONVERSATION_KINDS = ("mention", "mention_guest", "dm")
+
+
+@dataclass
+class DictTrust:
+    """A TrustOracle for tests: verified causes, checked lines, and windows
+    given as (start, end, kind, pgid)."""
+    verified_causes: set[str] = field(default_factory=set)
+    task_kinds: dict[int, str] = field(default_factory=dict)  # legacy in old tests; the index no longer reads task ids
+    checked_lines: set[str] | None = None      # None = every line under a verified cause counts
+    email_windows: list[tuple[datetime, datetime]] = field(default_factory=list)
+    windows: list[tuple] = field(default_factory=list)   # (start, end, kind, pgid)
+
+    def owner_verified(self, cause: str) -> bool:
+        return cause in self.verified_causes
+
+    def line_checked(self, ulid: str) -> bool:
+        return True if self.checked_lines is None else ulid in self.checked_lines
+
+    def _covering(self, when):
+        out = [(s, e, k, pg) for s, e, k, pg in self.windows if s <= when <= e]
+        out += [(s, e, "email", None) for s, e in self.email_windows if s <= when <= e]
+        return out
+
+    def line_tier(self, pg: str, when: datetime) -> str:
+        cov = self._covering(when)
+        mine = [w for w in cov if str(w[3]) == pg]
+        if mine:
+            return "session" if all(w[2] in CONVERSATION_KINDS for w in mine) else "email"
+        return "email" if any(w[2] not in CONVERSATION_KINDS for w in cov) else "session"
+
+    def window_tier(self, when: datetime) -> str:
+        return "email" if any(w[2] not in CONVERSATION_KINDS for w in self._covering(when)) else "session"
 
 
 @pytest.fixture(autouse=True)

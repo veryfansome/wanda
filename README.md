@@ -72,12 +72,14 @@ Each directory has a `CLAUDE.md` write-spec — what belongs there, how it is na
 rule priya.nash@example.org trash          # a triage rule, in any channel or DM
 rule sunnybrook.example ignore                  # by domain
 rule person/robin-vale prefers texts   # a preference about a subject
-rule k4                                   # accept an offer from the digest
+rule k4                                   # accept an offer from the digest (a bare `k4` works in the digest thread)
 attest people/robin-vale#c4            # raise a claim to your word
+pin people/robin-vale#c4               # keep a claim exactly as written
 forget people/robin-vale#c4            # retire it and suppress the pattern behind it
+unretire people/priya-nash.md              # bring back a note you deleted
 ```
 
-Only Slack users listed in `WANDA_MEMORY_OWNER_USER_IDS` can do this; a session cannot (it posts as the bot). In a channel the command needs an `@wanda` mention; in a DM or the digest thread it does not. Editing a note in Obsidian counts as your word too: a changed claim line is pinned and never rewritten; a renamed note keeps its history; a deleted note is retired and the patterns behind its claims are suppressed for a year (`unretire` brings the note back; the suppression stays until you `attest` or re-state what you want).
+Only Slack users listed in `WANDA_MEMORY_OWNER_USER_IDS` can do this; a session cannot (it posts as the bot). In a channel the command needs an `@wanda` mention; in a DM or the digest thread it does not. The daemon holds the authority for these lines in its own memory: a rule is applied only by a daemon that received the Slack event or fetched and verified the message, never on the strength of a database row. Editing a note in Obsidian counts as your word too: a changed claim line is pinned and never rewritten; a renamed note keeps its history; a deleted note is retired and the patterns behind its claims are suppressed for a year (`unretire` brings the note back; the suppression stays until you `attest` or re-state what you want).
 
 A daily `🧠 wanda memory` thread in the triage channel reports what changed: new subjects, write-spec rewrites, your hand edits, rules that went live, templated rule offers (`rule kN`), and anything that failed verification.
 
@@ -88,7 +90,9 @@ wanda memory who robin@example.com          # what wanda knows about a sender or
 wanda memory recall "HOA ballots"           # free-text recall
 wanda memory walk people/robin-vale.md   # a note with the filing guides above it
 wanda memory note "…" --about person/x      # record a fact (sessions do this)
-wanda memory import-cowork ~/.cowork        # one-time import of a previous vault (explicit, idempotent)
+wanda memory open "…" --check-by 2026-09-20 --about topic/x   # a dated commitment
+wanda memory search | show | rules | pin | forget | retire | unretire
+wanda memory import-cowork ~/.cowork        # one-time import of a previous vault (explicit, idempotent, owner only)
 wanda memory hourly | reindex | fsck | digest | status
 ```
 
@@ -100,7 +104,7 @@ Every tool call a session or the classifier makes is logged to `~/.wanda/logs/to
 
 That is a reasonable trade in a private workspace. It is not, if you ever invite people you don't trust, connect the app to a shared workspace, or let wanda read untrusted external content into a session. Before that, either run the daemon in a container, or set `WANDA_SLACK_ALLOWED_USER_IDS` to restrict who can trigger it and drop `Bash` from `WANDA_AGENT_ALLOWED_TOOLS` (the harness will then post replies itself).
 
-Memory does not widen this, and its own integrity does not rest on tool scoping: a session can write anything into the vault, but it cannot make that writing count as your word. Owner-tier lines must point at a Slack message the hourly pass fetches and checks (author, and that the line is one that message could have minted) — checked when first seen and again once a day, so a verification marker forged straight into `wanda.db` is caught within a day; a line written while an email-task session was running is email-tier no matter what it claims; and only owner-tier evidence can tell triage what to do. The tool-call log is tamper-evident rather than tamper-proof — a session can edit its own log, which is why lines are mirrored to the unified log.
+Memory does not widen this, and its own integrity does not rest on tool scoping: a session can write anything into the vault and into `wanda.db`, but it cannot make that writing count as your word. Owner-tier lines must point at a Slack message the daemon fetches and checks (author, and that the line is one that message could have minted); the result is held in the daemon's memory, re-checked daily, and never granted by a database row. A line written from a shell is attributed to the session that wrote it by process group — a session cannot join another session's group — and a line with no recognisable group written while an email task was running is email-tier. Only owner-tier evidence can tell triage what to do. Residuals, stated plainly: a session can edit run-window rows in `wanda.db` (the daemon keeps its own copy and only trusts the database at startup), and the tool-call log is tamper-evident rather than tamper-proof — a session can edit its own log, which is why lines are mirrored to the unified log.
 
 ## Safety model
 

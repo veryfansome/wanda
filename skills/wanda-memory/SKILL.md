@@ -38,4 +38,4 @@ wanda memory open "Ballot confirmation from Robin" --check-by 2026-09-20 --about
 - You cannot make a rule about what happens to email. Rules are the owner's word, given in Slack as `rule <address> trash|ignore|attention`; if you think one is warranted, say so in your reply and let them decide.
 - You cannot merge two notes (`retire --to`); say so in your reply if two notes are the same person.
 - Do not write secrets, credentials, or anything from an email verbatim. Describe; do not copy.
-- Do not edit files under `~/.wanda/memory/belt/` — they are regenerated hourly.
+- Do not edit files under the vault's `belt/` directory — they are regenerated hourly.

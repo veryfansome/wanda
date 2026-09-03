@@ -1,5 +1,6 @@
-"""Glue between the daemon and the memory package: paths, the trust
-oracle, seeding, the triage block, owner commands, and the two passes."""
+"""Glue between the daemon and the memory package: paths, the authority
+the daemon holds in memory, seeding, the triage block, owner commands, and
+the two passes."""
 from __future__ import annotations
 
 import asyncio
@@ -13,10 +14,11 @@ from wanda.memory import audit, commands, index as ix, passes, recall, render
 from wanda.memory.ledger import Observation, append as ledger_append
 from wanda.memory.subjects import subject_from_address
 from wanda.memory.vault import Vault, clean_text, slugify, write_atomic
+from wanda.triage import addresses_in, sanitize
 
 log = logging.getLogger(__name__)
 
-MEMO_CAUSE_CAP = 5  # per (subject, facet): past this, without an owner edge, a memo is dropped
+MEMO_CAUSE_CAP = 5  # per (subject, facet): past this, without an owner-tier line, a memo is dropped
 
 
 def default_wanda_bin() -> str:
@@ -37,6 +39,12 @@ class MemoryService:
         self.slack = slack
         self.vault = Vault(cfg.memory_vault)
         self.wanda_bin = wanda_bin or default_wanda_bin()
+        # Owner authority and run windows live here, in this process. A
+        # session can write wanda.db; it cannot write the daemon's memory.
+        closed = store.close_orphan_windows()
+        if closed:
+            log.warning("closed %d agent-run window(s) left open by a previous daemon", closed)
+        self.authority = passes.Authority(windows=store.all_windows())
 
     # --- setup ---
 
@@ -57,7 +65,7 @@ class MemoryService:
         return self.cfg.triage_settings_path
 
     def services(self) -> passes.Services:
-        return passes.Services(self.cfg, self.store, self.vault, verify_owner=self._verifier())
+        return passes.Services(self.cfg, self.store, self.vault, verify_owner=self._verifier(), authority=self.authority)
 
     def _verifier(self):
         if self.slack is None or not self.cfg.memory_owner_user_ids:
@@ -66,6 +74,24 @@ class MemoryService:
             self.slack.fetch_message_sync, list(self.cfg.memory_owner_user_ids),
             lambda: ix.open_readonly(self.cfg.memory_index_path), self.store, self.sender_for_thread,
         )
+
+    # --- run windows (provenance) ---
+
+    def open_window(self, session_id: str, task_id: int | None, kind: str) -> None:
+        w = self.store.open_run_window(session_id, task_id, kind)
+        self.authority.windows = [x for x in self.authority.windows if x["session_id"] != session_id] + [w]
+
+    def set_window_pgid(self, session_id: str, pgid: int) -> None:
+        self.store.set_run_window_pgid(session_id, pgid)
+        for w in self.authority.windows:
+            if w["session_id"] == session_id:
+                w["pgid"] = pgid
+
+    def close_window(self, session_id: str) -> None:
+        ended = self.store.close_run_window(session_id)
+        for w in self.authority.windows:
+            if w["session_id"] == session_id and not w.get("ended_at"):
+                w["ended_at"] = ended
 
     def conn_ro(self):
         """A read-only index connection. A missing index is built inline
@@ -102,7 +128,7 @@ class MemoryService:
             with passes.memory_lock(self.cfg.memory_lock_path):
                 conn = passes.open_conn(svc)
                 try:
-                    ix.rebuild(self.vault, conn, passes.StoreTrust(self.store), self.today())
+                    ix.rebuild(self.vault, conn, svc.trust(), self.today())
                 finally:
                     conn.close()
         except passes.Busy:
@@ -146,7 +172,6 @@ class MemoryService:
         if p.get("kind") == "dm":
             answers = self.store.recent_answers(p["channel"], limit=3)
             if answers:
-                from wanda.triage import sanitize
                 prior = "Your earlier answers in this conversation, oldest first:\n<transcript>\n" + "\n".join(
                     f"[{a['started_at'][:16]}] wanda: {sanitize((a['result_text'] or '')[:1200])}" for a in answers) + "\n</transcript>\n\n"
         return memory, prior
@@ -182,10 +207,10 @@ class MemoryService:
 
     def record_memos(self, rows_by_key: dict, verdicts: dict) -> int:
         """Triage memos become email-tier ledger lines. The subject is bound
-        by the harness from the real From header; the model never names it.
-        At most one memo per verdict; dropped once a (subject, facet) has
-        five causes and no owner-tier line, so a newsletter cannot write
-        forever. Drops are logged."""
+        by the harness from the real From header (and follows the note it
+        belongs to); the model never names it. At most one memo per verdict;
+        dropped once a (subject, facet) has five causes and no owner-tier
+        line, so a newsletter cannot write forever. Drops are logged."""
         n = 0
         conn = self.conn_ro()
         try:
@@ -241,11 +266,13 @@ class MemoryService:
         msg = self.store.get_message(task["message_pk"])
         if msg is None:
             return ""
-        from wanda.triage import addresses_in
         a = addresses_in(msg["from_addr"] or "")
         return a[0] if a else ""
 
     def handle_command(self, p: dict) -> str:
+        """Mint the owner's lines from a Slack event this daemon received,
+        hold their authority in memory, put them in the index now, and apply
+        them now — a rule is live for the next triage batch."""
         ctx = commands.Context(channel=p["channel"], ts=p["ts"], user=p["user"], text=p.get("text", ""),
                                task_sender=self.sender_for_thread(p["channel"], p.get("thread_ts") or ""))
         conn = self.conn_ro()
@@ -254,16 +281,37 @@ class MemoryService:
         finally:
             if conn is not None:
                 conn.close()
+        if not minted.observations:
+            return minted.reply
+        stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        self.store.set_owner_check(ctx.cause, True, passes.MINTED_IN_PROCESS)
         for o in minted.observations:
             ledger_append(self.vault, o)
-        if minted.observations:
-            # The harness itself saw this message from this author: verified
-            # now, and re-checked against Slack like any other line in a day.
-            self.store.set_owner_check(ctx.cause, True, passes.MINTED_IN_PROCESS)
-            stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
-            for o in minted.observations:
-                self.store.memory_set(f"checked:{o.ulid}", stamp)
+            self.authority.minted.add(o.ulid)
+            self.store.memory_set(f"checked:{o.ulid}", stamp)
+        try:
+            self.apply_now({o.ulid for o in minted.observations})
+        except passes.Busy:
+            log.info("owner command recorded; a pass holds the lock, it applies on the next one")
+        except Exception:
+            log.exception("owner command recorded but not applied yet; the next pass will")
         return minted.reply
+
+    def apply_now(self, ulids: set[str]) -> None:
+        """Zero-lag for owner ops: index the lines and apply them under the
+        lock, then rebuild so the projection and triage see the result."""
+        svc = self.services()
+        with passes.memory_lock(self.cfg.memory_lock_path):
+            conn = passes.open_conn(svc)
+            try:
+                trust = svc.trust()
+                for rec in passes.L.iter_observations(self.vault):
+                    if not isinstance(rec, passes.L.Rejected) and rec.ulid in ulids:
+                        ix.insert_observation(conn, rec, ix.tier_for_obs(rec, trust))
+                passes._apply_ops(svc, conn, passes.HourlyReport(), self.today(), only=ulids)
+                ix.rebuild(self.vault, conn, trust, self.today())
+            finally:
+                conn.close()
 
     # --- passes ---
 
@@ -280,7 +328,9 @@ class MemoryService:
 
     async def run_nightly(self, run_model, workspace: Path | None) -> passes.NightlyReport:
         """Prepare and apply in worker threads under the lock; the model
-        calls in between hold nothing, so hourly ticks are never starved."""
+        calls in between hold nothing, so hourly ticks are never starved.
+        Everything the model said is staged as one file before the vault is
+        touched, so a busy lock never loses paid output."""
         svc = self.services()
 
         def prepare():
@@ -302,21 +352,21 @@ class MemoryService:
             writespec_out = await run_model((passes.PROMPTS_DIR / "memory_writespec.md").read_text(),
                                             prep.writespec_prompt, passes.WRITESPECS_SCHEMA)
             calls += 1
+        payload = passes.merge_model_output(prep, distill_out, writespec_out)
+        staged = passes.stage(svc, payload) if (payload.get("resolutions") or payload.get("writespecs")) else None
 
         def apply():
-            # Paid output is staged before the lock is even attempted, so a
-            # busy lock never loses it: the next pass drains staging.
-            staged = passes.stage(svc, prep.payload) if (distill_out or prep.payload["resolutions"]) else None
             with passes.memory_lock(self.cfg.memory_lock_path):
                 conn = passes.open_conn(svc)
                 try:
-                    rep = passes.nightly_apply(svc, conn, prep, distill_out, writespec_out, workspace)
+                    rep = passes.nightly_apply(svc, conn, prep, payload, workspace)
                 finally:
                     conn.close()
-            if staged is not None and not rep.deferred:
+            if staged is not None and not rep.deferred and not rep.writespecs_deferred:
                 staged.unlink(missing_ok=True)
             return rep
 
         rep = await asyncio.to_thread(apply)
         rep.model_calls = calls
+        rep.skipped_reason = rep.skipped_reason or ("budget" if calls == 0 and (prep.ask or prep.contras) else "")
         return rep

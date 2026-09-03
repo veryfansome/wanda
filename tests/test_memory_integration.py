@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from tests.conftest import make_fake_claude, mk_obs
+from tests.conftest import make_fake_claude, mk_obs, DictTrust
 from tests.test_processor import FakeSlack
 from wanda.config import Config
 from wanda.main import Processor, conversation_seed_prompt, agent_seed_prompt, HOW_TO_REPLY
@@ -65,7 +65,7 @@ def test_triage_is_confined_and_memory_rides_in_the_user_message(tmp_path):
     n.claims.append(Claim("c1", "Closure notices.", [Edge("derived-from", "belt/ledger/2026-09-01", u)]))
     write_atomic(n.path, n.render())
     conn = ix.open_index(cfg.memory_index_path)
-    ix.rebuild(memory.vault, conn, ix.DictTrust(), "2026-09-03")
+    ix.rebuild(memory.vault, conn, DictTrust(), "2026-09-03")
     conn.close()
 
     asyncio.run(p.triage_batch(store.fetch_by_status("new")))
@@ -100,7 +100,7 @@ def test_seed_order_and_prior_answers_for_a_dm(tmp_path):
     n.claims.append(Claim("c1", "Prefers short answers."))
     write_atomic(n.path, n.render())
     conn = ix.open_index(cfg.memory_index_path)
-    ix.rebuild(memory.vault, conn, ix.DictTrust(), "2026-09-03")
+    ix.rebuild(memory.vault, conn, DictTrust(), "2026-09-03")
     conn.close()
     tid = store.create_task(None, "D5", "1.1", kind="dm")
     store.record_run(kind="agent", task_id=tid, session_id="s", started_at="2026-09-01T10:00:00+00:00", exit_code=0,
@@ -212,3 +212,25 @@ def test_workspace_settings_regenerated_even_without_memory(tmp_path):
     cfg = Config(_env_file=None, email_triage_slack_channel_id="C1", data_dir=tmp_path / "data", memory_enabled=False)
     ws = sync_workspace(cfg)
     assert "tool-log" in (ws / ".claude" / "settings.json").read_text()
+
+
+def test_owner_command_is_live_for_the_next_triage_batch(tmp_path):
+    """handle_command applies the rule now, so triage_block shows it without
+    waiting for the hourly pass."""
+    p, store, cfg, memory = make(tmp_path)
+    payload = {"kind": "command", "channel": "D5", "task_key": "3.3", "reply_thread": "3.3", "in_thread": False,
+               "user": "U_OWNER", "text": "rule priya@x.example trash", "ts": "3.3", "channel_type": "im", "thread_ts": None}
+    from wanda.events import Event
+    asyncio.run(p._handle_slack(Event("slack", "D5:3.3", payload)))
+    assert "Rule recorded" in p.slack.replies[0]
+    block = memory.triage_block([{"from_addr": "priya@x.example"}])
+    assert "trash mail from priya@x.example [rule]" in block, "the rule applies to the very next batch"
+
+
+def test_orphan_run_windows_are_closed_at_startup(tmp_path):
+    from wanda.memory.service import MemoryService
+    cfg = Config(_env_file=None, email_triage_slack_channel_id="C1", data_dir=tmp_path / "d", memory_dir=tmp_path / "d" / "m")
+    store = Store(cfg.db_path)
+    store.open_run_window("s-crashed", 7, "email")  # a window a previous daemon never closed
+    MemoryService(cfg, store)  # __init__ closes orphans
+    assert store.open_windows() == []

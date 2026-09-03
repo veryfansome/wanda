@@ -120,7 +120,8 @@ CREATE TABLE IF NOT EXISTS memory_run_windows (
   task_id    INTEGER,
   kind       TEXT NOT NULL,
   started_at TEXT NOT NULL,
-  ended_at   TEXT
+  ended_at   TEXT,
+  pgid       INTEGER
 );
 -- Digest lines waiting for the daily post.
 CREATE TABLE IF NOT EXISTS memory_digest (
@@ -155,6 +156,9 @@ MIGRATIONS = (
     # and for a DM holds a sentinel that is not a Slack timestamp.
     ("tasks", "reply_thread", "TEXT"),
     ("runs", "deliver_attempts", "INTEGER NOT NULL DEFAULT 0"),
+    # The claude subprocess's process group: the one identity a session's
+    # shell children carry that another session cannot forge.
+    ("memory_run_windows", "pgid", "INTEGER"),
 )
 
 
@@ -451,55 +455,43 @@ class Store:
 
     # --- memory: agent-run windows ---
 
-    def open_run_window(self, session_id: str, task_id: int | None, kind: str) -> None:
+    def open_run_window(self, session_id: str, task_id: int | None, kind: str, pgid: int | None = None) -> dict:
+        started = utcnow()
         self._exec(
-            "INSERT INTO memory_run_windows(session_id, task_id, kind, started_at, ended_at) VALUES(?,?,?,?,NULL) "
-            "ON CONFLICT(session_id) DO UPDATE SET started_at=excluded.started_at, ended_at=NULL, kind=excluded.kind",
-            (session_id, task_id, kind, utcnow()),
+            "INSERT INTO memory_run_windows(session_id, task_id, kind, started_at, ended_at, pgid) VALUES(?,?,?,?,NULL,?) "
+            "ON CONFLICT(session_id) DO UPDATE SET started_at=excluded.started_at, ended_at=NULL, kind=excluded.kind, pgid=excluded.pgid",
+            (session_id, task_id, kind, started, pgid),
         )
+        return {"session_id": session_id, "task_id": task_id, "kind": kind, "started_at": started, "ended_at": None, "pgid": pgid}
 
-    def close_run_window(self, session_id: str) -> None:
-        self._exec("UPDATE memory_run_windows SET ended_at=? WHERE session_id=? AND ended_at IS NULL", (utcnow(), session_id))
+    def set_run_window_pgid(self, session_id: str, pgid: int) -> None:
+        self._exec("UPDATE memory_run_windows SET pgid=? WHERE session_id=?", (pgid, session_id))
 
-    def windows_at(self, when_iso: str, slack_s: int = 300) -> list[sqlite3.Row]:
-        """Every agent run in flight at `when` (a small grace after the end,
-        since a session's last CLI call can land just after its envelope)."""
-        rows = self._query("SELECT * FROM memory_run_windows WHERE started_at <= ?", (when_iso,))
-        out = []
-        try:
-            w = datetime.fromisoformat(when_iso)
-        except (TypeError, ValueError):
-            return out
-        for r in rows:
-            try:
-                end = datetime.fromisoformat(r["ended_at"]) if r["ended_at"] else None
-            except (TypeError, ValueError):
-                end = None
-            if end is None or w <= end + timedelta(seconds=slack_s):
-                out.append(r)
-        return out
+    def close_run_window(self, session_id: str) -> str:
+        ended = utcnow()
+        self._exec("UPDATE memory_run_windows SET ended_at=? WHERE session_id=? AND ended_at IS NULL", (ended, session_id))
+        return ended
+
+    def close_orphan_windows(self) -> int:
+        """At startup: a window still open belongs to a run the previous
+        daemon never finished. Left open it would make every later line
+        look like it was written during that run."""
+        cur = self._exec("UPDATE memory_run_windows SET ended_at=? WHERE ended_at IS NULL", (utcnow(),))
+        return cur.rowcount
+
+    def all_windows(self, since_days: int = 400) -> list[dict]:
+        since = (datetime.now(timezone.utc) - timedelta(days=since_days)).isoformat(timespec="seconds")
+        return [dict(r) for r in self._query("SELECT * FROM memory_run_windows WHERE started_at >= ?", (since,))]
 
     def open_windows(self) -> list[sqlite3.Row]:
         return self._query("SELECT * FROM memory_run_windows WHERE ended_at IS NULL")
 
+    def windows_at(self, when_iso: str, slack_s: int = 300) -> list[dict]:
+        return windows_covering(self.all_windows(), when_iso, slack_s)
+
     def task_had_run_near(self, task_id: int, when_iso: str, slack_s: int = 300) -> bool:
-        """Was a run for this task in flight around `when`? Windows first;
-        the runs ledger (written at run end) as a fallback for old rows."""
-        if any(r["task_id"] == task_id for r in self.windows_at(when_iso, slack_s)):
-            return True
-        rows = self._query(
-            "SELECT started_at, ended_at FROM runs WHERE task_id=? AND started_at <= ? ORDER BY id DESC LIMIT 5",
-            (task_id, when_iso),
-        )
-        for r in rows:
-            try:
-                end = datetime.fromisoformat(r["ended_at"]) if r["ended_at"] else None
-                w = datetime.fromisoformat(when_iso)
-            except (TypeError, ValueError):
-                continue
-            if end is None or w <= end + timedelta(seconds=slack_s):
-                return True
-        return False
+        return any(r["task_id"] == task_id for r in self.windows_at(when_iso, slack_s))
+
 
     def set_task_session(self, task_id: int, session_id: str) -> None:
         self._exec(
@@ -715,3 +707,25 @@ class Store:
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (key, value),
         )
+
+
+
+def windows_covering(windows: list[dict], when_iso: str, slack_s: int = 300) -> list[dict]:
+    """The agent runs in flight at `when`. Ledger times are minute-truncated,
+    so both ends are compared at minute precision, with a small grace after
+    the end (a session's last CLI call can land just after its envelope)."""
+    try:
+        w = datetime.fromisoformat(when_iso).replace(second=0, microsecond=0)
+    except (TypeError, ValueError):
+        return []
+    out = []
+    for r in windows:
+        try:
+            start = datetime.fromisoformat(r["started_at"]).replace(second=0, microsecond=0)
+            end = datetime.fromisoformat(r["ended_at"]) if r["ended_at"] else None
+        except (TypeError, ValueError):
+            continue
+        if start <= w and (end is None or w <= (end + timedelta(seconds=slack_s)).replace(second=0, microsecond=0)):
+            out.append(r)
+    return out
+

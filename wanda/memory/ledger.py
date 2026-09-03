@@ -23,11 +23,12 @@ from wanda.memory.vault import (
 # index derives it from what the harness can verify (Slack authorship for
 # `owner`, the task's kind for `agent`); see index.tier_for_obs.
 SOURCES = ("triage", "agent", "owner", "harness", "import")
-OPS = ("", "retract", "attest", "rule", "veto", "pin", "retire", "unretire", "open")
-# Provenance tiers, least to most trusted.
-TIERS = ("email", "session", "owner")
+OPS = ("", "attest", "rule", "veto", "pin", "retire", "unretire", "open")
 
-_FIELD_KEYS = ("src", "op", "cause", "due", "until", "tier", "ref")
+# `pg` is the writer's process group: the claude subprocess the harness
+# started is its own group leader, so every shell child of a session carries
+# its pid as pgid — and a session cannot join another session's group.
+_FIELD_KEYS = ("src", "op", "cause", "due", "until", "tier", "ref", "pg")
 _SUBJECT_RE = r"[a-z]+/[a-z0-9][a-z0-9._+@-]*"
 LINE_RE = re.compile(
     r"^- (?P<hm>\d{2}:\d{2})Z `(?P<subject>" + _SUBJECT_RE + r")` `(?P<facet>[a-z0-9-]{0,32})`"
@@ -46,6 +47,7 @@ class Observation:
     due: str = ""
     until: str = ""
     ref: str = ""            # for attest/veto/pin: the claim or key it addresses
+    pg: str = ""             # writer's process group, when written from a shell
     ulid: str = field(default_factory=new_ulid)
     when: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     # Filled by the parser:
@@ -74,6 +76,8 @@ def format_line(o: Observation) -> str:
         fields.append(f"until={o.until}")
     if o.ref:
         fields.append(f"ref={quote(o.ref, safe=':/|,@#^.-_=+')}")
+    if o.pg:
+        fields.append(f"pg={o.pg}")
     text = clean_text(o.text)
     line = f"- {o.when.strftime('%H:%M')}Z `{o.subject}` `{o.facet}` {' '.join(fields)} — {text} ^{o.ulid}"
     if len(line.encode()) > LEDGER_LINE_CAP_B:
@@ -116,7 +120,7 @@ def obs_from(m, fields, when, day, path, lineno) -> Observation:
     return Observation(
         subject=m.group("subject"), facet=m.group("facet"), text=m.group("text"),
         src=fields.get("src", ""), op=fields.get("op", ""), cause=fields.get("cause", ""),
-        due=fields.get("due", ""), until=fields.get("until", ""), ref=fields.get("ref", ""),
+        due=fields.get("due", ""), until=fields.get("until", ""), ref=fields.get("ref", ""), pg=fields.get("pg", ""),
         ulid=m.group("ulid"), when=when, day=day or when.strftime("%Y-%m-%d"), path=path, lineno=lineno,
     )
 

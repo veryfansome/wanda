@@ -22,6 +22,10 @@ END = "<!-- wanda:end claims -->"
 INDEX_BEGIN = "<!-- wanda:begin index -->"
 INDEX_END = "<!-- wanda:end index -->"
 
+# Promotion thresholds, shared by the index (status) and the passes (graduation).
+GRADUATE_CAUSES = 3
+GRADUATE_DAYS = 2
+
 # Caps, in bytes. Enforced by generators, never requested of writers.
 PROJECTION_CAP_B = 4096
 WALK_CAP_B = 3000
@@ -35,6 +39,11 @@ LEDGER_LINE_CAP_B = 1024
 @dataclass
 class Vault:
     root: Path
+
+    def __post_init__(self):
+        # A symlinked vault (say, into an iCloud-synced Obsidian folder) must
+        # yield the same paths from `inside()` and from `rel()`.
+        self.root = Path(self.root).expanduser().resolve() if Path(self.root).expanduser().exists() else Path(self.root).expanduser()
 
     @property
     def ledger_dir(self) -> Path:
@@ -108,8 +117,8 @@ class Vault:
 # --- text hygiene -----------------------------------------------------------
 
 _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
-LIVE_STATUSES = ("owner-stated", "corroborated", "provisional", "disputed")
 LIVE_SQL = "('owner-stated','corroborated','provisional','disputed')"
+OBS_OPS_SQL = "('', 'rule', 'attest')"  # ledger lines that carry content, as opposed to bookkeeping ops
 
 
 def clean_text(text: str, cap_b: int = CLAIM_TEXT_CAP_B) -> str:
@@ -132,11 +141,12 @@ def clean_text(text: str, cap_b: int = CLAIM_TEXT_CAP_B) -> str:
 
 def clean_prose(text: str, cap_b: int = 4000) -> str:
     """For multi-line prose wanda writes into a write-spec: control characters
-    and tag/marker forms out, markdown structure (bullets, headings) kept."""
+    and tag/marker forms out; markdown structure, wikilinks and inline fields
+    kept (write-spec prose is never parsed as claims, and the projection
+    renders links as paths)."""
     t = unicodedata.normalize("NFC", text or "").replace("\r\n", "\n").replace("\r", "\n")
     t = _CONTROL.sub(" ", t)
     t = t.replace("<!--", "‹!--").replace("-->", "--›").replace("<", "‹").replace(">", "›")
-    t = t.replace("[[", "[").replace("]]", "]").replace("::", ":")
     lines = [" ".join(ln.split()) for ln in t.split("\n")]
     out = "\n".join(lines).strip()
     out = re.sub(r"\n{3,}", "\n\n", out)
@@ -342,8 +352,8 @@ def _unquote(s: str) -> str:
 
 
 def _scalar(v: str) -> Any:
-    if v in ("true", "false"):
-        return v == "true"
+    if v.lower() in ("true", "false", "yes", "no"):
+        return v.lower() in ("true", "yes")
     if re.fullmatch(r"-?\d+", v):
         return int(v)
     return _unquote(v)

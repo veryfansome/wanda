@@ -1,7 +1,7 @@
 """Owner commands: parsing, minting, refusal, and the message→line check."""
 from types import SimpleNamespace
 
-from tests.conftest import mk_obs
+from tests.conftest import mk_obs, DictTrust
 from wanda.memory import commands as C
 from wanda.memory import index as ix
 from wanda.memory.ledger import append
@@ -31,7 +31,7 @@ def test_parse_command():
 def test_rule_forms(tmp_path, vault):
     store = Store(tmp_path / "w.db")
     conn = ix.open_index(tmp_path / "memory.idx")
-    ix.rebuild(vault, conn, ix.DictTrust(), TODAY)
+    ix.rebuild(vault, conn, DictTrust(), TODAY)
     owners = ["U_OWNER"]
     m = C.handle(ctx("rule Priya.Nash@Example.org trash stale list"), conn, store, owners)
     o = m.observations[0]
@@ -54,7 +54,7 @@ def test_rule_forms(tmp_path, vault):
 def test_refusals(tmp_path, vault):
     store = Store(tmp_path / "w.db")
     conn = ix.open_index(tmp_path / "memory.idx")
-    ix.rebuild(vault, conn, ix.DictTrust(), TODAY)
+    ix.rebuild(vault, conn, DictTrust(), TODAY)
     assert not C.handle(ctx("rule x@y.example trash"), conn, store, []).ok
     assert "Only the configured owners" in C.handle(ctx("rule x@y.example trash", user="U_KID"), conn, store, ["U_OWNER"]).reply
     # Prose that merely starts with a verb word is not a command at all.
@@ -76,7 +76,7 @@ def test_attest_pin_forget_reference_claims(tmp_path, vault):
     write_atomic(n.path, n.render())
     store = Store(tmp_path / "w.db")
     conn = ix.open_index(tmp_path / "memory.idx")
-    ix.rebuild(vault, conn, ix.DictTrust(), TODAY)
+    ix.rebuild(vault, conn, DictTrust(), TODAY)
     m = C.handle(ctx("attest people/x@y.example#c1"), conn, store, ["U_OWNER"])
     assert m.observations[0].op == "attest" and m.observations[0].ref == "people/x@y.example.md#^c1"
     m = C.handle(ctx("pin people/x@y.example.md#^c1"), conn, store, ["U_OWNER"])
@@ -90,7 +90,7 @@ def test_attest_pin_forget_reference_claims(tmp_path, vault):
 def test_expected_for_message_recomputes_what_a_message_may_have_minted(tmp_path, vault):
     store = Store(tmp_path / "w.db")
     conn = ix.open_index(tmp_path / "memory.idx")
-    ix.rebuild(vault, conn, ix.DictTrust(), TODAY)
+    ix.rebuild(vault, conn, DictTrust(), TODAY)
     allowed = C.expected_for_message("rule priya@x.example trash", conn, store)
     assert allowed == [("rule", "person/priya@x.example", "mail-disposition", "trash mail from priya@x.example")]
     assert C.expected_for_message("hi wanda how are you", conn, store) == []
