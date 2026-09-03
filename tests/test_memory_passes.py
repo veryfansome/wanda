@@ -721,3 +721,23 @@ def test_cli_without_authority_never_grants_owner_tier(svc):
     row = conn.execute("SELECT tier FROM obs WHERE ulid=?", (forged.ulid,)).fetchone()
     assert row["tier"] != "owner", "no authority ⇒ never owner, whatever the database says"
     assert ix.standing_rules(conn) == []
+
+
+def test_drift_pin_does_not_relabel_a_hand_claims_tier(svc):
+    """HIGH-1 (daemon half): pinning a hand-written claim must not bump the
+    note's mtime, or a claim written during an email window would flip from
+    email to session when the idle hourly pass rewrites it."""
+    import os as _os
+    note = new_note(svc.vault.root / "people" / "p.md", "person", "P")
+    note.claims.append(Claim("c1", "typed by someone"))
+    write_atomic(note.path, note.render())
+    # Pretend it was written while an email task ran (mtime inside the window).
+    when = datetime(2026, 9, 1, 10, 0, tzinfo=timezone.utc)
+    _os.utime(note.path, (when.timestamp(), when.timestamp()))
+    svc.authority.windows = [{"session_id": "em", "task_id": 9, "kind": "email",
+                              "started_at": "2026-09-01T09:59:00+00:00", "ended_at": "2026-09-01T10:01:00+00:00"}]
+    conn = conn_for(svc)
+    P.hourly(svc, conn)  # drift pins c1 as owner-edited and rewrites the note
+    assert abs(_os.stat(note.path).st_mtime - when.timestamp()) < 2, "the pin preserved the owner's save time"
+    tier = conn.execute("SELECT tier FROM claims WHERE block='c1'").fetchone()["tier"]
+    assert tier == "email", "a hand claim written during an email window stays email after the pin"

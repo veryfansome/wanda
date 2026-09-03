@@ -580,7 +580,11 @@ def _detect_drift(svc: Services, rep: HourlyReport, today: str) -> None:
                     rep.conflicts.append(f"{rel}#^{block}")
         if changed or any(c.minted for c in note.claims):
             snap = Snapshot.take(path)
+            mtime_ns = snap.mtime_ns  # the owner's save time; pinning must not relabel a hand claim's tier
             if write_if_unchanged(snap, note.render()):
+                import os as _os
+                with contextlib.suppress(OSError):
+                    _os.utime(path, ns=(mtime_ns, mtime_ns))  # a pin is not a new write
                 svc.touched.add(rel)
                 store.memory_set(f"filesha:{rel}", sha_file(path))
                 current = {c.block: c.sha for c in note.claims}
