@@ -53,7 +53,7 @@ OPEN_LAPSE_DAYS = 7
 JACCARD_COVERED = 0.6
 CONTRADICTION_MAX_JACCARD = 0.5
 CONTRADICTION_MIN_SHARED = 2
-CLAIM_TEXT_CAP = 240           # bytes where clean_text applies it (:1242); characters as RESOLUTION_SCHEMA's maxLength (:94)
+CLAIM_TEXT_CAP = 240           # bytes where clean_text applies it (_apply_one); characters as RESOLUTION_SCHEMA's maxLength
 RESOLUTION_MODES = ("support", "append", "supersede", "contradict")   # the schema's enum and the apply-side guard, one list
 APPEND_MIN_CONFIDENCE = 0.4
 NIGHTLY_MAX_CANDIDATES = 15
@@ -75,6 +75,10 @@ OWNER_OPS = ("rule", "attest", "pin", "retire", "unretire")
 LINE_MISMATCH = "line does not match the message"
 CANNOT_CHECK = "cannot check"
 CLAIM_REWORDED = f"{CANNOT_CHECK}: the claim reads differently now"
+# The message parses to no line at all under the grammar wanda accepts now.
+# That is not evidence of a stowaway — a withdrawn command form reads exactly
+# the same way — so it never quarantines; it asks the owner to re-state.
+NO_CANDIDATES = f"{CANNOT_CHECK}: that message no longer names a rule wanda can mint"
 AUTHORITY_HELD = "authority held in memory"
 # Ops whose expected text is read out of claims.text, so a text-only mismatch
 # may be a legitimate rewording. Every other op's text is harness-built from
@@ -141,7 +145,7 @@ class Authority:
 
     Mutated without a lock, and only in these shapes: one dict-item
     assignment per minted line, from the worker thread handling an owner
-    command (service.py:324), and `windows` rebound — never edited in
+    command (MemoryService.handle_command), and `windows` rebound — never edited in
     place — from the event loop. Readers do single lookups (holds/wrote) or
     iterate a list that is replaced rather than mutated. A compound update
     added here would need a lock."""
@@ -165,10 +169,10 @@ class Services:
     # cause, line-json -> (ok, detail). Fetches the Slack message and checks author and text.
     verify_owner: Callable[[str, str], tuple[bool, str]] | None = None
     # UTC, because every date the vault persists is UTC: ledger day names
-    # (ledger.py:48, :56), `until`, `check_by`/`due` and the `owner-edited`
+    # (Observation.day), `until`, `check_by`/`due` and the `owner-edited`
     # stamps. Horizons therefore compare like with like. The local clock
     # appears only where a human reads a date — the nightly schedule
-    # (main.py:912-916) and the digest's date and thread key (digest.py:32) —
+    # (Processor._nightly_due) and the digest's date and thread key (digest.digest_key) —
     # so more than 3.5 h east of UTC the 03:30 nightly runs with yesterday's
     # UTC date, shifting due_soon, `until` expiry and open-item lapsing by a day.
     today: Callable[[], str] = lambda: datetime.now(timezone.utc).date().isoformat()
@@ -539,6 +543,15 @@ def _verify_owner_lines(svc: Services, rep: HourlyReport) -> None:
             # they attested has changed under them.
             log.warning("owner verification could not run for %s: %s", rec.cause, detail)
             store.memory_set(f"recheck:{rec.ulid}", now.isoformat(timespec="seconds"))
+            if detail == NO_CANDIDATES and not store.memory_get(f"obsolete:{rec.ulid}"):
+                # Once per line. The recheck cooldown above already bounds
+                # this to a daily cadence; without it the owner would be told
+                # again every day, forever, about a line only they can fix.
+                store.memory_set(f"obsolete:{rec.ulid}", now.isoformat(timespec="seconds"))
+                m = ix.DISPOSITION_RE.match(rec.text)
+                how = f"`rule {m.group(2)} {m.group(1)}`" if m else "`rule <address> trash|ignore|attention`"
+                store.digest_add("verify", f"your rule \u201c{rec.text[:80]}\u201d was given in a form wanda no longer accepts; "
+                                           f"re-state it as {how} and it becomes your word again ({rec.path}:{rec.lineno})")
             continue
         rep.unverified += 1
         if auth is not None:
@@ -582,10 +595,13 @@ def make_owner_verifier(fetch_message: Callable[[str, str], dict | None], owner_
     the Slack message dict, None when Slack says the message is not there,
     and raises when the lookup itself failed. A line checks out when the
     message exists, its author is an owner, and the line matches — field for
-    field — one of the lines that message could have minted. Three outcomes:
-    ok; LINE_MISMATCH, which says this line did not come from this message;
-    and a CANNOT_CHECK verdict, which says the recomputation could not be
-    done and accuses nobody."""
+    field — one of the lines that message could have minted. Outcomes: ok;
+    LINE_MISMATCH, the only durable one, which says this line did not come
+    from this message; any CANNOT_CHECK verdict, including NO_CANDIDATES for
+    a message that mints nothing under today's grammar, which says the
+    recomputation could not be done and accuses nobody; and a plain failure
+    detail (a missing message, a non-owner author) which leaves the line
+    unverified and retried."""
     fetched: dict[tuple[str, str], dict | None] = {}
 
     def verify(cause: str, line_json: str) -> tuple[bool, str]:
@@ -611,6 +627,12 @@ def make_owner_verifier(fetch_message: Callable[[str, str], dict | None], owner_
             with contextlib.suppress(Exception):
                 if conn is not None:
                     conn.close()
+        if not allowed:
+            # No candidate to compare against, so nothing was shown either
+            # way. A line minted by a command form since withdrawn lands
+            # here, and calling that a forgery would retire the owner's own
+            # rule and accuse them of planting it.
+            return False, NO_CANDIDATES
         drifted = False
         for op, subj, facet, text, ref in allowed:
             if op != line["op"]:

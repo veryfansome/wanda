@@ -99,7 +99,7 @@ def parse_command(text: str) -> Parsed | None:
         if OFFER_RE.match(args[0]) and len(args) == 1:
             return Parsed(verb, [args[0].lower()])
         if args[0].lower() in ACTIONS:
-            return Parsed(verb, args)  # `rule trash` inside an email thread
+            return Parsed(verb, args)  # parsed so `handle` can say a rule must name its target
         if len(args) >= 2 and target_like(args[0]):
             return Parsed(verb, args)
         return None

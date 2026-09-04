@@ -161,7 +161,7 @@ def test_pin_verb(env, monkeypatch, capsys):
 # --- wave 6: what a session may not do, and what the operator is told ------------------------------------
 
 def test_a_stale_run_window_is_visible_in_status(env, capsys):
-    """The one surface that shows what _in_session refuses five verbs on."""
+    """The one surface that shows what _in_session refuses four verbs on."""
     cfg, store, svc = env
     store.open_run_window("s-crashed", 7, "email")
     assert run(cfg, verb="status") == 0

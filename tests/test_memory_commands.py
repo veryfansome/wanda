@@ -25,7 +25,7 @@ def test_parse_command():
     assert C.parse_command("rule <mailto:a@b.example|a@b.example> ignore").args[0].startswith("<mailto:")
     assert C.parse_command("ruler of the world") is None
     assert C.parse_command("hi wanda, rule this") is None
-    assert C.parse_command("rule trash").args == ["trash"], "email-thread shorthand parses; handle() needs a sender"
+    assert C.parse_command("rule trash").args == ["trash"], "parses, so handle() can say a rule must name its target"
     assert C.is_command("attest people/x#c1")
     assert not C.is_command("attest people/../../etc/passwd#c1")
 

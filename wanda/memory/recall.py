@@ -30,6 +30,7 @@ FENCE_UNVERIFIED = "<memory trust=\"unverified\">\n"
 FENCE_CLOSE = "</memory>\n"
 MAX_TRIAGE_ADDRS = 200
 MAX_TRIAGE_RULES = 8
+TITLE_CAP_B = 60          # a note title is owner- or session-written and otherwise uncapped
 
 log = logging.getLogger(__name__)
 
@@ -111,8 +112,8 @@ def walk(vault: Vault, conn: sqlite3.Connection | None, note_paths: list[str], c
         title = conn.execute("SELECT title FROM docs WHERE path=?", (rel,)).fetchone()
         if not rows and not title:
             continue
-        if not b.add(f"[{rel}] {title['title'] if title else ''}\n"):
-            return b.text()  # a claim under the previous note's header would be misattributed
+        if not b.add(f"[{rel}] {truncate_bytes(title['title'], TITLE_CAP_B) if title else ''}\n"):
+            continue  # this note contributes nothing; a later, shorter one still can
         for r in rows:
             if not b.add(f"- {TIER_TAG.get(r['tier'], '')} {truncate_bytes(r['text'], 300)}\n"):
                 break
@@ -239,7 +240,7 @@ def for_triage(conn: sqlite3.Connection | None, rows, stats: StatsFn | None, exp
                 continue
             seen_addrs.add(a)
             if len(addrs) >= MAX_TRIAGE_ADDRS:
-                extra += 1    # a From header carries up to ~87 addresses (512 B at ingest) and
+                extra += 1    # a 512 B From header carries up to 128 addresses at ingest and
                 continue      # each costs a full `messages` scan in stats(); counted as not shown
             addrs.append(a)
     domains = {a: registrable_domain(a.rsplit("@", 1)[-1]) for a in addrs}

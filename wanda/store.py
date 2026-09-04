@@ -676,7 +676,7 @@ class Store:
         does not mirror triage.addresses_in's regex fallback, which would let
         exactly those attacker-shaped headers pool under any address they
         name. Callers pass one argument (recall.StatsFn); the window is
-        make_offers' (passes.py:1587)."""
+        make_offers'."""
         addr = addr.lower()
         window = " AND created_at >= ?" if since_iso else ""
         params = (addr, since_iso) if since_iso else (addr,)

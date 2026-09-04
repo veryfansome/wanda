@@ -500,6 +500,37 @@ def test_offers_aggregate_one_address_across_display_names(svc):
     assert P.make_offers(svc, conn, TODAY) == 1
 
 
+def test_a_rule_minted_by_a_withdrawn_form_is_not_called_a_forgery(svc):
+    """A rule the owner really gave, in a command form later withdrawn, has a
+    genuine cause whose message now recomputes to nothing. That is a grammar
+    change, not a stowaway, so it must not take LINE_MISMATCH's terminal
+    quarantine — which would retire the owner's own rule, accuse them of
+    planting it, and leave no way back."""
+    o = Observation(subject="org/sunnybrook.example", facet="mail-disposition", src="owner", op="rule",
+                    cause="slack:D1:9.9", text="trash mail from noreply@sunnybrook.example",
+                    when=datetime(2026, 9, 3, 10, tzinfo=timezone.utc))
+    append(svc.vault, o)
+    svc.store.set_owner_check("slack:D1:9.9", True, P.MINTED_IN_PROCESS)
+    svc.store.memory_set(f"checked:{o.ulid}", "2026-09-03T00:00:00+00:00")
+    # The message is real and the owner wrote it; it just mints nothing now.
+    svc.verify_owner = lambda cause, line: (False, P.NO_CANDIDATES)
+    rep = P.HourlyReport()
+    P._verify_owner_lines(svc, rep)
+    assert not svc.store.memory_get(f"quarantine:{o.ulid}"), "a withdrawn form is not a forgery"
+    assert svc.store.memory_get(f"checked:{o.ulid}") != "0", "and is not terminally skipped"
+    assert rep.unverified == 0, "nobody is accused"
+    told = [d["text"] for d in svc.store.digest_pending()]
+    assert any("no longer accepts" in d and "rule noreply@sunnybrook.example trash" in d for d in told), \
+        "the owner is told how to re-state it, naming the address from the line's own text"
+    # The advice is given once per line, not once per re-check. An immediate
+    # second pass is skipped by the recheck cooldown, so expire it first —
+    # otherwise this asserts nothing.
+    svc.store.memory_set(f"recheck:{o.ulid}", "2026-08-01T00:00:00+00:00")
+    P._verify_owner_lines(svc, P.HourlyReport())
+    assert sum("no longer accepts" in d["text"] for d in svc.store.digest_pending()) == 1, \
+        "a line only the owner can fix must not be re-reported every day"
+
+
 def test_owner_authority_lives_in_memory_not_the_database(svc):
     """A forged verification marker in wanda.db grants nothing: only a daemon
     that minted or fetched-and-verified the line holds its authority."""

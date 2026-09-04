@@ -373,6 +373,23 @@ def test_for_triage_tags_a_curated_note_noted_when_its_claims_expired(vault, tmp
     assert "B Person [noted]" in out
 
 
+def test_one_long_title_does_not_delete_the_notes_behind_it(vault, tmp_path):
+    """A note title is owner- or session-written and was the only text in the
+    walk that was not capped, so one long `# ` heading could consume the whole
+    budget and make every note after it vanish from the agent seed."""
+    note(vault, "person", "a", "T" * 600, [Claim("c1", "A claim.")])
+    note(vault, "person", "b", "BBBB", [Claim("c1", "Ok.")])
+    conn = build(vault, tmp_path)
+    # Generous budget: the long title is truncated rather than swallowing it.
+    text = recall.walk(vault, conn, ["people/a.md", "people/b.md"], cap_b=400, include_root=False)
+    assert "T" * 600 not in text and "T" * 60 in text, "the title is capped, not dropped"
+    assert "[people/b.md]" in text and "Ok." in text, "the note behind it survives"
+    # Tight budget: a's header cannot fit even capped, and b still gets in.
+    tight = recall.walk(vault, conn, ["people/a.md", "people/b.md"], cap_b=40, include_root=False)
+    assert "[people/a.md]" not in tight, "this is the case under test"
+    assert "[people/b.md]" in tight and "Ok." in tight, "a note that does not fit skips itself, not the rest"
+
+
 def test_walk_never_puts_a_claim_under_another_notes_header(vault, tmp_path):
     note(vault, "person", "a", "AAAA", [Claim("c1", "A claim of thirty bytes ok.")])
     note(vault, "person", "b", "BBBB", [Claim("c1", "Ok.")])

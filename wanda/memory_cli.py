@@ -388,7 +388,7 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
             print(f"export:  {cfg.memory_export_dir}")
             print(f"hourly:  {store.memory_get('hourly_at') or 'never'}")
             print(f"nightly: {store.memory_get('nightly_date') or 'never'}")
-            print(f"open windows: {len(store.open_windows())}")  # what _in_session refuses five verbs on
+            print(f"open windows: {len(store.open_windows())}")  # what _in_session refuses reindex, hourly, unretire and retire --to on
             conn = _conn(cfg)
             if conn is not None:
                 for t in ("docs", "claims", "obs", "subjects", "vetoes"):
