@@ -9,7 +9,6 @@ import os
 import re
 import sys
 from datetime import date, datetime, timezone
-from pathlib import Path
 
 from wanda.config import Config
 from wanda.memory import commands, index as ix, passes, recall
@@ -62,8 +61,6 @@ def add_parser(sub: argparse._SubParsersAction) -> None:
     verbs.add_parser("reindex", help="rebuild the derived index from the vault")
     verbs.add_parser("fsck", help="dangling links, duplicate ids, oversize notes, stray temps")
     verbs.add_parser("hourly", help="run the hourly pass now")
-    v = verbs.add_parser("import-cowork", help="one-time import of a .cowork-style vault (not while a session is running)")
-    v.add_argument("dir", help="the old vault directory")
     v = verbs.add_parser("digest", help="show pending digest lines")
     v.add_argument("--all", action="store_true", help="include lines already posted")
     verbs.add_parser("status", help="paths, counts, last passes")
@@ -305,7 +302,7 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
         print(f"forgotten on the next pass: {row['text']}")
         return 0
 
-    if verb in ("retire", "unretire", "reindex", "fsck", "hourly", "import-cowork", "digest", "status"):
+    if verb in ("retire", "unretire", "reindex", "fsck", "hourly", "digest", "status"):
         store = _store(cfg)
         svc = passes.Services(cfg, store, vault)
         if verb == "retire":
@@ -377,16 +374,6 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
             print("(a hand-run pass holds no owner authority: owner-tier lines are neither verified nor applied. A "
                   "running daemon with WANDA_MEMORY_OWNER_USER_IDS set repairs this on its next hourly pass, within "
                   "the hour.)", file=sys.stderr)
-            return 0
-        if verb == "import-cowork":
-            if _in_session(store):
-                sys.exit("import is for the owner at a terminal, not while a session is running")
-            try:
-                with passes.memory_lock(cfg.memory_lock_path):
-                    rep = passes.import_cowork(svc, Path(args.dir).expanduser())
-            except passes.Busy:
-                sys.exit("a memory pass is running; try again in a minute")
-            print(json.dumps(rep, indent=1))
             return 0
         if verb == "digest":
             rows = store._query("SELECT * FROM memory_digest ORDER BY id DESC LIMIT 100") if args.all else store.digest_pending()

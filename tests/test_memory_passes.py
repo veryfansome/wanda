@@ -330,45 +330,6 @@ def test_owner_verifier_checks_author_and_content(svc):
     assert verify("slack:D1:9.9", good)[0] is False
 
 
-def test_import_cowork(svc, tmp_path):
-    src = tmp_path / "cowork"
-    (src / "people").mkdir(parents=True)
-    (src / "journal").mkdir()
-    (src / "daily-inbox-sweep").mkdir()
-    (src / "documents").mkdir()
-    (src / "people" / "CLAUDE.md").write_text("# People\n\n## People\n- [Priya Nash](priya_nash.md) - school security lead; auto-trash his email\n- [Alex Romero](alex_romero.md) - The user\n")
-    (src / "people" / "priya_nash.md").write_text("# Priya Nash context\n\n# Facts\n- Email: priya@school.example\n- Community:\n  - School — security team lead\n- Notes:\n  - **Auto-trash all email from Priya Nash** during the sweep.\n")
-    (src / "people" / "alex_romero.md").write_text("# Alex Romero context\n\n# Facts\n- Born: June 30, 1987\n")
-    (src / "journal" / "2026-08-26-election.md").write_text("# 2026-08-26 — Board election\n\n- Statements due **Sept 15**.\n- People: [Priya Nash](../people/priya_nash.md)\n- Follow-up: Watch for the ballot.\n\n## Updates\n- 2026-08-29 — Alex sent his statement.\n")
-    (src / "daily-inbox-sweep" / "CLAUDE.md").write_text("# Sweep\n\n## Extra auto-trash categories (confirmed by Alex)\n- Trash anything from this school.\n")
-    (src / "journal" / "food-symptom-diary.md").write_text("private")
-    (src / "documents" / "x.md").write_text("doc")
-    rep = P.import_cowork(svc, src)
-    assert rep["people"] == 2 and rep["topics"] == 1 and rep["prefs"] >= 1
-    assert any("diary" in s for s in rep["skipped"]) and any("documents" in s for s in rep["skipped"])
-    priya = parse_note(svc.vault.root / "people" / "priya-nash.md")
-    assert priya.meta["ids"] == ["mailto:priya@school.example"]
-    assert any("security team lead" in c.text for c in priya.claims) and all(c.value("tier") == "session" for c in priya.claims)
-    alex = parse_note(svc.vault.root / "people" / "alex-romero.md")
-    assert alex.meta.get("export") is False
-    topic = parse_note(svc.vault.root / "topics" / "election.md")
-    assert any(c.text == "Statements due Sept 15." for c in topic.claims), "emphasis stripped"
-    assert topic.claims[0].targets("about") == [("people/priya-nash", "")]
-    assert [c.text for c in topic.claims if c.text.startswith("2026-08-29")] == ["2026-08-29: Alex sent his statement."], "one line per update"
-    assert list((svc.vault.root / "open").glob("*-election.md"))
-    prefs = parse_note(svc.vault.root / "prefs" / "mail-dispositions.md")
-    assert prefs.claims and all(c.value("tier") == "session" for c in prefs.claims), "imported dispositions are provisional"
-    assert not any("Extra auto-trash categories" in c.text for c in prefs.claims), "a heading is not a rule"
-    assert all(c.text and not c.text.startswith(("#", "-")) for c in prefs.claims)
-    offers = [r for r in svc.store.digest_pending() if r["kind"] == "offer"]
-    assert offers, "each disposition is offered as a rule"
-    conn = conn_for(svc)
-    ix.rebuild(svc.vault, conn, P.StoreTrust(svc.store), TODAY)
-    assert ix.standing_rules(conn) == [], "nothing imported can decide what happens to mail"
-    again = P.import_cowork(svc, src)
-    assert again["people"] == 0 and again["already"] >= 3
-
-
 def test_recently_edited_notes_are_skipped_and_ops_retry(svc, monkeypatch):
     """The Obsidian race: a note modified moments ago is left alone; the op
     that wanted it stays pending (not marked applied) and lands next pass."""
@@ -539,18 +500,6 @@ def test_offers_aggregate_one_address_across_display_names(svc):
     assert P.make_offers(svc, conn, TODAY) == 1
 
 
-def test_import_handles_two_people_with_one_slug(svc, tmp_path):
-    src = tmp_path / "cowork"
-    (src / "people").mkdir(parents=True)
-    (src / "people" / "CLAUDE.md").write_text("## People\n- [Sam Lee](sam_lee.md) - neighbour\n- [Sam Lee](sam_lee_2.md) - dentist\n")
-    (src / "people" / "sam_lee.md").write_text("# Sam Lee context\n\n# Facts\n- Residence: Fremont\n")
-    (src / "people" / "sam_lee_2.md").write_text("# Sam Lee context\n\n# Facts\n- Work:\n  - Title: dentist\n")
-    rep = P.import_cowork(svc, src)
-    assert rep["people"] == 2
-    files = sorted(p.name for p in (svc.vault.root / "people").glob("sam-lee*.md"))
-    assert len(files) == 2
-
-
 def test_owner_authority_lives_in_memory_not_the_database(svc):
     """A forged verification marker in wanda.db grants nothing: only a daemon
     that minted or fetched-and-verified the line holds its authority."""
@@ -600,24 +549,29 @@ def test_email_tier_candidate_cannot_dispute_the_owners_rule(svc):
     assert conn.execute("SELECT status FROM claims WHERE doc=? AND block=?", (doc, block)).fetchone()["status"] == "owner-stated"
 
 
-def test_owner_import_note_is_held_out_of_the_export(svc, tmp_path):
-    src = tmp_path / "cowork"
-    (src / "people").mkdir(parents=True)
-    (src / "CLAUDE.md").write_text("## People\n- [Alex Romero](people/alex_romero.md) - The user\n")
-    (src / "people" / "CLAUDE.md").write_text("## People\n- [Robin Vale](robin_vale.md) - HOA secretary\n")
-    (src / "people" / "alex_romero.md").write_text("# Alex Romero context\n\n# Facts\n- Born: June 30, 1987\n")
-    (src / "people" / "robin_vale.md").write_text("# Robin context\n\n# Facts\n- Work:\n  - Title: broker\n")
-    P.import_cowork(svc, src)
-    alex = parse_note(svc.vault.root / "people" / "alex-romero.md")
-    assert alex.meta.get("export") is False
+def test_a_note_marked_private_is_held_out_of_the_export(svc):
+    """`export: false` keeps a note out of the extract the untrusted-mail
+    classifier reads, and out of the belt subject files beside it."""
+    for slug, title, private in (("alex-romero", "Alex Romero", True), ("robin-vale", "Robin Vale", False)):
+        n = new_note(svc.vault.root / "people" / f"{slug}.md", "person", title, created=TODAY)
+        n.claims.append(Claim("c1", f"{title} is known to the owner."))
+        if private:
+            n.meta["export"] = False
+        write_atomic(n.path, n.render())
+        # Enough recurrence (GRADUATE_CAUSES distinct causes over GRADUATE_DAYS)
+        # that a subject file exists to be withheld: without one the subjects/
+        # assertion below would pass for the wrong reason.
+        for i in range(3):
+            append(svc.vault, mk_obs(f"person/{slug}", f"Wrote on day {i}.", f"2026-08-0{i + 1}", cause=f"{slug}:{i}"))
     conn = conn_for(svc)
     ix.rebuild(svc.vault, conn, svc.trust(), TODAY)
     R.regenerate_subject_files(svc.vault, conn, TODAY)
     R.render_export(svc.vault, conn, svc.cfg.memory_export_dir)
     exp = svc.cfg.memory_export_dir
+    assert (exp / "people" / "robin-vale.md").exists(), "a normal note reaches the classifier"
+    assert (exp / "subjects" / "person" / "robin-vale.md").exists(), "and so does its subject file"
     assert not (exp / "people" / "alex-romero.md").exists()
     assert not (exp / "subjects" / "person" / "alex-romero.md").exists()
-    assert (exp / "people" / "robin-vale.md").exists()
 
 
 def test_writespec_rewrite_preserves_owner_prose_and_retries_when_deferred(svc, monkeypatch):
@@ -1377,26 +1331,6 @@ def test_a_rename_reports_an_alias_it_could_not_add(svc, monkeypatch):
     assert rep.renamed == [("people/d@x.example.md", "people/robin-vale.md")]
     hand = [r["text"] for r in svc.store.digest_pending() if r["kind"] == "hand-edit"]
     assert hand and "was not added as an alias" in hand[-1] and "the old name is an alias" not in hand[-1]
-
-
-def test_import_defers_a_guide_that_changed_under_it(svc, tmp_path, monkeypatch):
-    src = tmp_path / "cowork"
-    src.mkdir()
-    (src / "CLAUDE.md").write_text("# Guide\n\nFile ballot mail under the election topic.\n")
-    real = P.parse_writespec
-
-    def racing(path, *a, **k):
-        ws = real(path, *a, **k)
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write("\nThe owner typed this.\n")
-        return ws
-
-    monkeypatch.setattr(P, "parse_writespec", racing)
-    rep = P.import_cowork(svc, src)
-    assert rep["writespecs"] == 0 and rep["prefs"] == 0
-    assert any("changed under us" in d for d in rep["deferred"]), rep["deferred"]
-    guide = (svc.vault.root / "CLAUDE.md").read_text()
-    assert "The owner typed this." in guide and "From the previous vault:" not in guide
 
 
 def test_retire_refuses_anything_but_a_curated_note(svc):

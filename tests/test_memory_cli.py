@@ -147,7 +147,7 @@ def test_merge_is_not_a_session_verb(env, monkeypatch):
     assert run(cfg, verb="retire", path="people/a@x.example.md", to="people/alice.md") == 0
 
 
-def test_pin_verb_and_import_guard(env, monkeypatch, capsys):
+def test_pin_verb(env, monkeypatch, capsys):
     cfg, store, svc = env
     n = new_note(svc.vault.root / "people" / "d.md", "person", "D")
     n.claims.append(Claim("c1", "Secretary."))
@@ -156,9 +156,6 @@ def test_pin_verb_and_import_guard(env, monkeypatch, capsys):
     assert run(cfg, verb="pin", ref="people/d#c1") == 0
     obs = [o for o in iter_observations(svc.vault) if isinstance(o, Observation)]
     assert obs[-1].op == "pin" and obs[-1].ref == "people/d.md#^c1"
-    store.open_run_window("s1", 1, "dm")
-    with pytest.raises(SystemExit):
-        run(cfg, verb="import-cowork", dir=str(svc.vault.root))
 
 
 # --- wave 6: what a session may not do, and what the operator is told ------------------------------------

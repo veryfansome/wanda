@@ -92,7 +92,6 @@ wanda memory walk people/robin-vale.md   # a note with the filing guides above i
 wanda memory note "…" --about person/x      # record a fact (sessions do this)
 wanda memory open "…" --check-by 2026-09-20 --about topic/x   # a dated commitment
 wanda memory search | show | rules | pin | forget | retire | unretire
-wanda memory import-cowork ~/.cowork        # one-time import of a previous vault (explicit, idempotent, owner only)
 wanda memory hourly | reindex | fsck | digest | status
 ```
 
