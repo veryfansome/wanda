@@ -37,13 +37,13 @@ def svc(tmp_path, monkeypatch):
     return s
 
 
-def mint_owner(svc, text, channel="D1", ts="1.1", sender=""):
+def mint_owner(svc, text, channel="D1", ts="1.1"):
     """What the daemon does for an owner command: mint, hold the lines'
     authority in memory, and stamp the cause and lines in the database."""
     conn = conn_for(svc)
     try:
         ix.rebuild(svc.vault, conn, P.StoreTrust(svc.store), TODAY)
-        m = C.handle(C.Context(channel, ts, "U_OWNER", text, task_sender=sender), conn, svc.store, ["U_OWNER"])
+        m = C.handle(C.Context(channel, ts, "U_OWNER", text), conn, svc.store, ["U_OWNER"])
     finally:
         conn.close()
     for o in m.observations:

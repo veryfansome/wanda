@@ -162,8 +162,6 @@ class Context:
     ts: str
     user: str
     text: str
-    # For a command typed inside an email task thread: the email's sender.
-    task_sender: str = ""
     when: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     @property
@@ -210,7 +208,7 @@ def _claim_for_ref(ref: str, conn) -> tuple[str, str, str, str] | None:
     return doc, block, row["text"], ix.subject_for_doc(doc) or GENERAL_PREF
 
 
-def expected_for_message(text: str, conn, store, task_sender: str = "") -> list[tuple[str, str, str, str, str]]:
+def expected_for_message(text: str, conn, store) -> list[tuple[str, str, str, str, str]]:
     """What ledger lines a given owner message may legitimately have minted:
     the whole line, (op, subject, facet, text, ref) — one per subject a rule's
     target may resolve to, one per line a ref verb mints. The verifier
@@ -260,9 +258,11 @@ def expected_for_message(text: str, conn, store, task_sender: str = "") -> list[
             return out
         args = list(p.args)
         if args[0].lower() in ACTIONS:
-            if not task_sender:
-                return []
-            args = [task_sender, *args]
+            # A rule must name its target. The bare in-thread form used to
+            # take it from the task's sender, which is a wanda.db row the
+            # verifier re-read at check time — so a rewritten row decided
+            # which address a genuine message was held to have named.
+            return []
         subj, display, _ = _target_to_subject(args[0], conn)
         if subj is None:
             return []
@@ -341,9 +341,7 @@ def handle(ctx: Context, conn, store, owner_ids: list[str]) -> Minted:
             return Minted([o], f"Recorded as your word: _{offer['text']}_")
         args = list(p.args)
         if args[0].lower() in ACTIONS:
-            if not ctx.task_sender:
-                return Minted(reply="Say who the rule is about: `rule <address|domain|subject> trash|ignore|attention`.")
-            args = [ctx.task_sender, *args]
+            return Minted(reply="Say who the rule is about: `rule <address|domain|subject> trash|ignore|attention`.")
         subj, display, nearest = _target_to_subject(args[0], conn)
         if subj is None:
             return Minted(reply=f"I don't know `{args[0]}`. Use an email address, a domain, or a subject like `person/robin-vale`.")

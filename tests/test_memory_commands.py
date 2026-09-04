@@ -14,8 +14,8 @@ from wanda.store import Store
 TODAY = "2026-09-03"
 
 
-def ctx(text, user="U_OWNER", channel="D1", ts="10.1", sender=""):
-    return C.Context(channel=channel, ts=ts, user=user, text=text, task_sender=sender)
+def ctx(text, user="U_OWNER", channel="D1", ts="10.1"):
+    return C.Context(channel=channel, ts=ts, user=user, text=text)
 
 
 def test_parse_command():
@@ -44,9 +44,6 @@ def test_rule_forms(tmp_path, vault):
     assert m.observations[0].subject == "org/riversidelanguageacademy.org"
     m = C.handle(ctx("rule person/robin-vale prefers text over email"), conn, store, owners)
     assert m.observations[0].facet == "preference" and m.observations[0].subject == "person/robin-vale"
-    # Inside an email task thread, `rule trash` targets that email's sender.
-    m = C.handle(ctx("rule trash", sender="noreply@sunnybrook.example"), conn, store, owners)
-    assert m.observations[0].text == "trash mail from noreply@sunnybrook.example"
     # An offer ref mints exactly the templated text, and takes the offer.
     ref = store.add_offer("disposition", "org/sunnybrook.example", "ignore", "ignore mail from noreply@sunnybrook.example")
     m = C.handle(ctx(f"rule {ref}"), conn, store, owners)
@@ -107,7 +104,7 @@ def test_expected_for_message_recomputes_what_a_message_may_have_minted(tmp_path
     allowed = C.expected_for_message("rule priya@x.example trash", conn, store)
     assert allowed == [("rule", "person/priya@x.example", "mail-disposition", "trash mail from priya@x.example", "")]
     assert C.expected_for_message("hi wanda how are you", conn, store) == []
-    assert C.expected_for_message("rule trash", conn, store, task_sender="s@x.example")[0][3] == "trash mail from s@x.example"
+    assert C.expected_for_message("rule trash", conn, store) == [], "a rule must name its target"
     # A ref verb's whole line is recomputed from the claim it quotes, so a
     # forged one cannot choose its own subject, facet or text.
     ref = "orgs/sunnybrook.example.md#^c1"
@@ -126,6 +123,26 @@ def test_expected_for_message_recomputes_what_a_message_may_have_minted(tmp_path
     # verdict about the line, so it must not read as an empty allow-list.
     with pytest.raises(C.CannotRecompute):
         C.expected_for_message("attest orgs/nobody#c1", conn, store)
+
+
+def test_a_rule_must_name_its_target(tmp_path, vault):
+    """`rule trash` with no address used to take its target from the task
+    thread's sender — a wanda.db row the verifier re-read at check time. Since
+    `_derive_owner_rules` reads the live rule's target out of the line's TEXT,
+    and that text was built from the row, rewriting the row decided which
+    address a genuine owner message was held to have named. A rule now names
+    its target, so the text is pinned to what the owner typed in Slack."""
+    store = Store(tmp_path / "w.db")
+    conn = ix.open_index(tmp_path / "memory.idx")
+    ix.rebuild(vault, conn, DictTrust(), TODAY)
+    for bare in ("rule trash", "rule ignore", "rule attention"):
+        assert C.expected_for_message(bare, conn, store) == [], f"{bare!r} may have minted nothing"
+        m = C.handle(ctx(bare), conn, store, ["U_OWNER"])
+        assert m.observations == [] and "Say who the rule is about" in m.reply
+    # Naming the address still works and pins the text to the message.
+    named = C.handle(ctx("rule priya@x.example trash"), conn, store, ["U_OWNER"])
+    assert len(named.observations) == 1
+    assert named.observations[0].text == "trash mail from priya@x.example"
 
 
 def test_an_offer_row_cannot_smuggle_prose(tmp_path, vault):

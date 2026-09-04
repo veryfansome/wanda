@@ -14,7 +14,7 @@ from wanda.memory import audit, commands, index as ix, passes, recall, render
 from wanda.memory.ledger import Observation, append as ledger_append, line_fingerprint
 from wanda.memory.subjects import subject_from_address
 from wanda.memory.vault import Vault, clean_text, slugify, write_atomic
-from wanda.triage import addresses_in, sanitize
+from wanda.triage import sanitize
 
 log = logging.getLogger(__name__)
 
@@ -95,7 +95,7 @@ class MemoryService:
             return None
         return passes.make_owner_verifier(
             self.slack.fetch_message_sync, list(self.cfg.memory_owner_user_ids),
-            lambda: ix.open_readonly(self.cfg.memory_index_path), self.store, self.sender_for_thread,
+            lambda: ix.open_readonly(self.cfg.memory_index_path), self.store,
         )
 
     # --- run windows (provenance) ---
@@ -291,24 +291,11 @@ class MemoryService:
 
     # --- owner commands ---
 
-    def sender_for_thread(self, channel: str, thread_ts: str) -> str:
-        if not thread_ts:
-            return ""
-        task = self.store.get_task_by_thread(channel, thread_ts)
-        if task is None or task["kind"] != "email" or not task["message_pk"]:
-            return ""
-        msg = self.store.get_message(task["message_pk"])
-        if msg is None:
-            return ""
-        a = addresses_in(msg["from_addr"] or "")
-        return a[0] if a else ""
-
     def handle_command(self, p: dict) -> str:
         """Mint the owner's lines from a Slack event this daemon received,
         hold their authority in memory, put them in the index now, and apply
         them now — a rule is live for the next triage batch."""
-        ctx = commands.Context(channel=p["channel"], ts=p["ts"], user=p["user"], text=p.get("text", ""),
-                               task_sender=self.sender_for_thread(p["channel"], p.get("thread_ts") or ""))
+        ctx = commands.Context(channel=p["channel"], ts=p["ts"], user=p["user"], text=p.get("text", ""))
         conn = self.conn_ro()
         try:
             minted = commands.handle(ctx, conn, self.store, list(self.cfg.memory_owner_user_ids))

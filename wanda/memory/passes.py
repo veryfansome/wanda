@@ -577,8 +577,7 @@ def _stale_check(mark: str | None, now: datetime) -> bool:
     return t > now or now - t > timedelta(hours=RECHECK_OWNER_LINES_H)
 
 
-def make_owner_verifier(fetch_message: Callable[[str, str], dict | None], owner_ids: list[str], conn_factory, store,
-                        sender_for_thread: Callable[[str, str], str] | None = None):
+def make_owner_verifier(fetch_message: Callable[[str, str], dict | None], owner_ids: list[str], conn_factory, store):
     """Build the verify_owner callable. `fetch_message(channel, ts)` returns
     the Slack message dict, None when Slack says the message is not there,
     and raises when the lookup itself failed. A line checks out when the
@@ -603,10 +602,9 @@ def make_owner_verifier(fetch_message: Callable[[str, str], dict | None], owner_
         if msg.get("user") not in owner_ids:
             return False, "author is not an owner"
         line = json.loads(line_json)
-        task_sender = sender_for_thread(channel, msg.get("thread_ts") or "") if sender_for_thread else ""
         conn = conn_factory()
         try:
-            allowed = expected_for_message(msg.get("text") or "", conn, store, task_sender)
+            allowed = expected_for_message(msg.get("text") or "", conn, store)
         except CannotRecompute as e:
             return False, f"{CANNOT_CHECK}: {e}"
         finally:
