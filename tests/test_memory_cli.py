@@ -76,7 +76,7 @@ def test_open_from_an_email_task_is_email_tier(env, monkeypatch, capsys):
     group), never from the environment or a default."""
     import os
     cfg, store, svc = env
-    store.ingest_message(dedupe_key="k", message_id="<k>", folder="INBOX", uidvalidity=1, uid=1, from_addr="a@b.c", subject="s", date_hdr="d", snippet="b")
+    store.ingest_message(dedupe_key="k", message_id="<k>", folder="INBOX", uidvalidity=1, uid=1, from_addr="a@b.c", subject="s", date_hdr="d")
     tid = store.create_task(1, "C1", "9.9", kind="email")
     store.open_run_window("s-email", tid, "email")  # an email task is running now
     monkeypatch.delenv("WANDA_TASK_ID", raising=False)  # unsetting it buys nothing
@@ -186,18 +186,17 @@ def test_fsck_does_not_build_the_shared_index(env, capsys):
     assert "reindex" in capsys.readouterr().err
 
 
-def test_unretire_is_not_a_session_verb_and_is_reported(env, monkeypatch, capsys):
+def test_retire_is_not_a_session_verb(env, monkeypatch):
     cfg, store, svc = env
     n = new_note(svc.vault.root / "people" / "a@x.example.md", "person", "a@x.example")
     write_atomic(n.path, n.render())
-    assert run(cfg, verb="retire", path="people/a@x.example.md", to=None) == 0
+    # A retire suppresses patterns for good and cannot be undone, so a session
+    # may not run it — bare or --to.
     monkeypatch.setenv("WANDA_TASK_ID", "3")
     with pytest.raises(SystemExit):
-        run(cfg, verb="unretire", path="people/a@x.example.md")
+        run(cfg, verb="retire", path="people/a@x.example.md", to=None)
     monkeypatch.delenv("WANDA_TASK_ID")
-    assert run(cfg, verb="unretire", path="people/a@x.example.md") == 0
-    assert [r["text"] for r in store.digest_pending() if "unretire`" in r["text"]] == [
-        "restored retired/people/a@x.example.md with `wanda memory unretire`"]
+    assert run(cfg, verb="retire", path="people/a@x.example.md", to=None) == 0
 
 
 def test_hourly_is_not_a_session_verb_and_does_not_claim_the_daemons_slot(env, capsys):
@@ -286,3 +285,18 @@ def test_note_says_when_there_was_no_index_to_match_against(env, capsys):
     cfg, store, svc = env
     assert run(cfg, verb="note", text="Dues are due.", about="topic/dues", facet="", until="") == 0
     assert "no index yet" in capsys.readouterr().err
+
+
+def _raise_rebuild_failed(*a, **k):
+    raise ix.RebuildFailed([("people/x.md", "bad frontmatter")])
+
+
+def test_reindex_reports_a_total_rebuild_failure_gracefully(env, monkeypatch):
+    """D1 makes rebuild raise when every note fails to parse. `reindex` is the
+    command a human runs to recover a broken vault, so it must name the notes
+    and exit cleanly, not dump a traceback."""
+    cfg, store, svc = env
+    monkeypatch.setattr("wanda.memory_cli.ix.rebuild", _raise_rebuild_failed)
+    with pytest.raises(SystemExit) as e:
+        run(cfg, verb="reindex")
+    assert "people/x.md" in str(e.value) and "last good index" in str(e.value)

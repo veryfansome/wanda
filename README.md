@@ -76,10 +76,9 @@ rule k4                                   # accept an offer from the digest (a b
 attest people/robin-vale#c4            # raise a claim to your word
 pin people/robin-vale#c4               # keep a claim exactly as written
 forget people/robin-vale#c4            # retire it and suppress the pattern behind it
-unretire people/priya-nash.md              # bring back a note you deleted
 ```
 
-Only Slack users listed in `WANDA_MEMORY_OWNER_USER_IDS` can do this; a session cannot (it posts as the bot). In a channel the command needs an `@wanda` mention; in a DM or the digest thread it does not. The daemon holds the authority for these lines in its own memory: a rule is applied only by a daemon that received the Slack event or fetched and verified the message, never on the strength of a database row. Editing a note in Obsidian counts as your word too: a changed claim line is pinned and never rewritten; a renamed note keeps its history; a deleted note is retired and the patterns behind its claims are suppressed for a year (`unretire` brings the note back; the suppression stays until you `attest` or re-state what you want).
+Only Slack users listed in `WANDA_MEMORY_OWNER_USER_IDS` can do this; a session cannot (it posts as the bot). In a channel the command needs an `@wanda` mention; in a DM or the digest thread it does not. The daemon holds the authority for these lines in its own memory: a rule is applied only by a daemon that received the Slack event or fetched and verified the message, never on the strength of a database row. Editing a note in Obsidian counts as your word too: a changed claim line is pinned and never rewritten; a renamed note keeps its history; a deleted note is retired and the patterns behind its claims are suppressed. There is no undo for a retire or a delete — add the note again to bring it back — because memory notes are not precious things to be afraid of losing.
 
 A daily `🧠 wanda memory` thread in the triage channel reports what changed: new subjects, write-spec rewrites, your hand edits, rules that went live, templated rule offers (`rule kN`), and anything that failed verification.
 
@@ -91,7 +90,7 @@ wanda memory recall "HOA ballots"           # free-text recall
 wanda memory walk people/robin-vale.md   # a note with the filing guides above it
 wanda memory note "…" --about person/x      # record a fact (sessions do this)
 wanda memory open "…" --check-by 2026-09-20 --about topic/x   # a dated commitment
-wanda memory search | show | rules | pin | forget | retire | unretire
+wanda memory search | show | rules | pin | forget | retire
 wanda memory hourly | reindex | fsck | digest | status
 ```
 

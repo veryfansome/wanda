@@ -25,7 +25,7 @@ class SlackWatcher:
     """Socket Mode listener. Acks every envelope immediately (Slack retries
     past ~3s), then classifies it into one of five triggers:
 
-      command       — an owner's `rule|attest|forget|pin|unretire …`, or a
+      command       — an owner's `rule|attest|forget|pin …`, or a
                       bare offer ref (`k4`) — both strictly parsed, so
                       "forget it, thanks" is not one — in a DM, in a digest
                       thread, or with a mention; handled in-process, never

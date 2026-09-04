@@ -262,7 +262,7 @@ def test_shrink_note_folds_and_caps():
 def test_offers_come_from_statistics_not_prose(svc):
     for i in range(6):
         svc.store.ingest_message(dedupe_key=f"k{i}", message_id=f"<{i}>", folder="INBOX", uidvalidity=1, uid=i,
-                                 from_addr="Sunnybrook <noreply@sunnybrook.example>", subject="Closure", date_hdr="d", snippet="b")
+                                 from_addr="Sunnybrook <noreply@sunnybrook.example>", subject="Closure", date_hdr="d")
         svc.store.set_triaged(f"k{i}", {}, "ignore")
     conn = conn_for(svc)
     ix.rebuild(svc.vault, conn, P.StoreTrust(svc.store), TODAY)
@@ -303,7 +303,6 @@ def test_deleting_a_note_in_obsidian_retires_and_vetoes(svc):
     assert rep.retired == ["people/spam@x.example.md"]
     assert (svc.vault.retired_dir / "people" / "spam@x.example.md").exists()
     assert ix.is_vetoed(conn, ["key:person/spam@x.example|"], TODAY)
-    assert P.unretire(svc, "people/spam@x.example.md") and n.path.exists()
 
 
 def test_open_items_lapse(svc):
@@ -436,13 +435,12 @@ def test_retire_is_confined_to_the_vault_and_refuses_stubs(svc, tmp_path):
         P.retire(svc, "people/a.md", to="../../evil.md")
 
 
-def test_unretire_restores_links_and_lapsed_items(svc):
+def test_retire_rewrites_links_and_open_items_lapse(svc):
     write_note(svc, "person", "b", "B", [Claim("c1", "B.")])
     write_note(svc, "topic", "t", "T", [Claim("c1", "See [[people/b]].")])
     P.retire(svc, "people/b.md")
+    # No unretire: a retire is final; the link points at the redirect stub.
     assert "[[retired/people/b]]" in (svc.vault.root / "topics" / "t.md").read_text()
-    assert P.unretire(svc, "people/b.md")
-    assert "[[people/b]]" in (svc.vault.root / "topics" / "t.md").read_text()
     n = new_note(svc.vault.root / "open" / "2026-08-01-old.md", "open", "Old thing")
     n.meta.update({"check_by": "2026-08-01", "tier": "session"})
     write_atomic(n.path, n.render())
@@ -450,8 +448,7 @@ def test_unretire_restores_links_and_lapsed_items(svc):
     os.utime(n.path, (old, old))
     conn = conn_for(svc)
     P.hourly(svc, conn)
-    assert not n.path.exists()
-    assert P.unretire(svc, "open/2026/2026-08-01-old.md") and n.path.exists()
+    assert not n.path.exists()  # lapsed and dropped; there is no bringing it back
 
 
 def test_forged_owner_line_borrowing_a_real_cause_stays_out(svc):
@@ -493,7 +490,7 @@ def test_offers_aggregate_one_address_across_display_names(svc):
     for i in range(6):
         name = "Sunnybrook" if i % 2 else "Sunnybrook Daycare"
         svc.store.ingest_message(dedupe_key=f"k{i}", message_id=f"<{i}>", folder="INBOX", uidvalidity=1, uid=i,
-                                 from_addr=f"{name} <noreply@sunnybrook.example>", subject="Closure", date_hdr="d", snippet="b")
+                                 from_addr=f"{name} <noreply@sunnybrook.example>", subject="Closure", date_hdr="d")
         svc.store.set_triaged(f"k{i}", {}, "ignore")
     conn = conn_for(svc)
     ix.rebuild(svc.vault, conn, P.StoreTrust(svc.store), TODAY)
@@ -1024,16 +1021,15 @@ def test_a_forged_attest_cannot_choose_its_own_subject_or_text(svc):
 
 
 def test_the_verifier_checks_every_field_of_a_ref_verb(svc):
-    """attest, pin, retire, veto and unretire were all accepted on a matching
-    ref alone, leaving subject, facet and text to whoever wrote the line —
-    under a message the owner really sent."""
+    """attest, pin, retire and veto were all accepted on a matching ref
+    alone, leaving subject, facet and text to whoever wrote the line — under
+    a message the owner really sent."""
     sunnybrook_claim(svc)
     conn = conn_for(svc)
     ix.rebuild(svc.vault, conn, P.StoreTrust(svc.store), TODAY)
     messages = {("D1", "1.0"): {"user": "U_OWNER", "text": "attest orgs/sunnybrook.example#c1"},
                 ("D1", "2.0"): {"user": "U_OWNER", "text": "pin orgs/sunnybrook.example#c1"},
-                ("D1", "3.0"): {"user": "U_OWNER", "text": "forget orgs/sunnybrook.example#c1"},
-                ("D1", "4.0"): {"user": "U_OWNER", "text": "unretire orgs/sunnybrook.example"}}
+                ("D1", "3.0"): {"user": "U_OWNER", "text": "forget orgs/sunnybrook.example#c1"}}
     verify = verifier(svc, lambda c, t: messages.get((c, t)))
     ref = "orgs/sunnybrook.example.md#^c1"
     genuine = [
@@ -1046,8 +1042,6 @@ def test_the_verifier_checks_every_field_of_a_ref_verb(svc):
         ("3.0", {"op": "veto", "subject": "org/sunnybrook.example", "facet": "veto",
                  "text": "Vetoed the pattern behind a forgotten claim",
                  "ref": "key:org/sunnybrook.example|mail-pattern"}),
-        ("4.0", {"op": "unretire", "subject": "pref/general", "facet": "unretire",
-                 "text": "Restore orgs/sunnybrook.example", "ref": "orgs/sunnybrook.example"}),
     ]
     for ts, line in genuine:
         assert verify(f"slack:D1:{ts}", json.dumps(line)) == (True, "ok"), line["op"]
@@ -1209,8 +1203,12 @@ def test_the_fetch_memo_does_not_survive_the_pass(svc):
     messages[("D1", "1.1")] = {"user": "U_OWNER", "text": "rule someone-else@x.example trash"}
     restart(svc)
     P.hourly(svc, conn)
-    assert svc.store.memory_get(f"quarantine:{u}") == P.LINE_MISMATCH, \
+    # The owner edited their own command: the second pass reads the new text
+    # (not the first pass's copy) and re-mints from it. Proof it re-read: the
+    # new rule is what goes live.
+    assert svc.store.memory_get(f"reminted:{u}"), \
         "the second pass must read the message again, not the first pass's copy"
+    assert "trash mail from someone-else@x.example" in [r["text"] for r in ix.standing_rules(conn)]
 
 
 def test_a_rule_from_a_role_address_offer_survives_a_restart(svc):
@@ -1220,7 +1218,7 @@ def test_a_rule_from_a_role_address_offer_survives_a_restart(svc):
     for i in range(6):
         name = "Sunnybrook" if i % 2 else "Sunnybrook Daycare"
         svc.store.ingest_message(dedupe_key=f"k{i}", message_id=f"<{i}>", folder="INBOX", uidvalidity=1, uid=i,
-                                 from_addr=f"{name} <noreply@sunnybrook.example>", subject="Closure", date_hdr="d", snippet="b")
+                                 from_addr=f"{name} <noreply@sunnybrook.example>", subject="Closure", date_hdr="d")
         svc.store.set_triaged(f"k{i}", {}, "ignore")
     conn = conn_for(svc)
     ix.rebuild(svc.vault, conn, P.StoreTrust(svc.store), TODAY)
@@ -1312,24 +1310,6 @@ def test_an_out_of_enum_mode_resolves_nothing(svc):
     assert not [r for r in svc.store.digest_pending() if r["kind"] == "graduated"]
 
 
-def test_unretire_restores_the_sha_baseline(svc):
-    """retire clears the note's shas; without a baseline the next drift check
-    reads every claim wanda wrote as the owner's hand edit."""
-    n = write_note(svc, "person", "b", "B", [Claim("c1", "Runs ballots."), Claim("c2", "Lives nearby.")])
-    conn = conn_for(svc)
-    P.hourly(svc, conn)
-    P.retire(svc, "people/b.md")
-    assert P.unretire(svc, "people/b.md")
-    rep = P.hourly(svc, conn)
-    assert rep.pinned == []
-    assert not [r for r in svc.store.digest_pending() if r["kind"] == "hand-edit" and "people/b" in r["text"]]
-    # Control: a real hand edit is still pinned, so the baseline is not a
-    # blanket drift suppressor.
-    n.path.write_text(n.path.read_text().replace("Runs ballots.", "Runs the ballots."))
-    rep = P.hourly(svc, conn)
-    assert rep.pinned == ["people/b.md#^c1"]
-
-
 def test_shrink_keeps_folded_claims_when_there_is_no_vault(tmp_path):
     n = new_note(tmp_path / "people" / "x.md", "person", "X")
     for i in range(8):
@@ -1397,7 +1377,7 @@ def test_a_cased_prefs_claim_is_superseded_not_duplicated(svc):
 
 def _ingest(svc, key, from_addr, action, created_at=""):
     svc.store.ingest_message(dedupe_key=key, message_id=f"<{key}>", folder="INBOX", uidvalidity=1, uid=abs(hash(key)) % 10000,
-                             from_addr=from_addr, subject="Closure", date_hdr="d", snippet="b")
+                             from_addr=from_addr, subject="Closure", date_hdr="d")
     svc.store.set_triaged(key, {}, action)
     if created_at:
         svc.store._exec("UPDATE messages SET created_at=? WHERE dedupe_key=?", (created_at, key))
@@ -1430,3 +1410,114 @@ def test_the_message_count_gate_needs_the_address_to_be_the_sender(svc):
     conn = conn_for(svc)
     ix.rebuild(svc.vault, conn, P.StoreTrust(svc.store), TODAY)
     assert P.make_offers(svc, conn, TODAY) == 0
+
+
+def test_bare_retire_suppresses_the_notes_patterns(svc):
+    """C2: a bare retire suppresses the note's patterns so they do not
+    re-graduate from the same witnesses — like an Obsidian delete."""
+    u = "01k4qm2f7a9x3h02"
+    append(svc.vault, mk_obs("org/sunnybrook.example", "Closure notices.", "2026-09-01", cause="m:1", ulid=u))
+    write_note(svc, "org", "sunnybrook.example", "sunnybrook.example",
+               [Claim("c1", "Closure notices.", [Edge("derived-from", "belt/ledger/2026-09-01", u)])])
+    conn = conn_for(svc)
+    P.hourly(svc, conn)  # index the note and its witness
+    P.retire(svc, "orgs/sunnybrook.example.md", conn=conn)
+    ix.rebuild(svc.vault, conn, P.StoreTrust(svc.store), TODAY)
+    assert parse_note(svc.vault.root / "orgs" / "sunnybrook.example.md").kind == "redirect"
+    assert ix.is_vetoed(conn, ["key:org/sunnybrook.example|mail-pattern"], TODAY)
+
+
+def test_retire_veto_is_scoped_to_the_notes_own_subject(svc):
+    """C4: a claim derived from a witness ABOUT ANOTHER subject must not
+    suppress that other subject when the note is retired."""
+    u = "01k4qm2f7a9x3h03"
+    append(svc.vault, mk_obs("org/other.example", "Other pattern.", "2026-09-01", cause="m:2", ulid=u))
+    write_note(svc, "person", "a@x.example", "a@x.example",
+               [Claim("c1", "Other pattern.", [Edge("derived-from", "belt/ledger/2026-09-01", u)])])
+    conn = conn_for(svc)
+    P.hourly(svc, conn)
+    P.retire(svc, "people/a@x.example.md", conn=conn)
+    ix.rebuild(svc.vault, conn, P.StoreTrust(svc.store), TODAY)
+    assert not ix.is_vetoed(conn, ["key:org/other.example|mail-pattern"], TODAY)
+
+
+def test_owner_editing_their_rule_command_re_mints_from_the_new_text(svc):
+    """B4: an owner who fixes their own command message has it re-minted from
+    the new text after a restart, not quarantined; the stale rule is retired."""
+    m = mint_owner(svc, "rule priya@x.example trash", ts="1.1")
+    old = m.observations[0]
+    messages = {("D1", "1.1"): {"user": "U_OWNER", "text": "rule priya@x.example trash"}}
+    svc.verify_owner = verifier(svc, lambda c, t: messages.get((c, t)))
+    conn = conn_for(svc)
+    P.hourly(svc, conn)
+    assert "trash mail from priya@x.example" in [r["text"] for r in ix.standing_rules(conn)]
+    # The owner fixes the address in their own message; the daemon restarts.
+    messages[("D1", "1.1")] = {"user": "U_OWNER", "text": "rule priya.nash@x.example trash"}
+    restart(svc)
+    rep = P.hourly(svc, conn)
+    assert rep.reminted == 1 and svc.store.memory_get(f"reminted:{old.ulid}")
+    rules = [r["text"] for r in ix.standing_rules(conn)]
+    assert "trash mail from priya.nash@x.example" in rules
+    assert "trash mail from priya@x.example" not in rules  # the stale claim was retired
+
+
+def test_a_forgery_on_a_message_blocks_re_mint_of_that_message(svc):
+    """A quarantined forgery taints its message: the owner cannot later have
+    that message re-minted (a session that forged one line cannot turn the
+    owner's later edit into a re-mint primitive). They re-send as a new one."""
+    m = mint_owner(svc, "rule priya@x.example trash", ts="1.1")
+    forged = forge(svc, m.observations[0], subject="person/victim@x.example",
+                   text="trash mail from victim@x.example")
+    messages = {("D1", "1.1"): {"user": "U_OWNER", "text": "rule priya@x.example trash"}}
+    svc.verify_owner = verifier(svc, lambda c, t: messages.get((c, t)))
+    conn = conn_for(svc)
+    P.hourly(svc, conn)
+    assert svc.store.memory_get(f"quarantine:{forged.ulid}") == P.LINE_MISMATCH
+    messages[("D1", "1.1")] = {"user": "U_OWNER", "text": "rule priya.nash@x.example trash"}
+    restart(svc)
+    rep = P.hourly(svc, conn)
+    assert rep.reminted == 0
+    assert "trash mail from priya.nash@x.example" not in [r["text"] for r in ix.standing_rules(conn)]
+
+
+def test_a_rewritten_offer_row_is_not_re_minted(svc):
+    """Security (B4): `rule kN` takes its action/target/subject from a
+    session-writable memory_offers row, not from the message tokens, so an
+    edited offer must never be re-minted to owner tier. The stale line is
+    quarantined; the owner re-accepts the offer live if they still want it."""
+    for i in range(6):
+        svc.store.ingest_message(dedupe_key=f"k{i}", message_id=f"<{i}>", folder="INBOX", uidvalidity=1, uid=i,
+                                 from_addr="Sunnybrook <noreply@sunnybrook.example>", subject="Closure", date_hdr="d")
+        svc.store.set_triaged(f"k{i}", {}, "ignore")
+    conn = conn_for(svc)
+    ix.rebuild(svc.vault, conn, P.StoreTrust(svc.store), TODAY)
+    P.make_offers(svc, conn, TODAY)
+    m = mint_owner(svc, "rule k1", ts="7.7")
+    old = m.observations[0]
+    # A compromised session rewrites the offer row to an attacker-chosen rule.
+    svc.store._exec("UPDATE memory_offers SET action='trash', text=?, subject=? WHERE ref='k1'",
+                    ("trash mail from lawyer@firm.example", "person/lawyer@firm.example"))
+    restart(svc)
+    messages = {("D1", "7.7"): {"user": "U_OWNER", "text": "rule k1"}}
+    svc.verify_owner = verifier(svc, lambda c, t: messages.get((c, t)))
+    rep = P.hourly(svc, conn)
+    assert rep.reminted == 0
+    assert "trash mail from lawyer@firm.example" not in [r["text"] for r in ix.standing_rules(conn)]
+    assert svc.store.memory_get(f"quarantine:{old.ulid}") == P.LINE_MISMATCH
+
+
+def test_retire_veto_follows_an_aliased_witness_subject(svc):
+    """C4 regression: an auto-minted address-keyed note that was later renamed
+    has its witnesses filed under the ORIGINAL address subject. Retiring it
+    must still veto those keys (they resolve to this note via the alias) — a
+    path-subject prefix match would drop them and the note would re-graduate."""
+    u = "01k4qm2f7a9x3h04"
+    append(svc.vault, mk_obs("person/mei@x.example", "Sends invoices.", "2026-09-01", cause="m:9", ulid=u))
+    write_note(svc, "person", "mei-delgado", "Mei Delgado",
+               [Claim("c1", "Sends invoices.", [Edge("derived-from", "belt/ledger/2026-09-01", u)])],
+               ids=["mailto:mei@x.example"])
+    conn = conn_for(svc)
+    P.hourly(svc, conn)  # builds the alias person/mei@x.example -> person/mei-delgado
+    P.retire(svc, "people/mei-delgado.md", conn=conn)
+    ix.rebuild(svc.vault, conn, P.StoreTrust(svc.store), TODAY)
+    assert ix.is_vetoed(conn, ["key:person/mei@x.example|mail-pattern"], TODAY)

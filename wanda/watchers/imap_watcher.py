@@ -54,7 +54,11 @@ def resolve_trash_folder(client: IMAPClient, cfg: Config) -> str:
 
 
 def _strip_html(text: str) -> str:
-    text = re.sub(r"<(script|style)\b[^>]*>.*?</\1>", " ", text, flags=re.S | re.I)
+    # `(?:</\1\s*>|\Z)` so an UNTERMINATED <script>/<style> is stripped to the
+    # end of the text, not left to leak its body as prose — the 64 KB partial
+    # fetch makes a missing closing tag routine, and a body larger than the
+    # fetch window is trivially attacker-controlled.
+    text = re.sub(r"<(script|style)\b[^>]*>.*?(?:</\1\s*>|\Z)", " ", text, flags=re.S | re.I)
     text = re.sub(r"<[^>]+>", " ", text)
     text = html_mod.unescape(text)
     return re.sub(r"[ \t\r\f\v]+", " ", text)
@@ -92,9 +96,11 @@ def parse_raw(raw: bytes, snippet_bytes: int) -> dict[str, str]:
         parse_failed = True
     if not body and parse_failed:
         # Only when structured parsing actually failed: otherwise this splices
-        # MIME scaffolding into the snippet for a legitimately text-free mail.
+        # MIME scaffolding into the body for a legitimately text-free mail.
+        # Strip it like any other HTML body — a truncated part can carry an
+        # unterminated <script> or raw tags — rather than splicing it raw.
         tail = raw.split(b"\r\n\r\n", 1)
-        body = tail[1].decode("utf-8", "replace") if len(tail) == 2 else ""
+        body = _strip_html(tail[1].decode("utf-8", "replace")) if len(tail) == 2 else ""
     body = re.sub(r"\n{3,}", "\n\n", body).strip()
     return {
         # Headers are attacker-controlled and unbounded; every consumer
@@ -103,7 +109,9 @@ def parse_raw(raw: bytes, snippet_bytes: int) -> dict[str, str]:
         "from_addr": hdr("From")[:HEADER_LIMIT],
         "subject": hdr("Subject")[:HEADER_LIMIT],
         "date_hdr": hdr("Date")[:HEADER_LIMIT],
-        "snippet": body[:snippet_bytes] or "(no text content)",
+        # The body is carried to triage in memory and never persisted; the key
+        # is "body", not "snippet", because nothing stores a snippet any more.
+        "body": body[:snippet_bytes] or "(no text content)",
     }
 
 
@@ -120,6 +128,31 @@ def fetch_parsed(client: IMAPClient, uids: list[int], snippet_bytes: int) -> lis
                 continue
             out.append((uid, parse_raw(raw, snippet_bytes)))
     return out
+
+
+def fetch_body(cfg: Config, folder: str, uidvalidity: int, uid: int) -> str | None:
+    """Re-fetch and parse one message body from IMAP, addressed by
+    (folder, uidvalidity, uid). Triage's fallback when a body was not carried
+    in memory — a crash between ingest and triage. Returns None when the
+    message is gone or the mailbox was re-created (UIDVALIDITY changed), in
+    which case the UID no longer names the same message and triage classifies
+    from the headers alone. A fresh short-lived connection, so it never
+    touches the watcher thread's IDLE socket."""
+    try:
+        with connect(cfg) as client:
+            info = client.select_folder(folder, readonly=True)
+            if int(info[b"UIDVALIDITY"]) != uidvalidity:
+                log.warning("re-fetch of uid %s: UIDVALIDITY changed; body unrecoverable", uid)
+                return None
+            data = client.fetch([uid], [FETCH_PARTIAL])
+            item: dict[bytes, Any] = data.get(uid, {})
+            raw = next((v for k, v in item.items() if k.startswith(b"BODY[")), None)
+            if raw is None:
+                return None
+            return parse_raw(raw, cfg.snippet_bytes)["body"]
+    except Exception:
+        log.exception("re-fetch of uid %s in %s failed", uid, folder)
+        return None
 
 
 def dedupe_key_for(parsed: dict[str, str], folder: str, uidvalidity: int, uid: int) -> str:
@@ -204,8 +237,11 @@ class ImapWatcher(threading.Thread):
                 from_addr=parsed["from_addr"],
                 subject=parsed["subject"],
                 date_hdr=parsed["date_hdr"],
-                snippet=parsed["snippet"],
             ):
+                # Hand the body to triage in memory; it is never written to the
+                # database. A crash before triage loses it, and triage then
+                # re-fetches from IMAP by (folder, uidvalidity, uid).
+                self.store.stash_body(key, parsed["body"])
                 ingested += 1
             # Advance only after the insert committed: crash-safe, at-least-once.
             self.store.set_cursor(FOLDER, uidvalidity, uid)

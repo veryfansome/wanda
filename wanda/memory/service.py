@@ -136,6 +136,28 @@ class MemoryService:
             if conn is None:
                 return None
             conn.execute("SELECT 1 FROM docs LIMIT 1")
+            if conn.execute("SELECT v FROM meta WHERE k='rebuilt_at'").fetchone() is None:
+                # `open_index` commits the schema (empty tables) outside the
+                # rebuild transaction, so a build that failed — or has not
+                # run — leaves a readable but never-populated index. Without
+                # `rebuilt_at` it has never been successfully built: treat it
+                # as unavailable so the projection shows the marker rather
+                # than rendering as though wanda knows nothing.
+                conn.close()
+                if not self.owns_shared_state:
+                    log.debug("memory index never built (no rebuilt_at); this process does not build it")
+                    return None
+                try:
+                    self._rebuild_inline()
+                except Exception:
+                    log.exception("memory index could not be built")
+                    return None
+                conn = ix.open_readonly(path)
+                if conn is None:
+                    return None
+                if conn.execute("SELECT v FROM meta WHERE k='rebuilt_at'").fetchone() is None:
+                    conn.close()
+                    return None
             return conn
         except sqlite3.DatabaseError as e:
             if not self.owns_shared_state:

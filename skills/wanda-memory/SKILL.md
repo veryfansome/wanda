@@ -36,7 +36,7 @@ wanda memory open "Ballot confirmation from Robin" --check-by 2026-09-20 --about
 ## What you cannot do
 
 - You cannot make a rule about what happens to email. Rules are the owner's word, given in Slack as `rule <address> trash|ignore|attention`; if you think one is warranted, say so in your reply and let them decide.
-- You cannot merge two notes (`retire --to`); say so in your reply if two notes are the same person.
-- You cannot restore a note the owner deleted (`unretire`), run the hourly pass, or rebuild the index. Those are the owner's, from a terminal; say so in your reply.
+- You cannot retire a note or merge two notes (`retire`, `retire --to`); a retire suppresses the note's patterns and cannot be undone, so it is the owner's call. Say so in your reply if a note should go or if two notes are the same person.
+- You cannot run the hourly pass or rebuild the index. Those are the owner's, from a terminal; say so in your reply.
 - Do not write secrets, credentials, or anything from an email verbatim. Describe; do not copy.
 - Do not edit or delete anything under the vault's `belt/` directory: `belt/subjects/` is regenerated hourly, and `belt/ledger/` is the append-only record the rest is derived from.

@@ -117,8 +117,9 @@ def test_expected_for_message_recomputes_what_a_message_may_have_minted(tmp_path
         ("attest", "org/sunnybrook.example", "attest", "Confirmed by the owner: Closure notices.", ref)]
     assert C.expected_for_message("pin orgs/sunnybrook.example#c1", conn, store) == [
         ("pin", "org/sunnybrook.example", "pin", "Pinned: Closure notices.", ref)]
-    assert C.expected_for_message("unretire orgs/sunnybrook.example", conn, store) == [
-        ("unretire", "pref/general", "unretire", "Restore orgs/sunnybrook.example", "orgs/sunnybrook.example")]
+    # `unretire` was withdrawn: it no longer parses as a command, so it mints
+    # nothing (an empty allow-list, not a candidate).
+    assert C.expected_for_message("unretire orgs/sunnybrook.example", conn, store) == []
     # A claim that has left the index cannot be recomputed. That is not a
     # verdict about the line, so it must not read as an empty allow-list.
     with pytest.raises(C.CannotRecompute):

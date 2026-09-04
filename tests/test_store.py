@@ -15,7 +15,7 @@ def store(tmp_path):
 def ingest(store, key="k1", uid=1, from_addr="a@example.com"):
     return store.ingest_message(
         dedupe_key=key, message_id=f"<{key}@x>", folder="INBOX", uidvalidity=7, uid=uid,
-        from_addr=from_addr, subject="hi", date_hdr="today", snippet="body",
+        from_addr=from_addr, subject="hi", date_hdr="today",
     )
 
 
@@ -138,3 +138,29 @@ def test_sender_stats_counts_only_this_address(store):
     assert store.sender_stats("first@x.example")["trashed"] == 1
     assert store.sender_stats("a_b@x.example")["seen"] == 0, "`_` is a LIKE wildcard; instr carries none"
     assert store.sender_stats("news@fabrikam.com", since_iso="2099-01-01")["seen"] == 0
+
+
+def test_body_cache_round_trips_and_is_not_persisted(store):
+    ingest(store, key="k1")
+    store.stash_body("k1", "the body")
+    # Not a column: nothing about the body is in the row.
+    row = store.get_message_by_key("k1")
+    assert "snippet" not in row.keys()
+    # take pops it; a second take is a miss (caller re-fetches from IMAP).
+    assert store.take_body("k1") == "the body"
+    assert store.take_body("k1") is None
+
+
+def test_body_cache_evicts_oldest_over_cap(store):
+    cap = Store.BODY_CACHE_CAP
+    for i in range(cap + 5):
+        store.stash_body(f"k{i}", f"b{i}")
+    # The five oldest were evicted; they miss and fall back to a re-fetch.
+    assert store.take_body("k0") is None
+    assert store.take_body("k4") is None
+    assert store.take_body(f"k{cap}") == f"b{cap}"
+
+
+def test_messages_table_has_no_snippet_column(store):
+    cols = {r["name"] for r in store._db.execute("PRAGMA table_info(messages)")}
+    assert "snippet" not in cols

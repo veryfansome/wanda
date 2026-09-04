@@ -23,7 +23,7 @@ from wanda.memory.vault import (
 # index derives it from what the harness can verify (Slack authorship for
 # `owner`, the task's kind for `agent`); see index.tier_for_obs.
 SOURCES = ("triage", "agent", "owner", "harness")
-OPS = ("", "attest", "rule", "veto", "pin", "retire", "unretire", "open")
+OPS = ("", "attest", "rule", "veto", "pin", "retire", "open")
 
 _FIELD_KEYS = ("src", "op", "cause", "due", "until", "tier", "ref")
 _SUBJECT_RE = r"[a-z]+/[a-z0-9][a-z0-9._+@-]*"

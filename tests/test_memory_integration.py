@@ -60,7 +60,7 @@ def test_triage_is_confined_and_memory_rides_in_the_user_message(tmp_path):
     fake = make_fake_claude(tmp_path, dump_script(tmp_path))
     p, store, cfg, memory = make(tmp_path, claude=fake)
     store.ingest_message(dedupe_key="k1", message_id="<k1>", folder="INBOX", uidvalidity=1, uid=1,
-                         from_addr="Sunnybrook <noreply@sunnybrook.example>", subject="Closure", date_hdr="d", snippet="body")
+                         from_addr="Sunnybrook <noreply@sunnybrook.example>", subject="Closure", date_hdr="d")
     # A known sender, so the block has something to say.
     u = "01k4qm2f7a9x3m01"
     append(memory.vault, mk_obs("org/sunnybrook.example", "Closure notices.", "2026-09-01", cause="m:1", ulid=u))
@@ -135,14 +135,14 @@ def test_owner_command_is_handled_in_process(tmp_path):
 
 def test_debounce_waits_for_a_batch(tmp_path):
     p, store, cfg, memory = make(tmp_path, triage_debounce_s=150)
-    store.ingest_message(dedupe_key="k1", message_id="<k1>", folder="INBOX", uidvalidity=1, uid=1, from_addr="a@b.c", subject="s", date_hdr="d", snippet="b")
+    store.ingest_message(dedupe_key="k1", message_id="<k1>", folder="INBOX", uidvalidity=1, uid=1, from_addr="a@b.c", subject="s", date_hdr="d")
     rows = store.fetch_by_status("new")
     assert p._debouncing(rows) is True
     old = (datetime.now(timezone.utc) - timedelta(seconds=200)).isoformat(timespec="seconds")
     store._exec("UPDATE messages SET created_at=?", (old,))
     assert p._debouncing(store.fetch_by_status("new")) is False
     for i in range(2, 12):
-        store.ingest_message(dedupe_key=f"k{i}", message_id=f"<k{i}>", folder="INBOX", uidvalidity=1, uid=i, from_addr="a@b.c", subject="s", date_hdr="d", snippet="b")
+        store.ingest_message(dedupe_key=f"k{i}", message_id=f"<k{i}>", folder="INBOX", uidvalidity=1, uid=i, from_addr="a@b.c", subject="s", date_hdr="d")
     assert p._debouncing(store.fetch_by_status("new", limit=10)) is False, "a full batch never waits"
 
 

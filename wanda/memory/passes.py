@@ -28,7 +28,8 @@ from wanda.memory import index as ix
 from wanda.memory import ledger as L
 from wanda.memory import render as R
 from wanda.memory.commands import (
-    DISPOSITION_FACET, CannotRecompute, expected_for_message, normalize_ref, rule_text,
+    DISPOSITION_FACET, OFFER_RE, CannotRecompute, expected_for_message, normalize_ref,
+    parse_command, rule_text,
 )
 from wanda.memory.notes import Claim, Edge, Note, new_note, parse_note, parse_writespec, strip_provenance
 from wanda.memory.subjects import parse_subject, subject_from_address
@@ -68,7 +69,7 @@ WRITESPEC_MODEL_CAP_B = 1500   # the prompt asks for < 1,200; a little slack bef
 PROMPTS_DIR = Path(__file__).resolve().parent.parent.parent / "prompts"
 MINTED_IN_PROCESS = "minted in-process"
 GENERAL_PREF_SUBJECT = "pref/general"
-OWNER_OPS = ("rule", "attest", "pin", "retire", "unretire")
+OWNER_OPS = ("rule", "attest", "pin", "retire")
 # Verification verdicts. LINE_MISMATCH is the only durable one: it says this
 # line did not come from this message, which re-checking can only repeat.
 # A CANNOT_CHECK verdict says the recomputation could not be done at all.
@@ -152,6 +153,7 @@ class Authority:
     minted: dict[str, str] = field(default_factory=dict)    # ulid -> content fingerprint
     verified: dict[str, str] = field(default_factory=dict)  # ulid -> content fingerprint
     authored: dict[str, str] = field(default_factory=dict)  # harness lines a pass wrote itself (e.g. a deletion veto)
+    reminted: set[str] = field(default_factory=set)         # old-line ulids re-minted this run (mutated/read only in the pass thread)
     windows: list[dict] | None = None                       # agent-run windows as the daemon saw them
 
     def holds(self, ulid_: str, fp: str) -> bool:
@@ -332,6 +334,7 @@ def _git_show_head(vault: Vault, rel: str) -> str | None:
 class HourlyReport:
     verified: int = 0
     unverified: int = 0
+    reminted: int = 0
     pinned: list[str] = field(default_factory=list)
     conflicts: list[str] = field(default_factory=list)
     applied: int = 0
@@ -352,7 +355,7 @@ class HourlyReport:
     projection_bytes: int = 0
 
     def summary(self) -> str:
-        return (f"verified={self.verified} unverified={self.unverified} pinned={len(self.pinned)} conflicts={len(self.conflicts)} "
+        return (f"verified={self.verified} unverified={self.unverified} reminted={self.reminted} pinned={len(self.pinned)} conflicts={len(self.conflicts)} "
                 f"applied={self.applied} deferred={self.deferred} staged={self.staged_applied} l1={self.l1_written}/{self.l1_removed} "
                 f"exported={self.exported} new_subjects={len(self.new_subjects)} retired={len(self.retired)} renamed={len(self.renamed)} "
                 f"lapsed={len(self.lapsed)} rejected={self.rejected} flags={self.flags} broken={len(self.broken)} "
@@ -361,20 +364,40 @@ class HourlyReport:
 
 # --- the hourly pass --------------------------------------------------------------------------------
 
+def _rebuild_or_report(svc: Services, vault: Vault, conn, trust, today: str) -> ix.RebuildReport:
+    """Rebuild the index, but if it fails systematically (empty result while
+    notes could not be parsed), name the offending notes in the digest before
+    re-raising. Otherwise the only signal is a generic `hourly_failures >= 3`
+    alert that names nothing, and the last good index keeps serving (the
+    failed rebuild rolled back), which is correct but silent."""
+    try:
+        return ix.rebuild(vault, conn, trust, today)
+    except ix.RebuildFailed as e:
+        for path, err in e.broken_notes:
+            key = f"unindexable:{path}:{err[:40]}"
+            if svc.store.memory_get(key) is None:
+                svc.store.memory_set(key, today)
+                svc.store.digest_add("error", f"the memory index could not be rebuilt — {path} cannot be parsed ({err[:100]}); "
+                                              f"memory stays on the last good index until it is fixed")
+        raise
+
+
 def hourly(svc: Services, conn, workspace: Path | None = None) -> HourlyReport:
     rep = HourlyReport()
     vault, store = svc.vault, svc.store
     today = svc.today()
     svc.touched.clear()
     ensure_vault(svc)
-    drain_retire_journal(svc)
+    # conn still holds the PREVIOUS pass's index here (the rebuild is step 3),
+    # so a delete's veto can read the doomed note's witnesses before they go.
+    drain_retire_journal(svc, conn)
     # 1. The owner's dirt gets its own commit before anything of ours lands.
-    _absorb_owner_changes(svc, rep, today)
+    _absorb_owner_changes(svc, rep, today, conn)
     # 2. Verify owner-tier lines against Slack (new ones now, old ones daily).
     _verify_owner_lines(svc, rep)
     # 3. Rebuild the index so drift and ops see current claims.
     trust = svc.trust()
-    rebuild = ix.rebuild(vault, conn, trust, today)
+    rebuild = _rebuild_or_report(svc, vault, conn, trust, today)
     rep.rejected = L.report_rejected(vault, rebuild.rejected)
     if rep.rejected:
         store.digest_add("rejected", f"{rep.rejected} ledger line(s) could not be parsed and were listed in belt/ledger/rejected.md")
@@ -385,7 +408,7 @@ def hourly(svc: Services, conn, workspace: Path | None = None) -> HourlyReport:
     rep.staged_applied = drain_staging(svc, conn)
     rep.applied, rep.deferred = _apply_ops(svc, conn, rep, today)
     if rep.applied or rep.pinned or rep.staged_applied:
-        rebuild = ix.rebuild(vault, conn, trust, today)
+        rebuild = _rebuild_or_report(svc, vault, conn, trust, today)
     rep.flags = _report_flags(svc, rebuild)
     # 6. Generated surfaces.
     rep.l1_written, rep.l1_removed = R.regenerate_subject_files(vault, conn, today)
@@ -417,11 +440,12 @@ def _is_curated_note(rel: str) -> bool:
             and not rel.endswith("CLAUDE.md") and rel.count("/") == 1)
 
 
-def _absorb_owner_changes(svc: Services, rep: HourlyReport, today: str) -> None:
+def _absorb_owner_changes(svc: Services, rep: HourlyReport, today: str, conn=None) -> None:
     """Anything dirty at pass start is the owner's (or a crashed pass's
     leftovers, which are harmless to attribute the same way). A renamed
     curated note keeps its hashes, gains its old name as an alias and pins
-    nothing; a deleted one is retired with its patterns suppressed."""
+    nothing; a deleted one is retired with its patterns suppressed. There is
+    no unretire — recovery is telling wanda the fact again."""
     vault, store = svc.vault, svc.store
     changes = _git_stage_all_and_diff(vault)
     if not changes:
@@ -436,10 +460,10 @@ def _absorb_owner_changes(svc: Services, rep: HourlyReport, today: str) -> None:
                              f"you renamed {old} → {new}; its history and hashes followed, but the old name was not added as an alias on {new} — see the log")
         elif code == "D" and _is_curated_note(old):
             body = _git_show_head(vault, old) or ""
-            _write_tombstone(vault, old, body, reason="deleted by owner")
-            _veto_note_claims(svc, old, body, today, cause=f"hand:{today}")
+            _write_tombstone(vault, old, reason="deleted by owner")
+            _veto_note_claims(svc, old, body, today, cause=f"hand:{today}", conn=conn)
             store.set_shas(old, {})
-            store.digest_add("retired", f"{old} was deleted in the vault; retired with its patterns suppressed (`unretire {old}` undoes it)")
+            store.digest_add("retired", f"{old} was deleted in the vault; retired with its patterns suppressed (there is no undo — add the note again to bring it back)")
             rep.retired.append(old)
     _git_commit_all(vault, "owner edits (auto)", author="owner via wanda")
 
@@ -489,6 +513,9 @@ def _verify_owner_lines(svc: Services, rep: HourlyReport) -> None:
     reset = getattr(svc.verify_owner, "reset", None)
     if reset is not None:
         reset()  # the real verifier memoises one fetch per message; the memo is per pass
+    remint = getattr(svc.verify_owner, "remint", None)
+    verified_causes: set[str] = set()   # causes with a genuine (held or matching) line this pass
+    mismatches: list[tuple[L.Observation, str]] = []
     seen: set[str] = set()
     for rec in L.iter_observations(svc.vault):
         if isinstance(rec, L.Rejected):
@@ -502,6 +529,12 @@ def _verify_owner_lines(svc: Services, rep: HourlyReport) -> None:
         mark = store.memory_get(f"checked:{rec.ulid}")
         if store.memory_get(f"quarantine:{rec.ulid}"):
             continue  # this line could not have come from the message it names; a human decides
+        if (auth is not None and rec.ulid in auth.reminted) or store.memory_get(f"reminted:{rec.ulid}"):
+            # Superseded: the owner edited this message and it was re-minted
+            # from the new text. The in-memory set is the robust bound (a
+            # session can clear the wanda.db marker but not this), so re-mint
+            # fires at most once per line per run.
+            continue
         # The marks in wanda.db cache what the daemon holds in memory; a
         # cleared or flipped row must not demote a line whose authority it
         # still holds, or wiping one row permanently drops the owner's rule.
@@ -509,6 +542,9 @@ def _verify_owner_lines(svc: Services, rep: HourlyReport) -> None:
             cached = store.owner_check(rec.cause)
             if cached is None or not cached["verified"]:
                 store.set_owner_check(rec.cause, True, AUTHORITY_HELD)
+            # A held line vouches for its message: a mismatching sibling citing
+            # the same cause is then a forgery, not the owner's own edit.
+            verified_causes.add(rec.cause)
         # Authority is bound to content: a line reusing a held ULID with
         # different content is NOT held, and falls through to verification.
         if auth is not None and auth.minted.get(rec.ulid) == fp:
@@ -520,7 +556,6 @@ def _verify_owner_lines(svc: Services, rep: HourlyReport) -> None:
         last_fail = store.memory_get(f"recheck:{rec.ulid}")
         if last_fail and not _stale_check(last_fail, now):
             continue  # the last check did not succeed; retry on the daily cadence, not every pass
-        prior = store.owner_check(rec.cause)
         try:
             ok, detail = svc.verify_owner(rec.cause, json.dumps({
                 "op": rec.op, "subject": rec.subject, "facet": rec.facet, "text": rec.text, "ref": rec.ref}))
@@ -535,6 +570,7 @@ def _verify_owner_lines(svc: Services, rep: HourlyReport) -> None:
             if auth is not None:
                 auth.verified[rec.ulid] = fp
             rep.verified += 1
+            verified_causes.add(rec.cause)
             continue
         if detail.startswith(CANNOT_CHECK):
             # Nothing was shown either way, so nobody is accused, the line
@@ -553,26 +589,111 @@ def _verify_owner_lines(svc: Services, rep: HourlyReport) -> None:
                 store.digest_add("verify", f"your rule \u201c{rec.text[:80]}\u201d was given in a form wanda no longer accepts; "
                                            f"re-state it as {how} and it becomes your word again ({rec.path}:{rec.lineno})")
             continue
+        if detail == LINE_MISMATCH:
+            # Defer: an owner editing their own command re-mints from the new
+            # text, a forgery citing a real message is quarantined, and the two
+            # cannot be told apart until the whole ledger is seen — a sibling
+            # line that still matches the message proves the command is
+            # unchanged and this one is a forgery. Decided after the loop.
+            mismatches.append((rec, fp))
+            continue
+        # A plain failure: the message is gone, its author is no longer an
+        # owner, or Slack could not be reached. Left pending and retried.
         rep.unverified += 1
         if auth is not None:
             auth.verified.pop(rec.ulid, None)
-        if detail == LINE_MISMATCH:
-            # The message is real and an owner wrote it, but it could not
-            # have minted this line: a stowaway. This is the one verdict that
-            # stays — it is about content, not reachability, so re-checking
-            # can only repeat it, while retrying would let a forgery that
-            # lost its race win later.
-            if prior is None or not prior["verified"]:
-                store.set_owner_check(rec.cause, False, detail)
-            store.memory_set(f"checked:{rec.ulid}", "0")
-            store.memory_set(f"quarantine:{rec.ulid}", detail)
-            store.digest_add("verify", f"a line borrowing your message {rec.cause} did not match it and was ignored: {rec.text[:100]} ({rec.path}:{rec.lineno})")
-        else:
-            store.set_owner_check(rec.cause, False, detail)
-            store.memory_set(f"checked:{rec.ulid}", "0")
-            store.memory_set(f"recheck:{rec.ulid}", now.isoformat(timespec="seconds"))
-            if not last_fail:
-                store.digest_add("verify", f"a line claiming your authority did not check out against Slack ({detail}) and is not applied until it does: {rec.text[:100]} ({rec.path}:{rec.lineno}) — say it again in Slack to re-record it")
+        store.set_owner_check(rec.cause, False, detail)
+        store.memory_set(f"checked:{rec.ulid}", "0")
+        store.memory_set(f"recheck:{rec.ulid}", now.isoformat(timespec="seconds"))
+        if not last_fail:
+            store.digest_add("verify", f"a line claiming your authority did not check out against Slack ({detail}) and is not applied until it does: {rec.text[:100]} ({rec.path}:{rec.lineno}) — say it again in Slack to re-record it")
+    _resolve_mismatches(svc, rep, mismatches, verified_causes, remint, now)
+
+
+def _resolve_mismatches(svc: Services, rep: HourlyReport, mismatches: list, verified_causes: set, remint, now: datetime) -> None:
+    """A line whose content the message could not have minted is either the
+    owner's own edited command (re-mint from the new text) or a forgery citing
+    a real message (quarantine). It is a forgery when a SIBLING line citing the
+    same message still matches it, or when the message already carries a
+    quarantined line — a prior forgery taints it against re-mint for good. Only
+    `rule` lines re-mint: `attest`/`pin` quote a claim from the vault, which a
+    session can edit, so re-minting one could launder attacker-edited text to
+    owner tier. Runs after the verify loop because re-mints append to the
+    ledger."""
+    store, auth = svc.store, svc.authority
+    for rec, fp in mismatches:
+        tainted = rec.cause in verified_causes or bool(store.memory_get(f"quarantine-cause:{rec.cause}"))
+        cands = remint(rec.cause) if (remint is not None and rec.op == "rule" and not tainted) else []
+        if cands:
+            _remint_owner_edit(svc, rec, cands, now)
+            store.memory_set(f"reminted:{rec.ulid}", now.isoformat(timespec="seconds"))
+            if auth is not None:
+                auth.reminted.add(rec.ulid)
+            rep.reminted += 1
+            continue
+        # Quarantined for good: about content, not reachability, so re-checking
+        # can only repeat it, and retrying would let a forgery that lost its
+        # race win by editing what the recomputation reads later.
+        rep.unverified += 1
+        if auth is not None:
+            auth.verified.pop(rec.ulid, None)
+        prior = store.owner_check(rec.cause)
+        if prior is None or not prior["verified"]:
+            store.set_owner_check(rec.cause, False, LINE_MISMATCH)
+        store.memory_set(f"checked:{rec.ulid}", "0")
+        store.memory_set(f"quarantine:{rec.ulid}", LINE_MISMATCH)
+        store.memory_set(f"quarantine-cause:{rec.cause}", "1")
+        store.digest_add("verify", f"a line borrowing your message {rec.cause} did not match it and was ignored: {rec.text[:100]} ({rec.path}:{rec.lineno})")
+
+
+def _remint_owner_edit(svc: Services, old: L.Observation, cands: list, now: datetime) -> None:
+    """Record the owner's edited command as fresh owner-tier lines and retire
+    the stale claim the old line produced. The old line stays in the append-
+    only ledger but loses its authority (the daemon never held this ULID after
+    the edit) and is marked reminted, so it neither re-applies nor quarantines."""
+    store = svc.store
+    today = svc.today()
+    _retire_reminted_claim(svc, old, today)
+    minted: list[str] = []
+    for op, subj, facet, text, ref in cands:
+        o = L.Observation(subject=subj, facet=facet, text=text, src="owner", op=op, cause=old.cause, ref=ref)
+        L.append(svc.vault, o)
+        if svc.authority is not None:
+            svc.authority.minted[o.ulid] = L.line_fingerprint(o)
+        store.memory_set(f"checked:{o.ulid}", now.isoformat(timespec="seconds"))
+        minted.append(text)
+    # The message is a real, owner-authored command now, so the cause is
+    # verified; the old line does not borrow this (its ULID is not held).
+    store.set_owner_check(old.cause, True, "re-minted from an edited message")
+    if minted:
+        extra = f" (+{len(minted) - 1} more)" if len(minted) > 1 else ""
+        store.digest_add("verify", f"you edited your command {old.cause}; wanda re-recorded it as: {minted[0][:100]}{extra}")
+
+
+def _retire_reminted_claim(svc: Services, old: L.Observation, today: str) -> None:
+    """Retire the claim the old owner line produced. A rule's claim lives on a
+    prefs note and quotes the old line in an owner-said edge; an attest/pin
+    only added an edge, which already loses owner tier once the daemon stops
+    holding the old ULID, so there is nothing to fold there."""
+    if old.op != "rule":
+        return
+    path = svc.vault.root / "prefs" / ("mail-dispositions.md" if old.facet == DISPOSITION_FACET else "preferences.md")
+    if not path.exists():
+        return
+    try:
+        note = parse_note(path)
+    except Exception as e:
+        log.warning("could not retire the claim of an edited rule on %s: %s", path, e)
+        return
+    ref = (f"belt/ledger/{old.day}", old.ulid)
+    changed = False
+    for c in note.claims:
+        if ref in c.targets("owner-said") and not c.has("retired"):
+            c.edges.append(Edge("retired", value=today))
+            c.folded = True
+            changed = True
+    if changed:
+        _write_note(svc, note)
 
 
 def _stale_check(mark: str | None, now: datetime) -> bool:
@@ -643,7 +764,46 @@ def make_owner_verifier(fetch_message: Callable[[str, str], dict | None], owner_
                 drifted = True  # this op quotes a claim, which the owner may legitimately have reworded
         return (False, CLAIM_REWORDED) if drifted else (False, LINE_MISMATCH)
 
+    def remint(cause: str) -> list[tuple[str, str, str, str, str]]:
+        """The lines the message at `cause` mints under today's grammar, for
+        re-minting after an owner edits their own command. Always the owner's
+        ACTUAL current words: a forged line that triggers this only causes the
+        real command to be re-minted, never anything the attacker chose. []
+        when the message is gone, not the owner's, or mints nothing now."""
+        try:
+            _, channel, ts = cause.split(":", 2)
+        except ValueError:
+            return []
+        if (channel, ts) not in fetched:
+            try:
+                fetched[(channel, ts)] = fetch_message(channel, ts)
+            except Exception:
+                return []
+        msg = fetched[(channel, ts)]
+        if not msg or msg.get("user") not in owner_ids:
+            return []
+        text = msg.get("text") or ""
+        # Re-mint ONLY commands whose content is built from the message tokens
+        # themselves. An offer acceptance (`rule kN` / bare `kN`) takes its
+        # action, target and subject from a `memory_offers` row — session-
+        # writable state — so re-minting it would launder a rewritten offer to
+        # owner tier with no live owner echo. Those are left to quarantine, and
+        # the owner re-accepts the offer live if they still want it.
+        p = parse_command(text)
+        if p is not None and p.verb == "rule" and len(p.args) == 1 and OFFER_RE.match(p.args[0]):
+            return []
+        conn = conn_factory()
+        try:
+            return expected_for_message(text, conn, store)
+        except CannotRecompute:
+            return []
+        finally:
+            with contextlib.suppress(Exception):
+                if conn is not None:
+                    conn.close()
+
     verify.reset = fetched.clear  # the memo is per pass, not per verifier
+    verify.remint = remint
     return verify
 
 
@@ -734,7 +894,7 @@ def _apply_ops(svc: Services, conn, rep: HourlyReport, today: str, only: set[str
             if o.op in ("rule", "attest") and tier != "owner":
                 _drop_op(svc, o, f"not the owner's word ({tier}-tier)")
                 continue
-            if o.op in ("pin", "retire", "unretire") and tier == "email":
+            if o.op in ("pin", "retire") and tier == "email":
                 _drop_op(svc, o, "written from an email task; email content cannot edit memory")
                 continue
             if o.op == "rule":
@@ -746,12 +906,6 @@ def _apply_ops(svc: Services, conn, rep: HourlyReport, today: str, only: set[str
                 _need(_add_edge_to_claim(svc, o.ref, Edge("owner-edited", value=today)), svc, o)
             elif o.op == "retire":
                 _need(_retire_claim(svc, o.ref, o, today), svc, o)
-            elif o.op == "unretire":
-                if unretire(svc, o.ref):
-                    store.digest_add("retired", f"restored {o.ref}")
-                else:
-                    _drop_op(svc, o, "nothing to restore")
-                    continue
             applied += 1
         except Deferred as e:
             deferred += 1
@@ -821,8 +975,6 @@ def _op_applied(vault: Vault, o: L.Observation) -> bool:
         if o.op == "pin":
             return c.has("owner-edited")
         return c.has("retired")
-    if o.op == "unretire":
-        return not (vault.retired_dir / o.ref).exists()
     return True
 
 
@@ -956,9 +1108,14 @@ def _retire_claim(svc: Services, ref: str, o: L.Observation, today: str) -> bool
     return True
 
 
-def _veto_note_claims(svc: Services, rel: str, body: str, today: str, cause: str) -> None:
-    """Deleting a note is a veto of everything on it: suppress every key
-    that produced its claims, via ledger lines (durable, index-derivable)."""
+def _veto_note_claims(svc: Services, rel: str, body: str, today: str, cause: str, conn=None) -> None:
+    """Retiring or deleting a note suppresses its patterns so they do not
+    re-graduate from the same witnesses. The veto names the recurrence keys
+    behind the note's LIVE claims (folded History is already gone), scoped to
+    the note's OWN subject: an `addr:`/`dom:` key or another subject's key
+    would suppress far more than this one note. Effective keys are read from
+    the index (the same edge→rkey join `forget` uses); with no index the
+    subject-level key still lands as a floor."""
     vault = svc.vault
     subject = ix.subject_for_doc(rel)
     if not subject:
@@ -971,11 +1128,29 @@ def _veto_note_claims(svc: Services, rel: str, body: str, today: str, cause: str
     keys: set[str] = {f"key:{subject}|"}
     try:
         note = parse_note(vault.root / rel, text=body)
-        for c in note.claims:
-            for _, u in c.targets("derived-from"):
-                keys.add(f"line:{u}")
+        live_blocks = [c.block for c in note.live()]
     except Exception:
         log.warning("could not parse deleted note %s; vetoing its subject key only", rel)
+        live_blocks = []
+    if conn is not None and live_blocks:
+        q = ",".join("?" * len(live_blocks))
+        rows = conn.execute(
+            f"SELECT DISTINCT k.key FROM edges e JOIN rkeys k ON k.ulid=e.dst_block "
+            f"WHERE e.src_doc=? AND e.rel='derived-from' AND e.src_block IN ({q})",
+            (rel, *live_blocks)).fetchall()
+        for r in rows:
+            key = r["key"]
+            if not key.startswith("key:"):
+                continue  # addr:/dom:/list:/shape: are cross-sender, far broader than one note
+            # Keep a witness key only if its subject RESOLVES to this note —
+            # its own subject or an alias of it (the address an auto-minted
+            # note was first filed under, before a rename). A path-subject
+            # prefix match would drop exactly those, so a renamed note's
+            # patterns would re-graduate; a genuinely different subject still
+            # resolves elsewhere and is left alone.
+            wsub = key[4:].split("|", 1)[0]
+            if ix.canonical_subject(conn, wsub) == subject:
+                keys.add(key)
     o = L.Observation(subject=subject, facet="veto", text=f"Note {rel} deleted by owner", src="harness",
                       op="veto", cause=cause, ref=",".join(sorted(keys)))
     L.append(vault, o)
@@ -985,10 +1160,10 @@ def _veto_note_claims(svc: Services, rel: str, body: str, today: str, cause: str
         svc.authority.authored[o.ulid] = L.line_fingerprint(o)
 
 
-TOMBSTONE_MARKER = "<!-- original content follows, for unretire -->\n\n"
-
-
-def _write_tombstone(vault: Vault, rel: str, body: str, reason: str, successor: str = "", original: str | None = None) -> Path:
+def _write_tombstone(vault: Vault, rel: str, reason: str, successor: str = "", original: str | None = None) -> Path:
+    """A metadata-only marker: the index reads it for the subject alias and a
+    retired docs row. No content is preserved — there is no unretire, and git
+    keeps the deleted note's history at its original path if it is ever wanted."""
     dst = vault.retired_dir / rel
     dst.parent.mkdir(parents=True, exist_ok=True)
     subject = ix.subject_for_doc(original or rel)
@@ -997,8 +1172,7 @@ def _write_tombstone(vault: Vault, rel: str, body: str, reason: str, successor: 
         meta["subject"] = subject
     if successor:
         meta["superseded_by"] = ix.subject_for_doc(successor) or successor
-    text = render_frontmatter(meta) + f"# retired: {rel}\n\n" + (f"- superseded-by:: [[{successor[:-3]}]]\n\n" if successor else "") + \
-        TOMBSTONE_MARKER + body
+    text = render_frontmatter(meta) + f"# retired: {rel}\n\n" + (f"- superseded-by:: [[{successor[:-3]}]]\n\n" if successor else "")
     write_atomic(dst, text)
     return dst
 
@@ -1032,10 +1206,10 @@ def _lapse_open_items(svc: Services, conn, today: str) -> list[str]:
             continue
         year = r["due"][:4]
         rel = f"open/{year}/{path.name}"
-        _write_tombstone(vault, rel, path.read_text(encoding="utf-8"), reason=f"lapsed (check_by {r['due']})", original=r["path"])
+        _write_tombstone(vault, rel, reason=f"lapsed (check_by {r['due']})", original=r["path"])
         path.unlink()
         lapsed.append(r["path"])
-        svc.store.digest_add("lapsed", f"open item lapsed: {r['path']} (check_by {r['due']}); `unretire {rel}` brings it back")
+        svc.store.digest_add("lapsed", f"open item lapsed and was dropped: {r['path']} (check_by {r['due']}); re-open it if it still matters")
     return lapsed
 
 
@@ -1429,7 +1603,7 @@ def nightly_prepare(svc: Services, conn) -> Prepared:
     """Phase A (sync, under the lock): what needs a model's word tonight."""
     today = svc.today()
     svc.touched.clear()
-    drain_retire_journal(svc)
+    drain_retire_journal(svc, conn)
     drain_staging(svc, conn)
     ix.rebuild(svc.vault, conn, svc.trust(), today)
     cands = graduation_candidates(conn, today)
@@ -1623,10 +1797,13 @@ def make_offers(svc: Services, conn, today: str) -> int:
 
 # --- retire / rename ritual ------------------------------------------------------------------------------
 
-def retire(svc: Services, rel: str, to: str | None = None, reason: str = "retired") -> dict:
+def retire(svc: Services, rel: str, to: str | None = None, reason: str = "retired", conn=None) -> dict:
     """Journaled so a crash mid-way leaves nothing dangling: (1) write the
     successor/tombstone, (2) rewrite referrers one file at a time, (3) leave
-    a redirect stub at the old path. Drained at the top of every pass."""
+    a redirect stub at the old path. Drained at the top of every pass. A bare
+    retire (no successor) also suppresses the note's patterns, exactly like an
+    Obsidian delete: without that a retired note re-graduates from the same
+    witnesses. There is no unretire."""
     vault = svc.vault
     old = vault.inside(rel)
     if not _is_curated_note(rel):
@@ -1646,6 +1823,12 @@ def retire(svc: Services, rel: str, to: str | None = None, reason: str = "retire
         raise ValueError(f"{rel} is already retired")
     entry = {"op": "retire", "old": rel, "new": to or "", "reason": reason, "done": []}
     _journal_write(svc, entry)
+    if not to:
+        # Suppress the note's patterns before the ritual writes anything, so a
+        # crash mid-way never leaves the note retired but its patterns live:
+        # a replay (stub not yet written) re-runs retire and re-vetoes, and a
+        # duplicate veto line is harmless (the `vetoes` row keeps MAX(until)).
+        _veto_note_claims(svc, rel, body, svc.today(), cause=f"retire:{svc.today()}", conn=conn)
     if to:
         new = vault.root / to
         if new.exists():
@@ -1666,7 +1849,7 @@ def retire(svc: Services, rel: str, to: str | None = None, reason: str = "retire
             svc.store.move_shas(rel, to)
             svc.store.memory_set(f"filesha:{to}", sha_file(new))
             svc.touched.add(to)
-    _write_tombstone(vault, rel, body, reason, successor=to or "")
+    _write_tombstone(vault, rel, reason, successor=to or "")
     _journal_mark(svc, entry, "tombstone")
     referrers = _rewrite_referrers(vault, rel, to or f"retired/{rel}")
     _journal_mark(svc, entry, "referrers")
@@ -1723,49 +1906,6 @@ def _rewrite_referrers(vault: Vault, old_rel: str, new_rel: str) -> list[str]:
     return touched
 
 
-def unretire(svc: Services, rel: str) -> bool:
-    """Bring back a retired or lapsed note (its tombstone carries the
-    original) and point referrers back at it."""
-    vault = svc.vault
-    try:
-        vault.inside(rel)
-    except ValueError:
-        return False
-    tomb = vault.retired_dir / rel
-    if not tomb.exists():
-        return False
-    text = tomb.read_text(encoding="utf-8")
-    if TOMBSTONE_MARKER not in text:
-        return False
-    body = text.split(TOMBSTONE_MARKER, 1)[1]
-    original = str(parse_note(tomb, text=text).meta.get("original") or rel)
-    try:
-        dst = vault.inside(original)
-    except ValueError:
-        log.warning("tombstone %s names an original outside the vault; refusing", rel)
-        return False
-    if not _is_curated_note(original):
-        return False
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    write_atomic(dst, body)
-    # `retire` and a hand deletion clear the note's shas, and `move_shas`
-    # relocates them for a rename, so without a baseline here `_detect_drift`
-    # reads every claim wanda wrote as an owner edit and pins it. Key on
-    # `original`: for a lapsed open item it differs from `rel`, and drift keys
-    # on the path. Re-parse the bytes just written, so the baseline is exactly
-    # what the next pass will compute from the same file.
-    try:
-        restored = parse_note(dst, text=body)
-        svc.store.set_shas(original, {"_": "baseline", **{c.block: c.sha for c in restored.claims}})
-        svc.store.memory_set(f"filesha:{original}", sha_file(dst))
-    except Exception as e:
-        log.warning("unretired %s but could not record its sha baseline: %s", original, e)
-    tomb.unlink()
-    _rewrite_referrers(vault, f"retired/{rel}", original)
-    _git_commit_all(vault, f"curated: unretire {original}")
-    return True
-
-
 def _journal_write(svc: Services, entry: dict) -> None:
     p = svc.cfg.retire_journal_path
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -1799,7 +1939,7 @@ def _journal_remove(svc: Services, entry: dict) -> None:
         write_atomic(svc.cfg.retire_journal_path, "\n".join(keep) + ("\n" if keep else ""))
 
 
-def drain_retire_journal(svc: Services) -> int:
+def drain_retire_journal(svc: Services, conn=None) -> int:
     latest: dict[str, dict] = {}
     for e in _journal_entries(svc):
         if e.get("old"):
@@ -1810,7 +1950,7 @@ def drain_retire_journal(svc: Services) -> int:
             old = svc.vault.root / e["old"]
             unfinished = old.exists() and "stub" not in e.get("done", [])
             if unfinished and parse_note(old).kind not in ix.STUB_KINDS:
-                retire(svc, e["old"], e["new"] or None, e.get("reason", "retired"))  # every step is idempotent
+                retire(svc, e["old"], e["new"] or None, e.get("reason", "retired"), conn=conn)  # every step is idempotent
                 n += 1
             else:
                 _journal_remove(svc, e)

@@ -26,7 +26,6 @@ CREATE TABLE IF NOT EXISTS messages (
   from_addr      TEXT,
   subject        TEXT,
   date_hdr       TEXT,
-  snippet        TEXT,
   status         TEXT NOT NULL DEFAULT 'new',
   verdict_json   TEXT,
   applied_action TEXT,
@@ -172,6 +171,14 @@ class Store:
         self._db = sqlite3.connect(str(path), check_same_thread=False)
         self._db.row_factory = sqlite3.Row
         self._lock = threading.RLock()
+        # Message bodies are never persisted: their one legitimate consumer is
+        # the triage classifier. The IMAP watcher stashes a body here at ingest
+        # (in-process, cross-thread) and triage takes it in the same cycle;
+        # a miss (a crash between ingest and triage) re-fetches from IMAP,
+        # where the body durably lives. Bounded so a stranded body cannot grow
+        # the process without limit.
+        self._bodies: dict[str, str] = {}
+        self._bodies_lock = threading.Lock()
         with self._lock:
             self._db.execute("PRAGMA journal_mode=WAL")
             self._db.execute("PRAGMA foreign_keys=ON")
@@ -308,17 +315,36 @@ class Store:
         from_addr: str,
         subject: str,
         date_hdr: str,
-        snippet: str,
     ) -> bool:
-        """Returns True if this is a new message (inserted), False if seen before."""
+        """Returns True if this is a new message (inserted), False if seen
+        before. The body is not stored; carry it with `stash_body`."""
         now = utcnow()
         cur = self._exec(
             "INSERT OR IGNORE INTO messages(dedupe_key, message_id, folder, uidvalidity, uid, "
-            "from_addr, subject, date_hdr, snippet, status, created_at, updated_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?,'new',?,?)",
-            (dedupe_key, message_id, folder, uidvalidity, uid, from_addr, subject, date_hdr, snippet, now, now),
+            "from_addr, subject, date_hdr, status, created_at, updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,'new',?,?)",
+            (dedupe_key, message_id, folder, uidvalidity, uid, from_addr, subject, date_hdr, now, now),
         )
         return cur.rowcount > 0
+
+    # --- transient message bodies (never persisted) ---
+
+    BODY_CACHE_CAP = 500
+
+    def stash_body(self, dedupe_key: str, body: str) -> None:
+        """Hold a message body in memory for triage to consume this cycle."""
+        with self._bodies_lock:
+            if dedupe_key not in self._bodies and len(self._bodies) >= self.BODY_CACHE_CAP:
+                # Drop the oldest; a stranded body falls back to an IMAP
+                # re-fetch, so eviction costs a fetch, never a wrong verdict.
+                self._bodies.pop(next(iter(self._bodies)), None)
+            self._bodies[dedupe_key] = body
+
+    def take_body(self, dedupe_key: str) -> str | None:
+        """Pop a stashed body. None means it was never stashed or already
+        taken — the caller re-fetches from IMAP."""
+        with self._bodies_lock:
+            return self._bodies.pop(dedupe_key, None)
 
     def fetch_by_status(self, status: str, limit: int = 50) -> list[sqlite3.Row]:
         return self._query(

@@ -59,7 +59,7 @@ def make(tmp_path, slack=None, **kw):
 
 def ingest_triaged(store, key, action, uid=1, confidence=0.95):
     store.ingest_message(dedupe_key=key, message_id=f"<{key}>", folder="INBOX", uidvalidity=1,
-                         uid=uid, from_addr="spam@x.example", subject="s", date_hdr="d", snippet="b")
+                         uid=uid, from_addr="spam@x.example", subject="s", date_hdr="d")
     v = Verdict(id="e1", action="trash" if action in ("trash", "shadow_trash") else "attention",
                 summary="s", reason="r", urgency="low", confidence=confidence)
     store.set_triaged(key, v.model_dump() | {"guard_note": ""}, action)
@@ -195,7 +195,7 @@ def test_malformed_verdict_does_not_wedge_the_pipeline(tmp_path):
     slack = FakeSlack()
     p, store = make(tmp_path, slack)
     store.ingest_message(dedupe_key="bad", message_id="<b>", folder="INBOX", uidvalidity=1, uid=1,
-                         from_addr="a@b.c", subject="s", date_hdr="d", snippet="b")
+                         from_addr="a@b.c", subject="s", date_hdr="d")
     store._exec("UPDATE messages SET status='triaged', verdict_json=?, applied_action='attention' "
                 "WHERE dedupe_key='bad'", (json.dumps({"action": "attention"}),))  # no id/summary/...
     ingest_triaged(store, "good", "attention", uid=2)
@@ -235,7 +235,7 @@ def test_undelivered_agent_answer_is_replayed(tmp_path):
     slack = FakeSlack()
     p, store = make(tmp_path, slack)
     store.ingest_message(dedupe_key="k1", message_id="<k1>", folder="INBOX", uidvalidity=1, uid=1,
-                         from_addr="a@b.c", subject="s", date_hdr="d", snippet="b")
+                         from_addr="a@b.c", subject="s", date_hdr="d")
     pk = store.get_message_by_key("k1")["id"]
     task_id = store.create_task(pk, "C1", "ts-1")
     store.record_run(kind="agent", task_id=task_id, session_id="s1", started_at=utcnow(),
@@ -251,7 +251,7 @@ def test_undelivered_agent_answer_is_replayed(tmp_path):
 def test_undeliverable_answer_stays_pending(tmp_path):
     p, store = make(tmp_path, FakeSlack())
     store.ingest_message(dedupe_key="k1", message_id="<k1>", folder="INBOX", uidvalidity=1, uid=1,
-                         from_addr="a@b.c", subject="s", date_hdr="d", snippet="b")
+                         from_addr="a@b.c", subject="s", date_hdr="d")
     pk = store.get_message_by_key("k1")["id"]
     tid = store.create_task(pk, "C1", "ts-1")
     store.record_run(kind="agent", task_id=tid, session_id="s", started_at=utcnow(), exit_code=0,
@@ -300,7 +300,7 @@ def test_cap_at_triage_time_defers_rather_than_retiring(tmp_path, monkeypatch):
 def test_deliver_pending_skips_in_flight_delivery(tmp_path):
     p, store = make(tmp_path, FakeSlack())
     store.ingest_message(dedupe_key="k1", message_id="<k1>", folder="INBOX", uidvalidity=1, uid=1,
-                         from_addr="a@b.c", subject="s", date_hdr="d", snippet="b")
+                         from_addr="a@b.c", subject="s", date_hdr="d")
     pk = store.get_message_by_key("k1")["id"]
     tid = store.create_task(pk, "C1", "ts-1")
     run_id = store.record_run(kind="agent", task_id=tid, session_id="s", started_at=utcnow(),

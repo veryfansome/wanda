@@ -1,8 +1,10 @@
 # wanda memory — follow-up (decisions taken)
 
-**Shipped on `memory-polish` already:** B1 (Z10, option B) as `9b1a781`, B2 (preference offers, option C) as `16a7b3b`, and the `.cowork` removal as `ff61168`. Everything else below is still outstanding.
+**Shipped on `memory-polish` already:** B1 (Z10, option B) as `9b1a781`, B2 (preference offers, option C) as `16a7b3b`, and the `.cowork` removal as `ff61168`.
 
-Owner decisions made in session on 2026-09-03, recorded here so they survive the conversation they were made in. Struck-through rows have shipped; the rest are outstanding.
+**Everything else below shipped on the `memory-followup` branch** (A1–A4, B3, B4, C1–C4, D1–D3). E1 is subsumed by A3; E2 (the rest of `G6`, retention) stays deferred by decision. See that branch's git log for the commits; the rows below record the decisions, not line numbers.
+
+Owner decisions made in session on 2026-09-03, recorded here so they survive the conversation they were made in.
 
 Rows name files and symbols rather than line numbers: the numbers drift with every commit, and these rows outlive them.
 

@@ -43,6 +43,7 @@ from wanda.watchers.imap_watcher import (
     ImapWatcher,
     connect,
     dedupe_key_for,
+    fetch_body,
     fetch_parsed,
     resolve_trash_folder,
 )
@@ -127,19 +128,42 @@ UNTRUSTED_NOTE = (
 )
 
 
+def _triage_read(row) -> str:
+    """wanda's own triage verdict for the email, rendered for an agent seed.
+    The message body itself is never carried into a session: its one
+    legitimate consumer is the sandboxed triage classifier. The agent works
+    from wanda's read plus the headers; the owner opens the mailbox for the
+    prose. Still sanitized — the summary and reason are model text derived
+    from untrusted content, and they sit inside the <email> fence."""
+    try:
+        v = json.loads(row["verdict_json"] or "{}")
+    except (ValueError, TypeError):
+        v = {}
+    summary = str(v.get("summary") or "").strip()
+    reason = str(v.get("reason") or "").strip()
+    urgency = str(v.get("urgency") or "").strip()
+    if not summary and not reason:
+        return "wanda's triage read: (none recorded for this message)\n"
+    line = f"wanda's triage read: {sanitize(summary)}\n" if summary else ""
+    if reason:
+        line += f"{sanitize(reason)}" + (f" (urgency: {sanitize(urgency)})" if urgency else "") + "\n"
+    return line
+
+
 def agent_seed_prompt(row, instruction: str, memory: str = "", memory_on: bool = True) -> str:
     return (
         "You are wanda, a personal assistant agent working a task for your owner, "
         "who assigned it by replying to a Slack notification about the email below.\n"
         f"{UNTRUSTED_NOTE}"
-        "You cannot send email.\n"
+        "You cannot send email, and you do not have the message body — work from "
+        "wanda's triage read and the headers; the owner reads the mail themselves.\n"
         f"{HOW_TO_REPLY}{MEMORY_HINT if memory_on else ''}\n"
         f"{memory}"
         "<email>\n"
         f"From: {sanitize(row['from_addr'] or '')}\n"
         f"Subject: {sanitize(row['subject'] or '')}\n"
         f"Date: {sanitize(row['date_hdr'] or '')}\n"
-        f"{sanitize(row['snippet'] or '')}\n"
+        f"{_triage_read(row)}"
         "</email>\n\n"
         f"Owner's instruction: {instruction}"
     )
@@ -357,9 +381,27 @@ class Processor:
             kw.update(tools="")
         return kw
 
+    async def _bodies_for(self, rows) -> dict[str, str]:
+        """Bodies for a triage batch: taken from the in-memory cache the
+        watcher filled at ingest, or re-fetched from IMAP on a miss (a crash
+        between ingest and triage). Never read from the database — nothing
+        stores a body there."""
+        bodies: dict[str, str] = {}
+        for row in rows:
+            key = row["dedupe_key"]
+            body = self.store.take_body(key)
+            if body is None:
+                body = await asyncio.to_thread(
+                    fetch_body, self.cfg, row["folder"], row["uidvalidity"], row["uid"]
+                )
+            if body is not None:
+                bodies[key] = body
+        return bodies
+
     async def triage_batch(self, rows) -> None:
         memory = self.memory.triage_block(rows) if (self.memory is not None and self.cfg.memory_enabled) else ""
-        prompt, id_map = build_batch_prompt(rows, memory=memory)
+        bodies = await self._bodies_for(rows)
+        prompt, id_map = build_batch_prompt(rows, memory=memory, bodies=bodies)
         batch = None
         error = ""
         for attempt in (1, 2):  # one fresh retry, then fail closed
@@ -1224,13 +1266,14 @@ async def run_triage_once(cfg: Config, limit: int) -> None:
         parsed = fetch_parsed(client, uids, cfg.snippet_bytes)
 
     keys = []
+    bodies: dict[str, str] = {}
     for uid, p in parsed:
         key = dedupe_key_for(p, "INBOX", uidvalidity, uid)
         store.ingest_message(
             dedupe_key=key, message_id=p["message_id"], folder="INBOX", uidvalidity=uidvalidity,
             uid=uid, from_addr=p["from_addr"], subject=p["subject"], date_hdr=p["date_hdr"],
-            snippet=p["snippet"],
         )
+        bodies[key] = p["body"]  # in hand from the fetch; no cache round-trip needed
         keys.append(key)
     rows = [r for r in (store.get_message_by_key(k) for k in keys) if r is not None]
 
@@ -1242,7 +1285,7 @@ async def run_triage_once(cfg: Config, limit: int) -> None:
             break
         chunk = rows[i : i + cfg.triage_batch_size]
         mem_block = memory.triage_block(chunk) if memory is not None else ""
-        prompt, id_map = build_batch_prompt(chunk, memory=mem_block)
+        prompt, id_map = build_batch_prompt(chunk, memory=mem_block, bodies=bodies)
         started = utcnow()
         rr = await runner.run(prompt, **proc.triage_run_kwargs())
         total_cost += rr.cost_usd

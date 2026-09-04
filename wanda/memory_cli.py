@@ -53,11 +53,9 @@ def add_parser(sub: argparse._SubParsersAction) -> None:
     v.add_argument("ref", help="claim reference like people/robin-vale#c4")
     v = verbs.add_parser("forget", help="veto a claim and the pattern behind it (owner-stated claims need Slack)")
     v.add_argument("ref", help="claim reference like people/robin-vale#c4")
-    v = verbs.add_parser("retire", help="retire a note, rewriting every link (--to merges it into a successor; not from a session)")
+    v = verbs.add_parser("retire", help="retire a note: suppress its patterns and rewrite every link (--to merges it into a successor; not from a session)")
     v.add_argument("path", help="vault-relative note path")
     v.add_argument("--to", help="successor note path, e.g. people/robin-vale.md")
-    v = verbs.add_parser("unretire", help="restore a retired or lapsed note (not from a session)")
-    v.add_argument("path", help="path under retired/, e.g. people/x.md or open/2026/2026-09-01-x.md")
     verbs.add_parser("reindex", help="rebuild the derived index from the vault")
     verbs.add_parser("fsck", help="dangling links, duplicate ids, oversize notes, stray temps")
     verbs.add_parser("hourly", help="run the hourly pass now")
@@ -302,15 +300,26 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
         print(f"forgotten on the next pass: {row['text']}")
         return 0
 
-    if verb in ("retire", "unretire", "reindex", "fsck", "hourly", "digest", "status"):
+    if verb in ("retire", "reindex", "fsck", "hourly", "digest", "status"):
         store = _store(cfg)
         svc = passes.Services(cfg, store, vault)
         if verb == "retire":
-            if args.to and _in_session(store):
-                sys.exit("merging notes (--to) is an identity decision for the owner, not for a session; retire without --to, or ask")
+            # A retire suppresses the note's patterns for good (there is no
+            # unretire; recovery is telling wanda again). That is the owner's
+            # call, not a session's — a session that could bare-retire any
+            # note would hold a year-long suppression primitive.
+            if _in_session(store):
+                sys.exit("retiring a note suppresses its patterns and cannot be undone from a session; "
+                         "leave it out of your reply, or ask the owner to run it")
             try:
                 with passes.memory_lock(cfg.memory_lock_path):
-                    r = passes.retire(svc, args.path, args.to)
+                    # The current index still holds the note's witnesses, so a
+                    # bare retire's veto can name their recurrence keys.
+                    conn = passes.open_conn(svc)
+                    try:
+                        r = passes.retire(svc, args.path, args.to, conn=conn)
+                    finally:
+                        conn.close()
             except (ValueError, FileNotFoundError) as e:
                 sys.exit(str(e))
             except passes.Deferred as e:
@@ -320,18 +329,6 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
                 sys.exit("a memory pass is running; try again in a minute")
             print(json.dumps(r, indent=1))
             return 0
-        if verb == "unretire":
-            if _in_session(store):
-                sys.exit("restoring a note the owner deleted is the owner's call, not a session's; say so in your reply")
-            try:
-                with passes.memory_lock(cfg.memory_lock_path):
-                    ok = passes.unretire(svc, args.path)
-            except passes.Busy:
-                sys.exit("a memory pass is running; try again in a minute")
-            if ok:
-                store.digest_add("retired", f"restored retired/{args.path} with `wanda memory unretire`")
-            print("restored" if ok else "nothing to restore")
-            return 0 if ok else 1
         if verb == "reindex":
             if _in_session(store):
                 sys.exit("reindex writes the shared index; leave it to the daemon's hourly pass while a session is running")
@@ -344,6 +341,12 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
                         conn.close()
             except passes.Busy:
                 sys.exit("a memory pass is running; it rebuilds the index itself")
+            except ix.RebuildFailed as e:
+                # Every note failed to parse: the last good index is kept
+                # (the rebuild rolled back). Name the notes so they can be
+                # fixed — this is the command a human runs to recover a vault.
+                lines = "\n".join(f"  - {p}: {err}" for p, err in e.broken_notes[:20])
+                sys.exit(f"index not rebuilt — every note failed to parse, so the last good index is kept:\n{lines}")
             print(f"indexed {rep.docs} notes, {rep.claims} claims, {rep.obs} observations; {len(rep.rejected)} rejected lines, {len(rep.flags)} flags")
             print("(a hand-run rebuild holds no owner authority: owner lines read back as session tier and the "
                   "standing-rules block is empty until a daemon pass re-verifies them from Slack.)", file=sys.stderr)
@@ -370,6 +373,10 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
                         conn.close()
             except passes.Busy:
                 sys.exit("a memory pass is already running")
+            except ix.RebuildFailed as e:
+                lines = "\n".join(f"  - {p}: {err}" for p, err in e.broken_notes[:20])
+                sys.exit(f"pass aborted — the index could not be rebuilt because every note failed to parse "
+                         f"(the last good index is kept):\n{lines}")
             print(rep.summary())
             print("(a hand-run pass holds no owner authority: owner-tier lines are neither verified nor applied. A "
                   "running daemon with WANDA_MEMORY_OWNER_USER_IDS set repairs this on its next hourly pass, within "
@@ -388,7 +395,7 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
             print(f"export:  {cfg.memory_export_dir}")
             print(f"hourly:  {store.memory_get('hourly_at') or 'never'}")
             print(f"nightly: {store.memory_get('nightly_date') or 'never'}")
-            print(f"open windows: {len(store.open_windows())}")  # what _in_session refuses reindex, hourly, unretire and retire --to on
+            print(f"open windows: {len(store.open_windows())}")  # what _in_session refuses reindex, hourly and retire on
             conn = _conn(cfg)
             if conn is not None:
                 for t in ("docs", "claims", "obs", "subjects", "vetoes"):

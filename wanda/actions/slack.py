@@ -22,7 +22,6 @@ log = logging.getLogger(__name__)
 METADATA_EVENT_TYPE = "wanda_task"
 URGENCY_EMOJI = {"high": "🔴", "medium": "🟡", "low": "🟢"}
 MIN_INTERVAL_S = 1.0  # chat.postMessage is ~1/s/channel
-SNIPPET_LIMIT = 1500
 TEXT_LIMIT = 3500  # well under Slack's 40k text cap, and headers can be huge
 MISSING_THREAD_ERRORS = {"thread_not_found", "message_not_found", "channel_not_found"}
 # Slack answered that the message is not there. Deliberately NOT
@@ -87,12 +86,13 @@ class SlackActions:
 
     async def post_task(self, row: sqlite3.Row, verdict: Verdict) -> str:
         emoji = URGENCY_EMOJI.get(verdict.urgency, "🟡")
-        snippet = esc((row["snippet"] or "")[:SNIPPET_LIMIT]).replace("```", "'''")
+        # No body snippet: the sender's prose has exactly one legitimate
+        # consumer, the sandboxed triage classifier. The owner opens their own
+        # mailbox to read the mail; this post is wanda's read of it.
         text = (
             f"{emoji} *{esc(verdict.summary)}*\n"
             f"From: {esc_inline(row['from_addr'])}\nSubject: {esc_inline(row['subject'])}\n"
             f"_{esc(verdict.reason)}_\n"
-            f"```{snippet}```\n"
             f"Reply in this thread to have wanda work on it."
         )
         resp = await self._call(

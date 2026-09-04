@@ -204,6 +204,18 @@ class RebuildReport:
     broken_notes: list[tuple[str, str]] = field(default_factory=list)
 
 
+class RebuildFailed(Exception):
+    """The rebuild would commit an empty index while notes could not be
+    parsed — a systematic fault (a code bug, a vault-wide stat() failure),
+    not a legitimately empty vault. Raised so the transaction rolls back
+    rather than replacing a good index with an empty one, and so the pass
+    can name the offending notes to the owner. Carries `broken_notes`."""
+
+    def __init__(self, broken_notes: list[tuple[str, str]]):
+        self.broken_notes = list(broken_notes)
+        super().__init__(f"index would be empty while {len(self.broken_notes)} note(s) could not be indexed")
+
+
 def rebuild(vault: Vault, conn: sqlite3.Connection, trust: TrustOracle, today: str | None = None) -> RebuildReport:
     """Full rebuild in one transaction, so a concurrent reader sees the old
     snapshot or the new one. Measured warm on an Apple-silicon laptop at
@@ -219,6 +231,12 @@ def rebuild(vault: Vault, conn: sqlite3.Connection, trust: TrustOracle, today: s
         _load_ledger(vault, conn, trust, rep)
         obs_by_ulid = {r["ulid"]: r for r in conn.execute("SELECT * FROM obs")}
         _load_notes(vault, conn, trust, rep, obs_by_ulid, today)
+        if rep.docs == 0 and rep.broken_notes:
+            # A successfully-empty index is fine (an empty vault); an index
+            # that is empty ONLY because every note failed to parse is not —
+            # committing it would hand every reader a "wanda knows nothing"
+            # projection with no marker. Roll back and keep the last good one.
+            raise RebuildFailed(rep.broken_notes)
         _finish_status(conn, today)
         _load_writespecs(vault, conn)
         _derive_owner_rules(conn)
@@ -454,7 +472,12 @@ def _index_claim(conn, trust, rep, c: Claim, doc: str, obs_by_ulid, today: str, 
                 else:
                     rep.flags.append((doc, c.block, "unverified-owner-edge", f"rule text mismatch {e.dst_doc}#^{e.dst_block}"))
                     continue
-            elif o["ref"] == f"{doc}#^{c.block}" or note_for_subject(o["subject"]) == doc:
+            elif o["ref"] == f"{doc}#^{c.block}":
+                # An attest confers authority on exactly the claim it names,
+                # never on any other claim that happens to sit on the same
+                # note. The old `note_for_subject(o["subject"]) == doc`
+                # fallback granted owner tier to a claim of arbitrary text as
+                # long as the attest's subject resolved here.
                 owner_said = 1
             else:
                 rep.flags.append((doc, c.block, "unverified-owner-edge", f"{e.dst_doc}#^{e.dst_block}"))

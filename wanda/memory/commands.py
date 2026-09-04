@@ -37,15 +37,14 @@ def _subjects_for_target(token: str, conn) -> set[str]:
     return out
 from wanda.triage import addresses_in
 
-VERBS = ("rule", "attest", "forget", "pin", "unretire")
+VERBS = ("rule", "attest", "forget", "pin")
 ACTIONS = ("trash", "ignore", "attention")
 MENTION_PREFIX = r"^\s*(?:<@[A-Z0-9]+(?:\|[^>]*)?>\s*)?"
-COMMAND_RE = re.compile(MENTION_PREFIX + r"(rule|attest|forget|pin|unretire)\b(.*)$", re.I | re.S)
+COMMAND_RE = re.compile(MENTION_PREFIX + r"(rule|attest|forget|pin)\b(.*)$", re.I | re.S)
 OFFER_ONLY_RE = re.compile(MENTION_PREFIX + r"(k\d+)\s*$", re.I)
 REF_RE = re.compile(r"^(?P<doc>(people|orgs|topics|prefs|open)/[^#\s/]+?)(?:\.md)?#\^?(?P<block>[a-z0-9]{1,24})$")
 OFFER_RE = re.compile(r"^k\d+$", re.I)
 DOMAIN_RE = re.compile(r"^[a-z0-9.-]+\.[a-z]{2,}$")
-PATH_RE = re.compile(r"^(people|orgs|topics|prefs|open)/[^\s/]+(\.md)?$")
 DISPOSITION_FACET = "mail-disposition"
 PREFERENCE_FACET = "preference"
 
@@ -105,8 +104,6 @@ def parse_command(text: str) -> Parsed | None:
         return None
     if verb in ("attest", "forget", "pin"):
         return Parsed(verb, args) if len(args) == 1 and normalize_ref(args[0]) else None
-    if verb == "unretire":
-        return Parsed(verb, args) if len(args) == 1 and PATH_RE.match(args[0]) else None
     return None
 
 
@@ -289,8 +286,6 @@ def expected_for_message(text: str, conn, store) -> list[tuple[str, str, str, st
         else:
             for o in forget_observations(conn, doc, block, claim_text, subj):
                 out.append((o.op, o.subject, o.facet, clean_text(o.text), o.ref))
-    elif p.verb == "unretire":
-        out.append(("unretire", GENERAL_PREF, "unretire", clean_text(f"Restore {p.args[0]}"), p.args[0]))
     return out
 
 
@@ -367,8 +362,4 @@ def handle(ctx: Context, conn, store, owner_ids: list[str]) -> Minted:
             return Minted([o], f"Pinned: _{claim_text}_ — wanda will not rewrite or fold it.")
         obs = forget_observations(conn, doc, block, claim_text, subj, **base)
         return Minted(obs, f"Forgotten, and the pattern behind it is suppressed for a year: _{claim_text}_")
-    if p.verb == "unretire":
-        path = p.args[0]
-        o = Observation(subject=GENERAL_PREF, facet="unretire", text=f"Restore {path}", op="unretire", ref=path, **base)
-        return Minted([o], f"Restoring `{path}` on the next pass.")
     return Minted(reply="")
