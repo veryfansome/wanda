@@ -58,7 +58,12 @@ class Observation:
 
 def format_line(o: Observation) -> str:
     """Normalises what a writer may have got slightly wrong (facet case and
-    spaces, an unquoted cause) and leaves the rest to `append`'s check."""
+    spaces, an unquoted cause) and leaves the rest to `append`'s check.
+    The cap trims the free text and never a field: a clipped cause would break
+    owner verification and a clipped ref would silently drop recurrence keys
+    from a veto, so a line whose fields alone exceed LEDGER_LINE_CAP_B is
+    written over the cap, with as much of the text trimmed as it takes —
+    possibly all of it."""
     o.facet = slugify(o.facet, 32) if o.facet else ""
     o.subject = o.subject.strip().lower()
     fields = [f"src={o.src}"]

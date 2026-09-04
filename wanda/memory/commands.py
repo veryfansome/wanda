@@ -123,6 +123,20 @@ def normalize_ref(ref: str) -> str | None:
     return f"{m.group('doc')}.md#^{m.group('block')}"
 
 
+class CannotRecompute(Exception):
+    """The line a message may have minted cannot be recomputed now (the claim
+    it quotes has left the index). Not a verdict about the line."""
+
+
+# Duplicated from passes.GENERAL_PREF_SUBJECT on purpose: `passes` imports
+# `commands`, so a shared constant here would be an import cycle.
+GENERAL_PREF = "pref/general"
+# A disposition offer's text is exactly `<action> mail from <address>`. The
+# `\S+` target is what rejects a row whose text smuggles anything past the
+# address; the rule_text() equality below is what pins the action.
+OFFER_TEXT_RE = re.compile(r"^\S+ mail from (?P<target>\S+)$")
+
+
 def rule_text(action: str, target: str, note: str = "") -> str:
     """Closed vocabulary, harness-built. This exact string becomes the claim,
     so an owner rule never carries model prose."""
@@ -184,17 +198,38 @@ def _target_to_subject(token: str, conn) -> tuple[str | None, str, list[str]]:
     return r.key, r.key, [k for k, _ in r.nearest] if r.how == "miss" else []
 
 
-def expected_for_message(text: str, conn, store, task_sender: str = "") -> list[tuple[str, str, str, str]]:
+def _claim_for_ref(ref: str, conn) -> tuple[str, str, str, str] | None:
+    """(doc, block, claim text, subject) for a normalized ref, or None when
+    the index has no such claim. `handle` mints from this and
+    `expected_for_message` recomputes from it, so the two cannot drift."""
+    doc, _, block = ref.partition("#^")
+    row = conn.execute("SELECT text FROM claims WHERE doc=? AND block=?",
+                       (doc, block)).fetchone() if conn is not None else None
+    if row is None:
+        return None
+    return doc, block, row["text"], ix.subject_for_doc(doc) or GENERAL_PREF
+
+
+def expected_for_message(text: str, conn, store, task_sender: str = "") -> list[tuple[str, str, str, str, str]]:
     """What ledger lines a given owner message may legitimately have minted:
-    (op, subject, facet, text-or-ref) — one entry per acceptable subject.
-    The verifier recomputes this from the fetched Slack message and requires
-    the ledger line to match one of them, so a forged line cannot borrow a
-    real owner message it did not come from. Text comes from the message
-    (harness-templated), never from anything a session could have edited."""
+    the whole line, (op, subject, facet, text, ref) — one per subject a rule's
+    target may resolve to, one per line a ref verb mints. The verifier
+    recomputes this from the fetched
+    Slack message and requires the ledger line to match one of them field for
+    field, so a forged line cannot pick its own subject, facet, text or ref
+    under a message the owner really wrote. A rule's fields are built from
+    the message; attest, pin, retire and veto quote a claim, so their fields
+    are recomputed from the index — which means a session that also rewrites
+    that claim can still make a forged line match, and the note edit is what
+    surfaces it, reported as a hand-edit.
+
+    Raises CannotRecompute when the claim a ref names is no longer in the
+    index: "we cannot recompute it" must never read as "a session forged it".
+    """
     p = parse_command(text)
     if p is None:
         return []
-    out: list[tuple[str, str, str, str]] = []
+    out: list[tuple[str, str, str, str, str]] = []
     if p.verb == "rule":
         if OFFER_RE.match(p.args[0]) and len(p.args) == 1:
             offer = store.get_offer(p.args[0]) if store is not None else None
@@ -203,16 +238,23 @@ def expected_for_message(text: str, conn, store, task_sender: str = "") -> list[
             if offer["kind"] == "disposition":
                 # Re-derive the templated text from the offer's own fields; a
                 # forged offer row cannot smuggle prose into a disposition.
-                t, _, slug = str(offer["subject"]).partition("/")
-                target = slug
-                if offer["action"] not in ACTIONS or rule_text(offer["action"], target) != offer["text"]:
+                # The target is in the offer's own TEXT, not in its subject:
+                # make_offers builds the text from rule_text(action, address)
+                # but the subject from subject_from_address(address), which
+                # for a role or list address is org/<registrable domain>.
+                # Reading the slug therefore compared that domain against the
+                # address and rejected every role-address offer.
+                m = OFFER_TEXT_RE.match(str(offer["text"]))
+                target = m.group("target") if m else ""
+                if offer["action"] not in ACTIONS or not target or rule_text(offer["action"], target) != offer["text"]:
                     return out
-                if subject_from_address(target) != offer["subject"] and f"org/{target}" != offer["subject"]:
+                if not ((addresses_in(target) == [target] and subject_from_address(target) == offer["subject"])
+                        or f"org/{target}" == offer["subject"]):
                     return out
                 for subj in ({offer["subject"]} | ({ix.canonical_subject(conn, offer["subject"])} if conn is not None else set())):
-                    out.append(("rule", subj, DISPOSITION_FACET, offer["text"]))
+                    out.append(("rule", subj, DISPOSITION_FACET, offer["text"], ""))
             else:
-                out.append(("rule", offer["subject"], PREFERENCE_FACET, offer["text"]))
+                out.append(("rule", offer["subject"], PREFERENCE_FACET, offer["text"], ""))
             return out
         args = list(p.args)
         if args[0].lower() in ACTIONS:
@@ -224,18 +266,29 @@ def expected_for_message(text: str, conn, store, task_sender: str = "") -> list[
             return []
         for s in _subjects_for_target(args[0], conn) | {subj}:
             if args[1].lower() in ACTIONS:
-                out.append(("rule", s, DISPOSITION_FACET, rule_text(args[1].lower(), display, " ".join(args[2:]))))
+                out.append(("rule", s, DISPOSITION_FACET, rule_text(args[1].lower(), display, " ".join(args[2:])), ""))
             else:
-                out.append(("rule", s, PREFERENCE_FACET, clean_text(" ".join(args[1:]), 300)))
+                out.append(("rule", s, PREFERENCE_FACET, clean_text(" ".join(args[1:]), 300), ""))
     elif p.verb in ("attest", "forget", "pin"):
+        # Recompute the whole line the way `handle` minted it. clean_text is
+        # not optional: format_line stores clean_text(o.text), which rewrites
+        # backticks, <>, :: and truncates at 600 bytes, while a hand-written
+        # claim may contain any of them — so without it a genuine attest of
+        # such a claim reads as a forgery.
         ref = normalize_ref(p.args[0])
-        if ref:
-            op = {"attest": "attest", "forget": "retire", "pin": "pin"}[p.verb]
-            out.append((op, "", "", ref))
-            if p.verb == "forget":
-                out.append(("veto", "", "", ref))
+        found = _claim_for_ref(ref, conn)
+        if found is None:
+            raise CannotRecompute(f"no claim at {ref}")
+        doc, block, claim_text, subj = found
+        if p.verb == "attest":
+            out.append(("attest", subj, "attest", clean_text(f"Confirmed by the owner: {claim_text}"), ref))
+        elif p.verb == "pin":
+            out.append(("pin", subj, "pin", clean_text(f"Pinned: {claim_text}"), ref))
+        else:
+            for o in forget_observations(conn, doc, block, claim_text, subj):
+                out.append((o.op, o.subject, o.facet, clean_text(o.text), o.ref))
     elif p.verb == "unretire":
-        out.append(("unretire", "", "", p.args[0]))
+        out.append(("unretire", GENERAL_PREF, "unretire", clean_text(f"Restore {p.args[0]}"), p.args[0]))
     return out
 
 
@@ -247,8 +300,8 @@ def forget_observations(conn, doc: str, block: str, text: str, subject: str, **b
         "SELECT DISTINCT k.key FROM edges e JOIN rkeys k ON k.ulid=e.dst_block "
         "WHERE e.src_doc=? AND e.src_block=? AND e.rel='derived-from'", (doc, block))] if conn is not None else []
     keys = keys or [f"key:{subject}|"]
-    # The veto ref must carry keys with the claim identity too, so a forged
-    # claim cannot be "forgotten" into a veto of an unrelated key set.
+    # The veto's ref is the key set the claim was derived from; verification
+    # recomputes it by calling this same function, so the two cannot drift.
     retire = Observation(subject=subject, facet="retire", text=f"Forgotten: {text}", op="retire", ref=ref, **base)
     veto = Observation(subject=subject, facet="veto", text="Vetoed the pattern behind a forgotten claim", op="veto",
                        ref=",".join(sorted(set(keys))), **base)
@@ -271,6 +324,11 @@ def handle(ctx: Context, conn, store, owner_ids: list[str]) -> Minted:
             offer = store.get_offer(p.args[0])
             if not offer:
                 return Minted(reply=f"No offer {p.args[0]}.")
+            if offer["taken_at"]:
+                # An offer is single-use: minting again would just duplicate
+                # the rule (_apply_rule's supersede branch skips an identical
+                # text, so the second claim stays live alongside the first).
+                return Minted(reply=f"Offer {p.args[0]} is already your word: _{offer['text']}_")
             facet = DISPOSITION_FACET if offer["kind"] == "disposition" else PREFERENCE_FACET
             o = Observation(subject=offer["subject"], facet=facet, text=offer["text"], op="rule", **base)
             store.take_offer(p.args[0])
@@ -293,21 +351,20 @@ def handle(ctx: Context, conn, store, owner_ids: list[str]) -> Minted:
         return Minted([o], f"Preference recorded for `{subj}`: _{text}_{near}")
     if p.verb in ("attest", "forget", "pin"):
         ref = normalize_ref(p.args[0])
-        doc, _, block = ref.partition("#^")
-        row = conn.execute("SELECT * FROM claims WHERE doc=? AND block=?", (doc, block)).fetchone() if conn is not None else None
-        if row is None:
+        found = _claim_for_ref(ref, conn)
+        if found is None:
             return Minted(reply=f"No claim at `{ref}`.")
-        subj = ix.subject_for_doc(doc) or "pref/general"
+        doc, block, claim_text, subj = found
         if p.verb == "attest":
-            o = Observation(subject=subj, facet="attest", text=f"Confirmed by the owner: {row['text']}", op="attest", ref=ref, **base)
-            return Minted([o], f"Confirmed as your word: _{row['text']}_")
+            o = Observation(subject=subj, facet="attest", text=f"Confirmed by the owner: {claim_text}", op="attest", ref=ref, **base)
+            return Minted([o], f"Confirmed as your word: _{claim_text}_")
         if p.verb == "pin":
-            o = Observation(subject=subj, facet="pin", text=f"Pinned: {row['text']}", op="pin", ref=ref, **base)
-            return Minted([o], f"Pinned: _{row['text']}_ — wanda will not rewrite or fold it.")
-        obs = forget_observations(conn, doc, block, row["text"], subj, **base)
-        return Minted(obs, f"Forgotten, and the pattern behind it is suppressed for a year: _{row['text']}_")
+            o = Observation(subject=subj, facet="pin", text=f"Pinned: {claim_text}", op="pin", ref=ref, **base)
+            return Minted([o], f"Pinned: _{claim_text}_ — wanda will not rewrite or fold it.")
+        obs = forget_observations(conn, doc, block, claim_text, subj, **base)
+        return Minted(obs, f"Forgotten, and the pattern behind it is suppressed for a year: _{claim_text}_")
     if p.verb == "unretire":
         path = p.args[0]
-        o = Observation(subject="pref/general", facet="unretire", text=f"Restore {path}", op="unretire", ref=path, **base)
+        o = Observation(subject=GENERAL_PREF, facet="unretire", text=f"Restore {path}", op="unretire", ref=path, **base)
         return Minted([o], f"Restoring `{path}` on the next pass.")
     return Minted(reply="")

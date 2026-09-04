@@ -27,8 +27,10 @@ from typing import Callable
 from wanda.memory import index as ix
 from wanda.memory import ledger as L
 from wanda.memory import render as R
-from wanda.memory.commands import DISPOSITION_FACET, expected_for_message, normalize_ref, rule_text
-from wanda.memory.notes import Claim, Edge, Note, new_note, parse_note, parse_writespec
+from wanda.memory.commands import (
+    DISPOSITION_FACET, CannotRecompute, expected_for_message, normalize_ref, rule_text,
+)
+from wanda.memory.notes import Claim, Edge, Note, new_note, parse_note, parse_writespec, strip_provenance
 from wanda.memory.subjects import parse_subject, subject_from_address
 from wanda.memory.vault import (
     GRADUATE_CAUSES, GRADUATE_DAYS, NOTE_CAP_B, TYPE_TO_DIR, Snapshot, Vault, clean_prose, clean_text, nbytes,
@@ -51,7 +53,8 @@ OPEN_LAPSE_DAYS = 7
 JACCARD_COVERED = 0.6
 CONTRADICTION_MAX_JACCARD = 0.5
 CONTRADICTION_MIN_SHARED = 2
-CLAIM_TEXT_CAP = 240           # matches RESOLUTION_SCHEMA maxLength
+CLAIM_TEXT_CAP = 240           # bytes where clean_text applies it (:1242); characters as RESOLUTION_SCHEMA's maxLength (:94)
+RESOLUTION_MODES = ("support", "append", "supersede", "contradict")   # the schema's enum and the apply-side guard, one list
 APPEND_MIN_CONFIDENCE = 0.4
 NIGHTLY_MAX_CANDIDATES = 15
 NIGHTLY_MAX_CONTRADICTIONS = 5
@@ -66,6 +69,17 @@ PROMPTS_DIR = Path(__file__).resolve().parent.parent.parent / "prompts"
 MINTED_IN_PROCESS = "minted in-process"
 GENERAL_PREF_SUBJECT = "pref/general"
 OWNER_OPS = ("rule", "attest", "pin", "retire", "unretire")
+# Verification verdicts. LINE_MISMATCH is the only durable one: it says this
+# line did not come from this message, which re-checking can only repeat.
+# A CANNOT_CHECK verdict says the recomputation could not be done at all.
+LINE_MISMATCH = "line does not match the message"
+CANNOT_CHECK = "cannot check"
+CLAIM_REWORDED = f"{CANNOT_CHECK}: the claim reads differently now"
+AUTHORITY_HELD = "authority held in memory"
+# Ops whose expected text is read out of claims.text, so a text-only mismatch
+# may be a legitimate rewording. Every other op's text is harness-built from
+# the message, so a text mismatch there is forgery.
+TEXT_FROM_VAULT_OPS = ("attest", "pin", "retire")
 
 RESOLUTION_SCHEMA = {
     "type": "object",
@@ -76,7 +90,7 @@ RESOLUTION_SCHEMA = {
                 "type": "object",
                 "properties": {
                     "key": {"type": "string"},
-                    "mode": {"type": "string", "enum": ["support", "append", "supersede", "contradict"]},
+                    "mode": {"type": "string", "enum": list(RESOLUTION_MODES)},
                     "text": {"type": "string", "maxLength": CLAIM_TEXT_CAP},
                     "winner_block": {"type": "string"},
                     "loser_blocks": {"type": "array", "items": {"type": "string"}},
@@ -123,7 +137,14 @@ class Deferred(Exception):
 class Authority:
     """Owner authority the daemon holds in its own memory: lines it minted
     from Slack events it received, and lines it fetched and verified. A row
-    in wanda.db can cache this, never grant it."""
+    in wanda.db can cache this, never grant it.
+
+    Mutated without a lock, and only in these shapes: one dict-item
+    assignment per minted line, from the worker thread handling an owner
+    command (service.py:324), and `windows` rebound — never edited in
+    place — from the event loop. Readers do single lookups (holds/wrote) or
+    iterate a list that is replaced rather than mutated. A compound update
+    added here would need a lock."""
     minted: dict[str, str] = field(default_factory=dict)    # ulid -> content fingerprint
     verified: dict[str, str] = field(default_factory=dict)  # ulid -> content fingerprint
     authored: dict[str, str] = field(default_factory=dict)  # harness lines a pass wrote itself (e.g. a deletion veto)
@@ -143,6 +164,13 @@ class Services:
     vault: Vault
     # cause, line-json -> (ok, detail). Fetches the Slack message and checks author and text.
     verify_owner: Callable[[str, str], tuple[bool, str]] | None = None
+    # UTC, because every date the vault persists is UTC: ledger day names
+    # (ledger.py:48, :56), `until`, `check_by`/`due` and the `owner-edited`
+    # stamps. Horizons therefore compare like with like. The local clock
+    # appears only where a human reads a date — the nightly schedule
+    # (main.py:912-916) and the digest's date and thread key (digest.py:32) —
+    # so more than 3.5 h east of UTC the 03:30 nightly runs with yesterday's
+    # UTC date, shifting due_soon, `until` expiry and open-item lapsing by a day.
     today: Callable[[], str] = lambda: datetime.now(timezone.utc).date().isoformat()
     authority: Authority | None = None
     touched: set[str] = field(default_factory=set)  # curated notes written this pass, for the commit message
@@ -157,8 +185,11 @@ class Services:
 
 class StoreTrust:
     """The TrustOracle backed by wanda.db plus, in the daemon, the authority
-    it holds in memory. Without authority (a CLI process) owner lines are
-    trusted from the cached marks only for display; only the daemon applies."""
+    it holds in memory. The cached marks never make a line owner tier on
+    their own: without authority (a CLI process) `line_checked` is false, so
+    an owner line reads at the tier of the run window it was written in. The
+    marks cache what the daemon holds, and are repaired from it — never the
+    reverse."""
 
     def __init__(self, store, authority: Authority | None = None):
         self.store = store
@@ -368,7 +399,6 @@ def hourly(svc: Services, conn, workspace: Path | None = None) -> HourlyReport:
         rep.committed = True
     if _git_commit_all(vault, _curated_message("hourly", svc)):
         rep.committed = True
-    store.memory_set("hourly_at", datetime.now(timezone.utc).isoformat(timespec="seconds"))
     return rep
 
 
@@ -395,9 +425,11 @@ def _absorb_owner_changes(svc: Services, rep: HourlyReport, today: str) -> None:
     for code, old, new in changes:
         if code == "R" and _is_curated_note(old) and _is_curated_note(new):
             store.move_shas(old, new)
-            _add_alias(svc, new, Path(old).stem)
+            aliased = _add_alias(svc, new, Path(old).stem)
             rep.renamed.append((old, new))
-            store.digest_add("hand-edit", f"you renamed {old} → {new}; its history and hashes followed, and the old name is an alias")
+            store.digest_add("hand-edit", f"you renamed {old} → {new}; its history and hashes followed, and the old name is an alias"
+                             if aliased else
+                             f"you renamed {old} → {new}; its history and hashes followed, but the old name was not added as an alias on {new} — see the log")
         elif code == "D" and _is_curated_note(old):
             body = _git_show_head(vault, old) or ""
             _write_tombstone(vault, old, body, reason="deleted by owner")
@@ -408,23 +440,33 @@ def _absorb_owner_changes(svc: Services, rep: HourlyReport, today: str) -> None:
     _git_commit_all(vault, "owner edits (auto)", author="owner via wanda")
 
 
-def _add_alias(svc: Services, rel: str, alias: str) -> None:
+def _add_alias(svc: Services, rel: str, alias: str) -> bool:
     """Add an alias to a note's frontmatter (the owner's note: metadata
-    only, claims untouched, hashes preserved)."""
+    only, claims untouched, hashes preserved). False when the alias is not
+    on the note afterwards, so the caller does not report one that is."""
     path = svc.vault.root / rel
-    if not path.exists() or not alias:
-        return
+    if not alias:
+        return False
+    if not path.exists():
+        log.warning("cannot alias %s: %s is gone", alias, rel)
+        return False
     try:
         note = parse_note(path)
-    except Exception:
-        return
+    except Exception as e:
+        log.warning("cannot alias %s on %s: %s", alias, rel, e)
+        return False
     aliases = list(note.meta.get("aliases") or [])
     if alias in aliases or alias == note.title:
-        return
+        return True  # already known by that name
     aliases.append(alias)
     note.meta["aliases"] = aliases
-    write_atomic(path, note.render())
+    # A rename is absorbed at hourly step 1, while an editor save can still be
+    # in flight: metadata is not worth losing the owner's text for.
+    if not write_if_unchanged(note.snap or Snapshot.take(path), note.render()):
+        log.warning("alias %s not added to %s: it changed under us", alias, rel)
+        return False
     svc.store.memory_set(f"filesha:{rel}", sha_file(path))
+    return True
 
 
 def _verify_owner_lines(svc: Services, rep: HourlyReport) -> None:
@@ -432,9 +474,17 @@ def _verify_owner_lines(svc: Services, rep: HourlyReport) -> None:
     written by an owner, and could have minted exactly this line. Lines the
     daemon minted itself, or verified since it started, are held in memory;
     everything else is checked now whatever the database says, and checked
-    again once a day."""
+    again once a day. A line the message could not have minted is held out
+    and reported, and that verdict is the only one that stays, because
+    nothing later re-derives it. Every other failure — the message is gone,
+    its author is no longer an owner, Slack could not be reached, or the
+    claim a line quotes has left the index — leaves the line pending and is
+    retried on the same daily cadence: a cached negative is not evidence."""
     store, auth = svc.store, svc.authority
     now = datetime.now(timezone.utc)
+    reset = getattr(svc.verify_owner, "reset", None)
+    if reset is not None:
+        reset()  # the real verifier memoises one fetch per message; the memo is per pass
     seen: set[str] = set()
     for rec in L.iter_observations(svc.vault):
         if isinstance(rec, L.Rejected):
@@ -446,8 +496,15 @@ def _verify_owner_lines(svc: Services, rep: HourlyReport) -> None:
             continue
         fp = L.line_fingerprint(rec)
         mark = store.memory_get(f"checked:{rec.ulid}")
-        if mark == "0":
-            continue  # quarantined; a human decides
+        if store.memory_get(f"quarantine:{rec.ulid}"):
+            continue  # this line could not have come from the message it names; a human decides
+        # The marks in wanda.db cache what the daemon holds in memory; a
+        # cleared or flipped row must not demote a line whose authority it
+        # still holds, or wiping one row permanently drops the owner's rule.
+        if auth is not None and auth.holds(rec.ulid, fp):
+            cached = store.owner_check(rec.cause)
+            if cached is None or not cached["verified"]:
+                store.set_owner_check(rec.cause, True, AUTHORITY_HELD)
         # Authority is bound to content: a line reusing a held ULID with
         # different content is NOT held, and falls through to verification.
         if auth is not None and auth.minted.get(rec.ulid) == fp:
@@ -456,32 +513,53 @@ def _verify_owner_lines(svc: Services, rep: HourlyReport) -> None:
             continue
         if svc.verify_owner is None:
             continue  # nothing to check against; stays pending, never assumed
+        last_fail = store.memory_get(f"recheck:{rec.ulid}")
+        if last_fail and not _stale_check(last_fail, now):
+            continue  # the last check did not succeed; retry on the daily cadence, not every pass
         prior = store.owner_check(rec.cause)
         try:
             ok, detail = svc.verify_owner(rec.cause, json.dumps({
                 "op": rec.op, "subject": rec.subject, "facet": rec.facet, "text": rec.text, "ref": rec.ref}))
-        except Exception as e:  # Slack down: leave as is, try next hour
+        except Exception as e:  # Slack down, or the lookup itself failed: leave as is, try next hour
             log.warning("owner verification failed for %s: %s", rec.cause, e)
             continue
         if ok:
             store.set_owner_check(rec.cause, True, detail)
             store.memory_set(f"checked:{rec.ulid}", now.isoformat(timespec="seconds"))
+            if last_fail:
+                store.memory_set(f"recheck:{rec.ulid}", "")
             if auth is not None:
                 auth.verified[rec.ulid] = fp
             rep.verified += 1
             continue
+        if detail.startswith(CANNOT_CHECK):
+            # Nothing was shown either way, so nobody is accused, the line
+            # keeps whatever authority it already had, and it is not counted
+            # as unverified. The drift pass is what tells the owner a claim
+            # they attested has changed under them.
+            log.warning("owner verification could not run for %s: %s", rec.cause, detail)
+            store.memory_set(f"recheck:{rec.ulid}", now.isoformat(timespec="seconds"))
+            continue
         rep.unverified += 1
         if auth is not None:
             auth.verified.pop(rec.ulid, None)
-        if prior is not None and prior["verified"] and detail == "line does not match the message":
-            # The cause is genuine for its own line; this line is a stowaway.
+        if detail == LINE_MISMATCH:
+            # The message is real and an owner wrote it, but it could not
+            # have minted this line: a stowaway. This is the one verdict that
+            # stays — it is about content, not reachability, so re-checking
+            # can only repeat it, while retrying would let a forgery that
+            # lost its race win later.
+            if prior is None or not prior["verified"]:
+                store.set_owner_check(rec.cause, False, detail)
             store.memory_set(f"checked:{rec.ulid}", "0")
             store.memory_set(f"quarantine:{rec.ulid}", detail)
-            store.digest_add("verify", f"a line borrowing your message {rec.cause} did not match it and was ignored: {rec.text[:100]}")
+            store.digest_add("verify", f"a line borrowing your message {rec.cause} did not match it and was ignored: {rec.text[:100]} ({rec.path}:{rec.lineno})")
         else:
             store.set_owner_check(rec.cause, False, detail)
             store.memory_set(f"checked:{rec.ulid}", "0")
-            store.digest_add("verify", f"a line claiming your authority did not check out against Slack ({detail}) and was downgraded: {rec.text[:100]} ({rec.path}:{rec.lineno})")
+            store.memory_set(f"recheck:{rec.ulid}", now.isoformat(timespec="seconds"))
+            if not last_fail:
+                store.digest_add("verify", f"a line claiming your authority did not check out against Slack ({detail}) and is not applied until it does: {rec.text[:100]} ({rec.path}:{rec.lineno}) — say it again in Slack to re-record it")
 
 
 def _stale_check(mark: str | None, now: datetime) -> bool:
@@ -502,16 +580,24 @@ def _stale_check(mark: str | None, now: datetime) -> bool:
 def make_owner_verifier(fetch_message: Callable[[str, str], dict | None], owner_ids: list[str], conn_factory, store,
                         sender_for_thread: Callable[[str, str], str] | None = None):
     """Build the verify_owner callable. `fetch_message(channel, ts)` returns
-    the Slack message dict or None. A line checks out when the message
-    exists, its author is an owner, and the line is one the message could
-    have minted (recomputed from the message text)."""
+    the Slack message dict, None when Slack says the message is not there,
+    and raises when the lookup itself failed. A line checks out when the
+    message exists, its author is an owner, and the line matches — field for
+    field — one of the lines that message could have minted. Three outcomes:
+    ok; LINE_MISMATCH, which says this line did not come from this message;
+    and a CANNOT_CHECK verdict, which says the recomputation could not be
+    done and accuses nobody."""
+    fetched: dict[tuple[str, str], dict | None] = {}
 
     def verify(cause: str, line_json: str) -> tuple[bool, str]:
         try:
             _, channel, ts = cause.split(":", 2)
         except ValueError:
             return False, "malformed cause"
-        msg = fetch_message(channel, ts)
+        if (channel, ts) not in fetched:
+            # A raised failure is deliberately not cached: it is retried.
+            fetched[(channel, ts)] = fetch_message(channel, ts)
+        msg = fetched[(channel, ts)]
         if not msg:
             return False, "message not found"
         if msg.get("user") not in owner_ids:
@@ -521,20 +607,23 @@ def make_owner_verifier(fetch_message: Callable[[str, str], dict | None], owner_
         conn = conn_factory()
         try:
             allowed = expected_for_message(msg.get("text") or "", conn, store, task_sender)
+        except CannotRecompute as e:
+            return False, f"{CANNOT_CHECK}: {e}"
         finally:
             with contextlib.suppress(Exception):
                 if conn is not None:
                     conn.close()
-        for op, subj, facet, payload in allowed:
+        drifted = False
+        for op, subj, facet, text, ref in allowed:
             if op != line["op"]:
                 continue
-            if op == "rule":
-                if subj == line["subject"] and facet == line["facet"] and payload == line["text"]:
-                    return True, "ok"
-            elif payload == line["ref"]:
+            if (subj, facet, text, ref) == (line["subject"], line["facet"], line["text"], line["ref"]):
                 return True, "ok"
-        return False, "line does not match the message"
+            if op in TEXT_FROM_VAULT_OPS and (subj, facet, ref) == (line["subject"], line["facet"], line["ref"]):
+                drifted = True  # this op quotes a claim, which the owner may legitimately have reworded
+        return (False, CLAIM_REWORDED) if drifted else (False, LINE_MISMATCH)
 
+    verify.reset = fetched.clear  # the memo is per pass, not per verifier
     return verify
 
 
@@ -593,7 +682,7 @@ def _detect_drift(svc: Services, rep: HourlyReport, today: str) -> None:
                 if block != "_" and block not in current:
                     rep.conflicts.append(f"{rel}#^{block}")
         if changed or any(c.minted for c in note.claims):
-            snap = Snapshot.take(path)
+            snap = note.snap or Snapshot.take(path)
             mtime_ns = snap.mtime_ns  # the owner's save time; pinning must not relabel a hand claim's tier
             if write_if_unchanged(snap, note.render()):
                 import os as _os
@@ -644,9 +733,9 @@ def _apply_ops(svc: Services, conn, rep: HourlyReport, today: str, only: set[str
                     _drop_op(svc, o, "nothing to restore")
                     continue
             applied += 1
-        except Deferred:
+        except Deferred as e:
             deferred += 1
-            _bump_attempts(svc, o, "the note kept changing under wanda")
+            _bump_attempts(svc, o, str(e)[:100])   # the note and the reason, not just "changing"
         except Exception as e:
             log.exception("applying %s %s failed", o.op, o.ulid)
             _bump_attempts(svc, o, str(e)[:100])
@@ -721,7 +810,14 @@ def _prefs_note(vault: Vault, facet: str, today: str) -> Note:
     slug, title = ("mail-dispositions", "Mail dispositions") if facet == DISPOSITION_FACET else ("preferences", "Preferences")
     path = vault.root / "prefs" / f"{slug}.md"
     if path.exists():
-        return parse_note(path)
+        note = parse_note(path)
+        if note.kind in ix.STUB_KINDS:
+            # A retire stub takes claims silently and the indexer skips them,
+            # so the rule would vanish and `_op_applied` would read it back off
+            # the stub and report it applied. Defer instead: `_apply_ops`
+            # retries and then names it in the digest.
+            raise Deferred(f"prefs/{slug}.md is a retire stub; nothing can be filed into it")
+        return note
     return new_note(path, "pref", title, created=today)
 
 
@@ -744,11 +840,15 @@ def _apply_rule(svc: Services, conn, o: L.Observation, today: str) -> None:
     if o.facet == DISPOSITION_FACET:
         m = ix.DISPOSITION_RE.match(o.text)
         if m:
-            target = m.group(2)
+            # DISPOSITION_RE reads case-folded (index.py:63), so the target
+            # comparison must too: otherwise a claim naming this same address
+            # in another case is never superseded and the note keeps two live,
+            # contradictory dispositions for one sender.
+            target = m.group(2).lower()
             prefs_rel = svc.vault.rel(note.path)[:-3]
             for old in note.live():
                 om = ix.DISPOSITION_RE.match(old.text)
-                if om and om.group(2) == target and old.text != o.text:
+                if om and om.group(2).lower() == target and old.text != o.text:
                     claim.edges.append(Edge("supersedes", prefs_rel, old.block))
                     old.edges.append(Edge("superseded-by", prefs_rel, claim.block))
                     old.folded = True
@@ -783,7 +883,7 @@ def _write_note(svc: Services, note: Note, group_of: dict | None = None) -> None
         shrink_note(note, svc.vault, group_of)
     text = note.render()
     if note.path.exists():
-        snap = Snapshot.take(note.path)
+        snap = note.snap or Snapshot.take(note.path)
         if not write_if_unchanged(snap, text):
             raise Deferred(f"{note.path.name} changed under us")
     else:
@@ -840,7 +940,14 @@ def _veto_note_claims(svc: Services, rel: str, body: str, today: str, cause: str
     """Deleting a note is a veto of everything on it: suppress every key
     that produced its claims, via ledger lines (durable, index-derivable)."""
     vault = svc.vault
-    subject = ix.subject_for_doc(rel) or GENERAL_PREF_SUBJECT
+    subject = ix.subject_for_doc(rel)
+    if not subject:
+        # `open/` has no subject key (DIR_TO_TYPE has no "open") and a ledger
+        # line needs one, which is what the fallback was for. pref/general is
+        # the wrong one: it silences facet-less general-preference graduation
+        # that the deleted item was never about.
+        log.info("deleted note %s has no subject key; nothing to veto", rel)
+        return
     keys: set[str] = {f"key:{subject}|"}
     try:
         note = parse_note(vault.root / rel, text=body)
@@ -888,7 +995,7 @@ def _report_flags(svc: Services, rebuild: ix.RebuildReport) -> int:
         key = f"broken:{path}:{err[:40]}"
         if svc.store.memory_get(key) is None:
             svc.store.memory_set(key, svc.today())
-            svc.store.digest_add("error", f"{path} could not be parsed and is skipped: {err[:100]}")
+            svc.store.digest_add("error", f"{path} could not be indexed and is skipped: {err[:100]}")
     return n
 
 
@@ -1004,7 +1111,7 @@ def contradiction_candidates(conn, limit: int = NIGHTLY_MAX_CONTRADICTIONS) -> l
     an edge, so each pair is asked once."""
     out = []
     judged: set[tuple[str, str, str]] = set()
-    for e in conn.execute("SELECT src_doc, src_block, dst_doc, dst_block FROM edges WHERE rel IN ('supersedes','contradicts','refines') AND dst_block IS NOT NULL"):
+    for e in conn.execute("SELECT src_doc, src_block, dst_doc, dst_block FROM edges WHERE rel IN ('supersedes','contradicts','refines') AND dst_block IS NOT NULL AND dst_doc IS NOT NULL"):
         d = e["dst_doc"] if e["dst_doc"].endswith(".md") else e["dst_doc"] + ".md"
         if d == e["src_doc"]:
             judged.add((d, *sorted((e["src_block"], e["dst_block"]))))
@@ -1117,12 +1224,20 @@ def _apply_one(svc: Services, c: dict, r: dict, today: str, group_of: dict) -> b
         if not target.exists():
             return False
     note = parse_note(target)
+    if note.kind in ix.STUB_KINDS:
+        return False  # a redirect/tombstone the retire ritual left: never mint into it
     witnesses = [(f"belt/ledger/{d}", u) for d, u in c["witness_refs"] if d]
     if not witnesses:
         return False
     if any((d, u) in cl.targets("derived-from") for cl in note.claims for d, u in witnesses):
         return False  # already applied
     mode = r.get("mode")
+    if mode not in RESOLUTION_MODES:
+        # Without this, an unknown mode matches no branch below, still reaches
+        # _write_note, reports applied and moves the note's mtime — which feeds
+        # the editor guard and a hand-written claim's derived tier.
+        log.warning("resolution for %s has mode %r, not one of %s; nothing applied", c["key"], mode, RESOLUTION_MODES)
+        return False
     conf = float(r.get("confidence") or 0)
     text = clean_text(r.get("text") or c["text"], CLAIM_TEXT_CAP)
     if mode == "support" or (mode == "append" and conf < APPEND_MIN_CONFIDENCE):
@@ -1245,7 +1360,9 @@ def shrink_note(note: Note, vault: Vault | None = None, group_of: dict | None = 
     if len(hist) > HISTORY_KEEP:
         referenced = {b for c in note.claims for _, b in c.targets("supersedes") + c.targets("contradicts") + c.targets("refines")}
         overflow = [c for c in hist[: len(hist) - HISTORY_KEEP] if c.block not in referenced]
-        if overflow and vault is not None:
+        if vault is None:
+            return  # nowhere to archive them: keep them in the note rather than lose them
+        if overflow:
             try:
                 rel = vault.rel(note.path)
                 dst = vault.history_path(rel)
@@ -1338,6 +1455,10 @@ def nightly_apply(svc: Services, conn, prep: Prepared, payload: dict, workspace:
     if payload.get("writespecs"):
         rep.writespecs_changed, rep.writespecs_deferred = _apply_writespecs(
             svc, payload["writespecs"], payload.get("writespecs_paths", []), payload.get("pref_refs", []), payload.get("prefs_sig", ""))
+        # In-memory only — stage() wrote the payload before this ran — so a
+        # leftover staged file lacks this key and drain_staging re-applies the
+        # guides every hourly until none is deferred. Idempotent: an unchanged
+        # guide stops at the `new == ws.prose` check.
         payload["writespecs_applied"] = not rep.writespecs_deferred
     rep.offers = make_offers(svc, conn, prep.today)
     ix.rebuild(svc.vault, conn, svc.trust(), prep.today)
@@ -1395,7 +1516,7 @@ def _prepare_writespecs(svc: Services, conn, prep: Prepared) -> None:
     sig = ix.sha_text("|".join(f"{p['doc']}#{p['block']}:{p['text']}" for p in prefs))
     if svc.store.memory_get("writespec_prefs_sha") == sig:
         return
-    specs = [{"path": svc.vault.rel(p), "prose": _strip_provenance(parse_writespec(p).prose)} for p in svc.vault.writespecs()]
+    specs = [{"path": svc.vault.rel(p), "prose": strip_provenance(parse_writespec(p).prose)} for p in svc.vault.writespecs()]
     prep.prefs_sig = sig
     prep.pref_refs = [f"{p['doc'][:-3]}#^{p['block']}" for p in prefs]
     prep.writespec_paths = [s["path"] for s in specs]
@@ -1405,18 +1526,13 @@ def _prepare_writespecs(svc: Services, conn, prep: Prepared) -> None:
         + "\n</guides>\n<preferences>\n" + _escape("\n".join(f"- {p['text']}" for p in prefs)) + "\n</preferences>")
 
 
-PROVENANCE_LINE_RE = re.compile(r"^- derived-from::? .*$", re.M)
-
-
-def _strip_provenance(prose: str) -> str:
-    return PROVENANCE_LINE_RE.sub("", prose).rstrip()
-
-
 def _apply_writespecs(svc: Services, specs: list, paths: list[str], pref_refs: list[str], sig: str) -> tuple[list[str], int]:
     """Write the revised guides. The model's text is cleaned of tag forms
     only (it is prose, not claims); the paragraph carries its evidence as a
     derived-from line. Guides being edited are deferred and the preference
-    signature is not advanced until every guide has been handled."""
+    signature is not advanced until every guide has been handled; a deferred
+    guide costs no second model call, because the payload was staged before
+    this ran and the next hourly's drain_staging re-applies it."""
     changed: list[str] = []
     deferred = 0
     by_path = {s.get("path"): s for s in specs if isinstance(s, dict)}
@@ -1429,7 +1545,7 @@ def _apply_writespecs(svc: Services, specs: list, paths: list[str], pref_refs: l
         except ValueError:
             continue
         ws = parse_writespec(spec_path)
-        body = _strip_provenance(clean_prose(str(s.get("prose") or ""), WRITESPEC_MODEL_CAP_B))
+        body = strip_provenance(clean_prose(str(s.get("prose") or ""), WRITESPEC_MODEL_CAP_B))
         if not body:
             continue
         new = body.rstrip("\n") + "\n\n- derived-from:: " + ", ".join(f"[[{r}]]" for r in pref_refs[:8])
@@ -1440,7 +1556,7 @@ def _apply_writespecs(svc: Services, specs: list, paths: list[str], pref_refs: l
             continue
         old = ws.prose
         ws.prose = new
-        snap = Snapshot.take(spec_path)
+        snap = ws.snap or Snapshot.take(spec_path)
         if write_if_unchanged(snap, ws.render()):
             changed.append(rel)
             svc.touched.add(rel)
@@ -1468,7 +1584,7 @@ def make_offers(svc: Services, conn, today: str) -> int:
     for addr, count in per_addr.items():
         if count < OFFER_MIN_MESSAGES:
             continue
-        st = store.sender_stats(addr)
+        st = store.sender_stats(addr, since)  # the same 30 days as the count, or old verdicts decide today's offer
         total = st["ignored"] + st["trashed"] + st["attention"]
         if total < OFFER_MIN_MESSAGES:
             continue
@@ -1493,6 +1609,11 @@ def retire(svc: Services, rel: str, to: str | None = None, reason: str = "retire
     a redirect stub at the old path. Drained at the top of every pass."""
     vault = svc.vault
     old = vault.inside(rel)
+    if not _is_curated_note(rel):
+        # `inside` bounds a path; it says nothing about shape. Without this,
+        # `retire belt/ledger/<day>.md` replaces a day of evidence with a
+        # redirect stub that `iter_observations` reads as one Rejected line.
+        raise ValueError(f"{rel} is not a curated note; only people/, orgs/, topics/, prefs/ or open/<name>.md can be retired")
     if to is not None:
         vault.inside(to)
         if not _is_curated_note(to):
@@ -1607,6 +1728,18 @@ def unretire(svc: Services, rel: str) -> bool:
         return False
     dst.parent.mkdir(parents=True, exist_ok=True)
     write_atomic(dst, body)
+    # `retire` and a hand deletion clear the note's shas, and `move_shas`
+    # relocates them for a rename, so without a baseline here `_detect_drift`
+    # reads every claim wanda wrote as an owner edit and pins it. Key on
+    # `original`: for a lapsed open item it differs from `rel`, and drift keys
+    # on the path. Re-parse the bytes just written, so the baseline is exactly
+    # what the next pass will compute from the same file.
+    try:
+        restored = parse_note(dst, text=body)
+        svc.store.set_shas(original, {"_": "baseline", **{c.block: c.sha for c in restored.claims}})
+        svc.store.memory_set(f"filesha:{original}", sha_file(dst))
+    except Exception as e:
+        log.warning("unretired %s but could not record its sha baseline: %s", original, e)
     tomb.unlink()
     _rewrite_referrers(vault, f"retired/{rel}", original)
     _git_commit_all(vault, f"curated: unretire {original}")
@@ -1678,8 +1811,8 @@ def fsck(vault: Vault, conn) -> list[str]:
         target = dst if dst.endswith(".md") else dst + ".md"
         if target not in docs and not (vault.root / target).exists():
             issues.append(f"dangling link {e['src_doc']} -> {dst}")
-    for f in conn.execute("SELECT path, detail FROM flags WHERE kind='duplicate-id'"):
-        issues.append(f"duplicate id on {f['path']}: {f['detail']}")
+    for f in conn.execute("SELECT path, kind, detail FROM flags WHERE kind IN ('duplicate-id','duplicate-block','duplicate-subject')"):
+        issues.append(f"{f['kind'].replace('-', ' ')} on {f['path']}: {f['detail']}")
     for r in conn.execute("SELECT path, nbytes FROM docs WHERE nbytes > ? AND retired=0", (NOTE_CAP_B,)):
         issues.append(f"{r['path']} is {r['nbytes']} bytes (cap {NOTE_CAP_B}); the nightly folds old claims — split it by hand if this persists")
     for p in vault.root.rglob(".*.tmp"):
@@ -1839,13 +1972,19 @@ def _import_writespecs(svc: Services, src: Path, ctx: dict) -> None:
             addition = _cowork_guidance(text)
             if addition and addition not in ws.prose:
                 ws.prose = (ws.prose + "\n\nFrom the previous vault:\n" + addition).strip()
-                write_atomic(spec, ws.render())
+                if not write_if_unchanged(ws.snap or Snapshot.take(spec), ws.render()):
+                    rep["deferred"].append(f"{rel}: {target} changed under us")
+                    continue  # sha unmarked: retried next run
                 store.memory_set(f"filesha:{target}", sha_file(spec))
                 rep["writespecs"] += 1
         dispositions = _cowork_dispositions(text)
         pending: list[tuple[str, str]] = []  # (disposition, ledger ulid) — offered only after the write lands
         if dispositions:
-            note = _prefs_note(vault, DISPOSITION_FACET, today)
+            try:
+                note = _prefs_note(vault, DISPOSITION_FACET, today)
+            except Deferred as e:
+                rep["deferred"].append(f"{rel}: {e}")
+                continue  # sha unmarked: retried next run
             for disp in dispositions:
                 if any(c.text == disp for c in note.claims):
                     continue

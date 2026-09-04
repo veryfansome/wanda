@@ -4,6 +4,7 @@ import json
 import sqlite3
 import threading
 from datetime import datetime, timedelta, timezone
+from email.utils import getaddresses
 from pathlib import Path
 from typing import Any
 
@@ -120,8 +121,7 @@ CREATE TABLE IF NOT EXISTS memory_run_windows (
   task_id    INTEGER,
   kind       TEXT NOT NULL,
   started_at TEXT NOT NULL,
-  ended_at   TEXT,
-  pgid       INTEGER
+  ended_at   TEXT
 );
 -- Digest lines waiting for the daily post.
 CREATE TABLE IF NOT EXISTS memory_digest (
@@ -156,9 +156,6 @@ MIGRATIONS = (
     # and for a DM holds a sentinel that is not a Slack timestamp.
     ("tasks", "reply_thread", "TEXT"),
     ("runs", "deliver_attempts", "INTEGER NOT NULL DEFAULT 0"),
-    # The claude subprocess's process group: the one identity a session's
-    # shell children carry that another session cannot forge.
-    ("memory_run_windows", "pgid", "INTEGER"),
 )
 
 
@@ -631,7 +628,11 @@ class Store:
 
     def add_offer(self, kind: str, subject: str, action: str | None, text: str) -> str:
         with self._lock:
-            n = self._db.execute("SELECT COUNT(*) AS n FROM memory_offers").fetchone()["n"]
+            # From the highest ref, not the row count: a deleted offer must
+            # not hand its ref to a new one (ref is the PRIMARY KEY).
+            n = self._db.execute(
+                "SELECT COALESCE(MAX(CAST(SUBSTR(ref, 2) AS INTEGER)), 0) AS n FROM memory_offers WHERE ref GLOB 'k*'"
+            ).fetchone()["n"]
             ref = f"k{n + 1}"
             self._db.execute(
                 "INSERT INTO memory_offers(ref, kind, subject, action, text, created_at) VALUES(?,?,?,?,?,?)",
@@ -663,14 +664,30 @@ class Store:
         q = ",".join("?" * len(ids))
         self._exec(f"UPDATE memory_digest SET posted_at=? WHERE id IN ({q})", (utcnow(), *ids))
 
-    def sender_stats(self, addr: str) -> dict:
-        """Verdict history for one address, from the messages table."""
+    def sender_stats(self, addr: str, since_iso: str = "") -> dict:
+        """Verdict history for one address, from the messages table; with
+        since_iso, only from that timestamp on. from_addr is the raw From
+        header, so rows are prefiltered by substring and then confirmed by
+        parsing that header: a bare `%addr%` counted enews@x for news@x, a
+        spoofed priya@x.example.evil.com for priya@x.example, and any address a
+        sender put inside their own display name. A header no parser can split
+        (`a@b.example>`, `a@b.example (N) <c@d.example>`) now counts for
+        nobody — the fail-closed direction for a count, and the reason this
+        does not mirror triage.addresses_in's regex fallback, which would let
+        exactly those attacker-shaped headers pool under any address they
+        name. Callers pass one argument (recall.StatsFn); the window is
+        make_offers' (passes.py:1587)."""
+        addr = addr.lower()
+        window = " AND created_at >= ?" if since_iso else ""
+        params = (addr, since_iso) if since_iso else (addr,)
         rows = self._query(
-            "SELECT applied_action, COUNT(*) AS n, MAX(created_at) AS last FROM messages "
-            "WHERE lower(from_addr) LIKE ? GROUP BY applied_action", (f"%{addr.lower()}%",),
+            "SELECT from_addr, applied_action, COUNT(*) AS n, MAX(created_at) AS last FROM messages "
+            f"WHERE instr(lower(from_addr), ?) > 0{window} GROUP BY from_addr, applied_action", params,
         )
         out = {"seen": 0, "ignored": 0, "trashed": 0, "attention": 0, "last": ""}
         for r in rows:
+            if addr not in [a.lower() for _, a in getaddresses([r["from_addr"] or ""]) if "@" in a]:
+                continue
             out["seen"] += r["n"]
             a = r["applied_action"] or ""
             if a == "ignore":

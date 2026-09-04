@@ -998,6 +998,7 @@ async def run_daemon(cfg: Config) -> None:
     memory = None
     if cfg.memory_enabled:
         memory = MemoryService(cfg, store, slack_actions)
+        memory.adopt_shared_state()  # this process is the daemon: it closes orphan windows and builds the index
         created = memory.ensure()
         if created:
             log.info("seeded memory vault at %s (%d files)", cfg.memory_vault, len(created))
@@ -1200,11 +1201,18 @@ async def run_triage_once(cfg: Config, limit: int) -> None:
     # daemon: they go in the live runs ledger so the cap and doctor see them.
     ledger = Store(cfg.db_path)
     runner = RunnerService(claude_bin)
-    # The same argv and the same memory block as the daemon — read from the
-    # live vault/index, never written to (no memos from a dry run).
+    # The same argv and the same memory block as the daemon. A dry run reads
+    # the live vault and index and repairs neither: it never builds the index
+    # or renames a corrupt one aside (MemoryService.adopt_shared_state), writes
+    # no memos, opens no run windows, and keeps message state in dryrun.db. It
+    # does seed missing vault files (copy-if-absent) and regenerate
+    # triage.settings.json.
     memory = MemoryService(cfg, ledger) if cfg.memory_enabled else None
     if memory is not None:
         memory.ensure()
+        if not cfg.memory_index_path.exists():
+            print("(no memory index yet, and a dry run does not build one: this run has no memory block — "
+                  "start the daemon, or run `wanda memory reindex`)")
     proc = Processor(cfg, ledger, asyncio.Queue(), None, runner, memory=memory)  # type: ignore[arg-type]
 
     with connect(cfg) as client:

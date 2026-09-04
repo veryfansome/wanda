@@ -16,12 +16,12 @@ CONVERSATION_KINDS = ("mention", "mention_guest", "dm")
 @dataclass
 class DictTrust:
     """A TrustOracle for tests: verified causes, checked lines, and windows
-    given as (start, end, kind, pgid)."""
+    given as (start, end, kind)."""
     verified_causes: set[str] = field(default_factory=set)
     task_kinds: dict[int, str] = field(default_factory=dict)  # legacy in old tests; the index no longer reads task ids
     checked_lines: set[str] | None = None      # None = every line under a verified cause counts
     email_windows: list[tuple[datetime, datetime]] = field(default_factory=list)
-    windows: list[tuple] = field(default_factory=list)   # (start, end, kind, pgid)
+    windows: list[tuple] = field(default_factory=list)   # (start, end, kind)
 
     def owner_verified(self, cause: str) -> bool:
         return cause in self.verified_causes

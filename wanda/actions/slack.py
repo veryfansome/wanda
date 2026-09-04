@@ -25,6 +25,10 @@ MIN_INTERVAL_S = 1.0  # chat.postMessage is ~1/s/channel
 SNIPPET_LIMIT = 1500
 TEXT_LIMIT = 3500  # well under Slack's 40k text cap, and headers can be huge
 MISSING_THREAD_ERRORS = {"thread_not_found", "message_not_found", "channel_not_found"}
+# Slack answered that the message is not there. Deliberately NOT
+# channel_not_found: for a digest parent that means "gone", but for a
+# one-message lookup it means we could not look.
+MESSAGE_ABSENT_ERRORS = {"thread_not_found", "message_not_found"}
 MAX_CONTEXT_PAGES = 10  # bounds a very long thread at ~2000 messages
 
 
@@ -34,6 +38,10 @@ def truncate_text(text: str) -> str:
 
 class DigestScanFailed(Exception):
     """The recovery history scan itself failed — 'not found' is not proven."""
+
+
+class MessageFetchFailed(Exception):
+    """The message lookup itself failed — 'not found' is not proven."""
 
 
 def esc(text: str | None) -> str:
@@ -171,21 +179,31 @@ class SlackActions:
     def fetch_message_sync(self, channel: str, ts: str) -> dict | None:
         """One message by (channel, ts), for the memory pass's owner check.
         Synchronous: it runs in the pass's worker thread. Tries history (a
-        top-level message) then replies (a message inside a thread)."""
+        top-level message) then replies (a message inside a thread). Returns
+        None only when Slack answered that the message is not there, and
+        raises MessageFetchFailed when the lookup itself failed — a missing
+        scope, a rotated token or a removed channel must not be reported as
+        an absent message, because the memory pass treats absence as a
+        verdict about the owner's line."""
+        failure: SlackApiError | None = None
         try:
             resp = self.web.conversations_history(channel=channel, latest=ts, oldest=ts, inclusive=True, limit=1)
             for m in resp.get("messages") or []:
                 if m.get("ts") == ts:
                     return m
-        except SlackApiError:
-            pass
+        except SlackApiError as e:
+            if (e.response or {}).get("error") not in MESSAGE_ABSENT_ERRORS:
+                failure = e
         try:
             resp = self.web.conversations_replies(channel=channel, ts=ts, limit=1)
             for m in resp.get("messages") or []:
                 if m.get("ts") == ts:
                     return m
-        except SlackApiError:
-            return None
+        except SlackApiError as e:
+            if (e.response or {}).get("error") not in MESSAGE_ABSENT_ERRORS:
+                failure = e
+        if failure is not None:
+            raise MessageFetchFailed(str(failure)) from failure
         return None
 
     async def alert(self, text: str) -> None:

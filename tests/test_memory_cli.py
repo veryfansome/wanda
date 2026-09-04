@@ -1,4 +1,5 @@
 """`wanda memory` verbs, including provenance from the harness environment."""
+import sqlite3
 from argparse import Namespace
 
 import pytest
@@ -158,3 +159,133 @@ def test_pin_verb_and_import_guard(env, monkeypatch, capsys):
     store.open_run_window("s1", 1, "dm")
     with pytest.raises(SystemExit):
         run(cfg, verb="import-cowork", dir=str(svc.vault.root))
+
+
+# --- wave 6: what a session may not do, and what the operator is told ------------------------------------
+
+def test_a_stale_run_window_is_visible_in_status(env, capsys):
+    """The one surface that shows what _in_session refuses five verbs on."""
+    cfg, store, svc = env
+    store.open_run_window("s-crashed", 7, "email")
+    assert run(cfg, verb="status") == 0
+    assert "open windows: 1" in capsys.readouterr().out
+
+
+def test_an_unreadable_store_counts_as_a_session(env, monkeypatch, capsys):
+    """A guard whose job is to refuse must not fail open."""
+    cfg, store, svc = env
+    monkeypatch.setattr(Store, "open_windows", lambda self: (_ for _ in ()).throw(sqlite3.DatabaseError("malformed")))
+    with pytest.raises(SystemExit):
+        run(cfg, verb="reindex")
+    assert "cannot read the run windows" in capsys.readouterr().err
+
+
+def test_fsck_does_not_build_the_shared_index(env, capsys):
+    """A read verb that rebuilds does it with no owner authority, which
+    empties the derived rules table. 1 already means "found N issues"."""
+    cfg, store, svc = env
+    assert run(cfg, verb="fsck") == 2
+    assert not cfg.memory_index_path.exists()
+    assert "reindex" in capsys.readouterr().err
+
+
+def test_unretire_is_not_a_session_verb_and_is_reported(env, monkeypatch, capsys):
+    cfg, store, svc = env
+    n = new_note(svc.vault.root / "people" / "a@x.example.md", "person", "a@x.example")
+    write_atomic(n.path, n.render())
+    assert run(cfg, verb="retire", path="people/a@x.example.md", to=None) == 0
+    monkeypatch.setenv("WANDA_TASK_ID", "3")
+    with pytest.raises(SystemExit):
+        run(cfg, verb="unretire", path="people/a@x.example.md")
+    monkeypatch.delenv("WANDA_TASK_ID")
+    assert run(cfg, verb="unretire", path="people/a@x.example.md") == 0
+    assert [r["text"] for r in store.digest_pending() if "unretire`" in r["text"]] == [
+        "restored retired/people/a@x.example.md with `wanda memory unretire`"]
+
+
+def test_hourly_is_not_a_session_verb_and_does_not_claim_the_daemons_slot(env, capsys):
+    cfg, store, svc = env
+    store.open_run_window("s-crashed", 7, "email")
+    with pytest.raises(SystemExit):
+        run(cfg, verb="hourly")
+    err = capsys.readouterr().err
+    assert "s-crashed" in err and "restart the daemon" in err
+    store.close_run_window("s-crashed")
+    assert run(cfg, verb="hourly") == 0
+    assert store.memory_get("hourly_at") is None, "a hand-run pass must not postpone the daemon's own"
+    assert "holds no owner authority" in capsys.readouterr().err
+
+
+def test_retire_into_a_freshly_edited_successor_says_the_merge_is_journaled(env):
+    """Both notes are written now and neither has a filesha: row, so the
+    successor is genuinely "being edited" and _write_note defers."""
+    cfg, store, svc = env
+    for slug, title in (("a@x.example", "a@x.example"), ("alice", "Alice")):
+        n = new_note(svc.vault.root / "people" / f"{slug}.md", "person", title)
+        write_atomic(n.path, n.render())
+    with pytest.raises(SystemExit) as e:
+        run(cfg, verb="retire", path="people/a@x.example.md", to="people/alice.md")
+    assert "journaled" in str(e.value) and "ten minutes" in str(e.value)
+    assert "people/a@x.example.md" in cfg.retire_journal_path.read_text()
+
+
+def test_a_busy_ledger_leaves_no_half_written_commitment(env, monkeypatch):
+    cfg, store, svc = env
+
+    def busy(*a, **kw):
+        raise TimeoutError("memory ledger is busy")
+
+    monkeypatch.setattr(memory_cli, "ledger_append", busy)
+    with pytest.raises(SystemExit) as e:
+        run(cfg, verb="open", title="Wire the dues", check_by="2026-09-10", about="topic/dues")
+    assert "not recorded" in str(e.value)
+    assert list((svc.vault.root / "open").glob("2026-*.md")) == [], "an untracked commitment is worse than none"
+    with pytest.raises(SystemExit) as e2:
+        run(cfg, verb="note", text="Dues are due.", about="topic/dues", facet="", until="")
+    assert "not recorded" in str(e2.value)
+
+
+def test_pin_without_an_index_advises_reindex(env, capsys):
+    cfg, store, svc = env
+    assert run(cfg, verb="pin", ref="people/d#c1") == 1
+    assert "reindex" in capsys.readouterr().err
+    with pytest.raises(SystemExit) as e:
+        run(cfg, verb="pin", ref="not a ref")
+    assert "expected a claim reference" in str(e.value)
+
+
+def test_reindex_and_hourly_close_the_index_connection(env, monkeypatch):
+    """passes.open_conn is a read-write WAL connection; closing it is what
+    checkpoints the WAL."""
+    cfg, store, svc = env
+    conns = []
+    real = P.open_conn
+    monkeypatch.setattr(P, "open_conn", lambda s: conns.append(real(s)) or conns[-1])
+    assert run(cfg, verb="reindex") == 0
+    assert run(cfg, verb="hourly") == 0
+    assert len(conns) == 2
+    for c in conns:
+        with pytest.raises(sqlite3.ProgrammingError):
+            c.execute("SELECT 1")
+
+
+def test_open_reports_the_subject_it_filed_under(env, capsys):
+    cfg, store, svc = env
+    n = new_note(svc.vault.root / "topics" / "hoa-board-election.md", "topic", "HOA board election")
+    write_atomic(n.path, n.render())
+    assert run(cfg, verb="reindex") == 0
+    capsys.readouterr()
+    assert run(cfg, verb="open", title="Ballots go out", check_by="2026-09-10", about="topic/hoa-election") == 0
+    out = capsys.readouterr().out
+    assert "filed under existing subject topic/hoa-board-election" in out
+    assert "stays off the always-loaded list" in out
+    assert run(cfg, verb="open", title="Pay the dues", check_by="2026-09-11", about="topic/dues") == 0
+    assert "new subject topic/dues" in capsys.readouterr().out
+    assert [r["text"] for r in store.digest_pending() if r["kind"] == "mint"] == [
+        "new subject topic/dues (from `wanda memory open`)"]
+
+
+def test_note_says_when_there_was_no_index_to_match_against(env, capsys):
+    cfg, store, svc = env
+    assert run(cfg, verb="note", text="Dues are due.", about="topic/dues", facet="", until="") == 0
+    assert "no index yet" in capsys.readouterr().err

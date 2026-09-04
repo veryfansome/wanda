@@ -101,6 +101,20 @@ class Config(BaseSettings):
             return [s.strip() for s in v.split(",") if s.strip()]
         return v
 
+    @field_validator("memory_nightly_local_time")
+    @classmethod
+    def _check_hhmm(cls, v: str) -> str:
+        """Parsed here exactly as main._nightly_due parses it. Left alone, a
+        bad value either raises inside memory_tick — caught by memory_loop, so
+        the nightly never runs again — or parses into an hour no clock reaches
+        (`25:00`, `0330` → hour 330), which disables it forever with not even
+        a log line."""
+        hh, mm = ((str(v).split(":") + ["0"])[:2])
+        hh, mm = hh.strip(), mm.strip()
+        if not (hh.isdigit() and mm.isdigit() and int(hh) <= 23 and int(mm) <= 59):
+            raise ValueError("must be HH:MM on a 24-hour clock, e.g. 03:30")
+        return v
+
     @property
     def expanded_data_dir(self) -> Path:
         return self.data_dir.expanduser()

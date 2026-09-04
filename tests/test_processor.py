@@ -480,6 +480,38 @@ def test_delivery_gives_up_and_stops_blocking(tmp_path):
     assert store.get_meta("abandoned_alert_pending") == "1", "and tell the owner"
 
 
+def test_fetch_message_sync_raises_when_it_cannot_look():
+    """The memory pass reads a None from this lookup as "the message is not
+    there", a verdict about the owner's line. A missing scope, a rotated
+    token, a removed channel or an exhausted rate limit prove nothing, so
+    they must raise instead."""
+    from slack_sdk.errors import SlackApiError
+
+    from wanda.actions.slack import MessageFetchFailed, SlackActions
+
+    class Web:
+        def __init__(self, code):
+            self.code = code
+
+        def _raise(self, **kw):
+            raise SlackApiError("nope", {"ok": False, "error": self.code})
+
+        conversations_history = _raise
+        conversations_replies = _raise
+
+    def actions(code):
+        a = object.__new__(SlackActions)
+        a.web = Web(code)
+        return a
+
+    for code in ("missing_scope", "invalid_auth", "channel_not_found", "ratelimited"):
+        with pytest.raises(MessageFetchFailed):
+            actions(code).fetch_message_sync("C1", "1.1")
+    # Only Slack saying the message itself is not there answers the question.
+    assert actions("message_not_found").fetch_message_sync("C1", "1.1") is None
+    assert actions("thread_not_found").fetch_message_sync("C1", "1.1") is None
+
+
 def test_reply_requires_an_explicit_channel():
     """A defaulted channel published a DM answer in the triage channel the one
     time a caller forgot it. Keyword-only and required makes that a TypeError."""

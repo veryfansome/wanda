@@ -33,7 +33,7 @@ TRIAGE_MEMORY_CAP_B = 1200
 WRITESPEC_PROSE_CAP_B = 1200
 NOTE_CAP_B = 8192
 CLAIM_TEXT_CAP_B = 600
-LEDGER_LINE_CAP_B = 1024
+LEDGER_LINE_CAP_B = 1024   # what the free text is trimmed to fit; fields are never truncated, so a long cause or ref can exceed it
 
 
 @dataclass
@@ -42,8 +42,10 @@ class Vault:
 
     def __post_init__(self):
         # A symlinked vault (say, into an iCloud-synced Obsidian folder) must
-        # yield the same paths from `inside()` and from `rel()`.
-        self.root = Path(self.root).expanduser().resolve() if Path(self.root).expanduser().exists() else Path(self.root).expanduser()
+        # yield the same paths from `inside()` and from `rel()` — including
+        # before the directory exists, since nothing re-resolves after
+        # ensure_vault() has created it.
+        self.root = Path(self.root).expanduser().resolve()
 
     @property
     def ledger_dir(self) -> Path:
@@ -94,6 +96,11 @@ class Vault:
         return self.rel(p) if p else ""
 
     def l2_notes(self):
+        """Every curated note directly under an L2 directory; a leading `_`
+        excludes a file. Not recursive, deliberately: a flat path is what
+        subject_for_doc and _is_curated_note require, so a note in a
+        subdirectory has no subject and is invisible to the index, to drift
+        detection and to referrer rewriting."""
         for d in L2_DIRS:
             p = self.root / d
             if p.is_dir():
@@ -208,8 +215,12 @@ def sha_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 
+def sha_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()[:16]
+
+
 def sha_file(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
+    return sha_bytes(path.read_bytes())
 
 
 # --- atomic files -------------------------------------------------------------
@@ -217,7 +228,10 @@ def sha_file(path: Path) -> str:
 def write_atomic(path: Path, text: str, mode: int | None = None) -> None:
     """mkstemp in the same directory (unique per writer, so two concurrent
     generators can never replace each other's half-written temp), fsync,
-    os.replace. Readers see the old file or the new one, never nothing."""
+    os.replace. Readers see the old file or the new one, never nothing.
+    A file that does not exist yet keeps mkstemp's 0600, so a note wanda
+    creates is private by default; pass `mode` for anything else (the L1
+    subject files ask for 0444, render.py:133)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=".", suffix=".tmp", dir=str(path.parent))
     try:
@@ -259,12 +273,18 @@ class Snapshot:
         st = path.stat()
         return cls(path, st.st_mtime_ns, st.st_size, sha_file(path))
 
+    @classmethod
+    def of_read(cls, path: Path, st: os.stat_result, data: bytes) -> "Snapshot":
+        """For content just read: the check then covers the whole read to
+        write window, not only the instant before the write."""
+        return cls(path, st.st_mtime_ns, len(data), sha_bytes(data))
+
     def unchanged(self) -> bool:
         try:
             st = self.path.stat()
-        except FileNotFoundError:
-            return False
-        return st.st_mtime_ns == self.mtime_ns and st.st_size == self.size and sha_file(self.path) == self.sha
+            return st.st_mtime_ns == self.mtime_ns and st.st_size == self.size and sha_file(self.path) == self.sha
+        except OSError:
+            return False   # an unreadable file is not unchanged: abandon this one write, never the whole pass
 
 
 def write_if_unchanged(snap: Snapshot, text: str) -> bool:
@@ -296,10 +316,18 @@ def parse_frontmatter(text: str) -> Doc:
     end = text.find("\n---", 4)
     if end < 0:
         return Doc({}, text)
-    head = text[4:end]
-    body = text[end + 4:]
-    if body.startswith("\n"):
-        body = body[1:]
+    eol = text.find("\n", end + 1)
+    if text[end + 4: eol if eol >= 0 else len(text)].strip():
+        # `----` or `--- x` is not a closing fence. Keep that whole line, and
+        # everything below it, in the body instead of eating its first four
+        # bytes and welding the remainder on.
+        head = text[4:end]
+        body = text[end + 1:]
+    else:
+        head = text[4:end]
+        body = text[end + 4:]
+        if body.startswith("\n"):
+            body = body[1:]
     meta: dict[str, Any] = {}
     key = None
     for raw in head.splitlines():
@@ -321,6 +349,12 @@ def parse_frontmatter(text: str) -> Doc:
             meta[key] = [_unquote(x.strip()) for x in _split_csv(inner)] if inner else []
         else:
             meta[key] = _scalar(val)
+    if not meta and head.strip():
+        # A head with content but not one `key:` line is the owner's `---`
+        # divider (or a YAML shape this parser does not read), not
+        # frontmatter; keeping it in the body is what stops a machine rewrite
+        # from deleting it.
+        return Doc({}, text)
     return Doc(meta, body)
 
 

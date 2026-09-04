@@ -57,7 +57,7 @@ def add_parser(sub: argparse._SubParsersAction) -> None:
     v = verbs.add_parser("retire", help="retire a note, rewriting every link (--to merges it into a successor; not from a session)")
     v.add_argument("path", help="vault-relative note path")
     v.add_argument("--to", help="successor note path, e.g. people/robin-vale.md")
-    v = verbs.add_parser("unretire", help="restore a retired or lapsed note")
+    v = verbs.add_parser("unretire", help="restore a retired or lapsed note (not from a session)")
     v.add_argument("path", help="path under retired/, e.g. people/x.md or open/2026/2026-09-01-x.md")
     verbs.add_parser("reindex", help="rebuild the derived index from the vault")
     verbs.add_parser("fsck", help="dangling links, duplicate ids, oversize notes, stray temps")
@@ -73,13 +73,11 @@ def _store(cfg: Config) -> Store:
     return Store(cfg.db_path)
 
 
-def _conn(cfg: Config, create: bool = False):
-    conn = ix.open_readonly(cfg.memory_index_path)
-    if conn is None and create:
-        svc = passes.Services(cfg, _store(cfg), Vault(cfg.memory_vault))
-        conn = passes.open_conn(svc)
-        ix.rebuild(svc.vault, conn, passes.StoreTrust(svc.store))
-    return conn
+def _conn(cfg: Config):
+    """Read-only, always. Building the shared index is the daemon's act and
+    `reindex`'s explicit one; a read verb that quietly rebuilds it does so
+    with no authority, which empties the derived rules table."""
+    return ix.open_readonly(cfg.memory_index_path)
 
 
 def _provenance() -> tuple[str, str]:
@@ -95,13 +93,24 @@ def _provenance() -> tuple[str, str]:
 def _in_session(store: Store | None = None) -> bool:
     """A session, not the owner at a terminal: WANDA_TASK_ID is set, or (since
     a session could unset it) an agent run is in flight. Maintenance verbs
-    that could poison shared state are refused when this is true."""
+    that could poison shared state are refused when this is true. State we
+    cannot read counts as a session: a guard whose job is to refuse must not
+    fail open. A window that is open because a daemon was killed refuses the
+    same verbs, so say which one it is — nothing else in the CLI would."""
     if os.environ.get(ENV_TASK, "").strip():
         return True
-    try:
-        return bool(store and store.open_windows())
-    except Exception:
+    if store is None:
         return False
+    try:
+        windows = store.open_windows()
+    except Exception as e:
+        print(f"(cannot read the run windows: {e}; treating this as a session)", file=sys.stderr)
+        return True
+    if windows:
+        which = ", ".join(f"{w['session_id']} since {w['started_at']}" for w in windows[:3])
+        print(f"({len(windows)} agent-run window(s) open: {which}. If no session is running, restart the daemon — "
+              f"it closes stale windows at startup; `wanda memory status` counts them.)", file=sys.stderr)
+    return bool(windows)
 
 
 def _append(cfg: Config, store: Store, vault: Vault, o: Observation) -> None:
@@ -220,8 +229,10 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
                         src=src, cause=cause, until=until)
         try:
             _append(cfg, store, vault, o)
-        except ValueError as e:
+        except (ValueError, TimeoutError) as e:  # ledger.append raises TimeoutError on a busy flock
             sys.exit(f"not recorded: {e}")
+        if conn is None:
+            print("(no index yet: the subject was taken as given, not matched against existing ones)", file=sys.stderr)
         if how == "near":
             print(f"filed under existing subject {subj} (close to {args.about})")
         elif how == "miss":
@@ -250,8 +261,22 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
         write_atomic(path, n.render())
         # The item's tier is derived by the index from this op=open line (by
         # the run window it was written in), not declared here.
-        _append(cfg, store, vault, Observation(subject=subj, facet="commitment", text=clean_text(args.title, 240), src=src,
-                                               cause=cause, op="open", due=check_by, ref=vault.rel(path)))
+        try:
+            _append(cfg, store, vault, Observation(subject=subj, facet="commitment", text=clean_text(args.title, 240), src=src,
+                                                   cause=cause, op="open", due=check_by, ref=vault.rel(path)))
+        except (ValueError, TimeoutError) as e:
+            # The note is written before the line. Without the ledger line the
+            # item has no tier, no due date in the index and nothing to lapse
+            # it, so roll it back rather than leave a commitment nothing tracks.
+            path.unlink(missing_ok=True)
+            sys.exit(f"not recorded: {e}")
+        if conn is None:
+            print("(no index yet: the subject was taken as given, not matched against existing ones)", file=sys.stderr)
+        elif how == "near":
+            print(f"filed under existing subject {subj} (close to {args.about})")
+        elif how == "miss":
+            store.digest_add("mint", f"new subject {subj} (from `wanda memory open`)")
+            print(f"opened on new subject {subj} (reported in the next digest)")
         print(f"opened {vault.rel(path)} (an email-task item stays off the always-loaded list)")
         return 0
 
@@ -259,8 +284,10 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
         store = _store(cfg)
         conn = _conn(cfg)
         ref = commands.normalize_ref(args.ref)
-        if not ref or conn is None:
-            sys.exit("expected a claim reference like people/robin-vale#c4" + ("" if ref else "") + (" (no index yet)" if ref and conn is None else ""))
+        if not ref:
+            sys.exit("expected a claim reference like people/robin-vale#c4")
+        if conn is None:
+            return _no_index()
         doc, _, block = ref.partition("#^")
         row = conn.execute("SELECT * FROM claims WHERE doc=? AND block=?", (doc, block)).fetchone()
         if row is None:
@@ -289,12 +316,23 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
                     r = passes.retire(svc, args.path, args.to)
             except (ValueError, FileNotFoundError) as e:
                 sys.exit(str(e))
+            except passes.Deferred as e:
+                sys.exit(f"{e}; the merge is journaled and completes on a later pass, once the successor has been "
+                         f"quiet for ten minutes")
             except passes.Busy:
                 sys.exit("a memory pass is running; try again in a minute")
             print(json.dumps(r, indent=1))
             return 0
         if verb == "unretire":
-            ok = passes.unretire(svc, args.path)
+            if _in_session(store):
+                sys.exit("restoring a note the owner deleted is the owner's call, not a session's; say so in your reply")
+            try:
+                with passes.memory_lock(cfg.memory_lock_path):
+                    ok = passes.unretire(svc, args.path)
+            except passes.Busy:
+                sys.exit("a memory pass is running; try again in a minute")
+            if ok:
+                store.digest_add("retired", f"restored retired/{args.path} with `wanda memory unretire`")
             print("restored" if ok else "nothing to restore")
             return 0 if ok else 1
         if verb == "reindex":
@@ -303,26 +341,42 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
             try:
                 with passes.memory_lock(cfg.memory_lock_path):
                     conn = passes.open_conn(svc)
-                    rep = ix.rebuild(vault, conn, passes.StoreTrust(store))
+                    try:
+                        rep = ix.rebuild(vault, conn, passes.StoreTrust(store))
+                    finally:
+                        conn.close()
             except passes.Busy:
                 sys.exit("a memory pass is running; it rebuilds the index itself")
             print(f"indexed {rep.docs} notes, {rep.claims} claims, {rep.obs} observations; {len(rep.rejected)} rejected lines, {len(rep.flags)} flags")
+            print("(a hand-run rebuild holds no owner authority: owner lines read back as session tier and the "
+                  "standing-rules block is empty until a daemon pass re-verifies them from Slack.)", file=sys.stderr)
             return 0
         if verb == "fsck":
-            conn = _conn(cfg, create=True)
+            conn = _conn(cfg)
+            if conn is None:
+                return _no_index(2)  # 1 already means "found N issues"; a wrapper must be able to tell them apart
             issues = passes.fsck(vault, conn)
             for i in issues:
                 print(f"- {i}")
             print("ok" if not issues else f"{len(issues)} issue(s)")
             return 0 if not issues else 1
         if verb == "hourly":
+            if _in_session(store):
+                sys.exit("the hourly pass writes the shared index and the workspace projection; leave it to the daemon "
+                         "while a session is running")
             try:
                 with passes.memory_lock(cfg.memory_lock_path):
                     conn = passes.open_conn(svc)
-                    rep = passes.hourly(svc, conn, cfg.workspace_dir)
+                    try:
+                        rep = passes.hourly(svc, conn, cfg.workspace_dir)
+                    finally:
+                        conn.close()
             except passes.Busy:
                 sys.exit("a memory pass is already running")
             print(rep.summary())
+            print("(a hand-run pass holds no owner authority: owner-tier lines are neither verified nor applied. A "
+                  "running daemon with WANDA_MEMORY_OWNER_USER_IDS set repairs this on its next hourly pass, within "
+                  "the hour.)", file=sys.stderr)
             return 0
         if verb == "import-cowork":
             if _in_session(store):
@@ -347,6 +401,7 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
             print(f"export:  {cfg.memory_export_dir}")
             print(f"hourly:  {store.memory_get('hourly_at') or 'never'}")
             print(f"nightly: {store.memory_get('nightly_date') or 'never'}")
+            print(f"open windows: {len(store.open_windows())}")  # what _in_session refuses five verbs on
             conn = _conn(cfg)
             if conn is not None:
                 for t in ("docs", "claims", "obs", "subjects", "vetoes"):
@@ -374,6 +429,6 @@ def _resolve_subject(about: str, conn):
     return ix.canonical_subject(conn, r.key), r.how, [k for k, _ in r.nearest]
 
 
-def _no_index() -> int:
+def _no_index(code: int = 1) -> int:
     print("memory index not built yet; run `wanda memory reindex` (the daemon does this hourly)", file=sys.stderr)
-    return 1
+    return code

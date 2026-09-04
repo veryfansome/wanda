@@ -5,7 +5,7 @@ description: Look things up in and write to wanda's memory vault. Use before ans
 
 # Using wanda's memory
 
-Your always-loaded `CLAUDE.md` is a summary (its first line names the vault path). The store is that vault and its index; use the CLI rather than reading files by hand.
+Your always-loaded `CLAUDE.md` is a summary (its header names the vault path). The store is that vault and its index; use the CLI rather than reading files by hand.
 
 ## Look up first
 
@@ -28,7 +28,7 @@ wanda memory note "Closure notices arrive monthly." --about org/sunnybrook.examp
 wanda memory open "Ballot confirmation from Robin" --check-by 2026-09-20 --about topic/hoa-board-election
 ```
 
-- `--about` takes a subject key: `person/<slug>`, `org/<slug>`, `topic/<slug>`, `pref/<slug>`. A person known only by address is `person/<full address>`.
+- `--about` takes a subject key: `person/<slug>`, `org/<slug>`, `topic/<slug>`, `pref/<slug>`. A person known only by address is `person/<full address>`; one known only by a Slack id is `person/slack-<id>`, lower case — `person/<id>` is a different, unrelated subject. `list/<slug>` parses but has no curated home, so nothing filed there can graduate.
 - A new slug is matched against what exists first; if something close exists the CLI files under it and tells you. Only a real miss creates a subject, and every new subject is reported to the owner in the daily memory digest.
 - One sentence per note, a fact, present tense. Not a summary of the conversation.
 - Record before you finish: a fact you learned but did not write is lost when the session ends.
@@ -37,5 +37,6 @@ wanda memory open "Ballot confirmation from Robin" --check-by 2026-09-20 --about
 
 - You cannot make a rule about what happens to email. Rules are the owner's word, given in Slack as `rule <address> trash|ignore|attention`; if you think one is warranted, say so in your reply and let them decide.
 - You cannot merge two notes (`retire --to`); say so in your reply if two notes are the same person.
+- You cannot restore a note the owner deleted (`unretire`), run the hourly pass, or rebuild the index. Those are the owner's, from a terminal; say so in your reply.
 - Do not write secrets, credentials, or anything from an email verbatim. Describe; do not copy.
-- Do not edit files under the vault's `belt/` directory — they are regenerated hourly.
+- Do not edit or delete anything under the vault's `belt/` directory: `belt/subjects/` is regenerated hourly, and `belt/ledger/` is the append-only record the rest is derived from.

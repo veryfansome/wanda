@@ -11,7 +11,7 @@ from datetime import date, timedelta
 from pathlib import Path
 
 from wanda.memory import index as ix
-from wanda.memory.notes import WIKILINK_RE, parse_writespec
+from wanda.memory.notes import WIKILINK_RE, parse_writespec, strip_provenance
 from wanda.memory.vault import (
     L2_DIRS, LIVE_SQL, OBS_OPS_SQL, PROJECTION_CAP_B, WRITESPEC_PROSE_CAP_B, Snapshot, Vault, nbytes, truncate_bytes,
     write_atomic, write_if_unchanged,
@@ -319,7 +319,7 @@ def compose_projection(vault: Vault, conn: sqlite3.Connection | None, today: str
     root = vault.root / "CLAUDE.md"
     if root.is_file():
         try:
-            prose = links_to_paths(parse_writespec(root).prose)
+            prose = links_to_paths(strip_provenance(parse_writespec(root).prose))
             prose = truncate_bytes(prose, WRITESPEC_PROSE_CAP_B)
             add(prose.strip() + "\n\n")
         except Exception:

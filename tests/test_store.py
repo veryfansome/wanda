@@ -12,10 +12,10 @@ def store(tmp_path):
     s.close()
 
 
-def ingest(store, key="k1", uid=1):
+def ingest(store, key="k1", uid=1, from_addr="a@example.com"):
     return store.ingest_message(
         dedupe_key=key, message_id=f"<{key}@x>", folder="INBOX", uidvalidity=7, uid=uid,
-        from_addr="a@example.com", subject="hi", date_hdr="today", snippet="body",
+        from_addr=from_addr, subject="hi", date_hdr="today", snippet="body",
     )
 
 
@@ -92,6 +92,15 @@ def test_bump_attempts(store):
     assert store.bump_attempts("k1") == 2
 
 
+def test_offer_refs_are_never_reused(store):
+    """ref is the PRIMARY KEY, so deriving the next one from the row count
+    hands a deleted offer's ref to a new one and the insert raises."""
+    for _ in range(4):
+        store.add_offer("disposition", "org/x.example", "ignore", "ignore mail from x.example")
+    store._exec("DELETE FROM memory_offers WHERE ref='k2'")
+    assert store.add_offer("disposition", "org/y.example", "ignore", "ignore mail from y.example") == "k5"
+
+
 def test_meta_and_digest(store):
     assert store.get_meta("x") is None
     store.set_meta("x", "1")
@@ -100,3 +109,32 @@ def test_meta_and_digest(store):
     assert store.get_digest("2026-08-31") is None
     store.set_digest("2026-08-31", "C1", "9.9")
     assert store.get_digest("2026-08-31")["thread_ts"] == "9.9"
+
+
+def test_sender_stats_counts_only_this_address(store):
+    """from_addr is the raw From header. Counting by substring pooled a
+    lookalike local part, a lookalike domain, and any address a sender wrote
+    into their own display name under the address being asked about."""
+    rows = [
+        ("news@fabrikam.com", "trash"),
+        ("News <news@fabrikam.com>", "trash"),
+        ("Enews <enews@fabrikam.com>", "ignore"),
+        ('"see news@fabrikam.com now" <evil@attacker.example>', "ignore"),
+        ("Spoof <news@fabrikam.com.evil.example>", "ignore"),
+        ("legacy@z.example (Legacy Form)", "ignore"),
+        ("first@x.example, news@fabrikam.com", "trash"),
+        ("Group: g@x.example;", "ignore"),
+        ("news@fabrikam.com>", "trash"),          # no parser can split this: it counts for nobody
+        ("Ax <axb@x.example>", "attention"),
+    ]
+    for i, (from_addr, action) in enumerate(rows):
+        ingest(store, key=f"k{i}", uid=i, from_addr=from_addr)
+        store.set_triaged(f"k{i}", {}, action)
+    st = store.sender_stats("news@fabrikam.com")
+    assert (st["seen"], st["trashed"], st["ignored"]) == (3, 3, 0)
+    # Forms a `= ? OR LIKE '%<addr>%'` narrowing would miss.
+    assert store.sender_stats("legacy@z.example")["ignored"] == 1
+    assert store.sender_stats("g@x.example")["ignored"] == 1
+    assert store.sender_stats("first@x.example")["trashed"] == 1
+    assert store.sender_stats("a_b@x.example")["seen"] == 0, "`_` is a LIKE wildcard; instr carries none"
+    assert store.sender_stats("news@fabrikam.com", since_iso="2099-01-01")["seen"] == 0
