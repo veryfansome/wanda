@@ -253,8 +253,10 @@ def expected_for_message(text: str, conn, store, task_sender: str = "") -> list[
                     return out
                 for subj in ({offer["subject"]} | ({ix.canonical_subject(conn, offer["subject"])} if conn is not None else set())):
                     out.append(("rule", subj, DISPOSITION_FACET, offer["text"], ""))
-            else:
-                out.append(("rule", offer["subject"], PREFERENCE_FACET, offer["text"], ""))
+            # Anything else mints nothing. A disposition's text is rebuilt
+            # above from the offer's own action and address, so a rewritten
+            # row is caught; free text has nothing to rebuild it from, so
+            # accepting one would take a wanda.db row as the owner's word.
             return out
         args = list(p.args)
         if args[0].lower() in ACTIONS:
@@ -329,8 +331,12 @@ def handle(ctx: Context, conn, store, owner_ids: list[str]) -> Minted:
                 # the rule (_apply_rule's supersede branch skips an identical
                 # text, so the second claim stays live alongside the first).
                 return Minted(reply=f"Offer {p.args[0]} is already your word: _{offer['text']}_")
-            facet = DISPOSITION_FACET if offer["kind"] == "disposition" else PREFERENCE_FACET
-            o = Observation(subject=offer["subject"], facet=facet, text=offer["text"], op="rule", **base)
+            if offer["kind"] != "disposition":
+                # Unverifiable by construction: see expected_for_message.
+                # Nothing produces these; a row that says otherwise is not
+                # the owner's word.
+                return Minted(reply=f"Offer {p.args[0]} is not one I can turn into a rule.")
+            o = Observation(subject=offer["subject"], facet=DISPOSITION_FACET, text=offer["text"], op="rule", **base)
             store.take_offer(p.args[0])
             return Minted([o], f"Recorded as your word: _{offer['text']}_")
         args = list(p.args)

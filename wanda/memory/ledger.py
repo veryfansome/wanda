@@ -22,7 +22,7 @@ from wanda.memory.vault import (
 # Who wrote a line. The tier a claim gets is NOT read from this field — the
 # index derives it from what the harness can verify (Slack authorship for
 # `owner`, the task's kind for `agent`); see index.tier_for_obs.
-SOURCES = ("triage", "agent", "owner", "harness", "import")
+SOURCES = ("triage", "agent", "owner", "harness")
 OPS = ("", "attest", "rule", "veto", "pin", "retire", "unretire", "open")
 
 _FIELD_KEYS = ("src", "op", "cause", "due", "until", "tier", "ref")

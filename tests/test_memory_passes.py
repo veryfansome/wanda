@@ -549,9 +549,12 @@ def test_email_tier_candidate_cannot_dispute_the_owners_rule(svc):
     assert conn.execute("SELECT status FROM claims WHERE doc=? AND block=?", (doc, block)).fetchone()["status"] == "owner-stated"
 
 
-def test_a_note_marked_private_is_held_out_of_the_export(svc):
-    """`export: false` keeps a note out of the extract the untrusted-mail
-    classifier reads, and out of the belt subject files beside it."""
+def test_export_false_keeps_a_note_out_of_the_classifier_extract(svc):
+    """`export: false` withholds a note from `memory.export/` — the only
+    vault-derived thing the untrusted-mail classifier can read (main.py
+    gives triage `tools="Read"` restricted to that directory) — and from
+    the belt subject files copied beside it. The note itself stays in the
+    vault and is still recalled for agent sessions."""
     for slug, title, private in (("alex-romero", "Alex Romero", True), ("robin-vale", "Robin Vale", False)):
         n = new_note(svc.vault.root / "people" / f"{slug}.md", "person", title, created=TODAY)
         n.claims.append(Claim("c1", f"{title} is known to the owner."))
