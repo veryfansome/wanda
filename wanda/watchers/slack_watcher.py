@@ -25,9 +25,12 @@ class SlackWatcher:
     """Socket Mode listener. Acks every envelope immediately (Slack retries
     past ~3s), then classifies it into one of five triggers:
 
-      command       — an owner's `rule|attest|forget|pin|unretire …`, or any
-                      owner message in a digest thread; handled in-process,
-                      never opens a session
+      command       — an owner's `rule|attest|forget|pin …`, or a
+                      bare offer ref (`k4`) — both strictly parsed, so
+                      "forget it, thanks" is not one — in a DM, in a digest
+                      thread, or with a mention; handled in-process, never
+                      opens a session. An owner's ordinary reply in a digest
+                      thread is chatter, dropped like anyone else's
       dm            — any message in a DM or group DM; no mention needed.
                       A DM behaves like a private channel: every top-level
                       message roots its own thread and task
@@ -68,7 +71,10 @@ class SlackWatcher:
         return not self.cfg.slack_allowed_user_ids or user in self.cfg.slack_allowed_user_ids
 
     def _is_owner(self, user: str) -> bool:
-        return user in self.cfg.memory_owner_user_ids
+        """With memory off there is no in-process handler, so nothing is a
+        command: classifying an owner's `rule …` as one drops it in silence
+        (main._handle_command returns when self.memory is None)."""
+        return bool(self.cfg.memory_enabled) and user in self.cfg.memory_owner_user_ids
 
     def _handle(self, client: SocketModeClient, req: SocketModeRequest) -> None:
         client.send_socket_mode_response(SocketModeResponse(envelope_id=req.envelope_id))
@@ -104,7 +110,9 @@ class SlackWatcher:
         # A command is an owner message with the SHAPE of a command (strictly
         # parsed, so "forget it, thanks" is not one), addressed to wanda: in a
         # DM, in a digest thread, or with a mention in a channel. Checked
-        # first, so `rule …` in a DM never opens a paid session.
+        # first, so `rule …` in a DM never opens a paid session — unless memory
+        # is off, when there are no commands at all and it is an ordinary DM
+        # (see _is_owner).
         if self._is_owner(user) and is_command(text) and (is_dm or in_digest or mentioned):
             kind = "command"
         elif in_digest and not mentioned:

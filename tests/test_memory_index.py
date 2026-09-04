@@ -297,3 +297,189 @@ def test_owner_rules_tie_break_on_when_they_were_said(vault, tmp_path):
     conn = ix.open_index(tmp_path / "memory.idx")
     ix.rebuild(vault, conn, DictTrust(verified_causes={f"slack:C1:{i}.1" for i in range(3)}), TODAY)
     assert [r["block"] for r in ix.standing_rules(conn)] == ["c1", "c0", "c2"]
+
+
+def test_a_duplicate_block_id_costs_one_line_not_the_whole_rebuild(vault, tmp_path):
+    """A copy-pasted claim line reuses its ^block id, which UNIQUE(doc, block)
+    refuses. One line and one flag, never the whole index."""
+    import wanda.memory.passes as P
+    write_note(vault, "person", "a", "A", [Claim("c1", "First."), Claim("c1", "Second."), Claim("c2", "Third.")])
+    write_note(vault, "person", "b", "B", [Claim("c1", "Fine.")])
+    conn = ix.open_index(tmp_path / "memory.idx")
+    rep = ix.rebuild(vault, conn, DictTrust(), TODAY)
+    assert (rep.docs, rep.claims, rep.broken_notes) == (2, 3, [])
+    assert {(r["doc"], r["block"], r["text"]) for r in conn.execute("SELECT doc, block, text FROM claims")} == {
+        ("people/a.md", "c1", "First."), ("people/a.md", "c2", "Third."), ("people/b.md", "c1", "Fine.")}
+    dup = [f for f in rep.flags if f[2] == "duplicate-block"]
+    assert len(dup) == 1 and dup[0][0] == "people/a.md" and dup[0][1] == "c1"
+    assert any("duplicate block on people/a.md" in i for i in P.fsck(vault, conn))
+
+
+def test_one_unindexable_note_does_not_take_the_index_with_it(vault, tmp_path, monkeypatch):
+    write_note(vault, "person", "a", "A", [Claim("c1", "Fine.")])
+    write_note(vault, "person", "b", "B", [Claim("c1", "Boom.")])
+    write_note(vault, "person", "c", "C", [Claim("c1", "Fine too.")])
+    real = ix._index_claim
+
+    def maybe_boom(conn, trust, rep, c, doc, *a, **kw):
+        if doc == "people/b.md":
+            raise RuntimeError("synthetic indexing failure")
+        return real(conn, trust, rep, c, doc, *a, **kw)
+
+    monkeypatch.setattr(ix, "_index_claim", maybe_boom)
+    conn = ix.open_index(tmp_path / "memory.idx")
+    rep = ix.rebuild(vault, conn, DictTrust(), TODAY)
+    assert (rep.docs, rep.claims) == (2, 2)
+    assert [p for p, _ in rep.broken_notes] == ["people/b.md"]
+    assert "indexing failed: " in rep.broken_notes[0][1]
+    assert conn.execute("SELECT COUNT(*) FROM docs WHERE path='people/b.md'").fetchone()[0] == 0, "the failed note's own rows go too"
+    assert conn.in_transaction is False
+
+
+def test_a_link_with_no_page_does_not_zero_the_index(vault, tmp_path):
+    """`- supersedes:: [[ #^c1]]` — a wikilink whose page is whitespace — names
+    no claim, so it supersedes nothing and the rebuild survives it."""
+    write_note(vault, "person", "d", "D", [
+        Claim("c1", "Old."), Claim("c2", "New.", [Edge("supersedes", " ", "c1")]),
+        Claim("c3", "Older."), Claim("c4", "Newer.", [Edge("supersedes", "people/d", "c3")]),
+    ])
+    conn = ix.open_index(tmp_path / "memory.idx")
+    rep = ix.rebuild(vault, conn, DictTrust(), TODAY)
+    assert rep.docs == 1
+    status = {r["block"]: r["status"] for r in conn.execute("SELECT block, status FROM claims")}
+    assert status["c3"] == "superseded", "a well-formed inbound supersedes still lands"
+    assert status["c1"] == "provisional"
+
+
+def test_a_link_with_no_page_does_not_kill_the_contradiction_pass(vault, tmp_path):
+    import wanda.memory.passes as P
+    write_note(vault, "person", "d", "D", [
+        Claim("c1", "Old."), Claim("c2", "New.", [Edge("supersedes", " ", "c1")]),
+        Claim("c3", "Older."), Claim("c4", "Newer.", [Edge("supersedes", "people/d", "c3")]),
+    ])
+    conn = ix.open_index(tmp_path / "memory.idx")
+    ix.rebuild(vault, conn, DictTrust(), TODAY)
+    assert isinstance(P.contradiction_candidates(conn), list)
+
+
+def test_a_reused_ulid_is_reported_with_its_own_line(vault, tmp_path):
+    u = "01k4qs81bdk3m9d1"
+    append(vault, obs("pref/mail-dispositions", "trash mail from priya@x.example", "2026-09-01", src="owner",
+                      op="rule", facet="mail-disposition", cause="slack:C1:1.1", ulid=u))
+    append(vault, obs("person/victim@x.example", "trash mail from victim@x.example", "2026-09-01", src="owner",
+                      op="rule", facet="mail-disposition", cause="slack:C1:1.1", ulid=u))
+    conn = ix.open_index(tmp_path / "memory.idx")
+    rep = ix.rebuild(vault, conn, DictTrust(verified_causes={"slack:C1:1.1"}), TODAY)
+    assert len(rep.rejected) == 1
+    assert "duplicate block id" in rep.rejected[0].why
+    assert "trash mail from victim@x.example" in rep.rejected[0].line, "rejected.md must show what it rejected"
+
+
+def test_two_owner_dispositions_in_one_minute_resolve_by_ulid(vault, tmp_path):
+    # Same day, same minute (obs() stamps 10:00), same target: only the ULID separates them.
+    first, second = "01k4qs81bdk3m9z9", "01k4qs81bdk3m9a1"
+    for u in (first, second):
+        append(vault, obs("pref/mail-dispositions", f"trash mail from s1@x.example: {u}", "2026-09-01", src="owner",
+                          op="rule", facet="mail-disposition", cause="slack:C1:1.1", ulid=u))
+    conn = ix.open_index(tmp_path / "memory.idx")
+    ix.rebuild(vault, conn, DictTrust(verified_causes={"slack:C1:1.1"}), TODAY)
+    rows = conn.execute("SELECT * FROM rules").fetchall()
+    assert len(rows) == 1 and rows[0]["text"].endswith(first), "the higher ULID is the later word, whatever the file order"
+
+
+def test_the_disposition_grammar_is_read_case_folded(vault, tmp_path):
+    append(vault, obs("pref/mail-dispositions", "Trash mail from S1@X.example", "2026-09-01", src="owner",
+                      op="rule", facet="mail-disposition", cause="slack:C1:1.1", ulid="01k4qs81bdk3m9h1"))
+    conn = ix.open_index(tmp_path / "memory.idx")
+    ix.rebuild(vault, conn, DictTrust(verified_causes={"slack:C1:1.1"}), TODAY)
+    r = conn.execute("SELECT * FROM rules").fetchone()
+    assert (r["target"], r["action"]) == ("s1@x.example", "trash")
+    assert len(ix.dispositions_for(conn, ["s1@x.example"], [])) == 1, "triage compares against lowercased addresses"
+
+
+def test_two_disposition_rules_with_one_subject_both_survive(vault, tmp_path):
+    texts = ["never auto-file anything from the school", "always keep the HOA thread"]
+    for i, (day, text) in enumerate(zip(["2026-09-01", "2026-09-02"], texts)):
+        append(vault, obs("pref/mail-dispositions", text, day, src="owner", op="rule",
+                          facet="mail-disposition", cause=f"slack:C1:{i}.1", ulid=f"01k4qs81bdk3m9j{i}"))
+    conn = ix.open_index(tmp_path / "memory.idx")
+    ix.rebuild(vault, conn, DictTrust(verified_causes={"slack:C1:0.1", "slack:C1:1.1"}), TODAY)
+    assert {r["text"] for r in ix.standing_rules(conn)} == set(texts), "two dispositions the grammar cannot read are not one rule"
+
+
+def test_a_freshly_built_index_has_no_write_only_columns(tmp_path):
+    conn = ix.open_index(tmp_path / "memory.idx")
+    cols = {t: {r[1] for r in conn.execute(f"PRAGMA table_info({t})")} for t in ("claims", "subjects")}
+    assert "facet" not in cols["claims"]
+    assert "has_file" not in cols["subjects"]
+
+
+def test_two_files_that_slugify_to_one_subject_are_flagged(vault, tmp_path):
+    import wanda.memory.passes as P
+    for name, title in (("Robin Vale", "Robin Vale"), ("robin-vale", "Robin S")):
+        n = new_note(vault.root / "people" / f"{name}.md", "person", title, created=TODAY)
+        n.claims.append(Claim("c1", f"From {name}."))
+        write_atomic(n.path, n.render())
+    conn = ix.open_index(tmp_path / "memory.idx")
+    rep = ix.rebuild(vault, conn, DictTrust(), TODAY)
+    dup = [f for f in rep.flags if f[2] == "duplicate-subject"]
+    assert len(dup) == 1
+    assert dup[0][3].startswith("person/robin-vale also on ")
+    assert {dup[0][0], dup[0][3].split(" also on ")[1]} == {"people/robin-vale.md", "people/Robin Vale.md"}
+    assert any("duplicate subject on people/robin-vale.md" in i for i in P.fsck(vault, conn))
+
+
+def test_export_false_is_honoured_however_it_is_typed(vault, tmp_path):
+    spellings = ["false", '"false"', "off", "0", "no", None, "true"]
+    for i, val in enumerate(spellings):
+        meta = f"export: {val}\n" if val is not None else ""
+        (vault.root / "people" / f"n{i}.md").write_text(f"---\ntype: person\ntitle: N{i}\n{meta}---\n\n# N{i}\n")
+    conn = ix.open_index(tmp_path / "memory.idx")
+    ix.rebuild(vault, conn, DictTrust(), TODAY)
+    got = [r["export"] for r in conn.execute("SELECT path, export FROM docs ORDER BY path")]
+    assert got == [0, 0, 0, 0, 0, 1, 1], "only an absent key or a real yes exports"
+
+
+def test_a_later_veto_line_can_neither_lift_nor_outlive_a_suppression(vault, tmp_path):
+    k, ell = "key:org/k.example|mail-pattern", "key:org/l.example|mail-pattern"
+    lines = [("2026-09-01", k, "", "01k4qs81bdk3m9v0"), ("2026-09-02", k, "2026-09-10", "01k4qs81bdk3m9v1"),
+             ("2026-09-02", ell, "2099-12-31", "01k4qs81bdk3m9v2")]
+    for i, (day, ref, until, u) in enumerate(lines):
+        append(vault, obs("org/k.example", "veto", day, src="owner", op="veto", cause=f"slack:C1:{i}.1",
+                          ref=ref, until=until, ulid=u))
+    conn = ix.open_index(tmp_path / "memory.idx")
+    ix.rebuild(vault, conn, DictTrust(verified_causes={f"slack:C1:{i}.1" for i in range(3)}), TODAY)
+    rows = {r["key"]: r["until"] for r in conn.execute("SELECT key, until FROM vetoes")}
+    assert rows[k] == "2027-09-01", "a later line cannot shorten a standing suppression"
+    assert ix.is_vetoed(conn, [k], "2026-12-01")
+    assert rows[ell] == "2027-09-02", "and no line reaches past a year from its own day"
+
+
+def test_a_tombstone_that_vanishes_mid_rebuild_costs_one_note(vault, tmp_path, monkeypatch):
+    """The tombstone is unlinked between the glob and the row that describes
+    it: every stat of it after it is read must sit inside the loop's try."""
+    import pathlib
+    write_note(vault, "person", "live", "Live", [Claim("c1", "Fine.")])
+    (vault.retired_dir / "people").mkdir(parents=True, exist_ok=True)
+    (vault.retired_dir / "people" / "gone.md").write_text(
+        "---\nkind: tombstone\nsubject: person/gone\nsuperseded_by: person/live\n---\n\n# Gone\n")
+    real_parse, real_stat = ix.parse_note, pathlib.Path.stat
+    gone = []
+
+    def parse(path, *a, **kw):
+        doc = real_parse(path, *a, **kw)
+        if path.name == "gone.md":
+            gone.append(path)     # read succeeded; from here the file is not there any more
+        return doc
+
+    def stat(self, *a, **kw):
+        if gone and self.name == "gone.md":
+            raise FileNotFoundError(2, "No such file or directory", str(self))
+        return real_stat(self, *a, **kw)
+
+    monkeypatch.setattr(ix, "parse_note", parse)
+    monkeypatch.setattr(pathlib.Path, "stat", stat)
+    conn = ix.open_index(tmp_path / "memory.idx")
+    rep = ix.rebuild(vault, conn, DictTrust(), TODAY)
+    assert rep.docs == 1
+    assert [p for p, _ in rep.broken_notes] == ["retired/people/gone.md"]

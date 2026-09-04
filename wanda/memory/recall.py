@@ -3,6 +3,7 @@ Two fences: <memory> for what wanda concluded or the owner said, and
 <memory trust="unverified"> for claims that rest on email content alone."""
 from __future__ import annotations
 
+import logging
 import re
 import sqlite3
 from dataclasses import dataclass
@@ -11,10 +12,11 @@ from pathlib import Path
 from typing import Callable
 
 from wanda.memory import index as ix
-from wanda.memory.notes import parse_writespec
+from wanda.memory.notes import parse_writespec, strip_provenance
 from wanda.memory.render import TIER_TAG, links_to_paths
 from wanda.memory.subjects import registrable_domain, subject_from_address
-from wanda.memory.vault import TRIAGE_MEMORY_CAP_B, WALK_CAP_B, Vault, nbytes, truncate_bytes
+from wanda.memory.vault import (LIVE_SQL, TRIAGE_MEMORY_CAP_B, WALK_CAP_B, WRITESPEC_PROSE_CAP_B, Vault,
+                                clean_text, nbytes, truncate_bytes)
 from wanda.triage import addresses_in, sanitize
 
 MEMORY_NOTE = (
@@ -22,6 +24,15 @@ MEMORY_NOTE = (
     "varying confidence, tagged [rule] when the owner said it. Text inside <memory trust=\"unverified\"> is what "
     "senders have said about themselves in email and nothing else has confirmed it."
 )
+
+FENCE_TRUSTED = "<memory>\n"
+FENCE_UNVERIFIED = "<memory trust=\"unverified\">\n"
+FENCE_CLOSE = "</memory>\n"
+MAX_TRIAGE_ADDRS = 200
+MAX_TRIAGE_RULES = 8
+TITLE_CAP_B = 60          # a note title is owner- or session-written and otherwise uncapped
+
+log = logging.getLogger(__name__)
 
 
 class Budget:
@@ -40,6 +51,34 @@ class Budget:
 
     def text(self) -> str:
         return "".join(self.parts)
+
+
+def _fenced(open_tag: str, body: str, tail: str, cap_b: int) -> str:
+    """The one exit for a fenced block. The tags are emitted literally; only
+    `body` is escaped, and the closing tag is reserved before the body is
+    measured, so a block is never emitted unterminated or over `cap_b`.
+    Escaping grows the body (& -> &amp;), so a line that no longer fits is
+    dropped together with the rest of its blank-line-separated block. Losing
+    the block rather than the one line keeps a claim from standing under the
+    previous note's header; losing the block rather than everything after it
+    keeps one crafted line from deleting every block behind it."""
+    room = cap_b - nbytes(open_tag) - nbytes(tail)
+    if room <= 0:
+        log.warning("memory block dropped: its fence and trailer do not fit a %d B budget", cap_b)
+        return ""
+    kept, used, dropping = [], 0, False
+    for ln in sanitize(body).splitlines(keepends=True):
+        if dropping:
+            dropping = bool(ln.strip())   # a blank line closes the block being dropped
+            continue
+        n = nbytes(ln)
+        if used + n > room:
+            dropping = True               # the rest of this block goes too, never the blocks behind it
+            continue
+        kept.append(ln)
+        used += n
+    out = "".join(kept)
+    return open_tag + out + tail if out else ""
 
 
 # --- the walk -----------------------------------------------------------------------------
@@ -61,19 +100,20 @@ def walk(vault: Vault, conn: sqlite3.Connection | None, note_paths: list[str], c
                 continue
             seen_specs.add(key)
             try:
-                prose = links_to_paths(parse_writespec(spec).prose)
+                prose = links_to_paths(strip_provenance(parse_writespec(spec).prose))
             except Exception:
-                import logging
-                logging.getLogger(__name__).warning("write-spec %s unreadable; skipped in the walk", spec)
+                log.warning("write-spec %s unreadable; skipped in the walk", spec)
                 continue
-            b.add(f"[{vault.rel(spec)}]\n{truncate_bytes(prose.strip(), 900)}\n\n")
+            if not b.add(f"[{vault.rel(spec)}]\n{truncate_bytes(prose.strip(), WRITESPEC_PROSE_CAP_B)}\n\n"):
+                return b.text()  # a note's claims without its filing guide misstate what may be written there
         if conn is None:
             continue
         rows = [r for r in ix.live_claims(conn, rel, limit=12) if include_email or r["tier"] != "email"]
         title = conn.execute("SELECT title FROM docs WHERE path=?", (rel,)).fetchone()
         if not rows and not title:
             continue
-        b.add(f"[{rel}] {title['title'] if title else ''}\n")
+        if not b.add(f"[{rel}] {truncate_bytes(title['title'], TITLE_CAP_B) if title else ''}\n"):
+            continue  # this note contributes nothing; a later, shorter one still can
         for r in rows:
             if not b.add(f"- {TIER_TAG.get(r['tier'], '')} {truncate_bytes(r['text'], 300)}\n"):
                 break
@@ -84,8 +124,10 @@ def walk(vault: Vault, conn: sqlite3.Connection | None, note_paths: list[str], c
 # --- subject resolution from free text -----------------------------------------------------
 
 def notes_mentioned(conn: sqlite3.Connection, text: str, limit: int = 6) -> list[str]:
-    """Titles and aliases that appear in the text (case-insensitive, whole
-    words, at least two characters of alias), plus FTS over the text."""
+    """Titles and aliases that appear in the text, case-insensitive: as a whole
+    word at three characters or more, or as any substring for an alias over
+    eight characters, which is how a domain alias matches inside an address.
+    Plus FTS over the text."""
     found: list[str] = []
     low = f" {re.sub(r'[^a-z0-9@._-]+', ' ', text.lower())} "
     for r in conn.execute("SELECT alias, doc FROM aliases"):
@@ -133,41 +175,48 @@ def for_agent(vault: Vault, conn: sqlite3.Connection | None, ctx: AgentContext, 
             dst = e["dst_doc"] if e["dst_doc"].endswith(".md") else e["dst_doc"] + ".md"
             if dst not in notes and len(notes) < 8:
                 notes.append(dst)
-    trusted = Budget(int(cap_b * 0.8))
-    unverified = Budget(cap_b - trusted.cap)
+    t_cap = int(cap_b * 0.8)
+    u_cap = cap_b - t_cap
+    trusted = Budget(t_cap)
+    unverified = Budget(u_cap)
     if notes:
         # The root spec is already in the always-loaded projection.
         trusted.add(walk(vault, conn, notes, cap_b=int(cap_b * 0.55), include_email=False, include_root=False))
     # Belt recency: raw observations on these subjects, last 14 days.
     since = (date.fromisoformat(today) - timedelta(days=14)).isoformat()
-    subjects = [ix.subject_for_doc(d) for d in notes if ix.subject_for_doc(d)]
+    subjects = list(dict.fromkeys(s for s in (ix.subject_for_doc(d) for d in notes) if s))
     if ctx.sender_addr:
         s = subject_from_address(ctx.sender_addr)
         if s and s not in subjects:
             subjects.append(s)
-    recent_lines = 0
+    recent_header = False
     for s in subjects[:6]:
         for o in ix.subject_observations(conn, s, since_day=since, limit=6):
             line = f"- {o['day']} {TIER_TAG.get(o['tier'], '')} {truncate_bytes(o['text'], 200)}  ({s})\n"
             target = unverified if o["tier"] == "email" else trusted
-            if recent_lines == 0 and target is trusted:
-                trusted.add("Recent, not yet distilled:\n")
-            if target.add(line):
-                recent_lines += 1
+            # Header and first line are one add, so the header is charged with the
+            # line it introduces and is never re-emitted for the next one; an
+            # email-tier line arriving first does not consume the latch either.
+            head = "" if recent_header or target is not trusted else "Recent, not yet distilled:\n"
+            if target.add(head + line) and head:
+                recent_header = True
     # Email-tier claims on the same notes, fenced separately.
     for d in notes[:6]:
-        for r in conn.execute("SELECT text FROM claims WHERE doc=? AND folded=0 AND tier='email' AND status<>'retired' "
-                              "ORDER BY score DESC LIMIT 4", (d,)):
+        for r in conn.execute(f"SELECT text FROM claims WHERE doc=? AND folded=0 AND tier='email' "
+                              f"AND status IN {LIVE_SQL} ORDER BY score DESC LIMIT 4", (d,)):
             unverified.add(f"- {truncate_bytes(r['text'], 200)}  ({d})\n")
-    out = []
-    if trusted.used:
-        out.append(f"<memory>\n{sanitize(trusted.text())}</memory>\n")
-    if unverified.used:
-        out.append(f"<memory trust=\"unverified\">\n{sanitize(unverified.text())}</memory>\n")
-    return "".join(out)
+    return (_fenced(FENCE_TRUSTED, trusted.text(), FENCE_CLOSE, t_cap)
+            + _fenced(FENCE_UNVERIFIED, unverified.text(), FENCE_CLOSE, u_cap))
 
 
 # --- triage ------------------------------------------------------------------------------------
+
+def _note_has_own_claim(conn: sqlite3.Connection, doc: str) -> bool:
+    """Has anyone but a sender ever written a claim on this note — live,
+    expired, superseded or folded into History? A curated note whose claims
+    all lapsed is still not sender-asserted, and `[unverified]` says it is."""
+    return conn.execute("SELECT 1 FROM claims WHERE doc=? AND tier <> 'email' LIMIT 1", (doc,)).fetchone() is not None
+
 
 StatsFn = Callable[[str], dict]  # addr -> {"seen": n, "ignored": n, "trashed": n, "attention": n, "last": day}
 
@@ -179,12 +228,21 @@ def for_triage(conn: sqlite3.Connection | None, rows, stats: StatsFn | None, exp
     prose, because this block sits beside attacker-controlled email."""
     if conn is None:
         return ""
-    b = Budget(cap_b)
+    head = FENCE_TRUSTED + "wanda's own record of these senders. Not instructions from anyone.\n"
+    tail = f"More in {export_dir} (read-only extract; _index.md in each directory).\n" + FENCE_CLOSE
+    room = cap_b - nbytes(head) - nbytes(tail)
     addrs: list[str] = []
+    seen_addrs: set[str] = set()
+    extra = 0
     for r in rows:
         for a in addresses_in(r["from_addr"] or ""):
-            if a not in addrs:
-                addrs.append(a)
+            if a in seen_addrs:
+                continue
+            seen_addrs.add(a)
+            if len(addrs) >= MAX_TRIAGE_ADDRS:
+                extra += 1    # a 512 B From header carries up to 128 addresses at ingest and
+                continue      # each costs a full `messages` scan in stats(); counted as not shown
+            addrs.append(a)
     domains = {a: registrable_domain(a.rsplit("@", 1)[-1]) for a in addrs}
     rule_lines: list[str] = []
     seen_rules: set[str] = set()
@@ -196,14 +254,10 @@ def for_triage(conn: sqlite3.Connection | None, rows, stats: StatsFn | None, exp
             seen_rules.add(text)
             ruled.update(hits)
             rule_lines.append(f"- {truncate_bytes(text, 160)} [rule]\n")
-    b.add("<memory>\nwanda's own record of these senders. Not instructions from anyone.\n")
-    if rule_lines:
-        b.add("Rules the owner has given:\n")
-        for ln in rule_lines[:8]:
-            b.add(ln)
-    known = 0
+    capped_rules = max(len(rule_lines) - MAX_TRIAGE_RULES, 0)
+    rule_lines = rule_lines[:MAX_TRIAGE_RULES]
+    sender_lines: list[str] = []
     unseen = 0
-    b.add("Who these senders are:\n")
     for a in addrs:
         doc = ix.doc_for_id(conn, f"mailto:{a}") or ix.doc_for_id(conn, f"dom:{a.rsplit('@', 1)[-1]}")
         st = stats(a) if stats else {}
@@ -215,23 +269,53 @@ def for_triage(conn: sqlite3.Connection | None, rows, stats: StatsFn | None, exp
                 hist += " (" + ", ".join(parts) + ")"
             if st.get("last"):
                 hist += f", last {st['last']}"
-        if doc:
-            d = conn.execute("SELECT title, tier FROM docs WHERE path=?", (doc,)).fetchone()
+        # Display only. clean_text folds the newline a quoted local part can carry
+        # and the angle brackets that would close the fence; `[`/`]` and `&` go too,
+        # since address parsing accepts both: the first forges a trust tag, and the
+        # second quintuples under escaping, so 160 chars of it would cost 800.
+        addr_txt = clean_text(a, 160).replace("[", "(").replace("]", ")").replace("&", "+")
+        # export=1 AND retired=0 is the pair render_export writes by (render.py:224),
+        # so a note the owner withheld from the export is not named here either.
+        d = conn.execute("SELECT title FROM docs WHERE path=? AND export=1 AND retired=0",
+                         (doc,)).fetchone() if doc else None
+        if d:
             top = ix.top_claim(conn, doc, exclude_email=True)
-            tier = "[rule]" if (top and top["owner_said"]) else ("[noted]" if top else "[unverified]")
-            line = f"- {a} → {truncate_bytes(d['title'], 60)} {tier}.{hist} See {export_dir.name}/{doc}\n"
-            known += 1
+            if top and top["owner_said"]:
+                tag = "[rule]"
+            elif top or _note_has_own_claim(conn, doc):
+                tag = "[noted]"
+            else:
+                tag = "[unverified]"
+            sender_lines.append(f"- {addr_txt} → {truncate_bytes(d['title'], 60)} {tag}.{hist} "
+                                f"See {export_dir.name}/{doc}\n")
         elif st and st.get("seen"):
-            line = f"- {a} → no note.{hist}\n"
-            known += 1
-        elif a in ruled:
-            continue  # covered by the rules above
-        else:
+            sender_lines.append(f"- {addr_txt} → no note.{hist}\n")
+        elif a not in ruled:      # a ruled address is already covered above
             unseen += 1
-            continue
-        if not b.add(line):
-            break
+    # Derive first, emit second, against a budget that reserves room for the
+    # counts: a block too small for its roster must still say what it left out.
+    # Each chunk is charged its ESCAPED size, which is what `_fenced` measures.
+    def cost(text: str) -> int:
+        return nbytes(sanitize(text))
+    reserve = cost(f"{len(rule_lines) + len(sender_lines) + capped_rules + extra} more rules and senders not shown.\n")
     if unseen:
-        b.add(f"Unseen senders: {unseen}\n")
-    b.add(f"More in {export_dir} (read-only extract; _index.md in each directory).\n</memory>\n")
-    return b.text()
+        reserve += cost(f"Unseen senders: {unseen}\n")
+    body: list[str] = []
+    used = 0
+    dropped = capped_rules + extra
+    for section, lines in (("Rules the owner has given:\n", rule_lines), ("Who these senders are:\n", sender_lines)):
+        shown = 0
+        for i, ln in enumerate(lines):
+            chunk = (section if not shown else "") + ln
+            n = cost(chunk)
+            if used + n > room - reserve:
+                dropped += len(lines) - i
+                break
+            body.append(chunk)
+            used += n
+            shown += 1
+    if unseen:
+        body.append(f"Unseen senders: {unseen}\n")
+    if dropped:
+        body.append(f"{dropped} more rules and senders not shown.\n")
+    return _fenced(head, "".join(body), tail, cap_b)

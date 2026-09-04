@@ -4,6 +4,7 @@ import stat
 
 import pytest
 
+from wanda.memory import vault as V
 from wanda.memory.vault import (
     Snapshot, Vault, clean_text, nbytes, parse_frontmatter, render_doc, sha_text,
     slugify, truncate_bytes, ulid, write_atomic, write_if_unchanged, ULID_RE,
@@ -102,3 +103,44 @@ def test_vault_paths(tmp_path):
     assert v.note_path("list/x") is None
     assert v.subject_file("org/acme.example").as_posix().endswith("belt/subjects/org/acme.example.md")
     assert sha_text("a") != sha_text("b")
+
+
+def test_vault_root_resolves_before_the_directory_exists(tmp_path):
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    v = Vault(link / "vault")            # reached through a symlink, and not created yet
+    assert v.rel(v.inside("people/x.md")) == "people/x.md"
+
+
+def test_a_malformed_frontmatter_fence_keeps_its_whole_line_in_the_body():
+    d = parse_frontmatter("---\ntype: person\n----\nids: [a]\n---\n\n# T\n")
+    assert d.meta == {"type": "person"}
+    assert d.body == "----\nids: [a]\n---\n\n# T\n"
+    ok = parse_frontmatter("---\ntype: person\n---\n\n# T\n")
+    assert ok.meta == {"type": "person"} and ok.body == "\n# T\n"
+
+
+def test_a_leading_thematic_break_is_not_frontmatter():
+    text = "---\n\n# Title\n\nSome prose.\n\n---\n\nMore.\n"
+    d = parse_frontmatter(text)
+    assert d.meta == {} and d.body == text
+
+
+def test_a_snapshot_of_an_unreadable_file_is_not_unchanged(tmp_path, monkeypatch):
+    p = tmp_path / "n.md"
+    p.write_text("one")
+    snap = Snapshot.take(p)
+    assert snap.unchanged() is True
+    monkeypatch.setattr(V, "sha_file", lambda path: (_ for _ in ()).throw(PermissionError(13, "denied", str(path))))
+    assert snap.unchanged() is False
+    monkeypatch.undo()
+    p.unlink()
+    assert snap.unchanged() is False
+
+
+def test_write_atomic_creates_a_private_file(tmp_path):
+    p = tmp_path / "fresh.md"
+    write_atomic(p, "x")
+    assert stat.S_IMODE(p.stat().st_mode) & 0o077 == 0, "nothing for group or other"

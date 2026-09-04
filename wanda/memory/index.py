@@ -30,7 +30,7 @@ CREATE TABLE IF NOT EXISTS aliases (alias TEXT NOT NULL, doc TEXT NOT NULL, PRIM
 CREATE TABLE IF NOT EXISTS subject_alias (from_subject TEXT PRIMARY KEY, to_subject TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS claims (
   id INTEGER PRIMARY KEY, doc TEXT NOT NULL, block TEXT NOT NULL, text TEXT NOT NULL, sha TEXT NOT NULL,
-  facet TEXT, cls TEXT NOT NULL, tier TEXT NOT NULL, n_support INTEGER, n_causes INTEGER, n_days INTEGER,
+  cls TEXT NOT NULL, tier TEXT NOT NULL, n_support INTEGER, n_causes INTEGER, n_days INTEGER,
   owner_said INTEGER, pinned INTEGER DEFAULT 0, first_seen TEXT, last_seen TEXT, until TEXT,
   folded INTEGER DEFAULT 0, status TEXT NOT NULL, score REAL NOT NULL, lineno INTEGER,
   UNIQUE(doc, block));
@@ -48,7 +48,7 @@ CREATE TABLE IF NOT EXISTS rkeys (ulid TEXT, key TEXT);
 CREATE INDEX IF NOT EXISTS ix_rkeys ON rkeys(key, ulid);
 CREATE TABLE IF NOT EXISTS vetoes (key TEXT PRIMARY KEY, until TEXT, ulid TEXT);
 CREATE TABLE IF NOT EXISTS subjects (key TEXT PRIMARY KEY, doc TEXT, n_obs INTEGER, n_causes INTEGER, n_days INTEGER,
-  first_seen TEXT, last_seen TEXT, untrusted INTEGER, has_file INTEGER DEFAULT 0);
+  first_seen TEXT, last_seen TEXT, untrusted INTEGER);
 CREATE TABLE IF NOT EXISTS rules (subject TEXT, facet TEXT, target TEXT, action TEXT, text TEXT, ledger_ref TEXT,
   created TEXT, doc TEXT, block TEXT);
 CREATE TABLE IF NOT EXISTS writespecs (path TEXT PRIMARY KEY, prose TEXT, sha TEXT);
@@ -60,7 +60,7 @@ TIERS = ("email", "session", "owner")
 TIER_RANK = {"email": 0, "session": 1, "owner": 2}
 CONVERSATION_KINDS = ("mention", "mention_guest", "dm")
 STUB_KINDS = ("redirect", "tombstone")
-DISPOSITION_RE = re.compile(r"^(trash|ignore|attention) mail from (\S+?)(:|$)")
+DISPOSITION_RE = re.compile(r"^(trash|ignore|attention) mail from (\S+?)(:|$)", re.I)  # the writer is lowercase (commands.rule_text); the reader must not silently drop a cased line
 
 
 class TrustOracle(Protocol):
@@ -80,11 +80,12 @@ def tier_for_obs(o: L.Observation, trust: TrustOracle) -> str:
       AND have passed the per-line check against that message; otherwise it
       is treated like any shell-written line.
     - triage: email, always.
-    - anything written from a shell (agent, harness, import): the writer's
-      process group names the session that wrote it — a session cannot join
-      another session's group — so the tier is that run's kind. A line with
-      no recognisable group is email-tier whenever an email-task session was
-      running at the time, since it could have been that session."""
+    - anything written from a shell (agent, harness, import): the tier is the
+      kind of the agent run whose recorded window covers the line's timestamp
+      (trust.window_tier), never anything in the line itself; a line the
+      daemon authored during its own pass is trusted via line_authored. A
+      line covered by an email-task window is email tier, since it could have
+      been that session."""
     fp = line_fingerprint(o)
     if o.src == "owner":
         if o.cause.startswith("slack:") and trust.owner_verified(o.cause) and trust.line_checked(o.ulid, fp):
@@ -154,7 +155,7 @@ def doc_for_subject(conn, subject: str) -> str | None:
     """The live note for a subject, hand-named files included (`docs.subject`
     is derived from the path), following aliases."""
     subject = canonical_subject(conn, subject)
-    r = conn.execute("SELECT path FROM docs WHERE subject=? AND retired=0", (subject,)).fetchone()
+    r = conn.execute("SELECT path FROM docs WHERE subject=? AND retired=0 ORDER BY path", (subject,)).fetchone()
     return r["path"] if r else None
 
 
@@ -162,7 +163,9 @@ def effective_status(c: dict, today: str) -> str:
     """`c` carries the claim's own flags plus `inbound_supersedes` and
     `inbound_contradicts`, resolved after every claim is loaded. The owner's
     word cannot be disputed by anything less than the owner's word: a
-    contradiction only marks non-owner claims."""
+    contradiction only marks non-owner claims. A claim carrying its own
+    `contradicts` edge is disputed by that edge alone, so marking a loser
+    disputed leaves both sides disputed: both stay, both rank last."""
     if c.get("retired"):
         return "retired"
     if c.get("superseded_by") or c.get("inbound_supersedes"):
@@ -201,10 +204,23 @@ class RebuildReport:
     broken_notes: list[tuple[str, str]] = field(default_factory=list)
 
 
+class RebuildFailed(Exception):
+    """The rebuild would commit an empty index while notes could not be
+    parsed — a systematic fault (a code bug, a vault-wide stat() failure),
+    not a legitimately empty vault. Raised so the transaction rolls back
+    rather than replacing a good index with an empty one, and so the pass
+    can name the offending notes to the owner. Carries `broken_notes`."""
+
+    def __init__(self, broken_notes: list[tuple[str, str]]):
+        self.broken_notes = list(broken_notes)
+        super().__init__(f"index would be empty while {len(self.broken_notes)} note(s) could not be indexed")
+
+
 def rebuild(vault: Vault, conn: sqlite3.Connection, trust: TrustOracle, today: str | None = None) -> RebuildReport:
     """Full rebuild in one transaction, so a concurrent reader sees the old
-    snapshot or the new one. Measured 5–53 ms at 100–1,000 notes; there is
-    deliberately no incremental path below ~2,000 notes."""
+    snapshot or the new one. Measured warm on an Apple-silicon laptop at
+    ~25 ms for 100 notes and ~370 ms for 1,000 (5 claims and 3 observations
+    per note); there is deliberately no incremental path below ~2,000 notes."""
     today = today or datetime.now(timezone.utc).date().isoformat()
     rep = RebuildReport()
     conn.execute("BEGIN IMMEDIATE")
@@ -215,6 +231,12 @@ def rebuild(vault: Vault, conn: sqlite3.Connection, trust: TrustOracle, today: s
         _load_ledger(vault, conn, trust, rep)
         obs_by_ulid = {r["ulid"]: r for r in conn.execute("SELECT * FROM obs")}
         _load_notes(vault, conn, trust, rep, obs_by_ulid, today)
+        if rep.docs == 0 and rep.broken_notes:
+            # A successfully-empty index is fine (an empty vault); an index
+            # that is empty ONLY because every note failed to parse is not —
+            # committing it would hand every reader a "wanda knows nothing"
+            # projection with no marker. Roll back and keep the last good one.
+            raise RebuildFailed(rep.broken_notes)
         _finish_status(conn, today)
         _load_writespecs(vault, conn)
         _derive_owner_rules(conn)
@@ -245,7 +267,7 @@ def _load_ledger(vault: Vault, conn, trust, rep: RebuildReport) -> None:
             # A ULID is unique by construction; a second line reusing one is a
             # forgery or corruption. Keep the first, reject the rest — never
             # let a later line overwrite an earlier one's obs row.
-            rep.rejected.append(L.Rejected(rec.path, rec.lineno, f"duplicate block id ^{rec.ulid}", "duplicate ulid"))
+            rep.rejected.append(L.Rejected(rec.path, rec.lineno, L.format_line(rec), f"duplicate block id ^{rec.ulid}"))
             continue
         seen_ulids.add(rec.ulid)
         _insert_obs(conn, rec, tier_for_obs(rec, trust))
@@ -260,15 +282,25 @@ def _insert_obs(conn, o: L.Observation, tier: str) -> None:
         conn.execute("INSERT INTO rkeys(ulid, key) VALUES(?,?)", (o.ulid, k))
     if o.op == "veto" and tier != "email":
         # A veto suppresses the CAUSE: every recurrence key named in ref,
-        # comma-separated, for a year.
-        until = o.until or _plus_days(o.day, 365)
+        # comma-separated, for a year from the line's own day - never longer,
+        # and never shorter than a suppression already standing on that key.
+        # A line's own `until` cannot reach past that cap, so back-dating a
+        # forged veto line no longer buys a fresh year.
+        cap = _plus_days(o.day, 365)
+        until = min(o.until, cap) if o.until else cap
         for key in [k for k in o.ref.split(",") if k]:
-            conn.execute("INSERT OR REPLACE INTO vetoes(key, until, ulid) VALUES(?,?,?)", (key, until, o.ulid))
+            conn.execute("INSERT INTO vetoes(key, until, ulid) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET "
+                         "ulid=CASE WHEN excluded.until > vetoes.until THEN excluded.ulid ELSE vetoes.ulid END, "
+                         "until=MAX(vetoes.until, excluded.until)", (key, until, o.ulid))
 
 
 def insert_observation(conn: sqlite3.Connection, o: L.Observation, tier: str) -> None:
-    """Zero-lag path for `wanda memory note`: the line just appended becomes
-    retrievable now; the hourly rebuild reconciles everything else."""
+    """Zero-lag path for a line just appended: `wanda memory note/open/pin/
+    forget` and the owner ops `apply_now` applies. The line is retrievable at
+    once, and a `forget`'s veto starts suppressing its recurrence keys at once
+    (unless an email-task window covers the line, which makes it email tier
+    and installs nothing) - not at the next rebuild. Everything else waits for
+    the hourly rebuild."""
     conn.execute("BEGIN IMMEDIATE")
     try:
         _insert_obs(conn, o, tier)
@@ -288,6 +320,7 @@ def _plus_days(day: str, n: int) -> str:
 
 def _load_notes(vault: Vault, conn, trust, rep, obs_by_ulid, today: str) -> None:
     seen_ids: dict[str, str] = {}
+    seen_subjects: dict[str, str] = {}
     open_lines = {r["ref"]: r for r in conn.execute("SELECT ref, tier FROM obs WHERE op='open'")}
     for path in vault.l2_notes():
         rel = vault.rel(path)
@@ -303,7 +336,20 @@ def _load_notes(vault: Vault, conn, trust, rep, obs_by_ulid, today: str) -> None
             if frm and dst:
                 conn.execute("INSERT OR REPLACE INTO subject_alias(from_subject, to_subject) VALUES(?,?)", (frm, dst))
             continue
-        _index_note(conn, trust, rep, note, rel, obs_by_ulid, today, seen_ids, open_lines)
+        n_claims, n_flags = rep.claims, len(rep.flags)
+        conn.execute("SAVEPOINT note")
+        try:
+            _index_note(conn, trust, rep, note, rel, obs_by_ulid, today, seen_ids, seen_subjects, open_lines)
+        except Exception as e:
+            # One note's rows, never the whole index: the note is skipped and
+            # named, exactly as a parse failure above is.
+            conn.execute("ROLLBACK TO note")
+            rep.claims = n_claims
+            del rep.flags[n_flags:]
+            rep.broken_notes.append((rel, f"indexing failed: {str(e)[:180]}"))
+            continue
+        finally:
+            conn.execute("RELEASE note")
         rep.docs += 1
     # Retired tombstones: subject renames and retired flags.
     if vault.retired_dir.is_dir():
@@ -312,6 +358,7 @@ def _load_notes(vault: Vault, conn, trust, rep, obs_by_ulid, today: str) -> None
                 continue
             try:
                 doc = parse_note(path)
+                mt = path.stat().st_mtime
             except Exception as e:
                 rep.broken_notes.append((vault.rel(path), str(e)[:200]))
                 continue
@@ -320,19 +367,31 @@ def _load_notes(vault: Vault, conn, trust, rep, obs_by_ulid, today: str) -> None
                 conn.execute("INSERT OR REPLACE INTO subject_alias(from_subject, to_subject) VALUES(?,?)", (str(frm), str(to)))
             conn.execute(
                 "INSERT OR REPLACE INTO docs(path, type, title, mtime, sha, retired, export, nbytes) VALUES(?,?,?,?,?,1,0,?)",
-                (vault.rel(path), "retired", doc.title, path.stat().st_mtime, sha_text(doc.raw), len(doc.raw.encode())),
+                (vault.rel(path), "retired", doc.title, mt, sha_text(doc.raw), len(doc.raw.encode())),
             )
 
 
-def _index_note(conn, trust, rep, note: Note, rel: str, obs_by_ulid, today: str, seen_ids: dict[str, str], open_lines) -> None:
+def _index_note(conn, trust, rep, note: Note, rel: str, obs_by_ulid, today: str, seen_ids: dict[str, str],
+                seen_subjects: dict[str, str], open_lines) -> None:
     d = rel.split("/", 1)[0]
     ntype = str(note.meta.get("type") or DIR_TO_TYPE.get(d) or d)
-    export = 0 if note.meta.get("export") is False else 1
+    ex = note.meta.get("export")
+    # A note the owner meant to withhold. Only bare false/no arrive as a bool
+    # (vault._scalar); off arrives as text, 0 as an int, and every quoted form
+    # as text - all of which used to export anyway. An absent key exports.
+    export = 0 if ex in (False, 0) or (isinstance(ex, str) and ex.strip().lower() in ("false", "no", "off", "0")) else 1
     due = str(note.meta.get("check_by") or note.meta.get("due") or "") or None
     about = str(note.meta.get("about") or "") or None
     mtime = note.path.stat().st_mtime
     when = datetime.fromtimestamp(mtime, tz=timezone.utc)
     subject = subject_for_doc(rel)
+    if subject:
+        # Two hand-named files can slugify to one subject key. The index has
+        # always flagged duplicate ids; a duplicate subject is the same class
+        # of collision and was silent.
+        if subject in seen_subjects and seen_subjects[subject] != rel:
+            rep.flags.append((rel, "", "duplicate-subject", f"{subject} also on {seen_subjects[subject]}"))
+        seen_subjects[subject] = rel
     doc_tier = None
     if ntype == "open":
         # Derived, not declared: the tier of the `op=open` ledger line that
@@ -371,7 +430,14 @@ def _index_note(conn, trust, rep, note: Note, rel: str, obs_by_ulid, today: str,
             conn.execute("INSERT OR IGNORE INTO subject_alias(from_subject, to_subject) VALUES(?,?)",
                          (f"{t}/{slugify(alias)}", subject))
     conn.execute("INSERT OR IGNORE INTO aliases(alias, doc) VALUES(?,?)", (note.title.lower(), rel))
+    seen_blocks: set[str] = set()
     for c in note.claims:
+        if c.block in seen_blocks:
+            # A repeated ^block id would violate UNIQUE(doc, block) and abort
+            # the whole rebuild. Index the first line, flag the rest.
+            rep.flags.append((rel, c.block, "duplicate-block", "repeated block id; only the first line is indexed"))
+            continue
+        seen_blocks.add(c.block)
         _index_claim(conn, trust, rep, c, rel, obs_by_ulid, today, ntype, when)
 
 
@@ -406,7 +472,12 @@ def _index_claim(conn, trust, rep, c: Claim, doc: str, obs_by_ulid, today: str, 
                 else:
                     rep.flags.append((doc, c.block, "unverified-owner-edge", f"rule text mismatch {e.dst_doc}#^{e.dst_block}"))
                     continue
-            elif o["ref"] == f"{doc}#^{c.block}" or note_for_subject(o["subject"]) == doc:
+            elif o["ref"] == f"{doc}#^{c.block}":
+                # An attest confers authority on exactly the claim it names,
+                # never on any other claim that happens to sit on the same
+                # note. The old `note_for_subject(o["subject"]) == doc`
+                # fallback granted owner tier to a claim of arbitrary text as
+                # long as the attest's subject resolved here.
                 owner_said = 1
             else:
                 rep.flags.append((doc, c.block, "unverified-owner-edge", f"{e.dst_doc}#^{e.dst_block}"))
@@ -439,9 +510,9 @@ def _index_claim(conn, trust, rep, c: Claim, doc: str, obs_by_ulid, today: str, 
     first_seen = first_seen or owner_day
     score = score_for(bool(owner_said), len(causes), last_seen or "", status, today)
     conn.execute(
-        "INSERT INTO claims(doc, block, text, sha, facet, cls, tier, n_support, n_causes, n_days, owner_said, pinned, "
-        "first_seen, last_seen, until, folded, status, score, lineno) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (doc, c.block, c.text, c.sha, None, cls, tier, n_support, len(causes), len(days), owner_said,
+        "INSERT INTO claims(doc, block, text, sha, cls, tier, n_support, n_causes, n_days, owner_said, pinned, "
+        "first_seen, last_seen, until, folded, status, score, lineno) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (doc, c.block, c.text, c.sha, cls, tier, n_support, len(causes), len(days), owner_said,
          1 if (c.has("owner-edited") or c.minted or hand_written) else 0, first_seen, last_seen, row["until"],
          1 if c.folded else 0, status, score, c.lineno),
     )
@@ -471,7 +542,9 @@ def _finish_status(conn, today: str) -> None:
     """Inbound edges: a claim someone else `supersedes` or `contradicts` is
     superseded / disputed even if only the winner's side was written."""
     inbound: dict[tuple[str, str], set[str]] = {}
-    for e in conn.execute("SELECT rel, dst_doc, dst_block FROM edges WHERE rel IN ('supersedes','contradicts') AND dst_block IS NOT NULL"):
+    for e in conn.execute("SELECT rel, dst_doc, dst_block FROM edges WHERE rel IN ('supersedes','contradicts') AND dst_block IS NOT NULL AND dst_doc IS NOT NULL"):
+        # dst_doc is NULL for a wikilink with no page ([[ #^c1]]): it names no
+        # claim, and dereferencing it on the next line aborts the rebuild.
         dst = e["dst_doc"] if e["dst_doc"].endswith(".md") else e["dst_doc"] + ".md"
         inbound.setdefault((dst, e["dst_block"]), set()).add(e["rel"])
     for (doc, block), rels in inbound.items():
@@ -488,12 +561,6 @@ def _finish_status(conn, today: str) -> None:
         if status != c["status"]:
             conn.execute("UPDATE claims SET status=?, score=? WHERE id=?",
                          (status, score_for(bool(c["owner_said"]), c["n_causes"] or 0, c["last_seen"] or "", status, today), c["id"]))
-    # Marking the loser disputed also marks the (non-owner) winner disputed: both stay, both ranked last.
-    for e in conn.execute("SELECT src_doc, src_block FROM edges WHERE rel='contradicts'"):
-        c = conn.execute("SELECT * FROM claims WHERE doc=? AND block=?", (e["src_doc"], e["src_block"])).fetchone()
-        if c is not None and c["status"] in ("provisional", "corroborated"):
-            conn.execute("UPDATE claims SET status='disputed', score=? WHERE id=?",
-                         (score_for(False, c["n_causes"] or 0, c["last_seen"] or "", "disputed", today), c["id"]))
 
 
 def _derive_owner_rules(conn) -> None:
@@ -506,17 +573,23 @@ def _derive_owner_rules(conn) -> None:
     # supersede a different preference about the same subject — distinct
     # preferences each keep a row; only an identical re-statement collapses.
     seen: dict[tuple, sqlite3.Row] = {}
-    for o in conn.execute("SELECT * FROM obs WHERE op='rule' AND tier='owner' ORDER BY ts ASC"):
+    for o in conn.execute("SELECT * FROM obs WHERE op='rule' AND tier='owner' ORDER BY ts ASC, ulid ASC"):
+        # ts is minute-precision, so same-minute lines tie; the ULID breaks
+        # the tie - mint-ordered to the millisecond, deterministic below it.
         m = DISPOSITION_RE.match(o["text"])
-        target = m.group(2) if m else o["subject"]
-        key = (o["facet"], target) if o["facet"] == "mail-disposition" else (o["facet"], target, o["norm"])
+        target = m.group(2).lower() if m else o["subject"]
+        key = (o["facet"], target) if (m and o["facet"] == "mail-disposition") else (o["facet"], target, o["norm"])  # a non-matching disposition falls back to the subject; two of them are not one rule
         seen[key] = o  # later line wins (same address for a disposition, same text for a preference)
     for key, o in seen.items():
         facet, target = key[0], key[1]
         m = DISPOSITION_RE.match(o["text"])
-        action = m.group(1) if m else None
+        action = m.group(1).lower() if m else None
         # The prefs claim that renders this rule, for reference/attest.
-        cl = conn.execute("SELECT doc, block FROM claims WHERE owner_said=1 AND text=? LIMIT 1", (o["text"],)).fetchone()
+        cl = conn.execute(
+                     # claims.id is the rowid alias, so this is insertion order -
+                     # what a full scan returns today. Named so a future index on
+                     # claims(text) cannot silently move the provenance line.
+                     "SELECT doc, block FROM claims WHERE owner_said=1 AND text=? ORDER BY id LIMIT 1", (o["text"],)).fetchone()
         conn.execute("INSERT INTO rules(subject, facet, target, action, text, ledger_ref, created, doc, block) "
                      "VALUES(?,?,?,?,?,?,?,?,?)",
                      (o["subject"], facet, target, action, o["text"], f"belt/ledger/{o['day']}#^{o['ulid']}", o["day"],

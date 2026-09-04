@@ -14,11 +14,18 @@ from wanda.memory import audit, commands, index as ix, passes, recall, render
 from wanda.memory.ledger import Observation, append as ledger_append, line_fingerprint
 from wanda.memory.subjects import subject_from_address
 from wanda.memory.vault import Vault, clean_text, slugify, write_atomic
-from wanda.triage import addresses_in, sanitize
+from wanda.triage import sanitize
 
 log = logging.getLogger(__name__)
 
 MEMO_CAUSE_CAP = 5  # per (subject, facet): past this, without an owner-tier line, a memo is dropped
+# Bytes, where prompts/email_triage.md:24, the batch schema (triage.py:44) and
+# triage.Memo (triage.py:59) all ask the model for <= 240 *characters*: a
+# non-ASCII memo is stored shorter than it was told. Not a safety bound —
+# ledger.format_line trims the free text to vault.CLAIM_TEXT_CAP_B (600 B) and
+# again to fit LEDGER_LINE_CAP_B, so an oversize memo is appended trimmed,
+# never dropped — just the tighter product choice for a short ledger line.
+MEMO_TEXT_CAP_B = 240
 
 
 def default_wanda_bin() -> str:
@@ -41,10 +48,26 @@ class MemoryService:
         self.wanda_bin = wanda_bin or default_wanda_bin()
         # Owner authority and run windows live here, in this process. A
         # session can write wanda.db; it cannot write the daemon's memory.
-        closed = store.close_orphan_windows()
+        self.authority = passes.Authority(windows=store.all_windows())
+        self.owns_shared_state = False
+
+    def adopt_shared_state(self) -> int:
+        """The daemon alone owns the derived state, and says so once, here: a
+        run window still open at startup belongs to a run a previous daemon
+        never finished, and only a process holding owner authority may build
+        the shared index. Every other process — a dry run, the CLI — reads
+        both and repairs neither. Runs once at daemon start, before any
+        worker thread exists, so the rebind below needs no lock. A new
+        construction site that forgets to call this gets a service that
+        never builds an index."""
+        closed = self.store.close_orphan_windows()
         if closed:
             log.warning("closed %d agent-run window(s) left open by a previous daemon", closed)
-        self.authority = passes.Authority(windows=store.all_windows())
+        # Re-read after closing, or a crashed run's window still looks open
+        # to window_tier for the rest of this process's life.
+        self.authority.windows = self.store.all_windows()
+        self.owns_shared_state = True
+        return closed
 
     # --- setup ---
 
@@ -72,35 +95,74 @@ class MemoryService:
             return None
         return passes.make_owner_verifier(
             self.slack.fetch_message_sync, list(self.cfg.memory_owner_user_ids),
-            lambda: ix.open_readonly(self.cfg.memory_index_path), self.store, self.sender_for_thread,
+            lambda: ix.open_readonly(self.cfg.memory_index_path), self.store,
         )
 
     # --- run windows (provenance) ---
 
     def open_window(self, session_id: str, task_id: int | None, kind: str) -> None:
+        # Event loop only (main.py:685). Rebound, never mutated in place: a
+        # pass in a worker thread may be iterating the current list.
         w = self.store.open_run_window(session_id, task_id, kind)
         self.authority.windows = [x for x in self.authority.windows if x["session_id"] != session_id] + [w]
 
     def close_window(self, session_id: str) -> None:
+        # Event loop only (main.py:720). The stamp is one dict-item assignment
+        # under the GIL, so a pass iterating the list sees this window either
+        # open or closed, never half-written.
         ended = self.store.close_run_window(session_id)
         for w in self.authority.windows:
             if w["session_id"] == session_id and not w.get("ended_at"):
                 w["ended_at"] = ended
 
     def conn_ro(self):
-        """A read-only index connection. A missing index is built inline
-        (measured 5–53 ms); a corrupt one is renamed aside and rebuilt; if
-        that fails too, None — callers degrade to header-only / no block."""
+        """A read-only index connection. A missing index is built inline by
+        the daemon only (~25 ms at 100 notes, ~370 ms at 1,000, at 5 claims
+        and 3 observations per note); a corrupt one is renamed aside and
+        rebuilt by the daemon only. In any other process both are None, so
+        callers degrade to header-only / no block."""
         path = self.cfg.memory_index_path
-        try:
-            if not path.exists():
+        if not path.exists():
+            if not self.owns_shared_state:
+                log.debug("memory index missing; this process does not build it")
+                return None
+            try:
                 self._rebuild_inline()
+            except Exception:
+                log.exception("memory index could not be built")
+                return None
+        try:
             conn = ix.open_readonly(path)
             if conn is None:
                 return None
             conn.execute("SELECT 1 FROM docs LIMIT 1")
+            if conn.execute("SELECT v FROM meta WHERE k='rebuilt_at'").fetchone() is None:
+                # `open_index` commits the schema (empty tables) outside the
+                # rebuild transaction, so a build that failed — or has not
+                # run — leaves a readable but never-populated index. Without
+                # `rebuilt_at` it has never been successfully built: treat it
+                # as unavailable so the projection shows the marker rather
+                # than rendering as though wanda knows nothing.
+                conn.close()
+                if not self.owns_shared_state:
+                    log.debug("memory index never built (no rebuilt_at); this process does not build it")
+                    return None
+                try:
+                    self._rebuild_inline()
+                except Exception:
+                    log.exception("memory index could not be built")
+                    return None
+                conn = ix.open_readonly(path)
+                if conn is None:
+                    return None
+                if conn.execute("SELECT v FROM meta WHERE k='rebuilt_at'").fetchone() is None:
+                    conn.close()
+                    return None
             return conn
         except sqlite3.DatabaseError as e:
+            if not self.owns_shared_state:
+                log.warning("memory index unreadable (%s); only the daemon rebuilds it", e)
+                return None
             log.warning("memory index unreadable (%s); rebuilding", e)
             try:
                 for suffix in ("", "-wal", "-shm"):
@@ -129,7 +191,7 @@ class MemoryService:
             pass  # a pass is building it right now
 
     def today(self) -> str:
-        return datetime.now(timezone.utc).date().isoformat()
+        return datetime.now(timezone.utc).date().isoformat()  # UTC, matching every persisted date; see Services.today
 
     # --- workspace ---
 
@@ -221,7 +283,7 @@ class MemoryService:
                     subject = ix.canonical_subject(conn, subject)
                 get = (lambda k: getattr(memo, k, None)) if not isinstance(memo, dict) else memo.get
                 facet = slugify(str(get("facet") or "mail-pattern"), 32) or "mail-pattern"
-                text = clean_text(str(get("text") or ""), 240)
+                text = clean_text(str(get("text") or ""), MEMO_TEXT_CAP_B)
                 if not text:
                     continue
                 if conn is not None and self._memo_saturated(conn, subject, facet):
@@ -251,24 +313,11 @@ class MemoryService:
 
     # --- owner commands ---
 
-    def sender_for_thread(self, channel: str, thread_ts: str) -> str:
-        if not thread_ts:
-            return ""
-        task = self.store.get_task_by_thread(channel, thread_ts)
-        if task is None or task["kind"] != "email" or not task["message_pk"]:
-            return ""
-        msg = self.store.get_message(task["message_pk"])
-        if msg is None:
-            return ""
-        a = addresses_in(msg["from_addr"] or "")
-        return a[0] if a else ""
-
     def handle_command(self, p: dict) -> str:
         """Mint the owner's lines from a Slack event this daemon received,
         hold their authority in memory, put them in the index now, and apply
         them now — a rule is live for the next triage batch."""
-        ctx = commands.Context(channel=p["channel"], ts=p["ts"], user=p["user"], text=p.get("text", ""),
-                               task_sender=self.sender_for_thread(p["channel"], p.get("thread_ts") or ""))
+        ctx = commands.Context(channel=p["channel"], ts=p["ts"], user=p["user"], text=p.get("text", ""))
         conn = self.conn_ro()
         try:
             minted = commands.handle(ctx, conn, self.store, list(self.cfg.memory_owner_user_ids))
@@ -299,13 +348,35 @@ class MemoryService:
             conn = passes.open_conn(svc)
             try:
                 trust = svc.trust()
+                seen: set[str] = set()
                 for rec in passes.L.iter_observations(self.vault):
-                    if not isinstance(rec, passes.L.Rejected) and rec.ulid in ulids:
+                    # First-wins, matching _load_ledger (index.py:248-254) and
+                    # _pending_ops (passes.py:765-771): a second line reusing a
+                    # ULID must not REPLACE the first one's obs row, or install
+                    # its own veto keys, in the window before the rebuild below.
+                    if isinstance(rec, passes.L.Rejected) or rec.ulid in seen:
+                        continue
+                    seen.add(rec.ulid)
+                    if rec.ulid in ulids:
                         ix.insert_observation(conn, rec, ix.tier_for_obs(rec, trust))
                 passes._apply_ops(svc, conn, passes.HourlyReport(), self.today(), only=ulids)
                 ix.rebuild(self.vault, conn, trust, self.today())
             finally:
                 conn.close()
+            if svc.touched:
+                # wanda's own write, committed as wanda's and under the same
+                # lock the hourly pass holds — outside it, that pass's
+                # `git add -A` (passes.py:283) could stage these paths into its
+                # own commit. Left uncommitted the note is absorbed next pass
+                # as "owner edits (auto)" (passes.py:440). Named paths only:
+                # _git_commit_paths(vault, msg, []) degrades to a bare
+                # `git add -A` (passes.py:314), which would sweep an owner edit
+                # in flight into a curated: commit. The ledger line stays for
+                # the next pass's `belt:` commit.
+                try:
+                    passes._git_commit_paths(self.vault, passes._curated_message("owner command", svc), sorted(svc.touched))
+                except Exception:
+                    log.exception("owner command applied; committing the note failed")
 
     # --- passes ---
 
@@ -316,9 +387,15 @@ class MemoryService:
         with passes.memory_lock(self.cfg.memory_lock_path):
             conn = passes.open_conn(svc)
             try:
-                return passes.hourly(svc, conn, workspace)
+                rep = passes.hourly(svc, conn, workspace)
             finally:
                 conn.close()
+        # The daemon's scheduler state belongs to the daemon's wrapper: a
+        # hand-run `wanda memory hourly` must not postpone the pass that
+        # holds owner authority. memory_tick's failure path stamps this too
+        # (main.py:893), so a raising pass still does not spin every tick.
+        self.store.memory_set("hourly_at", datetime.now(timezone.utc).isoformat(timespec="seconds"))
+        return rep
 
     async def run_nightly(self, run_model, workspace: Path | None) -> passes.NightlyReport:
         """Prepare and apply in worker threads under the lock; the model

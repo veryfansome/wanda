@@ -4,6 +4,7 @@ import json
 import sqlite3
 import threading
 from datetime import datetime, timedelta, timezone
+from email.utils import getaddresses
 from pathlib import Path
 from typing import Any
 
@@ -25,7 +26,6 @@ CREATE TABLE IF NOT EXISTS messages (
   from_addr      TEXT,
   subject        TEXT,
   date_hdr       TEXT,
-  snippet        TEXT,
   status         TEXT NOT NULL DEFAULT 'new',
   verdict_json   TEXT,
   applied_action TEXT,
@@ -120,8 +120,7 @@ CREATE TABLE IF NOT EXISTS memory_run_windows (
   task_id    INTEGER,
   kind       TEXT NOT NULL,
   started_at TEXT NOT NULL,
-  ended_at   TEXT,
-  pgid       INTEGER
+  ended_at   TEXT
 );
 -- Digest lines waiting for the daily post.
 CREATE TABLE IF NOT EXISTS memory_digest (
@@ -156,9 +155,6 @@ MIGRATIONS = (
     # and for a DM holds a sentinel that is not a Slack timestamp.
     ("tasks", "reply_thread", "TEXT"),
     ("runs", "deliver_attempts", "INTEGER NOT NULL DEFAULT 0"),
-    # The claude subprocess's process group: the one identity a session's
-    # shell children carry that another session cannot forge.
-    ("memory_run_windows", "pgid", "INTEGER"),
 )
 
 
@@ -175,6 +171,14 @@ class Store:
         self._db = sqlite3.connect(str(path), check_same_thread=False)
         self._db.row_factory = sqlite3.Row
         self._lock = threading.RLock()
+        # Message bodies are never persisted: their one legitimate consumer is
+        # the triage classifier. The IMAP watcher stashes a body here at ingest
+        # (in-process, cross-thread) and triage takes it in the same cycle;
+        # a miss (a crash between ingest and triage) re-fetches from IMAP,
+        # where the body durably lives. Bounded so a stranded body cannot grow
+        # the process without limit.
+        self._bodies: dict[str, str] = {}
+        self._bodies_lock = threading.Lock()
         with self._lock:
             self._db.execute("PRAGMA journal_mode=WAL")
             self._db.execute("PRAGMA foreign_keys=ON")
@@ -311,17 +315,36 @@ class Store:
         from_addr: str,
         subject: str,
         date_hdr: str,
-        snippet: str,
     ) -> bool:
-        """Returns True if this is a new message (inserted), False if seen before."""
+        """Returns True if this is a new message (inserted), False if seen
+        before. The body is not stored; carry it with `stash_body`."""
         now = utcnow()
         cur = self._exec(
             "INSERT OR IGNORE INTO messages(dedupe_key, message_id, folder, uidvalidity, uid, "
-            "from_addr, subject, date_hdr, snippet, status, created_at, updated_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?,'new',?,?)",
-            (dedupe_key, message_id, folder, uidvalidity, uid, from_addr, subject, date_hdr, snippet, now, now),
+            "from_addr, subject, date_hdr, status, created_at, updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,'new',?,?)",
+            (dedupe_key, message_id, folder, uidvalidity, uid, from_addr, subject, date_hdr, now, now),
         )
         return cur.rowcount > 0
+
+    # --- transient message bodies (never persisted) ---
+
+    BODY_CACHE_CAP = 500
+
+    def stash_body(self, dedupe_key: str, body: str) -> None:
+        """Hold a message body in memory for triage to consume this cycle."""
+        with self._bodies_lock:
+            if dedupe_key not in self._bodies and len(self._bodies) >= self.BODY_CACHE_CAP:
+                # Drop the oldest; a stranded body falls back to an IMAP
+                # re-fetch, so eviction costs a fetch, never a wrong verdict.
+                self._bodies.pop(next(iter(self._bodies)), None)
+            self._bodies[dedupe_key] = body
+
+    def take_body(self, dedupe_key: str) -> str | None:
+        """Pop a stashed body. None means it was never stashed or already
+        taken — the caller re-fetches from IMAP."""
+        with self._bodies_lock:
+            return self._bodies.pop(dedupe_key, None)
 
     def fetch_by_status(self, status: str, limit: int = 50) -> list[sqlite3.Row]:
         return self._query(
@@ -631,7 +654,11 @@ class Store:
 
     def add_offer(self, kind: str, subject: str, action: str | None, text: str) -> str:
         with self._lock:
-            n = self._db.execute("SELECT COUNT(*) AS n FROM memory_offers").fetchone()["n"]
+            # From the highest ref, not the row count: a deleted offer must
+            # not hand its ref to a new one (ref is the PRIMARY KEY).
+            n = self._db.execute(
+                "SELECT COALESCE(MAX(CAST(SUBSTR(ref, 2) AS INTEGER)), 0) AS n FROM memory_offers WHERE ref GLOB 'k*'"
+            ).fetchone()["n"]
             ref = f"k{n + 1}"
             self._db.execute(
                 "INSERT INTO memory_offers(ref, kind, subject, action, text, created_at) VALUES(?,?,?,?,?,?)",
@@ -663,14 +690,30 @@ class Store:
         q = ",".join("?" * len(ids))
         self._exec(f"UPDATE memory_digest SET posted_at=? WHERE id IN ({q})", (utcnow(), *ids))
 
-    def sender_stats(self, addr: str) -> dict:
-        """Verdict history for one address, from the messages table."""
+    def sender_stats(self, addr: str, since_iso: str = "") -> dict:
+        """Verdict history for one address, from the messages table; with
+        since_iso, only from that timestamp on. from_addr is the raw From
+        header, so rows are prefiltered by substring and then confirmed by
+        parsing that header: a bare `%addr%` counted enews@x for news@x, a
+        spoofed priya@x.example.evil.com for priya@x.example, and any address a
+        sender put inside their own display name. A header no parser can split
+        (`a@b.example>`, `a@b.example (N) <c@d.example>`) now counts for
+        nobody — the fail-closed direction for a count, and the reason this
+        does not mirror triage.addresses_in's regex fallback, which would let
+        exactly those attacker-shaped headers pool under any address they
+        name. Callers pass one argument (recall.StatsFn); the window is
+        make_offers'."""
+        addr = addr.lower()
+        window = " AND created_at >= ?" if since_iso else ""
+        params = (addr, since_iso) if since_iso else (addr,)
         rows = self._query(
-            "SELECT applied_action, COUNT(*) AS n, MAX(created_at) AS last FROM messages "
-            "WHERE lower(from_addr) LIKE ? GROUP BY applied_action", (f"%{addr.lower()}%",),
+            "SELECT from_addr, applied_action, COUNT(*) AS n, MAX(created_at) AS last FROM messages "
+            f"WHERE instr(lower(from_addr), ?) > 0{window} GROUP BY from_addr, applied_action", params,
         )
         out = {"seen": 0, "ignored": 0, "trashed": 0, "attention": 0, "last": ""}
         for r in rows:
+            if addr not in [a.lower() for _, a in getaddresses([r["from_addr"] or ""]) if "@" in a]:
+                continue
             out["seen"] += r["n"]
             a = r["applied_action"] or ""
             if a == "ignore":

@@ -22,8 +22,8 @@ from wanda.memory.vault import (
 # Who wrote a line. The tier a claim gets is NOT read from this field — the
 # index derives it from what the harness can verify (Slack authorship for
 # `owner`, the task's kind for `agent`); see index.tier_for_obs.
-SOURCES = ("triage", "agent", "owner", "harness", "import")
-OPS = ("", "attest", "rule", "veto", "pin", "retire", "unretire", "open")
+SOURCES = ("triage", "agent", "owner", "harness")
+OPS = ("", "attest", "rule", "veto", "pin", "retire", "open")
 
 _FIELD_KEYS = ("src", "op", "cause", "due", "until", "tier", "ref")
 _SUBJECT_RE = r"[a-z]+/[a-z0-9][a-z0-9._+@-]*"
@@ -58,7 +58,12 @@ class Observation:
 
 def format_line(o: Observation) -> str:
     """Normalises what a writer may have got slightly wrong (facet case and
-    spaces, an unquoted cause) and leaves the rest to `append`'s check."""
+    spaces, an unquoted cause) and leaves the rest to `append`'s check.
+    The cap trims the free text and never a field: a clipped cause would break
+    owner verification and a clipped ref would silently drop recurrence keys
+    from a veto, so a line whose fields alone exceed LEDGER_LINE_CAP_B is
+    written over the cap, with as much of the text trimmed as it takes —
+    possibly all of it."""
     o.facet = slugify(o.facet, 32) if o.facet else ""
     o.subject = o.subject.strip().lower()
     fields = [f"src={o.src}"]

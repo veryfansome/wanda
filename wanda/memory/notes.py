@@ -8,14 +8,14 @@ from pathlib import Path
 from typing import Any
 
 from wanda.memory.vault import (
-    BEGIN, END, INDEX_BEGIN, INDEX_END, parse_frontmatter, render_frontmatter, sha_text,
+    BEGIN, END, INDEX_BEGIN, INDEX_END, Snapshot, parse_frontmatter, render_frontmatter, sha_text,
 )
 
 EDGE_RELS = ("derived-from", "owner-said", "owner-edited", "supersedes", "superseded-by",
              "contradicts", "refines", "about", "until", "tier", "retired")
 WIKILINK_RE = re.compile(r"\[\[([^\]|#]+)(?:#\^?([^\]|]+))?(?:\|[^\]]*)?\]\]")
 CLAIM_LINE_RE = re.compile(r"^(?P<text>.*?)\s+\^(?P<block>[a-z0-9]{1,24})\s*$")
-EDGE_LINE_RE = re.compile(r"^- (?P<rel>[a-z-]+):: ?(?P<value>.*)$")
+EDGE_LINE_RE = re.compile(r"^[ \t]*- (?P<rel>[a-z-]+):: ?(?P<value>.*)$")
 
 
 @dataclass
@@ -102,6 +102,7 @@ class Note:
     post: str           # everything after the region (## Notes, owner prose)
     had_region: bool
     raw: str = ""
+    snap: Snapshot | None = None   # what the file looked like when this was read
 
     @property
     def kind(self) -> str:
@@ -132,7 +133,10 @@ class Note:
         return f"c{n + 1}"
 
     def render(self) -> str:
-        body = self.pre.rstrip("\n") + "\n\n" + render_region(self.claims) + "\n" + self.post
+        if not self.had_region and not self.claims:
+            body = self.pre.rstrip("\n") + "\n" + self.post   # no region to write: do not manufacture one
+        else:
+            body = self.pre.rstrip("\n") + "\n\n" + render_region(self.claims) + "\n" + self.post
         return render_frontmatter(self.meta) + body if self.meta else body
 
 
@@ -148,6 +152,19 @@ def parse_edges(value: str, rel: str) -> list[Edge]:
     return out
 
 
+def _read(path: Path, text: str | None) -> tuple[Snapshot | None, str]:
+    """Read a note and snapshot it in one go, so the optimistic-concurrency
+    check covers the whole read-to-write window. `text` is for callers that
+    already have the bytes (a deleted note's body, a tombstone); those get no
+    snapshot."""
+    if text is not None:
+        return None, text
+    st = path.stat()
+    data = path.read_bytes()
+    snap = Snapshot.of_read(path, st, data)
+    return snap, data.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")   # exactly what read_text() gave
+
+
 def parse_region(lines: list[str], start_lineno: int = 1) -> list[Claim]:
     claims: list[Claim] = []
     folded = False
@@ -156,18 +173,21 @@ def parse_region(lines: list[str], start_lineno: int = 1) -> list[Claim]:
     for i, raw in enumerate(lines):
         line = raw.rstrip()
         if not line.strip():
-            cur = None
-            continue
+            continue   # a blank line separates claims; it does not sever an edge from one
         if line.startswith("## "):
-            folded = line.strip().lower() == "## history"
+            if line.strip().lower() == "## history":
+                folded = True   # nothing below the history heading returns to the live region
             cur = None
             continue
         if line.startswith("<!--") or line.startswith(">"):
             continue  # comments and callouts are furniture, not claims
         m = EDGE_LINE_RE.match(line)
-        if m and cur is not None and m.group("rel") in EDGE_RELS:
-            cur.edges.extend(parse_edges(m.group("value"), m.group("rel")))
-            continue
+        if m and m.group("rel") in EDGE_RELS:
+            if cur is not None:
+                cur.edges.extend(parse_edges(m.group("value"), m.group("rel")))
+            continue   # an edge line with no claim above it is dropped, not minted as a claim whose text is an edge
+        if m:
+            line = line.replace("::", ":")   # an unrecognised rel is the owner's words: keep them, but not as an inline field
         m = CLAIM_LINE_RE.match(line)
         if m:
             cur = Claim(m.group("block"), m.group("text").strip(), folded=folded, lineno=start_lineno + i)
@@ -181,12 +201,12 @@ def parse_region(lines: list[str], start_lineno: int = 1) -> list[Claim]:
 
 
 def parse_note(path: Path, text: str | None = None) -> Note:
-    raw = path.read_text(encoding="utf-8") if text is None else text
+    snap, raw = _read(path, text)
     doc = parse_frontmatter(raw)
     body = doc.body
     b, e = body.find(BEGIN), body.find(END)
     if b < 0 or e < 0 or e < b:
-        return Note(path, doc.meta, body.rstrip("\n") + "\n", [], "", False, raw)
+        return Note(path, doc.meta, body.rstrip("\n") + "\n", [], "", False, raw, snap)
     pre = body[:b]
     region = body[b + len(BEGIN):e]
     post = body[e + len(END):]
@@ -202,7 +222,7 @@ def parse_note(path: Path, text: str | None = None) -> Note:
         if c.minted:
             n += 1
             c.block = f"c{n}"
-    return Note(path, doc.meta, pre, claims, post.lstrip("\n"), True, raw)
+    return Note(path, doc.meta, pre, claims, post.lstrip("\n"), True, raw, snap)
 
 
 def render_region(claims: list[Claim]) -> str:
@@ -245,6 +265,8 @@ class WriteSpec:
     meta: dict[str, Any]
     prose: str
     index: list[str]
+    post: str = ""                 # the owner's text below the generated block; re-emitted verbatim
+    snap: Snapshot | None = None   # what the file looked like when this was read
 
     def render(self) -> str:
         """Prose is preserved byte for byte — the cap applies where it is
@@ -252,7 +274,7 @@ class WriteSpec:
         prose = self.prose.strip("\n")
         block = "\n".join([INDEX_BEGIN, *self.index, INDEX_END])
         meta = {"kind": "write-spec", **{k: v for k, v in self.meta.items() if k != "kind"}}
-        return render_frontmatter(meta) + prose + "\n\n" + block + "\n"
+        return render_frontmatter(meta) + prose + "\n\n" + block + (self.post or "\n")
 
     @property
     def sha(self) -> str:
@@ -260,13 +282,23 @@ class WriteSpec:
 
 
 def parse_writespec(path: Path, text: str | None = None) -> WriteSpec:
-    raw = path.read_text(encoding="utf-8") if text is None else text
+    snap, raw = _read(path, text)
     doc = parse_frontmatter(raw)
     body = doc.body
     b, e = body.find(INDEX_BEGIN), body.find(INDEX_END)
     if b >= 0 and e > b:
         prose = body[:b]
         index = [ln for ln in body[b + len(INDEX_BEGIN):e].splitlines() if ln.strip()]
+        post = body[e + len(INDEX_END):]
     else:
-        prose, index = body, []
-    return WriteSpec(path, doc.meta, prose.strip("\n"), index)
+        prose, index, post = body, [], ""
+    return WriteSpec(path, doc.meta, prose.strip("\n"), index, post, snap)
+
+
+PROVENANCE_LINE_RE = re.compile(r"^- derived-from::? .*$", re.M)
+
+
+def strip_provenance(prose: str) -> str:
+    """A guide's derived-from:: line is provenance for the vault reader; it is
+    not part of the prose that goes into a prompt or the projection."""
+    return PROVENANCE_LINE_RE.sub("", prose).rstrip()

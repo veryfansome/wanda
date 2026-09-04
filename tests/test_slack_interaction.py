@@ -287,3 +287,12 @@ def test_channel_commands_need_a_mention_and_prose_is_not_a_command(store):
     ev = fire(store, {"type": "message", "user": "U_OTHER", "channel": "C_TRIAGE", "channel_type": "channel",
                       "ts": "500.4", "thread_ts": "500.1", "text": "<@UBOT> why was this trashed?"}, **owner)
     assert ev.payload["kind"] == "mention_guest"
+
+
+def test_memory_off_leaves_an_owner_command_an_ordinary_dm(store):
+    """With memory off there is no in-process handler, so calling this a
+    command drops it in silence. It is an ordinary DM instead."""
+    ev = fire(store, {"type": "message", "user": "U_OWNER", "channel": "D5", "channel_type": "im",
+                      "ts": "3.3", "text": "rule priya.nash@example.org trash"},
+              memory_owner_user_ids=["U_OWNER"], memory_enabled=False)
+    assert ev.payload["kind"] == "dm"

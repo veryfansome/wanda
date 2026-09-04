@@ -3,6 +3,8 @@ seeds, owner commands, the debounce, and the memory tick."""
 import asyncio
 import json
 import os
+import shutil
+import subprocess
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -12,7 +14,7 @@ from tests.test_processor import FakeSlack
 from wanda.config import Config
 from wanda.main import Processor, conversation_seed_prompt, agent_seed_prompt, HOW_TO_REPLY
 from wanda.memory import index as ix
-from wanda.memory.ledger import Observation, append, iter_observations
+from wanda.memory.ledger import Observation, append, iter_observations, line_fingerprint
 from wanda.memory.notes import Claim, Edge, new_note
 from wanda.memory.service import MemoryService
 from wanda.memory.vault import write_atomic
@@ -43,6 +45,7 @@ def make(tmp_path, claude="/bin/true", **kw):
     store = Store(cfg.db_path)
     slack = MemSlack()
     memory = MemoryService(cfg, store, slack, wanda_bin="/opt/wanda")
+    memory.adopt_shared_state()  # this fixture stands in for the daemon (main.py:1001)
     memory.ensure()
     p = Processor(cfg, store, asyncio.Queue(), slack, RunnerService(claude), memory=memory)
     return p, store, cfg, memory
@@ -57,7 +60,7 @@ def test_triage_is_confined_and_memory_rides_in_the_user_message(tmp_path):
     fake = make_fake_claude(tmp_path, dump_script(tmp_path))
     p, store, cfg, memory = make(tmp_path, claude=fake)
     store.ingest_message(dedupe_key="k1", message_id="<k1>", folder="INBOX", uidvalidity=1, uid=1,
-                         from_addr="Sunnybrook <noreply@sunnybrook.example>", subject="Closure", date_hdr="d", snippet="body")
+                         from_addr="Sunnybrook <noreply@sunnybrook.example>", subject="Closure", date_hdr="d")
     # A known sender, so the block has something to say.
     u = "01k4qm2f7a9x3m01"
     append(memory.vault, mk_obs("org/sunnybrook.example", "Closure notices.", "2026-09-01", cause="m:1", ulid=u))
@@ -132,14 +135,14 @@ def test_owner_command_is_handled_in_process(tmp_path):
 
 def test_debounce_waits_for_a_batch(tmp_path):
     p, store, cfg, memory = make(tmp_path, triage_debounce_s=150)
-    store.ingest_message(dedupe_key="k1", message_id="<k1>", folder="INBOX", uidvalidity=1, uid=1, from_addr="a@b.c", subject="s", date_hdr="d", snippet="b")
+    store.ingest_message(dedupe_key="k1", message_id="<k1>", folder="INBOX", uidvalidity=1, uid=1, from_addr="a@b.c", subject="s", date_hdr="d")
     rows = store.fetch_by_status("new")
     assert p._debouncing(rows) is True
     old = (datetime.now(timezone.utc) - timedelta(seconds=200)).isoformat(timespec="seconds")
     store._exec("UPDATE messages SET created_at=?", (old,))
     assert p._debouncing(store.fetch_by_status("new")) is False
     for i in range(2, 12):
-        store.ingest_message(dedupe_key=f"k{i}", message_id=f"<k{i}>", folder="INBOX", uidvalidity=1, uid=i, from_addr="a@b.c", subject="s", date_hdr="d", snippet="b")
+        store.ingest_message(dedupe_key=f"k{i}", message_id=f"<k{i}>", folder="INBOX", uidvalidity=1, uid=i, from_addr="a@b.c", subject="s", date_hdr="d")
     assert p._debouncing(store.fetch_by_status("new", limit=10)) is False, "a full batch never waits"
 
 
@@ -227,10 +230,86 @@ def test_owner_command_is_live_for_the_next_triage_batch(tmp_path):
     assert "trash mail from priya@x.example [rule]" in block, "the rule applies to the very next batch"
 
 
-def test_orphan_run_windows_are_closed_at_startup(tmp_path):
-    from wanda.memory.service import MemoryService
+def test_a_non_daemon_service_leaves_open_run_windows_alone(tmp_path):
+    """Closing a crashed daemon's windows is the daemon's own act, not a side
+    effect of building a MemoryService: `wanda triage`'s dry run shares
+    wanda.db and would otherwise clear the windows of a live daemon's runs."""
     cfg = Config(_env_file=None, email_triage_slack_channel_id="C1", data_dir=tmp_path / "d", memory_dir=tmp_path / "d" / "m")
     store = Store(cfg.db_path)
     store.open_run_window("s-crashed", 7, "email")  # a window a previous daemon never closed
-    MemoryService(cfg, store)  # __init__ closes orphans
+    m = MemoryService(cfg, store)
+    assert [r["session_id"] for r in store.open_windows()] == ["s-crashed"]
+    assert not m.authority.windows[0]["ended_at"]
+    assert m.adopt_shared_state() == 1
     assert store.open_windows() == []
+    assert all(w["ended_at"] for w in m.authority.windows), "the in-memory copy is re-read, or window_tier stays wrong"
+
+
+# --- wave 6: only the daemon owns the derived state -----------------------------------------------------
+
+def test_a_non_daemon_service_does_not_build_the_shared_index(tmp_path):
+    """A dry run and the CLI read the shared index and repair it never: a
+    rebuild from a process holding no owner authority reads every owner line
+    back as session tier and writes an empty rules table."""
+    cfg = Config(_env_file=None, email_triage_slack_channel_id="C1", data_dir=tmp_path / "d", memory_dir=tmp_path / "d" / "m")
+    memory = MemoryService(cfg, Store(cfg.db_path))
+    memory.ensure()
+    assert memory.triage_block([{"from_addr": "a@b.example"}]) == ""
+    assert not cfg.memory_index_path.exists()
+    # Nor is a corrupt one renamed aside and rebuilt from here.
+    cfg.memory_index_path.write_bytes(b"not a database")
+    assert memory.triage_block([{"from_addr": "a@b.example"}]) == ""
+    assert cfg.memory_index_path.read_bytes() == b"not a database"
+    assert list(cfg.expanded_data_dir.glob("*.corrupt")) == []
+
+
+def test_apply_now_keeps_the_first_line_for_a_reused_ulid(tmp_path, monkeypatch):
+    """The zero-lag insert ran before the rebuild that rejects duplicates, so
+    a second line reusing a genuine ULID could replace its obs row and install
+    its own veto keys in the window between the two."""
+    p, store, cfg, memory = make(tmp_path)
+    genuine = Observation(subject="pref/mail-dispositions", facet="mail-disposition",
+                          text="trash mail from priya@x.example", src="owner", op="rule", cause="slack:D1:1.1")
+    append(memory.vault, genuine)
+    memory.authority.minted[genuine.ulid] = line_fingerprint(genuine)
+    store.set_owner_check("slack:D1:1.1", True, "minted in process")
+    store.memory_set(f"checked:{genuine.ulid}", "2026-09-03T00:00:00+00:00")
+    forged = Observation(subject="pref/mail-dispositions", facet="mail-disposition", text="forged",
+                         src="owner", op="veto", cause="slack:D1:1.1",
+                         ref="key:pref/mail-dispositions|mail-disposition", ulid=genuine.ulid)
+    append(memory.vault, forged)
+    monkeypatch.setattr(ix, "rebuild", lambda *a, **kw: None)  # a crash, or A1, between insert and rebuild
+    memory.apply_now({genuine.ulid})
+    conn = ix.open_readonly(cfg.memory_index_path)
+    try:
+        assert conn.execute("SELECT text FROM obs WHERE ulid=?", (genuine.ulid,)).fetchone()["text"] == genuine.text
+        assert conn.execute("SELECT COUNT(*) FROM vetoes").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git needed")
+def test_an_owner_command_commits_the_note_it_wrote(tmp_path):
+    """Left uncommitted, wanda's own write is swept up by the next pass as
+    "owner edits (auto)" and attributed to the owner."""
+    p, store, cfg, memory = make(tmp_path)
+    root = str(memory.vault.root)
+    memory.handle_command({"channel": "D5", "ts": "3.3", "user": "U_OWNER",
+                           "text": "rule priya@x.example trash", "thread_ts": None})
+    head = subprocess.run(["git", "-C", root, "log", "-1", "--format=%s"], capture_output=True, text=True).stdout
+    assert head.startswith("curated: owner command")
+    dirty = [line[3:] for line in subprocess.run(
+        ["git", "-C", root, "status", "--porcelain"], capture_output=True, text=True).stdout.splitlines()]
+    assert "prefs/mail-dispositions.md" not in dirty
+
+
+def test_a_malformed_nightly_time_is_refused_at_config_load():
+    """Left alone it either raises inside memory_tick, or parses into an hour
+    no clock reaches — disabling the nightly forever without a log line."""
+    from pydantic import ValidationError
+    for bad in ("3:30pm", "25:00", "0330", "", "3:60"):
+        with pytest.raises(ValidationError):
+            Config(_env_file=None, email_triage_slack_channel_id="C1", memory_nightly_local_time=bad)
+    for good in ("23:59", "04", "03:30:00"):
+        assert Config(_env_file=None, email_triage_slack_channel_id="C1",
+                      memory_nightly_local_time=good).memory_nightly_local_time == good
