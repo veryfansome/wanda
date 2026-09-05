@@ -281,7 +281,7 @@ class Processor:
             await self._flush_alert(kind)
         await self.apply_pending()
         while True:
-            rows = self.store.fetch_by_status("new", limit=self.cfg.triage_batch_size)
+            rows = self.store.fetch_by_status("new", limit=self.cfg.email_triage_batch_size)
             if not rows:
                 return
             if self._debouncing(rows):
@@ -294,14 +294,14 @@ class Processor:
     def _debouncing(self, rows) -> bool:
         """Let a batch form. Under IMAP IDLE each arrival wakes the processor,
         so without this a "batch" is one or two emails. Bounded latency: the
-        oldest new row waits at most triage_debounce_s."""
-        if len(rows) >= self.cfg.triage_batch_size or self.cfg.triage_debounce_s <= 0:
+        oldest new row waits at most email_triage_debounce_s."""
+        if len(rows) >= self.cfg.email_triage_batch_size or self.cfg.email_triage_debounce_s <= 0:
             return False
         try:
             oldest = datetime.fromisoformat(rows[0]["created_at"])
             if oldest.tzinfo is None:
                 oldest = oldest.replace(tzinfo=timezone.utc)
-            return datetime.now(timezone.utc) - oldest < timedelta(seconds=self.cfg.triage_debounce_s)
+            return datetime.now(timezone.utc) - oldest < timedelta(seconds=self.cfg.email_triage_debounce_s)
         except (TypeError, ValueError):
             return False
 
@@ -367,8 +367,8 @@ class Processor:
         self.cfg.triage_cwd.mkdir(parents=True, exist_ok=True)
         kw = dict(
             model=self.cfg.email_triage_model,
-            max_budget_usd=self.cfg.triage_max_budget_usd,
-            timeout_s=self.cfg.triage_timeout_s,
+            max_budget_usd=self.cfg.email_triage_max_budget_usd,
+            timeout_s=self.cfg.email_triage_timeout_s,
             output_schema=VERDICT_SCHEMA,
             system_prompt=self.system_prompt,
             session_persistence=False,
@@ -1023,7 +1023,7 @@ async def run_daemon(cfg: Config) -> None:
     # slack_allowed_user_ids is deliberately optional: empty means anyone in the
     # workspace may talk to wanda.
     require_settings(cfg, [
-        "icloud_email", "icloud_app_password",
+        "email_icloud_email", "email_icloud_app_password",
         "slack_bot_token", "slack_app_token", "email_triage_slack_channel_id",
     ])
     claude_bin = cfg.resolve_claude_bin()
@@ -1060,7 +1060,7 @@ async def run_daemon(cfg: Config) -> None:
         loop.add_signal_handler(sig, stop.set)
 
     log.info("wanda running (enforcement=%s, email triage=%s, agent=%s)",
-             cfg.enforcement, cfg.email_triage_model, cfg.agent_model)
+             cfg.email_enforcement, cfg.email_triage_model, cfg.agent_model)
     # slack_loop starts first: recovery can take many paced Slack calls, and an
     # owner reply arriving during it must not sit undispatched in the queue.
     tasks = [asyncio.create_task(processor.slack_loop())]
@@ -1094,10 +1094,10 @@ async def run_doctor(cfg: Config, smoke: bool) -> int:
     print("wanda doctor\n")
 
     print("config:")
-    for name in ("icloud_email", "icloud_app_password", "slack_bot_token", "slack_app_token",
+    for name in ("email_icloud_email", "email_icloud_app_password", "slack_bot_token", "slack_app_token",
                  "email_triage_slack_channel_id"):
         report(name, bool(getattr(cfg, name)), "" if getattr(cfg, name) else "not set")
-    report("enforcement", True, cfg.enforcement)
+    report("enforcement", True, cfg.email_enforcement)
     report("who can talk to wanda", True,
            ", ".join(cfg.slack_allowed_user_ids) if cfg.slack_allowed_user_ids
            else "anyone in the workspace")
@@ -1173,7 +1173,7 @@ async def run_doctor(cfg: Config, smoke: bool) -> int:
                 report("smoke run", False, str(e))
 
     print("imap:")
-    if cfg.icloud_email and cfg.icloud_app_password:
+    if cfg.email_icloud_email and cfg.email_icloud_app_password:
         try:
             with connect(cfg) as client:
                 info = client.select_folder("INBOX", readonly=True)
@@ -1232,9 +1232,9 @@ async def run_triage_once(cfg: Config, limit: int) -> None:
     and act on them for real."""
     if limit <= 0:
         sys.exit("--limit must be a positive integer")
-    if limit > cfg.dryrun_max_limit:
-        sys.exit(f"--limit above {cfg.dryrun_max_limit} would cost real money; raise WANDA_DRYRUN_MAX_LIMIT to override")
-    require_settings(cfg, ["icloud_email", "icloud_app_password"])
+    if limit > cfg.email_dryrun_max_limit:
+        sys.exit(f"--limit above {cfg.email_dryrun_max_limit} would cost real money; raise WANDA_EMAIL_DRYRUN_MAX_LIMIT to override")
+    require_settings(cfg, ["email_icloud_email", "email_icloud_app_password"])
     claude_bin = cfg.resolve_claude_bin()
     if not claude_bin:
         sys.exit("claude CLI not found; set WANDA_CLAUDE_BIN")
@@ -1263,7 +1263,7 @@ async def run_triage_once(cfg: Config, limit: int) -> None:
         uids = client.search(["UNSEEN"]) or client.search(["ALL"])
         uids = sorted(uids)[-limit:]
         print(f"fetching {len(uids)} message(s) from INBOX…")
-        parsed = fetch_parsed(client, uids, cfg.snippet_bytes)
+        parsed = fetch_parsed(client, uids, cfg.email_snippet_bytes)
 
     keys = []
     bodies: dict[str, str] = {}
@@ -1278,12 +1278,12 @@ async def run_triage_once(cfg: Config, limit: int) -> None:
     rows = [r for r in (store.get_message_by_key(k) for k in keys) if r is not None]
 
     total_cost = 0.0
-    for i in range(0, len(rows), cfg.triage_batch_size):
+    for i in range(0, len(rows), cfg.email_triage_batch_size):
         n_runs, _spent = ledger.runs_today()
         if n_runs >= cfg.daily_run_cap:
             print(f"\nstopping: daily run cap reached ({n_runs} runs today)")
             break
-        chunk = rows[i : i + cfg.triage_batch_size]
+        chunk = rows[i : i + cfg.email_triage_batch_size]
         mem_block = memory.triage_block(chunk) if memory is not None else ""
         prompt, id_map = build_batch_prompt(chunk, memory=mem_block, bodies=bodies)
         started = utcnow()

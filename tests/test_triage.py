@@ -124,19 +124,19 @@ def test_never_trash_matching(addr, entries, expected):
 
 
 def test_guards_pass_through_non_trash(store):
-    gd = evaluate_guards(verdict("attention"), "x@y.z", cfg(enforcement="live"), store)
+    gd = evaluate_guards(verdict("attention"), "x@y.z", cfg(email_enforcement="live"), store)
     assert gd.applied_action == "attention" and gd.note == ""
 
 
 def test_guards_allowlist_beats_confidence(store):
     gd = evaluate_guards(verdict(confidence=0.99), "boss@corp.com",
-                         cfg(enforcement="live", never_trash=["corp.com"]), store)
+                         cfg(email_enforcement="live", email_never_trash=["corp.com"]), store)
     assert gd.applied_action == "ignore"
     assert "allowlist" in gd.note
 
 
 def test_guards_low_confidence_downgrades(store):
-    gd = evaluate_guards(verdict(confidence=0.5), "x@y.z", cfg(enforcement="live"), store)
+    gd = evaluate_guards(verdict(confidence=0.5), "x@y.z", cfg(email_enforcement="live"), store)
     assert gd.applied_action == "ignore"
     assert "low confidence" in gd.note
 
@@ -148,12 +148,12 @@ def test_guards_shadow_mode_default(store):
 
 
 def test_guards_live_allows_trash(store):
-    gd = evaluate_guards(verdict(), "x@y.z", cfg(enforcement="live"), store)
+    gd = evaluate_guards(verdict(), "x@y.z", cfg(email_enforcement="live"), store)
     assert gd.applied_action == "trash"
 
 
 def test_guards_cap_counts_executed_moves(store):
-    c = cfg(enforcement="live", trash_cap_hourly=1)
+    c = cfg(email_enforcement="live", email_trash_cap_hourly=1)
     store.ingest_message(dedupe_key="prev", message_id="<p@x>", folder="INBOX", uidvalidity=1,
                          uid=1, from_addr="s@p.am", subject="x", date_hdr="d")
     store.set_triaged("prev", {}, "trash")

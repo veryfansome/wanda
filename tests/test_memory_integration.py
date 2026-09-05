@@ -39,7 +39,7 @@ class MemSlack(FakeSlack):
 
 def make(tmp_path, claude="/bin/true", **kw):
     opts = dict(email_triage_slack_channel_id="C1", data_dir=tmp_path / "data", memory_dir=tmp_path / "data" / "memory",
-                memory_owner_user_ids=["U_OWNER"], triage_debounce_s=0)
+                memory_owner_user_ids=["U_OWNER"], email_triage_debounce_s=0)
     opts.update(kw)
     cfg = Config(_env_file=None, **opts)
     store = Store(cfg.db_path)
@@ -134,7 +134,7 @@ def test_owner_command_is_handled_in_process(tmp_path):
 
 
 def test_debounce_waits_for_a_batch(tmp_path):
-    p, store, cfg, memory = make(tmp_path, triage_debounce_s=150)
+    p, store, cfg, memory = make(tmp_path, email_triage_debounce_s=150)
     store.ingest_message(dedupe_key="k1", message_id="<k1>", folder="INBOX", uidvalidity=1, uid=1, from_addr="a@b.c", subject="s", date_hdr="d")
     rows = store.fetch_by_status("new")
     assert p._debouncing(rows) is True

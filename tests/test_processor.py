@@ -70,7 +70,7 @@ def test_trash_cap_is_rechecked_at_move_time(tmp_path, monkeypatch):
     """The whole batch is guarded in one pass before any move happens, so the
     cap only binds if it is re-checked here."""
     slack = FakeSlack()
-    p, store = make(tmp_path, slack, enforcement="live", trash_cap_hourly=2)
+    p, store = make(tmp_path, slack, email_enforcement="live", email_trash_cap_hourly=2)
     moves = []
     monkeypatch.setattr("wanda.main.move_to_trash", lambda cfg, uid, uidv: moves.append(uid) or "moved")
 
@@ -87,7 +87,7 @@ def test_trash_cap_is_rechecked_at_move_time(tmp_path, monkeypatch):
 
 def test_deferred_rows_move_once_the_window_reopens(tmp_path, monkeypatch):
     slack = FakeSlack()
-    p, store = make(tmp_path, slack, enforcement="live", trash_cap_hourly=2)
+    p, store = make(tmp_path, slack, email_enforcement="live", email_trash_cap_hourly=2)
     moves = []
     monkeypatch.setattr("wanda.main.move_to_trash", lambda cfg, uid, uidv: moves.append(uid) or "moved")
     for i in range(4):
@@ -107,7 +107,7 @@ def test_completed_move_is_never_relabelled(tmp_path, monkeypatch):
     """A digest failure used to re-guard an already-trashed message and report
     it to the owner as 'WOULD trash'."""
     slack = FakeSlack()
-    p, store = make(tmp_path, slack, enforcement="live", trash_cap_hourly=1)
+    p, store = make(tmp_path, slack, email_enforcement="live", email_trash_cap_hourly=1)
     monkeypatch.setattr("wanda.main.move_to_trash", lambda cfg, uid, uidv: "moved")
     ingest_triaged(store, "k1", "trash")
     slack.fail = True
@@ -126,7 +126,7 @@ def test_completed_move_is_never_relabelled(tmp_path, monkeypatch):
 def test_allowlist_added_after_triage_stops_the_move(tmp_path, monkeypatch):
     """The full guard chain re-runs at move time, not just enforcement+caps."""
     slack = FakeSlack()
-    p, store = make(tmp_path, slack, enforcement="live", never_trash=["x.example"])
+    p, store = make(tmp_path, slack, email_enforcement="live", email_never_trash=["x.example"])
     monkeypatch.setattr("wanda.main.move_to_trash", lambda *a: pytest.fail("allowlisted sender must not move"))
     ingest_triaged(store, "k1", "trash")  # from spam@x.example
     asyncio.run(p.apply_pending())
@@ -135,7 +135,7 @@ def test_allowlist_added_after_triage_stops_the_move(tmp_path, monkeypatch):
 
 def test_flipping_back_to_shadow_stops_queued_moves(tmp_path, monkeypatch):
     slack = FakeSlack()
-    p, store = make(tmp_path, slack, enforcement="shadow")
+    p, store = make(tmp_path, slack, email_enforcement="shadow")
     monkeypatch.setattr("wanda.main.move_to_trash", lambda *a: pytest.fail("must not move in shadow mode"))
     ingest_triaged(store, "k1", "trash")
     asyncio.run(p.apply_pending())
@@ -273,7 +273,7 @@ def test_cap_at_triage_time_defers_rather_than_retiring(tmp_path, monkeypatch):
     from wanda.triage import evaluate_guards
 
     slack = FakeSlack()
-    p, store = make(tmp_path, slack, enforcement="live", trash_cap_hourly=2)
+    p, store = make(tmp_path, slack, email_enforcement="live", email_trash_cap_hourly=2)
     moves = []
     monkeypatch.setattr("wanda.main.move_to_trash", lambda cfg, uid, uidv: moves.append(uid) or "moved")
 

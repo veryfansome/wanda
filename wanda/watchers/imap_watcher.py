@@ -38,15 +38,15 @@ class DeadConnection(Exception):
 
 def connect(cfg: Config) -> IMAPClient:
     client = IMAPClient(
-        cfg.imap_host, port=cfg.imap_port, ssl=True, ssl_context=ssl_context(), timeout=30
+        cfg.email_imap_host, port=cfg.email_imap_port, ssl=True, ssl_context=ssl_context(), timeout=30
     )
-    client.login(cfg.icloud_email, cfg.icloud_app_password)
+    client.login(cfg.email_icloud_email, cfg.email_icloud_app_password)
     return client
 
 
 def resolve_trash_folder(client: IMAPClient, cfg: Config) -> str:
-    if cfg.trash_folder:
-        return cfg.trash_folder
+    if cfg.email_trash_folder:
+        return cfg.email_trash_folder
     found = client.find_special_folder(b"\\Trash")
     if found:
         return found if isinstance(found, str) else found.decode()
@@ -149,7 +149,7 @@ def fetch_body(cfg: Config, folder: str, uidvalidity: int, uid: int) -> str | No
             raw = next((v for k, v in item.items() if k.startswith(b"BODY[")), None)
             if raw is None:
                 return None
-            return parse_raw(raw, cfg.snippet_bytes)["body"]
+            return parse_raw(raw, cfg.email_snippet_bytes)["body"]
     except Exception:
         log.exception("re-fetch of uid %s in %s failed", uid, folder)
         return None
@@ -226,7 +226,7 @@ class ImapWatcher(threading.Thread):
         if not uids:
             return 0
         ingested = 0
-        for uid, parsed in fetch_parsed(client, uids, self.cfg.snippet_bytes):
+        for uid, parsed in fetch_parsed(client, uids, self.cfg.email_snippet_bytes):
             key = dedupe_key_for(parsed, FOLDER, uidvalidity, uid)
             if self.store.ingest_message(
                 dedupe_key=key,
@@ -258,12 +258,12 @@ class ImapWatcher(threading.Thread):
                 self._poll_cycles = 0
                 self._idle_failures = 0
                 log.info("retrying IDLE after %d polling cycles", POLL_CYCLES_BEFORE_IDLE_RETRY)
-            self._stop.wait(self.cfg.poll_fallback_s)
+            self._stop.wait(self.cfg.email_poll_fallback_s)
             return
         try:
             client.idle()
             try:
-                deadline = time.monotonic() + self.cfg.idle_timeout_s
+                deadline = time.monotonic() + self.cfg.email_idle_timeout_s
                 instant_empty = 0
                 while not self._stop.is_set() and time.monotonic() < deadline:
                     started = time.monotonic()
@@ -288,7 +288,7 @@ class ImapWatcher(threading.Thread):
             if self._idle_failures >= MAX_IDLE_FAILURES:
                 self.store.set_meta("imap_mode", "poll")
                 self._poll_cycles = 0
-                self._stop.wait(self.cfg.poll_fallback_s)
+                self._stop.wait(self.cfg.email_poll_fallback_s)
                 return
             raise
         except Exception:

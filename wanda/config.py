@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import os
 import shutil
 from pathlib import Path
 from typing import Annotated, Literal
 
+from dotenv import dotenv_values
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
@@ -22,12 +24,20 @@ class Config(BaseSettings):
         extra="ignore",
     )
 
+    # Everything that only configures the mail pipeline is WANDA_EMAIL_*:
+    # the mailbox, triage, and the trash guards. Slack, claude, memory and
+    # daemon settings stay bare. Old bare names are refused at startup, see
+    # LEGACY_ENV_NAMES.
+
     # iCloud IMAP
-    icloud_email: str = ""
-    icloud_app_password: str = ""
-    imap_host: str = "imap.mail.me.com"
-    imap_port: int = 993
-    trash_folder: str = ""  # empty = discover via SPECIAL-USE
+    email_icloud_email: str = ""
+    email_icloud_app_password: str = ""
+    email_imap_host: str = "imap.mail.me.com"
+    email_imap_port: int = 993
+    email_trash_folder: str = ""  # empty = discover via SPECIAL-USE
+    email_idle_timeout_s: int = 720  # re-issue IDLE well under RFC 2177's 29-minute cap
+    email_poll_fallback_s: int = 180
+    email_snippet_bytes: int = 4096
 
     # Slack
     slack_bot_token: str = ""
@@ -41,27 +51,27 @@ class Config(BaseSettings):
     slack_context_limit: int = 50
 
     # Enforcement & trash guards
-    enforcement: Literal["shadow", "live"] = "shadow"
-    never_trash: CsvList = Field(default_factory=list)  # addresses or domains
-    trash_confidence_min: float = 0.8
-    trash_cap_hourly: int = 5
-    trash_cap_daily: int = 20
+    email_enforcement: Literal["shadow", "live"] = "shadow"
+    email_never_trash: CsvList = Field(default_factory=list)  # addresses or domains
+    email_trash_confidence_min: float = 0.8
+    email_trash_cap_hourly: int = 5
+    email_trash_cap_daily: int = 20
 
     # claude CLI
     claude_bin: str = ""
     email_triage_model: str = "claude-haiku-4-5-20251001"
     agent_model: str = "sonnet"
-    triage_batch_size: int = 10
+    email_triage_batch_size: int = 10
     # Wait for a batch to form before triaging: under IMAP IDLE every arrival
     # wakes the processor, and email is not latency-critical.
-    triage_debounce_s: int = 150
-    triage_timeout_s: int = 120
+    email_triage_debounce_s: int = 150
+    email_triage_timeout_s: int = 120
     agent_timeout_s: int = 900
     # Per-run ceilings. A size limit on one session that loops (there is no
     # --max-turns), not a bill: wanda runs on a subscription plan.
-    triage_max_budget_usd: float = 0.25
+    email_triage_max_budget_usd: float = 0.25
     agent_max_budget_usd: float = 2.0
-    dryrun_max_limit: int = 200
+    email_dryrun_max_limit: int = 200
     # Bash is included so sessions can drive `wanda slack` and `wanda memory`.
     # A headless session cannot scope Bash to one command (--allowedTools is
     # not enforced under --permission-mode dontAsk), so this grants a session
@@ -89,12 +99,9 @@ class Config(BaseSettings):
 
     # daemon
     data_dir: Path = Path("~/.wanda")
-    idle_timeout_s: int = 720  # re-issue IDLE well under RFC 2177's 29-minute cap
-    poll_fallback_s: int = 180
-    snippet_bytes: int = 4096
     log_level: str = "INFO"
 
-    @field_validator("slack_allowed_user_ids", "never_trash", "memory_owner_user_ids", mode="before")
+    @field_validator("slack_allowed_user_ids", "email_never_trash", "memory_owner_user_ids", mode="before")
     @classmethod
     def _split_csv(cls, v: object) -> object:
         if isinstance(v, str):
@@ -181,5 +188,34 @@ class Config(BaseSettings):
         return self.claude_bin or shutil.which("claude")
 
 
+# The bare names these settings had before the WANDA_EMAIL_ prefix. A stale
+# name is refused, not ignored: WANDA_NEVER_TRASH silently falling back to an
+# empty allowlist would be a safety regression nobody would notice.
+LEGACY_ENV_NAMES = {
+    f"WANDA_{n}": f"WANDA_EMAIL_{n}" for n in (
+        "ICLOUD_EMAIL", "ICLOUD_APP_PASSWORD", "IMAP_HOST", "IMAP_PORT", "TRASH_FOLDER",
+        "IDLE_TIMEOUT_S", "POLL_FALLBACK_S", "SNIPPET_BYTES",
+        "ENFORCEMENT", "NEVER_TRASH", "TRASH_CONFIDENCE_MIN", "TRASH_CAP_HOURLY", "TRASH_CAP_DAILY",
+        "TRIAGE_BATCH_SIZE", "TRIAGE_DEBOUNCE_S", "TRIAGE_TIMEOUT_S", "TRIAGE_MAX_BUDGET_USD",
+        "DRYRUN_MAX_LIMIT",
+    )
+}
+
+
+def legacy_env_names_in_use(environ=None, env_files=None) -> dict[str, str]:
+    """Old names present in the environment or in the .env files Config
+    reads, mapped to their replacements. Case-insensitive, as pydantic's
+    env lookup is."""
+    sources = [dict(os.environ if environ is None else environ)]
+    files = Config.model_config["env_file"] if env_files is None else env_files
+    for f in files:
+        sources.append(dotenv_values(f))  # a missing file is an empty dict
+    keys = {str(k).upper() for src in sources for k in src}
+    return {old: new for old, new in LEGACY_ENV_NAMES.items() if old in keys}
+
+
 def load_config() -> Config:
+    if legacy := legacy_env_names_in_use():
+        renames = "\n".join(f"  {old} -> {new}" for old, new in sorted(legacy.items()))
+        raise SystemExit(f"email settings are now prefixed WANDA_EMAIL_; rename these in .env or the environment:\n{renames}")
     return Config()

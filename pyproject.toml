@@ -9,6 +9,7 @@ dependencies = [
     "slack-sdk>=3.31",
     "pydantic>=2.7",
     "pydantic-settings>=2.6",
+    "python-dotenv>=1.0",  # read directly by config.legacy_env_names_in_use
 ]
 
 [dependency-groups]

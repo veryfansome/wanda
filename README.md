@@ -28,7 +28,7 @@ Triage is a one-shot batched `claude -p` call with `--json-schema`-enforced verd
 5. **Check**: `uv run wanda doctor` — verifies IMAP login, both Slack tokens, channel membership, the claude CLI (including a live smoke run), and the database.
 6. **Try it**: `uv run wanda triage --limit 10` — dry-run classification of recent inbox mail, prints what the daemon would do. No side effects, and it writes to a separate `dryrun.db` so a running daemon can never pick up and act on what it classified.
 7. **Run**: `uv run wanda run` — daemon in the foreground (shadow mode by default: trash verdicts are logged as "WOULD trash", nothing is moved).
-8. **Go live** once shadow digests look right: set `WANDA_ENFORCEMENT=live` in `.env`.
+8. **Go live** once shadow digests look right: set `WANDA_EMAIL_ENFORCEMENT=live` in `.env`.
 9. **Install as LaunchAgent**: see the header of `launchd/com.wanda.agent.plist` (a template — it carries a `sed` line to fill in absolute paths, which launchd requires).
 
 ## Talking to wanda

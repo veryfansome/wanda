@@ -163,9 +163,9 @@ def cap_exceeded(cfg: Config, store: Store) -> str:
     before each move — a batch is triaged in one pass, long before any of its
     moves happen, and every row would otherwise see the same stale count."""
     now = datetime.now(timezone.utc)
-    if store.trash_count_since(now - timedelta(hours=1)) >= cfg.trash_cap_hourly:
+    if store.trash_count_since(now - timedelta(hours=1)) >= cfg.email_trash_cap_hourly:
         return "hourly trash cap reached"
-    if store.trash_count_since(now - timedelta(days=1)) >= cfg.trash_cap_daily:
+    if store.trash_count_since(now - timedelta(days=1)) >= cfg.email_trash_cap_daily:
         return "daily trash cap reached"
     return ""
 
@@ -215,13 +215,13 @@ def evaluate_guards(verdict: Verdict, from_addr: str, cfg: Config, store: Store,
     a message permanently for a limit that is about to reset."""
     if verdict.action != "trash":
         return GuardDecision(verdict.action)
-    if matches_never_trash(from_addr, cfg.never_trash):
+    if matches_never_trash(from_addr, cfg.email_never_trash):
         return GuardDecision("ignore", "never-trash allowlist")
-    if verdict.confidence < cfg.trash_confidence_min:
+    if verdict.confidence < cfg.email_trash_confidence_min:
         return GuardDecision(
             "ignore", f"left in inbox, low confidence {verdict.confidence:.2f}"
         )
-    if cfg.enforcement != "live":
+    if cfg.email_enforcement != "live":
         return GuardDecision("shadow_trash", "shadow mode")
     if check_caps and (note := cap_exceeded(cfg, store)):
         return GuardDecision("shadow_trash", note)
