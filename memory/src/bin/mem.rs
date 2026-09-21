@@ -853,7 +853,8 @@ fn cmd_retract(v: &Vault, subject: &str, rel: &str, object: &str, inverse: &str,
         let kept: Vec<String> = lines.into_iter().filter(|l| !py_strip(l).is_empty()).collect();
         let kind = src.split(':').next().unwrap_or("").to_string();
         let _ = std::fs::write(&path,
-            format!("{}\n\n{}\n", memory::fm::dump(&meta, &kind), kept.join("\n")));
+            format!("{}\n\n{}\n", memory::fm::dump(&meta, &kind,
+                &memory::fm::former_names(&kept.join("\n"))), kept.join("\n")));
     }
     if hit == 0 {
         // ok here would be a silent success: nothing matched, so nothing was unsaid

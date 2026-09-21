@@ -23,10 +23,11 @@ pub const ENTITY_KINDS: [&str; 6] = ["person", "place", "org", "group", "thing",
 /// what Obsidian needs, derived every time the file is written.
 pub const DERIVED: [&str; 2] = ["aliases", "tags"];
 
-const COMMON: [&str; 4] = ["summary", "created", "made", "aka"];
+const COMMON: [&str; 3] = ["summary", "created", "made"];
 
-/// Our own field names, past and present. A relation sharing one of them is
-/// written with a prefix, so the two never meet.
+/// Our own field names, past and present — `aka` is past, and stays here for
+/// exactly that reason: `rel_key` prefixes a relation that collides with one,
+/// and a field we have stopped writing is still a name a relation could take.
 const FIELDS: [&str; 22] = [
     "name", "summary", "created", "made", "last_seen", "when", "permanence", "actor",
     "status", "opened", "expect", "expect_by", "closes", "closed", "ptype",
@@ -138,7 +139,45 @@ pub fn rel_key(rel: &str) -> String {
 /// relation — `member_of: ["[[235b7e]]"]` — which is both what the store means
 /// by it and what Obsidian draws: an id is unique across kinds, so the bare
 /// stem resolves.
-pub fn dump(meta: &Meta, kind: &str) -> String {
+static WAS_NAMED: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"~~was named: (.*?)~~").unwrap());
+static WAS_SUMMARISED: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"~~was summarised: (.*?)~~").unwrap());
+
+/// The names this node used to have, read back out of the struck lines
+/// `rename` already writes.
+///
+/// There is no field for this. There was — `aka`, one string joined on `"; "`
+/// — and since a summary is a sentence and sentences contain `"; "`, splitting
+/// it back invented labels that were never anyone's and lost the real one.
+/// The body is where the rename was recorded anyway, with its date and its
+/// reason, so the field was a second copy of a record that already existed.
+///
+/// Only `~~was named:~~` counts. `rename` writes that verb for an entity and
+/// `~~was summarised:~~` for an event, a thread or a rule, so the verb already
+/// carries the distinction this needs: an alias is for a thing with a name,
+/// and a sentence is not a name. A struck line from `retract --line` is a
+/// claim that was withdrawn and matches neither.
+pub fn former_names(body: &str) -> Vec<String> {
+    WAS_NAMED.captures_iter(body).map(|c| one_line(&c[1])).filter(|s| !s.is_empty()).collect()
+}
+
+/// Every label this node has answered to, former summaries included.
+///
+/// For `id_of` alone, which is the replay oracle: `rebuild.py` re-runs a
+/// recorded call against an archived store, and a call that named a node by a
+/// summary it has since outgrown has to keep finding it, or the replay stops
+/// reproducing the run it is checking.
+pub fn former_labels(body: &str) -> Vec<String> {
+    let mut v = former_names(body);
+    v.extend(WAS_SUMMARISED.captures_iter(body).map(|c| one_line(&c[1])));
+    v.retain(|s| !s.is_empty());
+    v
+}
+
+/// `former` is what `former_names` read off the body — passed in rather than
+/// parsed here, so this stays a serialiser.
+pub fn dump(meta: &Meta, kind: &str, former: &[String]) -> String {
     let mut by_rel: IndexMap<String, Vec<String>> = IndexMap::new();
     for e in &meta.edges {
         if e.to.is_empty() || !e.to.contains(':') {
@@ -171,7 +210,7 @@ pub fn dump(meta: &Meta, kind: &str) -> String {
     let mut aliases: Vec<String> = Vec::new();
     if ENTITY_KINDS.contains(&kind) {
         let mut cand = vec![one_line(meta.get("name"))];
-        cand.extend(meta.get("aka").split("; ").filter(|a| !a.is_empty()).map(one_line));
+        cand.extend(former.iter().map(|a| one_line(a)));
         for a in cand {
             if !a.is_empty() && !aliases.contains(&a) {
                 aliases.push(a);

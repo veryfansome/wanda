@@ -22,7 +22,7 @@ When someone corrects something, or says a thing that makes an earlier record fa
 
    - an edge: `mem retract --subject <id> --rel <rel> --object <id> --because "..."` — the edge is removed, and with `--inverse <rel>` its reverse too
    - a body line: `mem retract --subject <id> --line "<text in the line>" --because "..."` — the line is struck in place, since there the sentence is the record
-   - a name or a summary: `mem rename <id> "<new name>" --because "..."`, `mem rename <id> --summary "<new summary>" --because "..."` — the id stays, every edge to it stays, and the old name still resolves. A claim that reached a summary is on every index and in every search until this is done.
+   - a name or a summary: `mem rename <id> "<new name>" --because "..."`, `mem rename <id> --summary "<new summary>" --because "..."` — the id stays and every edge to it stays. A former *name* still resolves, so anyone who knew it by the old one still finds it; a former *summary* does not, because a summary is a sentence and a sentence is not a name. Either way the old wording is struck in the body, with the date and the reason. A claim that reached a summary is on every index and in every search until this is done.
    - a node that should never have existed: `mem forget <id> --because "..."`, once nothing links to it. Not a rename that labels it a mistake; it goes.
 
    Give the same `--because` each time, dated, saying who corrected it and when.

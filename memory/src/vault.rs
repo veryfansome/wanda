@@ -128,11 +128,9 @@ impl Vault {
         let mut hits: Vec<Node> = Vec::new();
         for n in self.nodes() {
             let label = fm::label(&n.meta).to_lowercase();
-            let aka = n.meta.get("aka").split("; ")
-                .filter(|a| !a.is_empty())
-                .map(|a| one_line(a).to_lowercase())
-                .collect::<Vec<_>>();
-            if label == want || aka.contains(&want) {
+            let former: Vec<String> = fm::former_names(&n.body).iter()
+                .map(|a| a.to_lowercase()).collect();
+            if label == want || former.contains(&want) {
                 hits.push(n);
             }
         }
@@ -174,9 +172,7 @@ impl Vault {
                 continue;
             }
             let mut names = vec![fm::label(&n.meta).to_lowercase()];
-            names.extend(n.meta.get("aka").split("; ")
-                .filter(|a| !a.is_empty())
-                .map(|a| one_line(a).to_lowercase()));
+            names.extend(fm::former_labels(&n.body).iter().map(|a| a.to_lowercase()));
             if names.contains(&want) && !exclude(&n.id) {
                 hits.push(n.id);
             }
@@ -293,37 +289,25 @@ impl Vault {
         let entity = fm::ENTITY_KINDS.contains(&kind.as_str());
         let mut new_name = one_line(new_name);
         let mut summary = one_line(summary);
-        let mut old_name = one_line(meta.get("name"));
+        let old_name = one_line(meta.get("name"));
         let old_summary = one_line(meta.get("summary"));
-        // an event, a thread or a rule is named by its summary: a new name is a
-        // new summary, and the old one is kept as a former label
+        // an event, a thread or a rule is named by its summary, so a new name
+        // for one of those is a new summary. It leaves `~~was summarised:~~`
+        // below rather than `~~was named:~~`, and only the second is read back
+        // as a name — what this node used to say is not what it used to be
+        // called.
         if !entity {
             if summary.is_empty() {
                 summary = new_name.clone();
             }
             new_name = String::new();
-            old_name = old_summary.clone();
         }
         let mut notes: Vec<String> = Vec::new();
-        let push_aka = |meta: &mut Meta, held: &str| {
-            let mut aka: Vec<String> = meta.get("aka").split("; ")
-                .filter(|a| !a.is_empty()).map(|a| a.to_string()).collect();
-            if !held.is_empty()
-                && !aka.iter().any(|a| a.to_lowercase() == held.to_lowercase()) {
-                aka.push(held.to_string());
-            }
-            meta.set("aka", aka.join("; "));
-        };
-        if !summary.is_empty() && !entity && summary != old_summary {
-            push_aka(&mut meta, &old_summary);
-        }
         if !new_name.is_empty() && new_name != old_name {
             meta.set("name", new_name.clone());
-            // the old name still finds the node: a session that knew it by the
-            // name it had before must not mint a second one
-            if old_name.to_lowercase() != new_name.to_lowercase() {
-                push_aka(&mut meta, &old_name);
-            }
+            // the struck line below is the whole record: `by_name` reads the
+            // old name back out of it, so a session that knew this node by the
+            // name it had before still finds it and does not mint a second one
             notes.push(format!("~~was named: {old_name}~~"));
         }
         if !summary.is_empty() && summary != old_summary {
@@ -347,7 +331,8 @@ impl Vault {
         } else {
             format!("{}\n\n{note}\n", body.trim_end_matches(crate::text::is_py_space))
         };
-        let _ = std::fs::write(&src, format!("{}\n\n{body}", fm::dump(&meta, &kind)));
+        let former = fm::former_names(&body);
+        let _ = std::fs::write(&src, format!("{}\n\n{body}", fm::dump(&meta, &kind, &former)));
         old.to_string()
     }
 
@@ -414,7 +399,8 @@ impl Vault {
                 lines.push(new_line.to_string());
             }
         }
-        let text = format!("{}\n\n{}\n", fm::dump(&meta, kind), lines.join("\n"));
+        let joined = lines.join("\n");
+        let text = format!("{}\n\n{joined}\n", fm::dump(&meta, kind, &fm::former_names(&joined)));
         let _ = std::fs::write(&p, text);
         p
     }

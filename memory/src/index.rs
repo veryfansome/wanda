@@ -97,8 +97,15 @@ pub fn build_index(vault: &Vault, db_path: &Path) -> rusqlite::Result<Connection
                 n.meta.get("created"), &seen, body.trim(),
                 n.meta.get("status"), n.meta.get("made"), &summary],
         )?;
+        // the names this node used to have go in the searchable text too, so a
+        // session that knows it by the name it had last month finds the node
+        // rather than the other nodes that happen to mention that name. `body`
+        // is the live body, with struck lines stripped, so without this the
+        // former name is searchable nowhere.
+        let former = crate::fm::former_names(&n.body).join(" ");
         con.execute("INSERT INTO fts VALUES(?,?)",
-            rusqlite::params![&n.id, format!("{label} {} {body}", n.meta.get("summary"))])?;
+            rusqlite::params![&n.id,
+                format!("{label} {} {body} {former}", n.meta.get("summary"))])?;
         for e in &n.meta.edges {
             if !e.to.is_empty() {
                 let rel = if e.rel.is_empty() { "related" } else { &e.rel };

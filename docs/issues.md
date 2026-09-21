@@ -58,39 +58,6 @@ No round-16 run ended with a duplicate of this shape. Those sessions rename by i
 
 **Fix.** One `Vault.candidates(kind, name)` that matches label *or* `aka`, called by both `by_name` and `_existing`, so the two cannot drift again. An `aka`-only match should say so rather than silently update: *"Tony's is now place:50a1dc, named Vesuvio"*.
 
-### 9. `aka` joins former labels with `"; "`, and summaries contain `"; "`
-
-`rename` writes former labels as one string joined on `"; "` (`store.py:610`, `619`); `by_name` (`573`), `id_of` (`493`) and the `aliases:` frontmatter (`192`) split it back on the same. Only a non-entity kind puts a former *summary* in that field, and a summary is a sentence: across the four round-16 vaults, 21 to 39 of 161 to 175 nodes carry a `"; "` in their summary as ordinary punctuation, 7 to 16 of them events, threads or rules.
-
-The corruption is not hypothetical. Two of the four round-16 runs ended with a former label the session never wrote:
-
-```
-$ grep aka runs/16B/vault/trajectories/27f857.md
-aka: "mei's lump — GP appointment 19 Aug 2026; mei found a lump, GP 19 Aug; keep from fan"
-      ^-- former summary 1 --------------^  ^-- former summary 2 ------^  ^-- invented --^
-
-$ mem show "keep from fan"        (against a copy of that vault)
-trajectory:27f857
-```
-
-runsimilarly in 16D: `trajectories/00d7ae.md` splits three former summaries into four aliases, and `mem show "reminder leaked to his mailbox"` resolves to it.
-
-The collision needs a coincidence, and it is available:
-
-```
-$ mem entity --kind person --name "Dara" --summary "the sitter"
-$ mem trajectory --summary "Dara; confirm she is free the week of 3 Aug" --expect "she replies"
-$ mem rename "Dara; confirm she is free the week of 3 Aug" --summary "sitter cover for the week of 3 Aug"
-$ mem recall Dara
-('Dara' is more than one node: person:5ac76d (the sitter);
- trajectory:8aada5 (sitter cover for the week of 3 Aug). Say which, by id.)
-nothing to expand from
-```
-
-A person becomes unreachable by name because an unrelated thread was resummarised.
-
-**Fix.** Stop using an in-band separator — write `aka` as a real list, or keep a former summary only in the struck body line `rename` already writes.
-
 ### 41. `mem show` piped into `head` panics, and the session is told the tool crashed
 
 A session that wants the top of a long node writes `mem show <id> | head -20`. `head` closes the pipe, `mem`'s next write gets EPIPE, and Rust's default handler turns that into a panic on stderr:
@@ -105,6 +72,26 @@ A session that wants the top of a long node writes `mem show <id> | head -20`. `
 Four sessions of 564 across round 17's four runs, every one of them `mem show` into `head`. The requested lines do arrive, and the pipeline's status is `head`'s, so nothing downstream breaks — what the session gets is a crash report for a command that worked, naming a file in the Rust standard library.
 
 **Fix.** Restore the default `SIGPIPE` disposition at startup, so the process dies quietly on a closed pipe the way every other command in the image does.
+
+### 42. A standing rule can be stated but never ended, so sessions end it by rewriting its handle
+
+`schema_fields` (`memory/src/fm.rs:38-50`) gives a trajectory `expect`, `expect_by`, `status` and `closed`, and gives a preference `ptype` and nothing else. `mem advance` — *"move or close a trajectory that already exists"* — refuses anything that is not one. So a rule that has been lifted has no field to say so.
+
+A rule also has no `name`: `label()` falls back to `summary` for every non-entity kind, so the summary is simultaneously what the rule says and what the rule is called. Rewriting it is the only move available, and it is the move sessions make. Across rounds 16 and 17, **every one of the seven resummarised preferences** is a lifecycle statement wedged into the handle, and the status column is empty because the field does not exist:
+
+```
+  "was thought to be text-only; contradicted 2026-07-14"
+  "lifted: fan now told about the scan, came back clear"
+  "was thought text-only; also replies to email"
+  "withhold from fan lifted 7 Sept — mei told him herself, scan clear"
+  "mei's lump/scan no longer secret from fan — she told him herself, results clear"
+```
+
+Three of the seven reach for the word *lifted* unprompted. Trajectories, which do have `status`, show the opposite shape: 7 of 38 resummarisations state a lifecycle change, and the rest are the thread genuinely being re-described.
+
+The cost is not only the churn. A lifted rule and a rule in force read the same way in an index — both are one line with no status — so a session must parse the prose to know whether the rule still binds. And these rewritten summaries were the supply line for [#9](#9): long sentences full of the punctuation its separator split on.
+
+**Fix.** Give a preference the lifecycle the shape already has — a status and the date it changed — and let `mem advance` take one. It changes what sessions do, so it wants its own round to compare against rather than riding along inside another change.
 
 ## Tools that report success when they have failed
 
@@ -573,11 +560,13 @@ The lab runs four containers in parallel but each has its own vault, so no run h
 
 **Fix.** Build it in memory. That also stops writing a file into the vault on every read command, where sessions can see it.
 
-### 13. `mem search` cannot find a node by a former name
+### 13. `mem search` cannot find a node by a former summary
 
-*Deferred because a fix moves the measurement.* Adding `aka` to the indexed text moves 72 of 851 recorded searches.
+*Half fixed.* A former **name** is now in the indexed text, so an entity found by the name it used to have is found by `search` as well as by `show` and `recall`. A former **summary** is not, and this is the remaining half.
 
-The FTS row is `label + summary + live body` (`store.py:727-728`). `aka` is not in it, and `live_body` strips the struck line that records the old name.
+The FTS row is `label + summary + live body + former names` (`memory/src/index.rs:100-107`). `live_body` strips the struck lines, so `~~was summarised: ...~~` is searchable nowhere.
+
+Whether it should be is a real question rather than an oversight. A struck line from `retract --line` is a claim that was never true, and surfacing it again is the one thing retraction exists to prevent. A former summary is not that — it is a true statement about what this node used to be called — but the two live in the same syntax, and only the `was summarised:` verb tells them apart. Indexing on that verb is the fix if it is wanted.
 
 ```
 $ mem rename "Tonelli" "Vesuvio" --because "renamed after the sale"
