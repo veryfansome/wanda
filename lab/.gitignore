@@ -1,0 +1,14 @@
+# lab/ is the instrument. Every reading a run takes — its vault, its
+# snapshots, its report, its logs and its transcripts — lands under `runs/`,
+# which is ignored whole. Nothing a run produces is committed: re-run to see
+# it again, and the plan document records what it showed.
+#
+# A run's directory is also the only thing mounted into the container beside
+# what the build writes, so keeping readings out of here is what lets those be
+# mounted read-only.
+__pycache__/
+lint*.md
+coherence*.md
+# the build output, and only that: without the leading slash this also matches
+# `harness/src/bin/`, where the binaries' own sources live
+/bin/

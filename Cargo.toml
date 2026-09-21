@@ -1,0 +1,12 @@
+# Two crates: the memory system, and the lab that measures it. Separate
+# because the product ships without the instrument — the same reason the
+# templates sit outside `lab/`.
+[workspace]
+resolver = "2"
+members = ["memory", "lab/harness"]
+
+# at the workspace root, because cargo ignores a profile in a member manifest.
+# Symbol names are module and function names, which describe the instrument to
+# anything that can read the file a session is given.
+[profile.release]
+strip = true

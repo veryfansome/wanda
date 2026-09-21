@@ -1,0 +1,108 @@
+# A round, from the repo root:
+#
+#   export LAB_RUN=16A
+#   LAB_REV=$(docker compose run --rm -T builder python3 /work/lab/build.py) || exit 1
+#   export LAB_REV
+#   mkdir -p runs/$LAB_RUN/transcripts
+#   python3 lab/corpus.py docs/recall-corpus.md \
+#     | docker compose run --rm -T lab \
+#         /work/lab/run --vault /work/runs/vault --out /work/runs/report$LAB_RUN.md
+#
+# `export LAB_REV=$(...)` on one line would report export's status and not the
+# build's, so a failed build would run the previous binaries under a revision
+# that never compiled. Assign, check, then export.
+#
+# `lab` runs the sessions under test and is given only what a run needs: three
+# binaries, read-only, and this one run's directory. They are compiled because
+# a source file carries comments and docstrings written by someone who knows
+# the history, and a binary carries neither. The history, the expectations,
+# `.git`, every earlier round and every earlier round's transcripts are not
+# mounted, so nothing in the container can reach them by any spelling. The
+# arrivals come in on stdin, so they are not a file either.
+#
+# `replay` runs sessions against a frozen store, so it is measured too and runs
+# under `lab` — it needs the run's own directory and nothing else.
+#
+# `tools` is for what only reads a finished run: judge, lint, rebuild. None of
+# them starts a session against a vault, so they get the repo. They reach the
+# store through the `memory` module, which `builder` puts in `lab/bin` with
+# the rest of the build.
+#
+# On a host checkout, `python3 lab/build.py` writes the same directory for the
+# host's own platform, which is useful for the module and useless for the three
+# binaries: they only ever run in the lab image. `lint.py --structural-only`
+# says so rather than leaving it to be discovered at container start.
+services:
+  lab:
+    build: .
+    image: wanda-lab
+    environment:
+      HOME: /home/lab
+      # only the credential a session needs. The rest of .env is the owner's
+      # real accounts, and a child cannot be kept from /proc/1/environ.
+      CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:?set it in .env}
+      # the revision that produced the readings. `git rev-parse` cannot answer
+      # here: .git is not mounted.
+      LAB_REV: ${LAB_REV:-unknown}
+    volumes:
+      # the binaries, written by lab/build.py. A missing one mounts as an
+      # empty directory rather than failing, so build before every run. They
+      # go in one directory because each looks for the others beside itself.
+      - ./lab/bin/mem:/work/lab/mem:ro
+      - ./lab/bin/run:/work/lab/run:ro
+      - ./lab/bin/replay:/work/lab/replay:ro
+      # the texts that ship into the vault, resolved by build.py from the
+      # product defaults and whatever variant the round selected. Plaintext
+      # on purpose: a session reads them in its own vault either way, and the
+      # binaries read them from beside themselves.
+      - ./lab/bin/templates:/work/lab/templates:ro
+      # every other compose command would fail on a `:?` here, so a
+      # forgotten LAB_RUN lands in its own directory rather than a round's
+      - ./runs/${LAB_RUN:-scratch}:/work/runs
+      # where Claude Code writes each session's transcript, which is the belt.
+      # One run's directory, so `mem session` reaches this run and no other.
+      - ./runs/${LAB_RUN:-scratch}/transcripts:/home/lab/.claude/projects
+    working_dir: /work/runs
+    init: true
+
+  tools:
+    build: .
+    image: wanda-lab
+    env_file: .env
+    environment:
+      HOME: /home/lab
+    volumes:
+      - .:/work
+    working_dir: /work
+    init: true
+
+  # the build, on the stock Rust image. The lab image is left alone: a change
+  # to the crate then cannot arrive together with a change to the CLI, which
+  # is most of what a session's context is, and a reading that moved would
+  # not say which of the two moved it. Nothing here is mounted into `lab`;
+  # the binaries it writes are. It has a Python of its own, which is what
+  # `lab/build.py` runs on.
+  builder:
+    # pinned, and to what the host builds with: a floating tag moved this to
+    # 1.98 while the host was on 1.91, which would have meant the binary under
+    # test and the binary that ships came from different compilers. The image
+    # is the full one rather than slim because the bundled SQLite is C.
+    image: rust:1.91.1
+    volumes:
+      - .:/work
+    working_dir: /work
+    environment:
+      # beside the host's own target directory, not in it: that one holds a
+      # binary built for the host and this one builds for the container
+      CARGO_TARGET_DIR: /work/target-linux
+      # this runs as root over a repo checked out by someone else, and git
+      # refuses to read one it does not trust. Without this the build cannot
+      # name the tree, and refuses rather than stamping a revision it guessed.
+      GIT_CONFIG_COUNT: "1"
+      GIT_CONFIG_KEY_0: safe.directory
+      GIT_CONFIG_VALUE_0: /work
+      # which variant of the vault's standing texts this build resolves, if
+      # the round is testing one. The build is where that is decided, so it
+      # has to reach here and not only the lab.
+      LAB_VARIANT: ${LAB_VARIANT:-}
+    init: true

@@ -1,0 +1,9 @@
+.venv
+.git
+lab/vault*
+lab/*-snaps.git
+lab/report*
+lab/scored*
+lab/*.log
+lab/*.out
+__pycache__

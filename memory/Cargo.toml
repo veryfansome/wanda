@@ -1,0 +1,48 @@
+[package]
+name = "memory"
+version = "0.1.0"
+edition = "2021"
+
+# The store, and the CLI a session drives. One crate because `mem` is the only
+# thing that writes to a vault and the rules for what a node may hold are the
+# store's; splitting them would put the same invariants in two places.
+[lib]
+name = "memory"
+path = "src/lib.rs"
+# rlib for the binaries in this workspace, cdylib for the Python module the
+# tools that read a finished run import
+crate-type = ["rlib", "cdylib"]
+
+[[bin]]
+name = "mem"
+path = "src/bin/mem.rs"
+
+[dependencies]
+# bundled, so the FTS5 ranking a search depends on is a known version rather
+# than whatever the host has
+rusqlite = { version = "0.32", features = ["bundled"] }
+regex = "1"
+# an insertion-ordered map: a node keeps the field order it was written in
+indexmap = "2"
+sha2 = "0.10"
+serde = { version = "1", features = ["derive"] }
+# preserve_order, because a dict keeps the order it was built in and a
+# transcript's tool input is printed as json.dumps writes it
+serde_json = { version = "1", features = ["preserve_order"] }
+unicode-general-category = "1.1.0"
+hex = "0.4.3"
+getrandom = "0.4.3"
+clap = { version = "4.6.7", features = ["derive"] }
+# the store as a Python module, built only when the `python` feature is on.
+# abi3 so one build serves every Python 3.9 and later rather than being tied
+# to the interpreter that compiled it
+pyo3 = { version = "0.27", features = ["extension-module", "abi3-py39"], optional = true }
+# dladdr, to ask the dynamic linker where the module was loaded from
+libc = { version = "0.2", optional = true }
+
+[build-dependencies]
+pyo3-build-config = { version = "0.27", optional = true }
+
+[features]
+python = ["dep:pyo3", "dep:pyo3-build-config", "dep:libc"]
+
