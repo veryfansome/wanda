@@ -221,7 +221,10 @@ pub fn dump(meta: &Meta, kind: &str, former: &[String]) -> String {
     if meta.get("status") == "open" {
         tags.push("open".into());
     }
-    if kind == "preference" && !meta.get("ptype").is_empty() {
+    // `ptype` is one of three values and one of them is the kind's own name,
+    // so a plain rule would carry `["preference", "preference"]`
+    if kind == "preference" && !meta.get("ptype").is_empty()
+        && meta.get("ptype") != kind {
         tags.push(meta.get("ptype").to_string());
     }
     tags.retain(|t| !t.is_empty());

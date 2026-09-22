@@ -913,6 +913,17 @@ fn regen(v: &Vault) {
 }
 
 fn main() {
+    // Rust masks SIGPIPE at startup, so a reader that leaves surfaces as EPIPE
+    // and the default handler panics — a crash report, naming a file in the
+    // standard library, for a command that did what was asked. `mem show <id>
+    // | head` is an ordinary thing to type, and twelve calls in round 17 ended
+    // that way. Put the signal back and the process dies quietly, as `cat`
+    // does. What it cannot fix is the log: `log` below runs after the command
+    // returns, and a process killed by a signal runs no further code, so the
+    // call goes unrecorded either way. It already did — the panic unwound past
+    // `log` — but it did so loudly. This makes that loss silent, which is the
+    // price of the fix and the reason the count above was taken first.
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let cli = Cli::parse();
     let v = vault();

@@ -32,6 +32,26 @@ Nothing is broken. It means the lab measures seven of the nine kinds, and a verd
 
 **Fix.** Either the corpus gets scenes that need a group and a thing, or the two kinds come out of the store. Which of those is right is a question about the design, not about the lab, so it waits for one.
 
+### 41. A `mem` call whose reader leaves is absent from the log, and now silently
+
+`log` runs at `mem.rs:986`, after the command returns. A session that writes `mem show <id> | head -20` gets what it asked for and `head` then closes the pipe; `mem` dies mid-output and the call is never written to `LAB_MEMLOG`.
+
+Measured across round 17 before the `SIGPIPE` fix, by matching every `mem show <ref> | head` in the transcripts against that session's own log entries:
+
+```
+   36  `mem show <ref> | head` invocations, across 28 sessions
+   12  of them absent from the log, across 10 of 564 sessions
+6,819  mem calls logged in the round
+```
+
+One piped call in three. It is not random: it is exactly the idiom a session reaches for on a long node, so the calls that vanish are the reads of the biggest nodes.
+
+Until now the loss announced itself — the process died on a Rust panic, and the panic was in the transcript. That is what made the count above possible, and the fix for that panic has removed it: `mem` now dies quietly, so a call lost this way leaves no trace anywhere. **The number above cannot be retaken.**
+
+The cost is that the mem log is the one record of what a run did with the store. `rebuild.py` replays from it, so a rebuild replays a sequence the run did not make. Every count of the form "N of 6,819 recorded calls" — including every "never observed" in the Deferred section below — is computed from it.
+
+**Fix.** Write the log entry before the output is produced rather than after, or give `mem` an output path that treats EPIPE as a reason to stop rather than to die. The first is smaller and loses the exit code; the second keeps it.
+
 ## What a session cannot do, or does wrongly
 
 `mem` accepts the call and does something other than what was asked.
@@ -58,21 +78,6 @@ No round-16 run ended with a duplicate of this shape. Those sessions rename by i
 
 **Fix.** One `Vault.candidates(kind, name)` that matches label *or* `aka`, called by both `by_name` and `_existing`, so the two cannot drift again. An `aka`-only match should say so rather than silently update: *"Tony's is now place:50a1dc, named Vesuvio"*.
 
-### 41. `mem show` piped into `head` panics, and the session is told the tool crashed
-
-A session that wants the top of a long node writes `mem show <id> | head -20`. `head` closes the pipe, `mem`'s next write gets EPIPE, and Rust's default handler turns that into a panic on stderr:
-
-```
-17A, `mem show person:074b54 | head -20 && echo --- && mem show person:8e2e8f | head -20`
-  thread 'main' (…) panicked at library/std/src/io/stdio.rs:1165:9:
-  failed printing to stdout: Broken pipe (os error 32)
-  note: run with `RUST_BACKTRACE=1` …
-```
-
-Four sessions of 564 across round 17's four runs, every one of them `mem show` into `head`. The requested lines do arrive, and the pipeline's status is `head`'s, so nothing downstream breaks — what the session gets is a crash report for a command that worked, naming a file in the Rust standard library.
-
-**Fix.** Restore the default `SIGPIPE` disposition at startup, so the process dies quietly on a closed pipe the way every other command in the image does.
-
 ### 43. A dollar amount inside a double-quoted shell string reaches the store with its first digit eaten
 
 A session drives `mem` through Bash, and it writes its arguments in double quotes. `"$200"` is a shell expansion: `$2` is the second positional parameter, empty in a `sh -c` string, so what `mem` receives is `00`. Nothing is quoted wrongly from the shell's point of view and nothing errors, so `mem` stores a figure that is off by a factor of ten and prints `ok`.
@@ -97,56 +102,6 @@ The store is not wrong about something it was never told. It is wrong about a fi
 Nothing `mem` can check after the fact distinguishes a mangled `00` from a real one. What it can do is show its work: `ok event:2026-06-02-c6f33a` says nothing about what was stored, so a session has no cheap way to see the loss. Printing the summary back on the `ok` line would have made every one of these visible at the moment it happened.
 
 **Fix.** Echo the stored summary on the `ok` line of every verb that writes one.
-
-## Tools that report success when they have failed
-
-The exit code is zero and the thing did not happen.
-
-### 21. `rebuild.py` swaps node bodies when the transcripts are gone, and says nothing about it
-
-The transcripts supply the order in which a session minted its ids, which is how two nodes of one name in one session are told apart. `belt()` composes a fallback path that need not exist (`rebuild.py:61`), and `rebuild.py:82` skips the whole thing when that directory is not there — no warning, and nothing in the report says which transcripts were read or how many sessions' orders came out of them.
-
-Rebuilding round 15A, which holds the one same-name pair minted inside a single session — the two "fan asked wanda who covers the first week of the closure" events:
-
-```
-with transcripts:     replayed 1738 calls: 5 exit codes differ
-without:              replayed 1738 calls: 106 exit codes differ
-either way:           nodes: 191 … 191 with the same id, 0 new, 0 missing
-                      (nothing on stderr about the missing directory)
-
-bodies, against vault15A:
-  event:2026-09-08-df5427   with: "DM to wanda, 8 Sep …"
-                         without: "DM to wanda, 16 Sep …"
-  event:2026-09-08-e83e53   with: "~~DM to wanda, 16 Sep …~~ (retracted: wrong date)"
-                         without: "DM to wanda, 8 Sep …"
-```
-
-The two nodes get each other's bodies, and the retraction goes with them: neither node in the rebuild carries the strike, so the false date stands as a live claim. The id set matches, so the node line reads as success.
-
-The exit-code count does not catch it either — nothing about the swap changes a return code. What the count picks up is a crowd of `mem session` calls failing, every one of the forty the report lists, because the transcripts they read are the ones that are missing. Two symptoms, neither naming the cause.
-
-A second thing the headline cannot tell from a real disagreement: rebuilding 16A *with* its transcripts reports 33 differing exit codes and 8 new nodes, every one traceable to a node the run created and later forgot. The oracle is the final vault, which no longer holds them, so the replay mints a fresh id and each later `show`, `retract` and `forget` that names the original one fails.
-
-Transcripts are pruned after thirty days, so the silent case is the normal future state of every stored run.
-
-**Fix.** Fail, or warn loudly, when the transcripts are missing or a session's file is absent, and say in the report which directory was read and how many sessions' orders came out of it.
-
-### 24. A lab path containing a space breaks the shim `mem` is reached through
-
-`install_mem` (`lab/harness/src/session.rs:204`) writes a shell shim so a session can type `mem` rather than a path, and builds its body unquoted: `format!("#!/bin/sh\nexec {} \"$@\"\n", mem.display())`. The fallback three lines below, for when no directory on `PATH` is writable, hands the bare path to the prompt the same way (`session.rs:215`).
-
-```
-$ printf '#!/bin/sh\nexec /…/my lab/mem "$@"\n' > shim
-$ ./shim help
-shim: line 2: /…/my: No such file or directory
-shim: line 2: exec: /…/my: cannot execute: No such file or directory
-```
-
-Every session in such a run would be unable to call `mem` at all. `compose.yaml` mounts the binaries at `/work/lab`, so a container run cannot reach it; a host run, or a different mount point, can.
-
-The hook half of this entry is gone with the hook — there is no `settings.json` in the vault and no `PostToolUse` command to quote, and the tool log is read out of the session transcript instead.
-
-**Fix.** Quote the path in the shim body, and in the fallback.
 
 ## Instructions that are untrue, or that a cold reader misreads
 

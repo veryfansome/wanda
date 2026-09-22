@@ -197,6 +197,12 @@ pub fn summarise_trace(trace: &[Value], mem: &[Value]) -> String {
 /// the tool instead of using it. The shim goes where the image already points
 /// PATH, not beside the store, so it is not a file in the session's own
 /// directory.
+/// A path as a single shell word. There is no escape for `'` inside `'…'`, so
+/// a quote closes, escapes itself, and reopens — the only POSIX spelling.
+fn sh_quote(p: &Path) -> String {
+    format!("'{}'", p.display().to_string().replace('\'', r"'\''"))
+}
+
 pub fn install_mem(mem: &Path) -> String {
     for d in std::env::var("PATH").unwrap_or_default().split(':') {
         let bin_dir = Path::new(d);
@@ -204,7 +210,10 @@ pub fn install_mem(mem: &Path) -> String {
             continue;
         }
         let shim = bin_dir.join("mem");
-        if std::fs::write(&shim, format!("#!/bin/sh\nexec {} \"$@\"\n", mem.display())).is_err() {
+        // one word, whatever the path holds: a lab directory with a space in
+        // it would otherwise make `exec` try the first half of it, and every
+        // session in that run would be unable to call `mem` at all
+        if std::fs::write(&shim, format!("#!/bin/sh\nexec {} \"$@\"\n", sh_quote(mem))).is_err() {
             continue;
         }
         #[cfg(unix)]
@@ -214,8 +223,9 @@ pub fn install_mem(mem: &Path) -> String {
         }
         return "mem".into();
     }
-    // nowhere on PATH is writable: name the file, as before
-    mem.display().to_string()
+    // nowhere on PATH is writable: name the file. Quoted, because this is the
+    // name the prompt gives the tool and a session types what it is told.
+    sh_quote(mem)
 }
 
 pub const MODEL: &str = "claude-sonnet-5";

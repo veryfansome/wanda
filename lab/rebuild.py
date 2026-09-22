@@ -149,12 +149,25 @@ def main() -> int:
     # the order each session minted its ids in, read off its transcript: the
     # `ok <id>` lines mem printed back, in sequence. Two nodes of one name in
     # one session are told apart by this
+    # Without these the replay has no oracle order, and two nodes of one name
+    # minted in one session can be given each other's bodies — with the id set
+    # still matching, so the node line at the end reads as success. Transcripts
+    # are pruned after thirty days, which makes the empty case the normal future
+    # state of every stored run. Hence the counting: a rebuild may proceed
+    # without them, because refusing would make an old run unrebuildable, but it
+    # may not stay quiet about it.
     order: dict[str, list[str]] = {}
     tdir = Path(transcripts)
-    if tdir.exists():
-        for sid in set(session_of.values()):
+    want = {sid for sid in session_of.values() if sid}
+    absent = 0
+    if not tdir.is_dir():
+        print(f"no transcripts at {tdir}: replaying with no mint order, so two "
+              f"nodes of one name in one session may swap bodies", file=sys.stderr)
+    else:
+        for sid in sorted(want):
             f = tdir / f"{sid}.jsonl"
             if not f.exists():
+                absent += 1
                 continue
             ids: list[str] = []
             for line in f.read_text().splitlines():
@@ -171,6 +184,10 @@ def main() -> int:
                         ids += [x for x in re.findall(r"\bok ((?:person|place|org|group|thing|topic|event|preference|trajectory):[0-9a-f-]+)", c)
                                 if x not in ids]
             order[sid] = ids
+        if absent:
+            print(f"{absent} of {len(want)} sessions have no transcript in {tdir}: "
+                  f"replaying those with no mint order", file=sys.stderr)
+    blank = sum(1 for sid in session_of.values() if not sid)
     order_path = out / ".oracle-order.json"
     order_path.write_text(json.dumps(order))
 
@@ -291,6 +308,12 @@ def main() -> int:
     if len(mismatches) > 40:
         print(f"  … {len(mismatches) - 40} more")
     print(f"differences written to {diff_path}")
+    # said whatever happened, so a report can never imply an oracle it did not
+    # have. `blank` is a session the run recorded no id for, which has no
+    # transcript to look for rather than a missing one.
+    short = f", {blank} with no session id recorded" if blank else ""
+    print(f"mint order: {len(order)} of {len(want)} sessions read from "
+          f"{tdir if tdir.is_dir() else str(tdir) + ' (absent)'}{short}")
     print(f"{n} calls traced to {trace_path}; {len(files)} files hashed to {vault_path_out}")
     print(f"nodes: {len(before)} in {src.name}, {len(after)} in {out.name}; "
           f"{len(before & after)} with the same id, {len(after - before)} new, {len(before - after)} missing")
