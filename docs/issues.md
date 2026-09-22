@@ -76,6 +76,8 @@ No `--new` was passed. The same happens to a trajectory restated in its original
 
 No round-16 run ended with a duplicate of this shape. Those sessions rename by id and re-state by id, which hides the defect rather than removing it.
 
+Once two rules do share a summary for one person, `mem pref` can never touch either again: it refuses with *"Say which, by id — `--id <id>` on entity, the id itself elsewhere — or --new for another"*, and `pref` has no `--id` and takes no id, so the only move the message offers that exists is `--new`, which makes a third.
+
 **Fix.** One `Vault.candidates(kind, name)` that matches label *or* `aka`, called by both `by_name` and `_existing`, so the two cannot drift again. An `aka`-only match should say so rather than silently update: *"Tony's is now place:50a1dc, named Vesuvio"*.
 
 ### 43. A dollar amount inside a double-quoted shell string reaches the store with its first digit eaten

@@ -134,7 +134,11 @@ def main() -> int:
         kids = sorted(d for d in root.glob("-*") if d.is_dir()) if root.is_dir() else []
         return str(kids[0]) if len(kids) == 1 else str(root / "-work-runs-vault")
 
-    transcripts = args.transcripts or belt()
+    # absolute, because the same string goes to the replayed `mem` as
+    # MEM_TRANSCRIPTS with the rebuilt vault as its cwd: a relative path would
+    # be read here and unreadable there, and the coverage line would be true
+    # of this process and false of the replay
+    transcripts = str(Path(args.transcripts or belt()).resolve())
 
     out = Path(args.out).resolve() if args.out else \
         (src.parent.parent / f"{src.parent.name}_debug" / "vault").resolve()
@@ -197,9 +201,6 @@ def main() -> int:
         if absent:
             print(f"{absent} of {len(want)} sessions have no transcript in {tdir}: "
                   f"replaying those with no mint order", file=sys.stderr)
-    # an arrival the run never recorded a session id for. Its calls, if it made
-    # any, are already in `want` under the id the memlog carries.
-    blank = sum(1 for sid in session_of.values() if not sid)
     order_path = out / ".oracle-order.json"
     order_path.write_text(json.dumps(order))
 
@@ -324,20 +325,23 @@ def main() -> int:
     # have. `blank` is a session the run recorded no id for, which has no
     # transcript to look for rather than a missing one.
     # `order` counts transcripts opened; `carrying` counts the ones that held
-    # an id to order by. A session that wrote nothing has an empty order and
-    # that is correct — but a directory where every order is empty is not a
-    # run in which nobody wrote, it is a transcript shape this no longer
-    # reads, and the replay cannot tell the two apart.
+    # an id to order by. A session that wrote nothing has an empty order, and
+    # so does a whole run that only read — a smoke run can be one. What cannot
+    # be is a log full of successful writes and not one `ok <id>` in any
+    # transcript: that is a transcript shape this no longer reads, or the
+    # wrong run's transcripts, and the log is what tells the cases apart.
     carrying = sum(1 for ids in order.values() if ids)
-    if order and not carrying:
-        print(f"every transcript in {tdir} was read and none held a mint "
-              f"order: the transcript shape has changed, or these are not "
-              f"this run's", file=sys.stderr)
-    short = f", {blank} with no session id recorded" if blank else ""
+    reads = {"recall", "search", "show", "help", "session"}
+    wrote = sum(1 for c in calls if c.get("cmd") not in reads and c.get("rc") == 0)
+    if order and not carrying and wrote:
+        print(f"{len(order)} transcripts read from {tdir} and none held a mint "
+              f"order, though the log records {wrote} successful writes: the "
+              f"transcript shape has changed, or these are not this run's",
+              file=sys.stderr)
     where = str(tdir) if tdir.is_dir() else \
         f"{tdir} ({'not a directory' if tdir.exists() else 'absent'})"
     print(f"mint order: {len(order)} of {len(want)} sessions read from {where}, "
-          f"{carrying} carrying one{short}")
+          f"{carrying} carrying one")
     print(f"{n} calls traced to {trace_path}; {len(files)} files hashed to {vault_path_out}")
     print(f"nodes: {len(before)} in {src.name}, {len(after)} in {out.name}; "
           f"{len(before & after)} with the same id, {len(after - before)} new, {len(before - after)} missing")

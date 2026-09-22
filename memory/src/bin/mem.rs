@@ -103,10 +103,10 @@ enum Cmd {
         summary: String,
         #[arg(long, default_value = "")]
         body: String,
-        /// what sort of rule; a restated rule keeps the one it has
-        #[arg(long, default_value = "",
-              value_parser = ["", "mail-disposition","preference","etiquette"])]
-        kind: String,
+        /// what sort of rule. A new rule is a preference unless told
+        /// otherwise; a restated rule keeps the kind it has
+        #[arg(long, value_parser = ["mail-disposition","preference","etiquette"])]
+        kind: Option<String>,
         #[arg(long, default_value = "")]
         about: String,
         #[arg(long)]
@@ -672,7 +672,9 @@ fn cmd_pref(v: &Vault, whose: &str, summary: &str, body: &str, kind: &str,
     // nothing at all for a restated one, which keeps what it has. Before this
     // the flag defaulted to "preference" and a restate without it — the common
     // case, since three rules in four are something else — silently
-    // reclassified the rule.
+    // reclassified the rule. The flag is an Option so that the help says
+    // nothing false: a rendered default of "" was the one thing a session
+    // could read about the flag, and it was an artefact of the fix.
     let ptype = if !kind.is_empty() { kind.to_string() }
         else if found.is_none() { "preference".to_string() }
         else { String::new() };
@@ -958,7 +960,7 @@ fn main() {
             object: restamp(&object), inverse: restamp(&inverse) },
         Cmd::Pref { whose, summary, body, kind, about, new } => Cmd::Pref {
             whose: restamp(&whose), summary: restamp(&summary), body: restamp(&body),
-            kind: restamp(&kind), about: restamp(&about), new },
+            kind: kind.map(|k| restamp(&k)), about: restamp(&about), new },
         Cmd::Trajectory { summary, body, expect, by, about, new } => Cmd::Trajectory {
             summary: restamp(&summary), body: restamp(&body), expect: restamp(&expect),
             by, about: restamp(&about), new },
@@ -988,7 +990,7 @@ fn main() {
         Cmd::Relate { subject, rel, object, inverse } =>
             cmd_relate(&v, subject, rel, object, inverse),
         Cmd::Pref { whose, summary, body, kind, about, new } =>
-            cmd_pref(&v, whose, summary, body, kind, about, *new),
+            cmd_pref(&v, whose, summary, body, kind.as_deref().unwrap_or(""), about, *new),
         Cmd::Trajectory { summary, body, expect, by, about, new } =>
             cmd_trajectory(&v, summary, body, expect, by, about, *new),
         Cmd::Advance { r#ref, status, by, note } => cmd_advance(&v, r#ref, status, by, note),
