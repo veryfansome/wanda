@@ -73,25 +73,30 @@ Four sessions of 564 across round 17's four runs, every one of them `mem show` i
 
 **Fix.** Restore the default `SIGPIPE` disposition at startup, so the process dies quietly on a closed pipe the way every other command in the image does.
 
-### 42. A standing rule can be stated but never ended, so sessions end it by rewriting its handle
+### 43. A dollar amount inside a double-quoted shell string reaches the store with its first digit eaten
 
-`schema_fields` (`memory/src/fm.rs:38-50`) gives a trajectory `expect`, `expect_by`, `status` and `closed`, and gives a preference `ptype` and nothing else. `mem advance` — *"move or close a trajectory that already exists"* — refuses anything that is not one. So a rule that has been lifted has no field to say so.
+A session drives `mem` through Bash, and it writes its arguments in double quotes. `"$200"` is a shell expansion: `$2` is the second positional parameter, empty in a `sh -c` string, so what `mem` receives is `00`. Nothing is quoted wrongly from the shell's point of view and nothing errors, so `mem` stores a figure that is off by a factor of ten and prints `ok`.
 
-A rule also has no `name`: `label()` falls back to `summary` for every non-entity kind, so the summary is simultaneously what the rule says and what the rule is called. Rewriting it is the only move available, and it is the move sessions make. Across rounds 16 and 17, **every one of the seven resummarised preferences** is a lifecycle statement wedged into the handle, and the status column is empty because the field does not exist:
+The call that did it, from 16D's mem log — note the body, where the session spelled the number out in words and it survived:
 
 ```
-  "was thought to be text-only; contradicted 2026-07-14"
-  "lifted: fan now told about the scan, came back clear"
-  "was thought text-only; also replies to email"
-  "withhold from fan lifted 7 Sept — mei told him herself, scan clear"
-  "mei's lump/scan no longer secret from fan — she told him herself, results clear"
+event --summary "fan texted Robin about the 00 hall-booking deposit"
+      --body "fan (DM, 2026-06-02): texted Robin about the two hundred from the hall booking…"
 ```
 
-Three of the seven reach for the word *lifted* unprompted. Trajectories, which do have `status`, show the opposite shape: 7 of 38 resummarisations state a lifecycle change, and the rest are the thread genuinely being re-described.
+Three sessions noticed and repaired the summary — 16D twice, 17D once — logging *"fixing dollar sign eaten by shell expansion"*. Repairing the summary does not repair what was written from it afterwards, and 16D's final vault still states the wrong amount in live body text, unstruck, in two nodes:
 
-The cost is not only the churn. A lifted rule and a rule in force read the same way in an index — both are one line with no status — so a session must parse the prose to know whether the rule still binds. And these rewritten summaries were the supply line for [#9](#9): long sentences full of the punctuation its separator split on.
+```
+trajectories/a1f9bc.md:19  confirmed the 00 hall-booking deposit is still outstanding
+trajectories/a1f9bc.md:20  fan says Robin's away until 9 Sep; no point chasing the 00 before then
+trajectories/d3a0a0.md:14  fan texted Robin; deposit is 00 from the hall booking
+```
 
-**Fix.** Give a preference the lifecycle the shape already has — a status and the date it changed — and let `mem advance` take one. It changes what sessions do, so it wants its own round to compare against rather than riding along inside another change.
+The store is not wrong about something it was never told. It is wrong about a figure it was told correctly, and it says so as plainly as it says anything else.
+
+Nothing `mem` can check after the fact distinguishes a mangled `00` from a real one. What it can do is show its work: `ok event:2026-06-02-c6f33a` says nothing about what was stored, so a session has no cheap way to see the loss. Printing the summary back on the `ok` line would have made every one of these visible at the moment it happened.
+
+**Fix.** Echo the stored summary on the `ok` line of every verb that writes one.
 
 ## Tools that report success when they have failed
 

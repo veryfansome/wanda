@@ -235,11 +235,23 @@ Every index is up in 17, by three to five points except topics, which is up ten 
 
 What this replaces is the `indexes read N` on every trace line, which counted Read calls naming a `CLAUDE.md` and so missed every `cat`. Over round 17's checkpoints it read 0.86 where 2.21 arrived, and reported none for 125 of 216 where 48 had none. It is gone; the tool log it was computed from clips a command at 400 characters, so no rule written against that log could have done better.
 
-**A rule can be stated and never ended, and the alias field was hiding it.** `aka` held a node's former labels as one string joined on `"; "`, and summaries are sentences that contain `"; "`, so splitting it back invented labels nobody wrote and destroyed the real ones — seven of the eight archived vaults carry the damage. The fix was to delete the field: `rename` already writes the former value into the body as a struck line with its date and reason, so the field was a second copy of a record that existed, and the copy was the broken one. Reading it back off the body drops 15 fabricated labels and recovers 8 true ones the split had shredded.
+**The alias field held a node's former labels, and it was the wrong place for them.** `aka` joined them into one string on `"; "`, and summaries are sentences that contain `"; "`, so splitting it back invented labels nobody wrote and destroyed the real ones — seven of the eight archived vaults carry the damage. The fix was to delete the field. `rename` already writes the former value into the body as a struck line with its date and its reason, so `aka` was a second copy of a record that existed, and the copy was the broken one. Reading it back off the body drops 15 fabricated labels and recovers 8 true ones the split had shredded.
 
-What the field was covering for is the finding. Only the six entity kinds have a `name`; an event, a thread or a rule is called by its summary, so for those the handle and the content are one field. A trajectory can survive that, because `advance` gives it somewhere else to put a change of state. A preference cannot: `schema_fields` gives it `ptype` and nothing else, and `mem advance` takes trajectories only. So when a standing rule is lifted, the only writable field is the one the rule is named by — and **every one of the seven resummarised preferences across both rounds is a lifecycle statement wedged into the handle**, three of them reaching for the word *lifted* unprompted. Trajectories, which have the field, show the opposite: 7 of 38.
+**Why a summary gets rewritten at all is instructed, not improvised.** The first reading of this was that a standing rule has no lifecycle — no `status`, no verb — so a session ending one has nowhere to put it but the summary, which for a kind with no `name` is the node's only handle. Reading every rewrite rather than the seven that fitted says otherwise. Across both rounds there are 72 of them, 71 with a recorded reason:
 
-That is [issue 42](issues.md), and it is the next thing worth changing: a rule in force and a rule that was lifted read identically in an index, so a session has to parse prose to know whether a rule still binds. It changes what sessions do, so it wants its own round rather than riding along inside another change.
+```
+  33  (46%)  the thread moved on
+  14  (19%)  make the constraint visible in the index
+  10  (14%)  name the rule that governs this thread
+   8  (11%)  a rule lifted, or a claim contradicted
+   6  ( 8%)  a correction — a typo, or a dollar amount the shell ate
+```
+
+The 33% that copy a constraint into a summary are following `enrich.md` step 4, which says to do exactly that and says why: *"The index shows summaries; it does not show bodies or edges. A session that only reads the index must still see it."* The reasons sessions log are near-quotes of it — *"index does not show edges"*, *"surface the constraint in the index summary per enrich"*. Another 46% are a thread being re-described as it moves, which is what `rename --summary` is for.
+
+That leaves eight rewrites across eight runs, about one a run, for a rule ending — and every one of those was on a node that already had `status` and `closed` and had used them. `trajectory:6b40eb` in 17A is the whole pattern in one file: closed on the day the secret lifted, carrying a `constrained_by` edge to the rule, and rewritten three times anyway, because the summary is the only part of it an index shows. Nothing is missing. Issue 42 was closed on this evidence rather than fixed.
+
+What the exercise did turn up is that a dollar amount written inside a double-quoted shell string reaches the store with its leading digit eaten, and the store then states the wrong amount as fact. That is [issue 43](issues.md).
 
 ## Where the work goes next
 
