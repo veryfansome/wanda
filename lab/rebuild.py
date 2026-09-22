@@ -148,21 +148,31 @@ def main() -> int:
 
     # the order each session minted its ids in, read off its transcript: the
     # `ok <id>` lines mem printed back, in sequence. Two nodes of one name in
-    # one session are told apart by this
-    # Without these the replay has no oracle order, and two nodes of one name
-    # minted in one session can be given each other's bodies — with the id set
-    # still matching, so the node line at the end reads as success. Transcripts
-    # are pruned after thirty days, which makes the empty case the normal future
-    # state of every stored run. Hence the counting: a rebuild may proceed
-    # without them, because refusing would make an old run unrebuildable, but it
-    # may not stay quiet about it.
+    # one session are told apart by this, and without it they can be given each
+    # other's bodies — with the id set still matching, so the node line at the
+    # end reads as success either way. Transcripts are pruned after thirty days,
+    # which makes the empty case the normal future state of every stored run. A
+    # rebuild may proceed without them, because refusing would make an old run
+    # unrebuildable, but it may not stay quiet about it.
+    #
+    # Which sessions to look for is the memlog's question, not the arrival
+    # log's: `ran_on` below takes each call's session from the call itself and
+    # falls back to the arrival only for older logs that carry none. An arrival
+    # whose session errored is written back with an empty id while its calls
+    # still name it, so counting arrivals would skip the session that most needs
+    # an order and report full coverage.
     order: dict[str, list[str]] = {}
     tdir = Path(transcripts)
-    want = {sid for sid in session_of.values() if sid}
+    want = {c.get("session") or session_of.get(c.get("input_key", ""), "")
+            for c in calls}
+    want.discard("")
     absent = 0
     if not tdir.is_dir():
-        print(f"no transcripts at {tdir}: replaying with no mint order, so two "
-              f"nodes of one name in one session may swap bodies", file=sys.stderr)
+        # a file where a directory should be is a different mistake from
+        # nothing being there, and the one an operator would chase first
+        what = "is not a directory" if tdir.exists() else "is not there"
+        print(f"{tdir} {what}: replaying with no mint order, so two nodes of "
+              f"one name in one session may swap bodies", file=sys.stderr)
     else:
         for sid in sorted(want):
             f = tdir / f"{sid}.jsonl"
@@ -187,6 +197,8 @@ def main() -> int:
         if absent:
             print(f"{absent} of {len(want)} sessions have no transcript in {tdir}: "
                   f"replaying those with no mint order", file=sys.stderr)
+    # an arrival the run never recorded a session id for. Its calls, if it made
+    # any, are already in `want` under the id the memlog carries.
     blank = sum(1 for sid in session_of.values() if not sid)
     order_path = out / ".oracle-order.json"
     order_path.write_text(json.dumps(order))
@@ -311,9 +323,21 @@ def main() -> int:
     # said whatever happened, so a report can never imply an oracle it did not
     # have. `blank` is a session the run recorded no id for, which has no
     # transcript to look for rather than a missing one.
+    # `order` counts transcripts opened; `carrying` counts the ones that held
+    # an id to order by. A session that wrote nothing has an empty order and
+    # that is correct — but a directory where every order is empty is not a
+    # run in which nobody wrote, it is a transcript shape this no longer
+    # reads, and the replay cannot tell the two apart.
+    carrying = sum(1 for ids in order.values() if ids)
+    if order and not carrying:
+        print(f"every transcript in {tdir} was read and none held a mint "
+              f"order: the transcript shape has changed, or these are not "
+              f"this run's", file=sys.stderr)
     short = f", {blank} with no session id recorded" if blank else ""
-    print(f"mint order: {len(order)} of {len(want)} sessions read from "
-          f"{tdir if tdir.is_dir() else str(tdir) + ' (absent)'}{short}")
+    where = str(tdir) if tdir.is_dir() else \
+        f"{tdir} ({'not a directory' if tdir.exists() else 'absent'})"
+    print(f"mint order: {len(order)} of {len(want)} sessions read from {where}, "
+          f"{carrying} carrying one{short}")
     print(f"{n} calls traced to {trace_path}; {len(files)} files hashed to {vault_path_out}")
     print(f"nodes: {len(before)} in {src.name}, {len(after)} in {out.name}; "
           f"{len(before & after)} with the same id, {len(after - before)} new, {len(before - after)} missing")

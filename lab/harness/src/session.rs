@@ -191,18 +191,18 @@ pub fn summarise_trace(trace: &[Value], mem: &[Value]) -> String {
             trace.len())
 }
 
-/// `mem`, on the session's PATH, and the name the prompt gives it.
-///
-/// An absolute path in front of every call invites a session to go and read
-/// the tool instead of using it. The shim goes where the image already points
-/// PATH, not beside the store, so it is not a file in the session's own
-/// directory.
 /// A path as a single shell word. There is no escape for `'` inside `'…'`, so
 /// a quote closes, escapes itself, and reopens — the only POSIX spelling.
 fn sh_quote(p: &Path) -> String {
     format!("'{}'", p.display().to_string().replace('\'', r"'\''"))
 }
 
+/// `mem`, on the session's PATH, and the name the prompt gives it.
+///
+/// An absolute path in front of every call invites a session to go and read
+/// the tool instead of using it. The shim goes where the image already points
+/// PATH, not beside the store, so it is not a file in the session's own
+/// directory.
 pub fn install_mem(mem: &Path) -> String {
     for d in std::env::var("PATH").unwrap_or_default().split(':') {
         let bin_dir = Path::new(d);

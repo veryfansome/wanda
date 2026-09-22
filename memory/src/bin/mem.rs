@@ -103,8 +103,9 @@ enum Cmd {
         summary: String,
         #[arg(long, default_value = "")]
         body: String,
-        #[arg(long, default_value = "preference",
-              value_parser = ["mail-disposition","preference","etiquette"])]
+        /// what sort of rule; a restated rule keeps the one it has
+        #[arg(long, default_value = "",
+              value_parser = ["", "mail-disposition","preference","etiquette"])]
         kind: String,
         #[arg(long, default_value = "")]
         about: String,
@@ -667,13 +668,21 @@ fn cmd_pref(v: &Vault, whose: &str, summary: &str, body: &str, kind: &str,
         match existing(v, "preference", &summary, "", &whose_id, false) {
             Ok(x) => x, Err(rc) => return rc }
     };
+    // a kind given is written; none given is "preference" for a new rule and
+    // nothing at all for a restated one, which keeps what it has. Before this
+    // the flag defaulted to "preference" and a restate without it — the common
+    // case, since three rules in four are something else — silently
+    // reclassified the rule.
+    let ptype = if !kind.is_empty() { kind.to_string() }
+        else if found.is_none() { "preference".to_string() }
+        else { String::new() };
     let nid = found.unwrap_or_else(|| v.mint("preference", "", None, &summary));
     let mut edges = vec![Edge { rel: "whose".into(), to: whose_id }];
     if !about_id.is_empty() {
         edges.push(Edge { rel: "concerns".into(), to: about_id });
     }
     v.upsert(&nid, "preference", &summary, &summary, body,
-             &[("ptype".to_string(), kind.to_string())], &edges, &today());
+             &[("ptype".to_string(), ptype)], &edges, &today());
     regen(v);
     println!("ok {nid}");
     0
