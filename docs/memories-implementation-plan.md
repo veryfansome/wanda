@@ -253,6 +253,18 @@ That leaves eight rewrites across eight runs, about one a run, for a rule ending
 
 What the exercise did turn up is that a dollar amount written inside a double-quoted shell string reaches the store with its leading digit eaten, and the store then states the wrong amount as fact. That is [issue 43](issues.md).
 
+**Round 18 is the instruction batch: it made sessions efficient and their notes thinner.** Four runs on `0817039`, CLI 2.1.268 as in round 17, 564 sessions, no errors. Round 17 ran at `86b27b2`, and two changes landed between that are not the batch and that a session could notice: a node is now findable by a name it used to have, and a former summary no longer resolves as a name. Neither turned up as the cause of any item below.
+
+What the batch was for, it did. Across the round, per-verb `--help` lookups fell from 1,341 to 547, calls that failed on the command's shape from 79 to 35, and `mem add` — a verb that does not exist, which round-17 sessions reached for 27 times in place of the writer the old list never named — to none. Turns per session fell from 18.2 to 15.8 and cost from $0.198 to $0.170, the cheapest round yet at $95.79.
+
+Recall fell. Hits per run 82, 83, 78, 84 against round 17's 93, 85, 81, 84 — a mean of 81.75 against 85.75. That alone is not established: rounds 16 and 17 give eight runs from 81 to 93, and round 18 sits about 1.8 standard errors below them. Discipline and distractors did not move. Of 120 expectations, 68 held, 39 moved by one run, and 13 by two or more; the 13 and the four that moved off zero for the first time were each traced through the snapshots, recalled lists and answers of all eight runs, and 14 of the 17 are noise or judge variance — among them #115, none of four runs to three, and the three first-ever single hits, all in 18C.
+
+What is established is the mechanism under the fall, and it is round-wide rather than a matter of three items. **The verb list's forms were copied as written, and they were incomplete.** They show no `--body`, and they do not name `advance`. Writes carrying a body fell from 77% and 81% in rounds 16 and 17 to 50%; events with a body from 89% to 59%, trajectories from 71% to 35%. `advance` fell from 212 to 119 while new trajectories rose from 128 to 155: part of what used to update a thread already underway now opens another, and part is not written as an update at all. The judge renders a node's summary and body, so detail that never reached a body cannot be recalled. Position 107 shows it cleanly — the fundraiser was written into the thread's body in three of four round-17 runs, and in none of round 18's, where it went into a separate event that the thread only points back from.
+
+The 140 cap was used — a third of writes exceed 80, and the median summary grew from 57 to 69 — but it does not explain the bodies: a write without a body has a summary barely shorter than one with (65 against 70), which is not what summaries absorbing the body would look like. That points at the forms. The two shipped together, so the split is a reading, not a measurement.
+
+Unresolved refs rose from 63 to 152, and they are not the cause. 114 of the 152 name a node that exists, in a spelling the resolver refuses — `person:718db3 mei`, `pref:304aec`, `prefs/57dc6d` — and the missed content sat in the unread body in two of 40 non-hits. That is [issue 47](issues.md). The capture regression is [issue 46](issues.md), and it is the next thing to change: show `--body` in the four writer forms and name `advance`, which round 19 would measure against this round.
+
 ## Where the work goes next
 
 **1. The corpus.** Forty-five scenes in one file, all run.

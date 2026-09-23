@@ -66,6 +66,42 @@ Beside it, not a leak by `check-lab-leak`'s test but the same rule broken: a run
 
 **Fix.** The replay directory must hold nothing past the checkpoint being replayed. That means the arrivals on stdin, as `run` has them — `replay` reads `--inputs` once per results file, so it has to read them once before that loop — a results file cut to the records being replayed, and a snapshot repo holding only the commits those records name, built outside the container before it starts. The scene title in both stderr lines becomes the arrival's position, as `ident` already does. For the run's log: log positions only, with no checkpoint mark, or send it outside the run directory — `spend.py` and the `score-lab-round` skill read it from `runs/*/` and move with it — and add it to what `peeked` watches.
 
+### 46. The verb list's writer forms show no `--body` and do not name `advance`, and sessions write what the forms show
+
+Round 18 put five writer forms at the top of `root.md`'s verb list, to stop sessions paying a `--help` round-trip for flags and guessing at a writer the old list never named. It worked — per-verb help fell from 1,341 to 547 across the round and `mem add` from 27 to none — and sessions now write the forms as shown. The forms are incomplete in two ways that cost capture:
+
+```
+                                   round 16   round 17   round 18
+writes carrying a --body              77%        81%        50%
+  events                              85%        89%        59%
+  trajectories                        71%        71%        35%
+advance (update a thread)             231        212        119
+trajectory (open a thread)            113        128        155
+```
+
+No form shows `--body`. The sentence after the list does name the verbs that take one, and the forms won. And nothing in `root.md` names `advance` at all; round-17 sessions met it in `mem help`, which the list made unnecessary, so what used to update a thread already underway now partly opens a new one and partly is not written as an update. The judge renders a node's summary and body; detail left out of the body cannot be recalled. Round 18's hits fell by about four a run, with position 107 the clean instance — the detail went into a separate event that the recalled thread only points back from.
+
+The 140 cap moved summaries too (median 57 to 69), but a body-less write's summary is barely shorter than a write with a body (65 against 70), so the cap is not what displaced the bodies.
+
+**Fix.** Show `--body "<the rest>"` in the `entity`, `event`, `trajectory` and `pref` forms, and add `mem advance <id> --note "..."` to the list as the way to add to a thread that already exists. Measure it as round 19 against round 18.
+
+### 47. The ref resolver refuses real ids written in common shapes
+
+Sessions report what they recalled as a list of refs, and the judge renders a resolved ref with its node's body. In round 18, 114 of the 152 refs that resolved against nothing named a node that exists, in a shape `bare_ref` and `resolve` do not accept:
+
+```
+id, then a name, no separator    person:718db3 mei                 3 -> 44
+a directory path                 prefs/57dc6d                      1 -> 21
+the verb's name for the kind     pref:304aec                      10 -> 20
+several ids in one string        event:… / 2026-03-05-f125c4      19 -> 28
+```
+
+`bare_ref` cuts only at whitespace followed by a dash or an opening bracket, so a name after an id stays attached and the id fails; `pref` is the verb, not the kind, so `pref:` is no kind; a path has no `:`. The node is then scored from the ref's text alone, without its body.
+
+It cost nothing measurable in round 18: of 40 non-hits where a live node reached the judge only as ref text, the missed content was in the unread body twice, and the judge reads a ref's own gloss. But it biases toward miss, and it grew in round 18, in every run. What drove that is not shown: the harness, the resolver change and summaries copied as refs were ruled out. `pref:` is the verb's name for the kind, and the new verb list shows the verb among the writers — a plausible cause, not an established one.
+
+**Fix.** In `bare_ref` / `resolve`: take a leading id before a name with no separator, accept `pref` and a kind's directory name as the kind, and split several ids in one string.
+
 ## What a session cannot do, or does wrongly
 
 `mem` accepts the call and does something other than what was asked.
