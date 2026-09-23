@@ -55,9 +55,9 @@ What you yourself said and did is not in the store unless you filed it. The exch
     mem event --summary "<what happened>" --body "<the rest>" --participants "<name>,<name>"
                                           something that happened and stays true
     mem trajectory --summary "<what is underway>" --body "<the rest>" --expect "<what would close it>" --about "<name>,<name>"
-                                          something not finished yet, and not already open
+                                          something not finished yet, and not already here
     mem advance <id> --note "<what is new>"
-                                          more on a trajectory already open
+                                          more on a trajectory already here, open or closed
     mem pref --whose "<name>" --summary "<the rule>" --body "<the rest>"
                                           a standing rule, instruction or preference
     mem relate --subject <id> --rel <relation> --object <id>
