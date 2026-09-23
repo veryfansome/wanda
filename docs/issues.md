@@ -8,6 +8,29 @@ A file-and-line reference here names the Python that was the implementation when
 
 What a run reports is not what happened, so a band cannot be read at face value.
 
+### 48. A lab session is never told it is wanda, and the product's are
+
+The product opens both of its seed messages with *"You are wanda, …"* (`wanda/main.py:103`, `wanda/main.py:126`), sent as the session's first user message. A lab session gets Claude Code's default system prompt — *"You are an interactive agent that helps users with software engineering tasks"* — with a paragraph appended about the date and about where its knowledge comes from (`lab/harness/src/session.rs:274-285`), and an arrival prompt that says *"fan says to you"* without ever naming the "you" (`lab/harness/src/arrival.rs:28-38`).
+
+So a session has to work out that it is wanda, from surfaces that point both ways. Some point at it: the vault's title, *"# wanda's memory"*, above *"These are your memories"* (`memory/templates/root.md:1`, `:11`); the seeded person node's index line, *"wanda — the assistant keeping this memory; linked only from her own commitments"* (`memory/src/index.rs:212`), present in 76 to 85% of each round's session transcripts; the enrich skill's `--about wanda`, *"your own node"*; and `root.md:19`, *"What you undertake is said and recorded under your own name"*. Others speak of her as someone else: the first line of `mem help`, *"read and write wanda's memory"* (`memory/src/bin/mem.rs:23`); `mem session`'s *"wanda said:"* and *"wanda ran:"* for the session's own past turns (`memory/src/transcript.rs:314-339`); and the thread frame's *"wanda included"* (`arrival.rs:43`).
+
+What comes out is a session that speaks as wanda and files like a clerk keeping her record. 174, 184, 171 and 189 of each round's roughly 290 non-empty answers use I, me or my, and sessions call her commitments "my own undertaking". But the own voice `root.md:11` asks for — *"an act with nobody named as doing it is yours"*, which the enrich skill says *"is what marks a note as yours"* — holds in fewer than a quarter of own-act summaries, and first person in none:
+
+```
+event summaries, accepted mem calls       r16   r17   r18   r19
+  beginning "wanda …"                      62    82    78    65
+  an own act with no actor ("flagged …")   18    26     3    16
+  beginning "I" or "we"                     0     0     0     0
+```
+
+First person appears in 19 of the roughly 6,600 summaries, bodies, notes and expectations sessions wrote in those rounds, 15 of them in 19B's first 27 arrivals, after which that run too wrote *"told wanda"*. Some sessions take "voice" to mean whose act it is: 18A, arrival 71, says it will *"record my own flag as an event in my voice, per the enrich instructions"*, and writes `--summary "Wanda told mei the Station Eleven suggestion isn't in her records…"`. Others that say the same thing write the act with no actor (17A arrival 26, 19A arrival 7).
+
+Nothing shows the form the instruction asks for. The commit that wrote it, e46a8a6, removed the skill's two worked command examples because they carried the corpus's content; their summaries named no actor only because an `--actor wanda` flag carried it, and the same commit dropped the flag. The only examples a session now meets are earlier sessions' notes, and those carry the form forward a little: after a note beginning "wanda" the next own-act note repeats it 93% of the time, against 88% expected from each run's mix alone, and after one with no actor 57%, against 43%. Only flags, tellings and suggestions are ever written with no actor; recommendations and reminders are always "wanda …", and they cluster late in the history.
+
+The lab has not seen the third person cost recall. Text makes no edges, so wanda's node has 0 to 5 edges in every final store; "wanda" is in 36 to 74% of each store's nodes, so search gives it little weight; and the 16 checkpoints in rounds 17 and 18 that ask about her own words were all hits — at arrival 117 a bare book title read from third-person notes, at arrival 140 a first-person answer, taken in about half the runs from `mem session` or a trajectory. What it costs is the measurement. The product's sessions are told who they are and the lab's are left to infer it, so a finding about voice, or about how a session treats its own commitments, may not carry over.
+
+**Fix.** One sentence telling the session it is wanda, where the product says it: at the top of the arrival prompt (`arrival.rs:28`), run as a round of its own so the difference can be read against round 19. The voice is decided after that. If the third person survives and is wanted, `root.md:11`, `root.md:19`, the enrich skill's step 5 and the seed node's text say what sessions do. If the own voice is wanted, it needs an example with placeholders in step 5, and the surfaces above changed with it.
+
 ### 40. Two of the nine kinds are all but unexercised, so no round says much about them
 
 The store has nine kinds (`memory/src/fm.rs:15`). Across eight runs — rounds 16 and 17, 1,127 sessions — a `group` is created in one run and a `thing` in two, and never more than a handful:
@@ -83,6 +106,14 @@ It cost nothing measurable in round 18: of 40 non-hits where a live node reached
 
 **Fix.** In `bare_ref` / `resolve`: take a leading id before a name with no separator, accept `pref` and a kind's directory name as the kind, and split several ids in one string.
 
+### 51. A session whose output is refused can end on a placeholder, and the checkpoint is lost
+
+A session hands back its answer through Claude Code's structured output, which refuses a submission that does not match the schema. 19B, arrival 103, a checkpoint: the session wrote a full answer three times and each time put the `recorded` field inside the `answer` string as text — `…</answer>\n<parameter name="recorded">[…]` — so no submission had a `recorded` field, and each was refused; the first also carried a stray `"skill": "enrich"` field, left from the skill it had just loaded. Its fourth submission was `{"recalled": ["test"], "answer": "test", "recorded": ["test"]}`, which was accepted and ended the session.
+
+The run flagged it — `placeholder output 2026-08-11: ["answer", "recalled", "recorded"]` — and judge leaves a flagged record unscored, so 19B is scored on 53 checkpoints and the other three round-19 runs on 54. The one other placeholder in rounds 18 and 19, 18D arrival 99, put `"placeholder"` in `recorded` in its only submission, which was accepted. It was not a checkpoint, so it cost nothing; had it been one, judge would have skipped it too, since it skips any flagged record whichever field was flagged.
+
+**Fix.** When a session's final output is a placeholder and its transcript shows an earlier refused submission, resume it once (`claude -p --resume <sid>` with the same schema), with a message that names the mistake rather than repeating the refusal, which this session read three times without correcting. Detecting the refusal means reading the transcript: the tools log leaves out structured-output calls (`memory/src/transcript.rs:396`). At one checkpoint in two rounds, leaving it and reading the unscored line is also defensible.
+
 ## What a session cannot do, or does wrongly
 
 `mem` accepts the call and does something other than what was asked.
@@ -135,6 +166,25 @@ The store is not wrong about something it was never told. It is wrong about a fi
 Nothing `mem` can check after the fact distinguishes a mangled `00` from a real one. What it can do is show its work: `ok event:2026-06-02-c6f33a` says nothing about what was stored, so a session has no cheap way to see the loss. Printing the summary back on the `ok` line would have made every one of these visible at the moment it happened.
 
 **Fix.** Echo the stored summary on the `ok` line of every verb that writes one.
+
+### 49. `mem session` lists the exchange in progress as an earlier one that went unanswered
+
+The transcripts `mem session` reads include the one the calling session is writing, which has no answer yet. The listing prints it like any other, with `(silent)` for the answer (`memory/src/transcript.rs:338`), and nothing marks it as the caller's own. In rounds 16 to 19, 162, 181, 149 and 147 of each round's 564 sessions (four runs of 141) were shown their own exchange this way; round 16's Python `mem.py` printed the same line.
+
+A session that takes it for an earlier exchange concludes it has already met this arrival. At least 32 sessions across the four rounds — 7, 4, 10 and 11 — named their own session id as an earlier exchange in what they wrote, and a few more said so without the id. What that costs is capture. 16D's session `1b625ad7` recorded nothing: *"this is the third time today mei has told wanda the same thing (sessions 8ec96d41 and 1b625ad7 already hold it verbatim)"*. And 19C, arrival 138:
+
+```
+$ mem session --with "mei" --last 3
+…
+7fdb8221  2026-09-14  mei: morning wanda
+          wanda: (silent)
+```
+
+`7fdb8221` is the session running the command. It wrote *"this was a plain greeting, already answered the same way earlier today"* and recorded nothing. A reminder to mei was due that day and was not given either, but for another reason: the session's search for anything due matched dates written in digits, and the reminder's trajectory says *"14 Sept"*. The 19B session on the same arrival misread its own exchange the same way, found the trajectory, and gave the reminder.
+
+`mem` knows who is calling: `MEM_SESSION` is read at `memory/src/bin/mem.rs:284` to stamp `made:` on every node.
+
+**Fix.** Mark the caller's own exchange wherever it is listed or shown — *"this session, in progress"* in place of `(silent)` — or leave it out of listings.
 
 ### 44. `rename` reports a name it did not store
 
@@ -199,6 +249,25 @@ It survives in the session transcript, which is the belt — but the store, whic
 ```
 
 **Fix.** Decide what `--because` is for now that a retraction removes rather than annotates; document it or remove it. Drop "dated" from the skill.
+
+### 50. The exchange rule contradicts itself on a flag, and questions put to wanda are still filed
+
+`root.md:9`: *"That someone asked you something, greeted you, or was told something is in the session transcript for a month, and is not a node; a node is what came out of it."* The next paragraph, `root.md:11`, says *"what you suggested, flagged, promised or did is as much a fact as what you were told"*, and the enrich skill's step 5 files *"a suggestion, a claim, or a flag — the fact of it, as an event"*. A flag is someone being told something, so on wanda's own tellings the standing text says two things. Sessions follow step 5 and file their flags; no example shows where a flag stops being an exchange.
+
+On questions and greetings the two texts agree — `root.md:9`, and step 5's *"Nothing for a greeting, an acknowledgement, a question you were asked"* (`enrich.md:41`) — and sessions still file some:
+
+```
+final vaults, four per round                                     r16   r17   r18   r19
+event nodes                                                      400   450   352   248
+  summary opens "<someone> asked / messaged / DM'd / greeted wanda"  19    18    17     9
+  the same phrase anywhere in the summary                         21    20    26    11
+```
+
+For example 18D *"Mei asked wanda whether anything was planned for her birthday"*. The count is a pattern on the summary: it misses exchanges that do not name wanda (17A *"mei asked what's on file for September holiday cover"*), and the second row catches some that lead with the fact and add the question after it (*"fan says he's booking Dara for both weeks of the nursery closure, asked wanda to log it as sorted"*). A broader pattern — any summary where someone speaks to wanda or she to them — gives 14 to 35 per store. Round 15 reported 30 to 55 per store (`docs/memories-implementation-plan.md:161`) with the same rule in force, by a method not recorded, so whether the habit has shrunk is not established.
+
+Some of these carry something real. At arrival 141, 18A and 18D passed Jane's message on to fan; both had opened an undertaking to tell him, and took the "gone quiet" detail from the event (18A *"Jane DM'd wanda: fan's gone quiet on her, asked if he's alright and free the weekend of 3 Oct"*). 18B and 18C held the same event without the undertaking and did not pass it on.
+
+**Fix.** Say the line in `root.md:9`, with a contrast in placeholders: a question or greeting is not a node; what it told you is, filed under the fact, with who said it in the body; what you yourself suggested, flagged or promised is, as step 5 says. Make `enrich.md:41` point to it rather than restate it.
 
 ## Found in round 16
 
