@@ -50,10 +50,11 @@ enum Cmd {
         #[arg(long, required = true,
               value_parser = ["person","place","org","group","thing","topic"])]
         kind: String,
-        /// the label; the same name is the same node
-        #[arg(long, required = true)]
+        #[arg(long, required = true,
+              help = format!("the label, at most {} characters; the same name is the same node", memory::SUMMARY_MAX))]
         name: String,
-        #[arg(long, default_value = "")]
+        #[arg(long, default_value = "",
+              help = format!("the index line: one line, at most {} characters", memory::SUMMARY_MAX))]
         summary: String,
         #[arg(long, default_value = "")]
         body: String,
@@ -66,7 +67,8 @@ enum Cmd {
     },
     /// record something that happened and stays true; not a message
     Event {
-        #[arg(long, required = true)]
+        #[arg(long, required = true,
+              help = format!("the index line: one line, at most {} characters", memory::SUMMARY_MAX))]
         summary: String,
         #[arg(long, default_value = "")]
         body: String,
@@ -99,7 +101,8 @@ enum Cmd {
         /// whose preference it is
         #[arg(long, required = true)]
         whose: String,
-        #[arg(long, required = true)]
+        #[arg(long, required = true,
+              help = format!("the index line: one line, at most {} characters", memory::SUMMARY_MAX))]
         summary: String,
         #[arg(long, default_value = "")]
         body: String,
@@ -114,7 +117,8 @@ enum Cmd {
     },
     /// open something mid-sequence
     Trajectory {
-        #[arg(long, required = true)]
+        #[arg(long, required = true,
+              help = format!("the index line: one line, at most {} characters", memory::SUMMARY_MAX))]
         summary: String,
         #[arg(long, default_value = "")]
         body: String,
@@ -144,10 +148,11 @@ enum Cmd {
     /// give a node a new name or summary; its id and every edge to it stay
     Rename {
         node: String,
-        #[arg(default_value = "")]
+        #[arg(default_value = "",
+              help = format!("a new name, at most {} characters", memory::SUMMARY_MAX))]
         name: String,
-        /// a new summary — the index line — instead of or as well as a new name
-        #[arg(long, default_value = "")]
+        #[arg(long, default_value = "",
+              help = format!("a new summary — the index line, at most {} characters. An event, a thread or a rule is named by its summary: give it one or the other, not both", memory::SUMMARY_MAX))]
         summary: String,
         #[arg(long, default_value = "")]
         because: String,

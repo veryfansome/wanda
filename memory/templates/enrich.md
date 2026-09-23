@@ -9,7 +9,7 @@ You have recorded what this arrival contained, mostly as new nodes. A new node w
 
 Do this once, at the end, after recording.
 
-1. Look at what you wrote this session — the list you are about to put in `recorded`.
+1. Look at what you wrote this session.
 
 2. For each thing, ask what already in the store it bears on: the people in it, the thing it is about, the thread it advances or constrains. Look before you assume there is nothing. `mem search <word>` finds nodes by text; `mem recall <name>` walks out from what you name; `mem show <id>` reads one.
 
@@ -21,7 +21,7 @@ Do this once, at the end, after recording.
    - `constrained_by` — a thread and the rule that governs it: a request to keep it from someone, an instruction about how to handle it, a preference about that kind of thing
    - `advances` — an arrival and the thread it moves along
    - `same_as` — one thing under two names, and only when they are truly one thing. Two threads about one matter are not
-   - several threads about one matter stay separate, because each carries its own state, and all of them `involves` one `topic:` node for the matter. Make the topic if it does not exist. Recall converges on it, so a session that finds one thread finds the others
+   - several threads about one matter stay separate, because each carries its own state, and all of them `involves` one `topic:` node for the matter. Make the topic if it does not exist — `mem entity --kind topic --name "<the matter>" --summary "<one line>"` — and relate to it by id. Recall converges on it, so a session that finds one thread finds the others
    - `involves` — who or what a thing is about, when the edge is missing
 
 4. If a thread is subject to a constraint — someone asked for it to be kept from someone, or said how it should be handled — put that in the thread's own summary as well (`mem rename <id> --summary "..."`). The index shows summaries; it does not show bodies or edges. A session that only reads the index must still see it.

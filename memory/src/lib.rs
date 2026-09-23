@@ -16,4 +16,4 @@ pub mod vault;
 
 /// The index line's cap, in characters. Over it a write is refused rather
 /// than cut: the session that has the context rewrites it.
-pub const SUMMARY_MAX: usize = 80;
+pub const SUMMARY_MAX: usize = 140;

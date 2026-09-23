@@ -67,9 +67,9 @@ pub fn one_line(text: &str) -> String {
 /// One line within the cap, cut at a word and marked as cut. For text nobody
 /// is around to rewrite — a migration; a session gets a refusal instead.
 ///
-/// The cap counts characters, not bytes: a summary of 82 characters can be 85
-/// bytes, and cutting at byte 80 would both cut in the wrong place and split a
-/// character in half.
+/// The cap counts characters, not bytes: a summary with an em dash in it is
+/// longer in bytes than in characters, and cutting at the cap's byte count
+/// would both cut in the wrong place and split a character in half.
 pub fn clip(text: &str, cap: usize) -> String {
     let t = one_line(text);
     if t.chars().count() <= cap {

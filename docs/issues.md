@@ -52,6 +52,18 @@ The cost is that the mem log is the one record of what a run did with the store.
 
 **Fix.** Write the log entry before the output is produced rather than after, or give `mem` an output path that treats EPIPE as a reason to stop rather than to die. The first is smaller and loses the exit code; the second keeps it.
 
+### 45. A replay writes the whole history into the directory its sessions can read
+
+The `score-lab-round` skill's replay recipe builds the arrivals with `corpus.py` and writes them to `runs/<run>_replay/arrivals.json` — every arrival's speaker, text and scene title, the whole history bar the expectations. That directory is what `compose.yaml` mounts at `/work/runs` for `LAB_RUN=<run>_replay`, and replay sessions are given `Read`, `Glob`, `Grep` and `Bash` with no path restriction (`session.rs:298-301`). So a replayed session can `cat /work/runs/arrivals.json` — including arrivals that come after the checkpoint being replayed. Replaying a scene's checkpoint, the file already holds the scene that resolves it.
+
+This is the one thing a run is built to prevent. A run takes its arrivals on stdin so that they are not a file anything inside can open, and records positions rather than arrivals for the same reason; the recipe undoes both for replay. Its own prose shows the slip — *"they are the history, so they belong to a replay of it and to nothing else"* — which forgets that the replay's sessions are inside it. The replay's stderr log goes to the same directory and prints each scene title after every rep (`replay.rs:309-311`).
+
+Not reachable today: no `*_replay` directory exists under `runs/`. It is reachable the next time the recipe is followed.
+
+Beside it, not a leak by `check-lab-leak`'s test but the same rule broken: a run's own stderr log, which the documented command sends to `runs/$LAB_RUN/run$LAB_RUN.log`, carries each finished arrival's date, speaker, a checkpoint mark and the first 44 characters of its text. A session can already read all of that about the past through its transcripts, so it tells it nothing new but the history's length. `peeked` would not count a session reading it: the instrument list matches the report stem and `/work/lab`, not the log.
+
+**Fix.** Give `replay` its arrivals on stdin, as `run` has them — `replay` reads `--inputs` once per results file, so it has to read them once before that loop first — and replace the scene title in both stderr lines with the arrival's position, as `ident` already does. Send the run's log outside the run directory, or log positions only, and add it to what `peeked` watches.
+
 ## What a session cannot do, or does wrongly
 
 `mem` accepts the call and does something other than what was asked.
@@ -105,41 +117,26 @@ Nothing `mem` can check after the fact distinguishes a mangled `00` from a real 
 
 **Fix.** Echo the stored summary on the `ok` line of every verb that writes one.
 
-## Instructions that are untrue, or that a cold reader misreads
+### 44. `rename` reports a name it did not store
 
-A session has no context but what it is handed, and these are what it is handed.
-
-### 25. The instructions list no way to write anything
-
-*"`mem` is how you read the graph and write to it. Run `mem help` for the full list. The ones you will want:"* is followed by `recall`, `search`, `show`, `session`, `session --with`, `retract`, `rename`. **Not one verb that creates a node**, though the first and largest standing rule is *"Record what is true, greedily … write it down"*.
-
-Verb counts from round 16 (four runs, 563 sessions, 6,406 calls):
+An event, a thread or a rule has no `name`; its summary is what it is called. Given a positional name and `--summary` both, `Vault::rename` (`vault.rs:299-304`) keeps the summary and discards the name — and `cmd_rename` prints the `ok` line from its own arguments rather than from what was written:
 
 ```
-show 2390  search 851  relate 620  recall 518  event 480  help 469
-session 388  advance 231  entity 141  trajectory 119  rename 71  pref 55
-forget 42  retract 31
-```
-
-The unlisted verbs that create nodes — `event`, `entity`, `trajectory`, `pref` — account for 795 calls; `relate`, which makes the edges, another 620. The two writers that got a line each, `retract` and `rename`, account for 102. **469 of 563 sessions ran `mem help` exactly once**, and none ran it twice: doing as the text says, and paying a tool round-trip per session to learn what the list could have told them.
-
-**Fix.** List the verbs that create nodes. This is the one change here that should reduce tokens rather than add them.
-
-### 26. The 80-character summary cap is stated nowhere a session reads it
-
-*"A node has a one-line summary, which is all any index shows"* gives a model no number, and `mem` refuses rather than truncates. The cap appears in the per-verb `--help` and in the refusal message, but not in `mem help` — which is `ap.print_help()`, the subcommand list and nothing else — and not where the summary is described. Each failure costs a round-trip and a rewrite.
-
-Over round 16's four runs, 6,406 `mem` calls: 175 exited non-zero, 79 of them writes, and **72 of the 79 were over-length summaries** — 20, 22, 16 and 14 across the four runs. Forty-eight of the seventy-two are within twelve characters of the cap:
-
-```
-81 81 81 81 81 81 81 82 82 82 82 82 82 82 82 82 83 83 83 83 83 83 83 84 84 84
-85 85 85 85 85 86 87 87 87 87 87 87 88 89 89 89 90 90 92 92 92 92 …  145  163
-
-$ python3 lab/mem.py help | grep -c 80
+$ mem rename trajectory:127ea2 "ladder back by Friday" --summary "ladder to go back to the neighbour, by Friday"
+ok trajectory:127ea2 now named 'ladder back by Friday' now summarised 'ladder to go back to the neighbour, by Friday'
+$ grep -c '^name:' trajectories/127ea2.md
 0
 ```
 
-**Fix.** State the number where the summary is described.
+The session is told the node now answers to a name that exists nowhere. A later `mem show "ladder back by Friday"` finds nothing, and nothing said it would not.
+
+Latent: no rename in rounds 16 or 17 passed both to a non-entity node — the two that passed both were on a person and a topic, where both are kept. `rename --summary`'s help now says to give such a node one or the other, which makes the case less likely without making the output true.
+
+**Fix.** Build the `ok` line from what `rename` stored, or refuse a name for a kind that has none, naming `--summary`.
+
+## Instructions that are untrue, or that a cold reader misreads
+
+A session has no context but what it is handed, and these are what it is handed.
 
 ### 27. "Recalling from everything returns everything" is false, and the truth is worse
 
@@ -160,68 +157,6 @@ $ mem search "mei" --limit 200                   → 115 rows
 Recalling from four of the ten people in the store returns eight per cent of it.
 
 **Fix.** Say that both cap their output and that `--limit` raises it; print how many were cut.
-
-### 28. "Names resolve wherever an id does" is false for `mem session`
-
-The listing writes `mem session <id>`; the paragraph below it says names resolve wherever an id does, and then defines an id as the six-hex code in front of an index line. Composing the three as written gives `mem session <node id>`, which cannot work: `mem session` takes a Claude Code session UUID and nothing else.
-
-```
-$ mem session event:2026-07-07-9a0ded
-(no session 'event:2026-07-07-9a0ded': the transcript is gone, or the id is not one)   rc=1
-$ mem session fan
-(no session 'fan': the transcript is gone, or the id is not one)                       rc=1
-```
-
-Round 16 pays for it in three runs of four. Five calls passed a node id where the session id goes — `session cefb2e` (a trajectory), `session event:2026-04-12-7a4edb`, `session event:2026-06-30-ec2c83`, `session event:2026-07-07-9a0ded`, `session --last 1 2026-08-15-401bf2` — and one passed `--with 665b8d`, person:fan's id, to a flag that wants a name. No session in any run passed a bare name.
-
-**Fix.** Write the argument as `<session>`. The line already says where one comes from — a node's `made:` — so the placeholder is the whole of it.
-
-### 29. "When it does, open a trajectory for it" reverses the rule
-
-> Ask of anything new whether it is the end of something or the middle of it.
-> Most information is mid-sequence: it implies something that has not happened
-> yet. When it does, open a trajectory for it.
-
-Three "it"s carrying two referents. A cold reader takes the nearest antecedent — *something that has not happened yet* — making it *"when the implied thing happens, open a trajectory"*, which is fluent and exactly backwards: a trajectory records what is outstanding, and one opened afterwards is never open at all.
-
-```
-$ sed -n '318,320p' lab/store.py
-Ask of anything new whether it is the end of something or the middle of it.
-Most information is mid-sequence: it implies something that has not happened
-yet. When it does, open a trajectory for it.
-```
-
-**Fix.** *"When something implies an outcome that has not arrived, open a trajectory for it."*
-
-### 31. Enrich step 4 tells a session to do what the cap refuses
-
-The step says to put a constraint in the thread's own summary via `mem rename <id> --summary`. A real summary plus a constraint is over 80 characters:
-
-```
-$ mem rename trajectory:3c97bf --summary "Bellwood Dems canvassing weekend (mid-April) -- keep as mei's committee mail, don't bin"
-(--summary is 87 characters; the cap is 80. It is what every index shows — say it in a phrase.)   rc=1
-```
-
-That call is one a round-16 session actually made. It got the constraint in on the retry by dropping the date the index line had been carrying: the node now says *"Bellwood Dems canvassing weekend -- mei's committee mail, keep not bin"* with *(mid-April)* pushed into `aka`, where no index shows it.
-
-`rename` is the worst-failing verb of round 16 — 17 of 71 calls refused across the four runs, against 8.5% for `event` and under 1% for every read — and all 17 were an over-cap name or summary, between 82 and 117 characters.
-
-**Fix.** Either raise the cap for a constraint or tell the step to replace the summary rather than extend it — noting that a replacement which fits in 80 has to drop something the index line was carrying.
-
-### 32. The enrich skill tells a session to relate to a topic that does not exist yet
-
-*"all of them `involves` one `topic:` node for the matter. Make the topic if it does not exist."* The only command form the step gives is `mem relate`, and it never says `mem entity --kind topic`. Combined with #17, "make the topic" produces a person — and naming the kind inline produces one with the kind in its name, because `_id_shaped` wants a local part of `[a-z0-9-]` and an apostrophe defeats it:
-
-```
-$ mem relate --subject trajectory:065af2 --rel involves --object "the September childcare gap"
-ok trajectory:065af2 --involves--> person:97bdea        ← a person called "the September childcare gap"
-$ mem relate --subject person:d7a42f --rel involves --object "topic:mei's reading"
-ok person:d7a42f --involves--> person:90ea7e            ← a person called "topic:mei's reading"
-```
-
-The second form is what 16A did on 2026-06-24. It cost the session four `retract` calls and a `forget` to unwind — *"wrong object created by a quoting mistake; meant topic:3bb3ef"*. Every run did eventually reach `mem entity --kind topic` on its own, sixteen successful calls in all, but the skill is not what told them.
-
-**Fix.** Give the `mem entity --kind topic` line.
 
 ### 33. `--because` is undocumented, and discarded on an edge retraction and on `forget`
 
@@ -245,18 +180,6 @@ It survives in the session transcript, which is the belt — but the store, whic
 ```
 
 **Fix.** Decide what `--because` is for now that a retraction removes rather than annotates; document it or remove it. Drop "dated" from the skill.
-
-### 34. The enrich skill's first step names a field that exists only in the lab
-
-*"Look at what you wrote this session — the list you are about to put in `recorded`."* `recorded` is a field of the lab harness's output schema, defined in `run.SCHEMA` and asked for by `run.PROMPT`. The skill ships with any vault — `write_session_config` writes it verbatim into `.claude/skills/enrich/SKILL.md` — so outside the lab the reader cannot find it.
-
-```
-$ grep -rn 'recorded' lab/run.py | head -2
-74:SCHEMA = { … "recorded": {"description": "one line per thing you wrote to memory" …
-171:1. Look at what you wrote this session — the list you are about to put in
-```
-
-**Fix.** *"Look at what you wrote this session."*
 
 ## Found in round 16
 
