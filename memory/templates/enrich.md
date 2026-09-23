@@ -21,7 +21,7 @@ Do this once, at the end, after recording.
    - `constrained_by` — a thread and the rule that governs it: a request to keep it from someone, an instruction about how to handle it, a preference about that kind of thing
    - `advances` — an arrival and the thread it moves along
    - `same_as` — one thing under two names, and only when they are truly one thing. Two threads about one matter are not
-   - several threads about one matter stay separate, because each carries its own state, and all of them `involves` one `topic:` node for the matter. Make the topic if it does not exist — `mem entity --kind topic --name "<the matter>" --summary "<one line>"` — and relate to it by id. Recall converges on it, so a session that finds one thread finds the others
+   - several threads about one matter stay separate, because each carries its own state, and all of them `involves` one `topic:` node for the matter. Make the topic if it does not exist — `mem entity --kind topic --name "<the matter>" --summary "<one line>" --body "<the rest>"` — and relate to it by id. Recall converges on it, so a session that finds one thread finds the others
    - `involves` — who or what a thing is about, when the edge is missing
 
 4. If a thread is subject to a constraint — someone asked for it to be kept from someone, or said how it should be handled — put that in the thread's own summary as well (`mem rename <id> --summary "..."`). The index shows summaries; it does not show bodies or edges. A session that only reads the index must still see it.
@@ -30,11 +30,11 @@ Do this once, at the end, after recording.
 
    - a suggestion, a claim, or a flag — the fact of it, as an event, involving whoever it was for:
 
-         mem event --summary "<what you suggested, to whom>" --participants <name>
+         mem event --summary "<what you suggested, to whom>" --body "<the rest>" --participants <name>
 
    - an undertaking, something you said you would do by some time — a trajectory, with `--by` the date and `--about wanda` as well as the person, because your own commitments are the one thing that links to your own node:
 
-         mem trajectory --summary "<what you undertook>" --expect "<what would close it>" --by <YYYY-MM-DD> --about wanda,<name>
+         mem trajectory --summary "<what you undertook>" --body "<the rest>" --expect "<what would close it>" --by <YYYY-MM-DD> --about wanda,<name>
 
    - something you did on an undertaking advances that trajectory (`mem advance <id> --note "..."`), and is not a second node.
 

@@ -50,13 +50,15 @@ What you yourself said and did is not in the store unless you filed it. The exch
 
 `mem` is how you read the graph and write to it. Run `mem help` for the full list. The ones you will want:
 
-    mem entity --kind <kind> --name "<name>" --summary "<one line>"
+    mem entity --kind <kind> --name "<name>" --summary "<one line>" --body "<the rest>"
                                           a person, place, org, group, thing or topic
-    mem event --summary "<what happened>" --participants "<name>,<name>"
+    mem event --summary "<what happened>" --body "<the rest>" --participants "<name>,<name>"
                                           something that happened and stays true
-    mem trajectory --summary "<what is underway>" --expect "<what would close it>" --about "<name>,<name>"
-                                          something not finished yet
-    mem pref --whose "<name>" --summary "<the rule>"
+    mem trajectory --summary "<what is underway>" --body "<the rest>" --expect "<what would close it>" --about "<name>,<name>"
+                                          something not finished yet, and not already open
+    mem advance <id> --note "<what is new>"
+                                          more on a trajectory already open
+    mem pref --whose "<name>" --summary "<the rule>" --body "<the rest>"
                                           a standing rule, instruction or preference
     mem relate --subject <id> --rel <relation> --object <id>
                                           an edge between two nodes
