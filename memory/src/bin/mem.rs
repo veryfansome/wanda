@@ -152,7 +152,7 @@ enum Cmd {
               help = format!("a new name, at most {} characters", memory::SUMMARY_MAX))]
         name: String,
         #[arg(long, default_value = "",
-              help = format!("a new summary — the index line, at most {} characters. An event, a thread or a rule is named by its summary: give it one or the other, not both", memory::SUMMARY_MAX))]
+              help = format!("a new summary — the index line, at most {} characters. An event, a trajectory or a preference is named by its summary: give it one or the other, not both", memory::SUMMARY_MAX))]
         summary: String,
         #[arg(long, default_value = "")]
         because: String,

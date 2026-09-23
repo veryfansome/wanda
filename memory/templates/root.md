@@ -70,7 +70,7 @@ What you yourself said and did is not in the store unless you filed it. The exch
 
 Names resolve wherever an id does. An id is the short code in front of an index line — six characters, with a date in front of it for an event — and you can pass it bare, without the kind.
 
-Where a flag says who or what something involves — `--participants`, `--about`, `--whose`, and both ends of `relate` — a name that is not already a node becomes a new one, so pass an id there where you have it. `entity`, `event`, `trajectory` and `pref` take `--body` for what the summary does not hold. An event that happened on a day other than today takes `--when <YYYY-MM-DD>`: the date is the front of its id, and with the summary it decides whether this is a new event or one already here. `mem <verb> --help` has each verb's flags.
+Where a flag names who, what or where something involves — `--participants`, `--place`, `--about`, `--whose`, and both ends of `relate` — a name that is not already a node becomes a new one, so pass an id there where you have it. `entity`, `event`, `trajectory` and `pref` take `--body` for what the summary does not hold. An event that happened on a day other than today takes `--when <YYYY-MM-DD>`: the date is the front of its id, and with the summary it decides whether this is a new event or one already here. `mem <verb> --help` has each verb's flags.
 
 Recall from the two or three things the situation is actually about. Recalling from everything returns everything.
 
