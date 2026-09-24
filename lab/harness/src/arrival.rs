@@ -25,7 +25,9 @@ impl Input {
     }
 }
 
-pub const PROMPT: &str = "Today is {date}.\n\n{arrival}\n\nDo two things, in this order.\n\n\
+// The product's sessions are told who they are at the top of their first
+// message (wanda/main.py); this says it in the same place.
+pub const PROMPT: &str = "You are wanda.\n\nToday is {date}.\n\n{arrival}\n\nDo two things, in this order.\n\n\
 First, work out what you already know that bears on this. Read the indexes,\n\
 navigate to what looks relevant, and use `mem recall` on the two or three\n\
 things this is actually about. Put what you found in `recalled`, most relevant\n\
@@ -86,8 +88,9 @@ pub fn prompt_for(date: &str, arrival: &str, mem: &str) -> String {
 
 /// The projection reads this prompt back out of a session's transcript. The
 /// two are checked against each other at startup, so that editing the prompt
-/// without the parser cannot quietly turn every exchange into "someone said:
-/// Today is...".
+/// without the parser cannot quietly turn every exchange into someone saying
+/// the whole prompt. The prompt without its opening line is checked too: that
+/// is the shape every transcript from before round 20 holds.
 pub fn check_prompt_shape() -> Result<(), String> {
     for chan in ["dm", "email", "thread"] {
         let inp = Input {
@@ -103,11 +106,20 @@ pub fn check_prompt_shape() -> Result<(), String> {
         for history in [vec![], vec![("probe".to_string(), "earlier".to_string()),
                                      ("wanda".to_string(), "reply".to_string())]] {
             let probe = prompt_for("2026-01-01", &arrival_text(&inp, &members, &history), "mem");
-            let got = memory::transcript::parse_prompt(&probe);
+            // cut at the date line rather than at the opener's words, so that
+            // rewording the opener cannot turn this into a second copy of the
+            // new shape
+            let old = &probe[probe.find("Today is ")
+                .ok_or_else(|| "the prompt has no date line".to_string())?..];
             let want = ("2026-01-01".to_string(), chan.to_string(), "probe".to_string(),
                         "one line\nand a second".to_string());
-            if got != want {
-                return Err(format!("the prompt and the parser disagree for {chan}: {got:?}"));
+            for (shape, p) in [("as written", probe.as_str()),
+                               ("without its opening line, as before round 20", old)] {
+                let got = memory::transcript::parse_prompt(p);
+                if got != want {
+                    return Err(format!(
+                        "the prompt and the parser disagree for {chan}, {shape}: {got:?}"));
+                }
             }
         }
     }

@@ -275,7 +275,7 @@ Misses were mostly not capture in round 18 either; what round 19 changed is that
 
 **Sessions use edges to move, and a returned node seldom reached them by an edge alone.** Across rounds 17 and 18, the last thing that named a node before a session opened it was an edge 39% of the time — a `mem recall` row past the node it named, a link in a node's frontmatter, or a "referred to by" line — against 14 to 20% for index lines; counted by where the session first met the node, the two are about level. Of the refs checkpoints returned, 13% had reached the session only by an edge. Round 19, with fewer `advances` edges, opened by an edge 35% of the time and returned 10% by an edge alone.
 
-Reading these rounds turned up issues 48 to 51. The one that bears on how every round is read is [48](issues.md): the product tells its sessions they are wanda and the lab never does, and lab sessions answer in the first person while filing their own acts as "wanda …" in about four summaries of five.
+Reading these rounds turned up issues 48 to 51. [48](issues.md) is the voice: through round 19 the lab never told its sessions they were wanda, as the product does, and they answered in the first person while filing their own acts as "wanda …" in about four summaries of five. Round 20 tells them.
 
 ## Where the work goes next
 

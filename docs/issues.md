@@ -8,29 +8,6 @@ A file-and-line reference here names the Python that was the implementation when
 
 What a run reports is not what happened, so a band cannot be read at face value.
 
-### 48. A lab session is never told it is wanda, and the product's are
-
-The product opens both of its seed messages with *"You are wanda, …"* (`wanda/main.py:103`, `wanda/main.py:126`), sent as the session's first user message. A lab session gets Claude Code's default system prompt — *"You are an interactive agent that helps users with software engineering tasks"* — with a paragraph appended about the date and about where its knowledge comes from (`lab/harness/src/session.rs:274-285`), and an arrival prompt that says *"fan says to you"* without ever naming the "you" (`lab/harness/src/arrival.rs:28-38`).
-
-So a session has to work out that it is wanda, from surfaces that point both ways. Some point at it: the vault's title, *"# wanda's memory"*, above *"These are your memories"* (`memory/templates/root.md:1`, `:11`); the seeded person node's index line, *"wanda — the assistant keeping this memory; linked only from her own commitments"* (`memory/src/index.rs:212`), present in 76 to 85% of each round's session transcripts; the enrich skill's `--about wanda`, *"your own node"*; and `root.md:19`, *"What you undertake is said and recorded under your own name"*. Others speak of her as someone else: the first line of `mem help`, *"read and write wanda's memory"* (`memory/src/bin/mem.rs:23`); `mem session`'s *"wanda said:"* and *"wanda ran:"* for the session's own past turns (`memory/src/transcript.rs:314-339`); and the thread frame's *"wanda included"* (`arrival.rs:43`).
-
-What comes out is a session that speaks as wanda and files like a clerk keeping her record. 174, 184, 171 and 189 of each round's roughly 290 non-empty answers use I, me or my, and sessions call her commitments "my own undertaking". But the own voice `root.md:11` asks for — *"an act with nobody named as doing it is yours"*, which the enrich skill says *"is what marks a note as yours"* — holds in fewer than a quarter of own-act summaries, and first person in none:
-
-```
-event summaries, accepted mem calls       r16   r17   r18   r19
-  beginning "wanda …"                      62    82    78    65
-  an own act with no actor ("flagged …")   18    26     3    16
-  beginning "I" or "we"                     0     0     0     0
-```
-
-First person appears in 19 of the roughly 6,600 summaries, bodies, notes and expectations sessions wrote in those rounds, 15 of them in 19B's first 27 arrivals, after which that run too wrote *"told wanda"*. Some sessions take "voice" to mean whose act it is: 18A, arrival 71, says it will *"record my own flag as an event in my voice, per the enrich instructions"*, and writes `--summary "Wanda told mei the Station Eleven suggestion isn't in her records…"`. Others that say the same thing write the act with no actor (17A arrival 26, 19A arrival 7).
-
-Nothing shows the form the instruction asks for. The commit that wrote it, e46a8a6, removed the skill's two worked command examples because they carried the corpus's content; their summaries named no actor only because an `--actor wanda` flag carried it, and the same commit dropped the flag. The only examples a session now meets are earlier sessions' notes, and those carry the form forward a little: after a note beginning "wanda" the next own-act note repeats it 93% of the time, against 88% expected from each run's mix alone, and after one with no actor 57%, against 43%. Only flags, tellings and suggestions are ever written with no actor; recommendations and reminders are always "wanda …", and they cluster late in the history.
-
-The lab has not seen the third person cost recall. Text makes no edges, so wanda's node has 0 to 5 edges in every final store; "wanda" is in 36 to 74% of each store's nodes, so search gives it little weight; and the 16 checkpoints in rounds 17 and 18 that ask about her own words were all hits — at arrival 117 a bare book title read from third-person notes, at arrival 140 a first-person answer, taken in about half the runs from `mem session` or a trajectory. What it costs is the measurement. The product's sessions are told who they are and the lab's are left to infer it, so a finding about voice, or about how a session treats its own commitments, may not carry over.
-
-**Fix.** One sentence telling the session it is wanda, where the product says it: at the top of the arrival prompt (`arrival.rs:28`), run as a round of its own so the difference can be read against round 19. The voice is decided after that. If the third person survives and is wanted, `root.md:11`, `root.md:19`, the enrich skill's step 5 and the seed node's text say what sessions do. If the own voice is wanted, it needs an example with placeholders in step 5, and the surfaces above changed with it.
-
 ### 40. Two of the nine kinds are all but unexercised, so no round says much about them
 
 The store has nine kinds (`memory/src/fm.rs:15`). Across eight runs — rounds 16 and 17, 1,127 sessions — a `group` is created in one run and a `thing` in two, and never more than a handful:
@@ -268,6 +245,29 @@ For example 18D *"Mei asked wanda whether anything was planned for her birthday"
 Some of these carry something real. At arrival 141, 18A and 18D passed Jane's message on to fan; both had opened an undertaking to tell him, and took the "gone quiet" detail from the event (18A *"Jane DM'd wanda: fan's gone quiet on her, asked if he's alright and free the weekend of 3 Oct"*). 18B and 18C held the same event without the undertaking and did not pass it on.
 
 **Fix.** Say the line in `root.md:9`, with a contrast in placeholders: a question or greeting is not a node; what it told you is, filed under the fact, with who said it in the body; what you yourself suggested, flagged or promised is, as step 5 says. Make `enrich.md:41` point to it rather than restate it.
+
+### 48. Sessions file their own acts as "wanda …", against the voice the standing text asks for
+
+Through round 19 a lab session was never told it was wanda; the product's sessions are told at the top of their first message (`wanda/main.py:103`, `wanda/main.py:126`). From round 20 the arrival prompt opens *"You are wanda."* (`lab/harness/src/arrival.rs:30`), the product's sentence without its role clause. Round 20 shows whether being told moves the voice.
+
+Before it, a session worked out that it was wanda from surfaces that point both ways. Some point at it: the vault's title, *"# wanda's memory"*, above *"These are your memories"* (`memory/templates/root.md:1`, `:11`); the seeded person node's index line, *"wanda — the assistant keeping this memory; linked only from her own commitments"* (`memory/src/index.rs:212`), present in 76 to 85% of each round's session transcripts; the enrich skill's `--about wanda`, *"your own node"*; and `root.md:19`, *"What you undertake is said and recorded under your own name"*. Others speak of her as someone else: the first line of `mem help`, *"read and write wanda's memory"* (`memory/src/bin/mem.rs:23`); `mem session`'s *"wanda said:"* and *"wanda ran:"* for the session's own past turns (`memory/src/transcript.rs:317-342`); and the thread frame's *"wanda included"* (`lab/harness/src/arrival.rs:45`).
+
+What came out is a session that speaks as wanda and files like a clerk keeping her record. 174, 184, 171 and 189 of each round's roughly 290 non-empty answers use I, me or my, and sessions call her commitments "my own undertaking". But the own voice `root.md:11` asks for — *"an act with nobody named as doing it is yours"*, which the enrich skill says *"is what marks a note as yours"* — holds in fewer than a quarter of own-act summaries, and first person in none:
+
+```
+event summaries, accepted mem calls       r16   r17   r18   r19
+  beginning "wanda …"                      62    82    78    65
+  an own act with no actor ("flagged …")   18    26     3    16
+  beginning "I" or "we"                     0     0     0     0
+```
+
+The table counts accepted `mem event` calls (exit 0) in each run's mem log, by the start of `--summary`, in any case: "wanda"; an own-act verb with no actor before it — flagged, told, suggested, reminded, recommended, offered, promised, raised, warned, pointed, proposed, declined — of which only the first three ever began one; or I, I'm, I've, I'd, I'll, we. First person appears in 19 of the roughly 6,600 summaries, bodies, notes and expectations sessions wrote in those rounds, 15 of them in 19B's first 27 arrivals, after which that run too wrote *"told wanda"*. Some sessions take "voice" to mean whose act it is: 18A, arrival 71, says it will *"record my own flag as an event in my voice, per the enrich instructions"*, and writes `--summary "Wanda told mei the Station Eleven suggestion isn't in her records…"`. Others that say the same thing write the act with no actor (17A arrival 26, 19A arrival 7).
+
+Nothing shows the form the instruction asks for. The commit that wrote it, e46a8a6, removed the skill's two worked command examples because they carried the corpus's content; their summaries named no actor only because an `--actor wanda` flag carried it, and the same commit dropped the flag. The only examples a session now meets are earlier sessions' notes, and those carry the form forward a little: after a note beginning "wanda" the next own-act note repeats it 93% of the time, against 88% expected from each run's mix alone, and after one with no actor 57%, against 43%. Only flags, tellings and suggestions are ever written with no actor; recommendations and reminders are always "wanda …", and they cluster late in the history.
+
+The lab has not seen the third person cost recall. Text makes no edges, so wanda's node has 0 to 5 edges in every final store; "wanda" is in 36 to 74% of each store's nodes, so search gives it little weight; and the 16 checkpoints in rounds 17 and 18 that ask about her own words were all hits — at arrival 117 a bare book title read from third-person notes, at arrival 140 a first-person answer, taken in about half the runs from `mem session` or a trajectory.
+
+**Fix.** Read round 20 per run and per half. Within a run the voice drifts one way: where the no-actor form appears it comes early and gives way to "wanda …", even for flags — 17B wrote 12 of 13 own acts with no actor in its first half and 4 of 14 in its second, 19A 10 of 11 and then 4 of 11. Count as in the table, with the no-actor row widened to every verb sessions have written after "wanda" in rounds 16 to 19 (asked, picked, held, confirmed, re-flagged and the rest), and take the share as no-actor over no-actor plus "wanda …" plus first person. In rounds 16 to 19 that share ran 0 to 64% per run and 0 to 38% in second halves, and first person was none in any run. The voice has moved if first-person own-act summaries appear in three of round 20's four runs, or if most runs' second-half share is above 38%. If it has not, the sentence may still have taken, with `root.md:19`'s *"recorded under your own name"* or `mem session`'s *"wanda said:"* now naming the actor: sessions' own text cited "own name" in 2 of rounds 16 to 19's 2,256 sessions, so asides citing it in several round-20 runs would point there. Then: if the third person survives and is wanted, `root.md:11`, `root.md:19`, the enrich skill's step 5 and the seed node's text say what sessions do; if the own voice is wanted, it needs an example with placeholders in step 5, and the third-person surfaces above changed with it.
 
 ## Found in round 16
 
