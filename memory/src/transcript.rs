@@ -28,11 +28,11 @@ pub fn project_dir(vault: &Path) -> PathBuf {
     PathBuf::from(home).join(".claude").join("projects").join(key)
 }
 
-// the shape of an arriving prompt, as the harness writes it. The harness checks
-// at startup that what it writes is what this reads, so the two cannot drift
-// apart. The opening "You are wanda." is optional because earlier rounds'
-// transcripts, written without it, are still read with this build: rebuild.py
-// replays their `mem session` calls, and reading a finished round goes through it.
+// the shape of the prompt a session is handed, as the harness writes it. The
+// harness checks at startup that this still reads it, so the two cannot drift
+// apart. The opening "You are wanda." is optional because transcripts written
+// before the prompt had it are still read with this build: rebuild.py replays
+// their `mem session` calls, and so does anyone reading back a finished run.
 static PROMPT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
     r"(?s)^(?:You are wanda\.\s*\n\n)?Today is (\d{4}-\d{2}-\d{2})\.\s*\n\n(.*?)\n\nDo two things").unwrap());
 static DM_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(

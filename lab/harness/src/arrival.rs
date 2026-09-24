@@ -25,8 +25,9 @@ impl Input {
     }
 }
 
-// The product's sessions are told who they are at the top of their first
-// message (wanda/main.py); this says it in the same place.
+// Opens by telling the session who it is, because the product's own prompts
+// open that way (wanda/main.py) and the lab should hand a session what the
+// product hands it.
 pub const PROMPT: &str = "You are wanda.\n\nToday is {date}.\n\n{arrival}\n\nDo two things, in this order.\n\n\
 First, work out what you already know that bears on this. Read the indexes,\n\
 navigate to what looks relevant, and use `mem recall` on the two or three\n\
@@ -86,11 +87,13 @@ pub fn prompt_for(date: &str, arrival: &str, mem: &str) -> String {
     PROMPT.replace("{date}", date).replace("{arrival}", arrival).replace("{mem}", mem)
 }
 
-/// The projection reads this prompt back out of a session's transcript. The
-/// two are checked against each other at startup, so that editing the prompt
-/// without the parser cannot quietly turn every exchange into someone saying
-/// the whole prompt. The prompt without its opening line is checked too: that
-/// is the shape every transcript from before round 20 holds.
+/// `mem session` shows a session what earlier sessions were told, by parsing
+/// this prompt back out of their transcripts (`memory::transcript::parse_prompt`).
+/// Run at startup, this checks that the parser still reads the prompt as it is
+/// written here, so that an edit to one without the other stops the run rather
+/// than turning every listed exchange into someone saying the whole prompt.
+/// It also checks the prompt as it was before it opened with "You are wanda.",
+/// because transcripts from those runs are still read with this build.
 pub fn check_prompt_shape() -> Result<(), String> {
     for chan in ["dm", "email", "thread"] {
         let inp = Input {
@@ -106,15 +109,16 @@ pub fn check_prompt_shape() -> Result<(), String> {
         for history in [vec![], vec![("probe".to_string(), "earlier".to_string()),
                                      ("wanda".to_string(), "reply".to_string())]] {
             let probe = prompt_for("2026-01-01", &arrival_text(&inp, &members, &history), "mem");
-            // cut at the date line rather than at the opener's words, so that
-            // rewording the opener cannot turn this into a second copy of the
-            // new shape
+            // The older prompt is this one with everything before the date line
+            // removed. Cutting at the date line, rather than removing the exact
+            // words "You are wanda.", keeps this testing the older prompt even
+            // if those words are changed later.
             let old = &probe[probe.find("Today is ")
                 .ok_or_else(|| "the prompt has no date line".to_string())?..];
             let want = ("2026-01-01".to_string(), chan.to_string(), "probe".to_string(),
                         "one line\nand a second".to_string());
             for (shape, p) in [("as written", probe.as_str()),
-                               ("without its opening line, as before round 20", old)] {
+                               ("without its opening line, as older prompts were", old)] {
                 let got = memory::transcript::parse_prompt(p);
                 if got != want {
                     return Err(format!(
