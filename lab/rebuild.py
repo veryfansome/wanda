@@ -251,7 +251,8 @@ def main() -> int:
     for c in calls:
         key = c["input_key"]
         ran_date, ran_session = ran_on(c)
-        argv, gone = [], REMOVED.get(c["cmd"], {})
+        # stripped of the flag clap refused it for, a refused call would replay as a write
+        argv, gone = [], {} if c["rc"] == 2 else REMOVED.get(c["cmd"], {})
         skip = 0
         for a in c["argv"]:
             if skip:

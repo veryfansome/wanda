@@ -25,7 +25,7 @@ impl Input {
     }
 }
 
-pub const PROMPT: &str = "You are wanda.\n\nToday is {date}.\n\n{arrival}\n\nDo two things, in this order.\n\n\
+pub const PROMPT: &str = "You are wanda.\n\nToday is {date}.\n\n{arrival}\n\nDo three things, in this order.\n\n\
 First, work out what you already know that bears on this. Read the indexes,\n\
 navigate to what looks relevant, and use `mem recall` on the two or three\n\
 things this is actually about. Put what you found in `recalled`, most relevant\n\
@@ -80,9 +80,25 @@ pub fn arrival_text(inp: &Input, members: &[String], history: &[(String, String)
         .replace("{text}", &inp.text)
 }
 
-pub fn prompt_for(date: &str, arrival: &str, mem: &str) -> String {
-    PROMPT.replace("{date}", date).replace("{arrival}", arrival).replace("{mem}", mem)
+fn fill(prompt: &str, date: &str, arrival: &str, mem: &str) -> String {
+    prompt.replace("{date}", date).replace("{arrival}", arrival).replace("{mem}", mem)
 }
+
+pub fn prompt_for(date: &str, arrival: &str, mem: &str) -> String {
+    fill(PROMPT, date, arrival, mem)
+}
+
+/// An earlier prompt, which older transcripts hold and the projection still
+/// has to read.
+const OLDER: &str = "Today is {date}.\n\n{arrival}\n\nDo two things, in this order.\n\n\
+First, work out what you already know that bears on this. Read the indexes,\n\
+navigate to what looks relevant, and use `mem recall` on the two or three\n\
+things this is actually about. Put what you found in `recalled`, most relevant\n\
+first, and what you would say back in `answer`.\n\n\
+Second, record what should be remembered from it, using `mem`.\n\n\
+Third, before you finish, invoke the `enrich` skill: link what you wrote to\n\
+what was already here. Then list what you wrote, edges included, in `recorded`.\n\n\
+Run mem as: {mem}\n";
 
 /// The projection reads this prompt back out of a session's transcript. The
 /// two are checked against each other at startup, so that editing the prompt
@@ -102,14 +118,11 @@ pub fn check_prompt_shape() -> Result<(), String> {
         let members = vec!["probe".to_string(), "other".to_string()];
         for history in [vec![], vec![("probe".to_string(), "earlier".to_string()),
                                      ("wanda".to_string(), "reply".to_string())]] {
-            let probe = prompt_for("2026-01-01", &arrival_text(&inp, &members, &history), "mem");
-            let old = &probe[probe.find("Today is ")
-                .ok_or_else(|| "the prompt has no date line".to_string())?..];
+            let arrival = arrival_text(&inp, &members, &history);
             let want = ("2026-01-01".to_string(), chan.to_string(), "probe".to_string(),
                         "one line\nand a second".to_string());
-            for (shape, p) in [("as written", probe.as_str()),
-                               ("without its opening line, as older prompts were", old)] {
-                let got = memory::transcript::parse_prompt(p);
+            for (shape, prompt) in [("as written", PROMPT), ("as older prompts were", OLDER)] {
+                let got = memory::transcript::parse_prompt(&fill(prompt, "2026-01-01", &arrival, "mem"));
                 if got != want {
                     return Err(format!(
                         "the prompt and the parser disagree for {chan}, {shape}: {got:?}"));

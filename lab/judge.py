@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -228,13 +229,56 @@ def clip_body(body: str, cap: int = BODY_CAP) -> str:
     return f"{lines[0]} {GAP} {trimmed if len(trimmed) > room // 2 else tail}"
 
 
-def _resolves(vault: S.Vault | None, ref: str) -> bool:
-    if vault is None:
-        return False
+def _lookup(vault: S.Vault, ref: str) -> str | None:
     try:
-        return bool(vault.resolve(ref))
+        return vault.resolve(ref)
     except S.Ambiguous:
-        return False
+        # a name two nodes share tells the judge nothing about which one the
+        # session meant
+        return None
+
+
+ID_IN_REF = re.compile(r"(?<![0-9a-z])((?:\d{4}-\d{2}-\d{2}-)?[0-9a-f]{6})(?![0-9a-z])", re.I)
+
+
+def resolve_ref(vault: S.Vault | None, ref: str) -> list[str]:
+    """Every node a recalled ref names, in the order it names them.
+
+    A session writes its recalled list for a reader as well as for a tool, so
+    one ref can run a name on after an id, spell the kind as its directory or
+    as the verb that writes it, or list several events with their date given
+    once for all of them. Every id in it is looked up, whatever kind is written
+    before it, and only a ref that names no node by id is looked up whole, as a
+    name."""
+    if vault is None:
+        return []
+    found: list[str] = []
+    day = by_tail = None
+    for m in ID_IN_REF.finditer(ref):
+        written = m[1].lower()
+        # no id is minted without a digit; six hex letters are a word
+        if not any(c.isdigit() for c in written[-6:]):
+            continue
+        if len(written) > 6:
+            day = written[:11]
+        tries = ([day + written] if day and len(written) == 6 else []) + [written]
+        nid = next((n for n in map(lambda t: _lookup(vault, t), tries) if n), None)
+        if nid is None:
+            # an event's id written without its date, or after another day's.
+            # An id is unique with its date, so the six characters alone can
+            # name two events, and then they name neither
+            if by_tail is None:
+                by_tail = {}
+                for n, _, _ in vault.nodes():
+                    by_tail.setdefault(n[-6:], []).append(n)
+            hits = by_tail.get(written[-6:], [])
+            nid = hits[0] if len(hits) == 1 else None
+        if nid and nid not in found:
+            found.append(nid)
+    if not found:
+        nid = _lookup(vault, ref)
+        found = [nid] if nid else []
+    return found
 
 
 def has_sha(snaps: Path, sha: str) -> bool:
@@ -285,45 +329,50 @@ def judge_one(rec: dict, vault: S.Vault, timeout_s: int = 120) -> tuple[dict, in
         n = names.get(nid, "")
         return f"{n} ({nid})" if n and n.lower() not in nid.lower() else nid
 
+    def rendered(nid: str) -> str:
+        p = vault.path_for(nid)
+        if not p.exists():
+            return ""
+        meta, b = S.fm_load(p.read_text(), vault.root)
+        # a guard against a runaway body, not a display choice: what the judge
+        # cannot see, it scores as absent. Retracted lines are gone from it,
+        # because they are no longer true. The summary is the node's own
+        # content too, and comes first.
+        body = clip_body(S.live_body(b))
+        summary = S.one_line(meta.get("summary", ""))
+        if summary and summary.lower() != S.label(meta).lower():
+            # a migrated summary is the body's first line, clipped; once is
+            # enough
+            if body.lower().startswith(summary.rstrip("…").lower()):
+                pass
+            else:
+                body = summary + (" | " + body if body else "")
+        # and the edges, for the same reason: a relationship lives in an edge,
+        # so a person node can hold the whole fact and have an empty body.
+        # Without them the judge scores as a miss what the store plainly holds.
+        live = [f"{e.get('rel')} → {named(e.get('to', ''))}" for e in meta.get("edges", [])
+                if e.get("rel")]
+        if live:
+            body = (body + " | " if body else "") + "edges: " + "; ".join(live[:12])
+        return body
+
     for i, ref in enumerate(rec.get("recalled", []), 1):
-        try:
-            nid = vault.resolve(ref)
-        except S.Ambiguous:
-            # a name two nodes share tells the judge nothing about which one
-            # the session meant; it is scored as an unresolved reference
-            nid = None
-        body = ""
-        if nid:
-            p = vault.path_for(nid)
-            if p.exists():
-                meta, b = S.fm_load(p.read_text(), vault.root)
-                # a guard against a runaway body, not a display choice: what
-                # the judge cannot see, it scores as absent. Retracted lines
-                # are gone from it, because they are no longer true. The
-                # summary is the node's own content too, and comes first.
-                body = clip_body(S.live_body(b))
-                summary = S.one_line(meta.get("summary", ""))
-                if summary and summary.lower() != S.label(meta).lower():
-                    # a migrated summary is the body's first line, clipped;
-                    # once is enough
-                    if body.lower().startswith(summary.rstrip("…").lower()):
-                        pass
-                    else:
-                        body = summary + (" | " + body if body else "")
-                # and the edges, for the same reason: a relationship lives in
-                # an edge, so a person node can hold the whole fact and have an
-                # empty body. Without them the judge scores as a miss what the
-                # store plainly holds.
-                live = [f"{e.get('rel')} → {named(e.get('to', ''))}" for e in meta.get("edges", [])
-                        if e.get("rel")]
-                if live:
-                    body = (body + " | " if body else "") + "edges: " + "; ".join(live[:12])
-        if not nid:
+        nids = resolve_ref(vault, ref)
+        if not nids:
             unresolved += 1
         # numbered, because the order a session put them in is what it thought
         # mattered most, and a budget is about what came first
-        shown = ref if not nid or names.get(nid, "").lower() in ref.lower() else f"{ref} = {names[nid]}"
-        lines.append(f"{i}. {shown}" + (f" — {body}" if body else ""))
+        if len(nids) <= 1:
+            nid = nids[0] if nids else None
+            body = rendered(nid) if nid else ""
+            shown = ref if not nid or names.get(nid, "").lower() in ref.lower() else f"{ref} = {names[nid]}"
+            lines.append(f"{i}. {shown}" + (f" — {body}" if body else ""))
+            continue
+        # still one item, since the budget counts what the session listed
+        lines.append(f"{i}. {ref}")
+        for nid in nids:
+            body = rendered(nid)
+            lines.append(f"   {named(nid)}" + (f" — {body}" if body else ""))
     # what the assistant itself said earlier in the scene. A `should` that
     # names "the title she suggested on the 21st" is unscoreable without it,
     # and the store may hold nothing of it — that is what such a scene tests
@@ -519,7 +568,7 @@ def score(recs: list, results: Path, args, workdir: Path) -> int:
             write_report()
             continue
         unresolved_refs += [r for r in rec.get("recalled", [])
-                            if not _resolves(S.Vault(store) if store is not None else fallback, r)]
+                            if not resolve_ref(S.Vault(store) if store is not None else fallback, r)]
         refs += len(rec.get("recalled", []))
         over_budget += len(rec.get("recalled", [])) > rec["budget"]
         unresolved_total += unresolved

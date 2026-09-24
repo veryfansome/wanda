@@ -303,6 +303,7 @@ impl Vault {
             new_name = String::new();
         }
         let mut notes: Vec<String> = Vec::new();
+        let mut changed = false;
         if !new_name.is_empty() && new_name != old_name {
             meta.set("name", new_name.clone());
             // the struck line below is the whole record: `by_name` reads the
@@ -315,8 +316,9 @@ impl Vault {
                 notes.push(format!("~~was summarised: {old_summary}~~"));
             }
             meta.set("summary", take_chars(&summary, SUMMARY_MAX));
+            changed = true;
         }
-        if notes.is_empty() {
+        if notes.is_empty() && !changed {
             return old.to_string();
         }
         let verb = if new_name.is_empty() { "resummarised" } else { "renamed" };
@@ -326,7 +328,9 @@ impl Vault {
             format!(" ({verb} {when}: {because})")
         };
         let note = notes.join(" ") + &why;
-        let body = if crate::text::py_strip(&body).is_empty() {
+        let body = if notes.is_empty() {
+            body
+        } else if crate::text::py_strip(&body).is_empty() {
             note + "\n"
         } else {
             format!("{}\n\n{note}\n", body.trim_end_matches(crate::text::is_py_space))

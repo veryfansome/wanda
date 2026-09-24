@@ -41,6 +41,8 @@ runs/16A/transcripts/-work-runs-vault/   every session's transcript, mounted out
 runs/16A/run16A.log                      the run's own stderr, and its last line is the run's cost
 ```
 
+The mem log has one line per invocation: the arguments as `mem` received them, after the shell, its exit code, and the date and session it ran under. From round 20, `"cut": true` marks a call whose reader left before the output ended, as `head` does, and the call still ran to the end; a `--help` answer is logged as `help` with the verb in its arguments; and a call the argument parser refused has exit code 2, which `mem` itself never returns. Earlier logs have none of these — about a hundred calls a run in round 19, and a few piped ones — and `help` there is only the bare listing.
+
 `judge.py` puts `scored16A.md` beside them. `rebuild.py` writes to `runs/16A_debug/vault` — beside the run, never inside it, because a run's directory is mounted whole into whatever session runs against it next.
 
 ## The three services
@@ -102,7 +104,7 @@ docker compose run --rm -T builder python3 /work/lab/build.py   # the checks rea
 python3 lab/lint.py --structural-only                            # free, exact, and the gate
 ```
 
-`corpus.py` drops a line it cannot parse rather than failing, so the first catches an arrival or an expectation whose shape is slightly wrong and would otherwise be silently absent from the history. The second matters because the checks read the built templates and binaries: lint against a stale build and it answers about something that is not running. The third checks the mount list, looks for a five-word span of the history quoted word for word, and looks for the experiment described to its own subject. It also plants each fault it exists to catch in a copy of the tree and reports any the checks miss. It writes findings to `lab/lint.md`, prints a count, and exits non-zero on anything it finds. It reads a binary byte by byte, so it runs anywhere, whichever platform the build was made on.
+`corpus.py` drops a line it cannot parse rather than failing, so the first catches an arrival or an expectation whose shape is slightly wrong and would otherwise be silently absent from the history. The second matters because the leak reading below reads the built templates and binaries: against a stale build it answers about something that is not running. The third checks the history itself: an arrival or an expectation that did not parse, a checkpoint with nothing to measure, dates and markers that can drift. It writes findings to `lab/lint.md`, prints a count, and exits non-zero on anything broken; notes are listed and do not fail it. It does not read the binaries, the templates or the mount list; whether anything a session can reach carries the history is the `check-lab-leak` skill's reading.
 
 Two questions remain that no mechanical check answers. Both need a model:
 

@@ -31,7 +31,7 @@ pub fn project_dir(vault: &Path) -> PathBuf {
 // the shape of an arriving prompt, as the harness writes it. The harness checks
 // at startup that what it writes is what this reads, so the two cannot drift apart.
 static PROMPT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
-    r"(?s)^(?:You are wanda\.\s*\n\n)?Today is (\d{4}-\d{2}-\d{2})\.\s*\n\n(.*?)\n\nDo two things").unwrap());
+    r"(?s)^(?:You are wanda\.\s*\n\n)?Today is (\d{4}-\d{2}-\d{2})\.\s*\n\n(.*?)\n\nDo (?:two|three) things").unwrap());
 static DM_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
     r"(?s)^(.+?) says to you, in a direct message:\n\n(.*)$").unwrap());
 static EMAIL_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
@@ -94,6 +94,11 @@ pub struct Exchange {
 impl Exchange {
     pub fn actions(&self) -> Vec<&Turn> {
         self.turns.iter().filter(|t| t.kind == "did").collect()
+    }
+
+    /// Whether the session has given its answer, which can be an empty one.
+    pub fn answered(&self) -> bool {
+        !self.answer.is_empty() || self.turns.iter().any(|t| t.kind == "answered")
     }
 }
 
@@ -296,7 +301,8 @@ fn result_text(c: Option<&Value>) -> String {
 
 /// What a session sees: the exchange's own date, and times of day only — a
 /// timestamp's date is never rendered, whatever day the reader is on.
-pub fn render(ex: &Exchange, full: bool) -> String {
+/// `in_progress` marks the caller's own exchange while it has not answered.
+pub fn render(ex: &Exchange, full: bool, in_progress: bool) -> String {
     let mut head = format!("session {}", ex.session);
     if !ex.date.is_empty() {
         head += &format!(" \u{b7} {}", ex.date);
@@ -305,6 +311,9 @@ pub fn render(ex: &Exchange, full: bool) -> String {
         head += &format!(" \u{b7} {}", ex.channel);
     }
     head += &format!(" \u{b7} {} actions", ex.actions().len());
+    if in_progress {
+        head += " \u{b7} this session, in progress";
+    }
     let mut out = vec![head, String::new()];
     let who = if ex.speaker.is_empty() { "someone" } else { &ex.speaker };
     for t in &ex.turns {
@@ -325,8 +334,13 @@ pub fn render(ex: &Exchange, full: bool) -> String {
         }
     }
     if !ex.turns.iter().any(|t| t.kind == "answered") {
-        out.push(format!("          wanda said: {}", if ex.answer.is_empty() {
-            "(nothing \u{2014} the session did not answer)" } else { &ex.answer }));
+        out.push(format!("          wanda said: {}", if !ex.answer.is_empty() {
+            &ex.answer
+        } else if in_progress {
+            "(nothing yet \u{2014} this session is in progress)"
+        } else {
+            "(nothing \u{2014} the session did not answer)"
+        }));
     }
     out.join("\n")
 }

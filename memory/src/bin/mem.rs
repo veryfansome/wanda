@@ -18,6 +18,7 @@ use memory::vault::Vault;
 use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Parser)]
 #[command(name = "mem", about = "read and write wanda's memory", disable_help_subcommand = true)]
@@ -275,6 +276,34 @@ fn civil_from_days(z: i64) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
+/// None for a date not on the calendar, which `date_or_die` lets through.
+fn days_from_civil(s: &str) -> Option<i64> {
+    let y: i64 = s.get(0..4)?.parse().ok()?;
+    let m: i64 = s.get(5..7)?.parse().ok()?;
+    let d: i64 = s.get(8..10)?.parse().ok()?;
+    let y2 = if m <= 2 { y - 1 } else { y };
+    let era = y2.div_euclid(400);
+    let yoe = y2 - era * 400;
+    let doy = (153 * ((m + 9) % 12) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let z = era * 146_097 + doe - 719_468;
+    (civil_from_days(z) == s.get(..10)?).then_some(z)
+}
+
+/// A deadline counted from the wrong today looks like any other date; its
+/// distance from the right one does not.
+fn by_from_today(by: &str) -> Option<String> {
+    let today = today();
+    let n = days_from_civil(by)? - days_from_civil(&today)?;
+    Some(match n {
+        0 => format!("(--by {by} is today, {today})"),
+        1 => format!("(--by {by} is 1 day after today, {today})"),
+        -1 => format!("(--by {by} is 1 day before today, {today})"),
+        n if n > 0 => format!("(--by {by} is {n} days after today, {today})"),
+        n => format!("(--by {by} is {} days before today, {today})", -n),
+    })
+}
+
 fn vault() -> Vault {
     // MEM_SESSION is the id this session was given; every node written here is
     // stamped with it, so a node knows the exchange that made it
@@ -296,6 +325,25 @@ fn vault() -> Vault {
     v
 }
 
+/// A write failed because the reader left, as `head` does.
+static CUT: AtomicBool = AtomicBool::new(false);
+
+/// A line to stdout. A reader that has left does not stop the command, so the
+/// call is still logged, with its exit code.
+macro_rules! out {
+    ($($a:tt)*) => { emit(&mut std::io::stdout(), format_args!($($a)*)) };
+}
+
+macro_rules! err {
+    ($($a:tt)*) => { emit(&mut std::io::stderr(), format_args!($($a)*)) };
+}
+
+fn emit(w: &mut dyn Write, line: std::fmt::Arguments) {
+    if writeln!(w, "{line}").is_err() {
+        CUT.store(true, Ordering::Relaxed);
+    }
+}
+
 /// What was actually asked of memory, recorded by the thing being asked.
 /// Reconstructing it from the outside undercounts: several `mem` calls chain
 /// into one shell command, and only the first is visible there. Never fails the
@@ -305,7 +353,7 @@ fn log(cmd: &str, rc: i32, argv: &[String]) {
     if path.is_empty() {
         return;
     }
-    let rec = serde_json::json!({
+    let mut rec = serde_json::json!({
         "ts": iso_now(),
         "input_key": std::env::var("LAB_INPUT").unwrap_or_default(),
         // the date and session this call ran under, so a rebuild reads them
@@ -314,6 +362,9 @@ fn log(cmd: &str, rc: i32, argv: &[String]) {
         "session": std::env::var("MEM_SESSION").unwrap_or_default(),
         "cmd": cmd, "rc": rc, "argv": argv,
     });
+    if CUT.load(Ordering::Relaxed) {
+        rec["cut"] = serde_json::Value::Bool(true);
+    }
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
         let _ = writeln!(f, "{}", memory::text::py_json_utf8(&rec));
     }
@@ -336,7 +387,7 @@ fn resolve(v: &Vault, r: &str) -> Result<Option<String>, i32> {
     match v.resolve(r, "") {
         Ok(x) => Ok(x),
         Err(a) => {
-            println!("({a}. Say which, by id.)");
+            out!("({a}. Say which, by id.)");
             Err(1)
         }
     }
@@ -359,10 +410,10 @@ fn cmd_recall(v: &Vault, refs: &[String], hops: i64, limit: i64) -> i32 {
     // sorted, so that what a session reads is the same whichever order it named
     // the refs in — the two streams are merged by the tool it runs this with
     for c in &complaints {
-        eprintln!("{c}");
+        err!("{c}");
     }
     if seeds.is_empty() {
-        println!("nothing to expand from");
+        out!("nothing to expand from");
         return 1;
     }
     let rows = match recall::walk(&con, &seeds, hops) {
@@ -370,12 +421,12 @@ fn cmd_recall(v: &Vault, refs: &[String], hops: i64, limit: i64) -> i32 {
         Err(_) => return 1,
     };
     if let Some(w) = recall::dangling_warning(&con) {
-        eprint!("{w}");
+        err!("{}", w.strip_suffix('\n').unwrap_or(&w));
     }
-    println!("expanded from {}: {}\n", seeds.len(),
+    out!("expanded from {}: {}\n", seeds.len(),
              seeds.iter().cloned().collect::<Vec<_>>().join(", "));
     for r in recall::take_limit(&rows, limit) {
-        println!("{}", r.line());
+        out!("{}", r.line());
     }
     0
 }
@@ -398,10 +449,10 @@ fn cmd_search(v: &Vault, text: &str, limit: i64) -> i32 {
         Some(out)
     })().unwrap_or_default();
     for (nid, name, summary, status) in &rows {
-        println!("`{nid}`{}  {}", marks(status), line_for(name, summary));
+        out!("`{nid}`{}  {}", marks(status), line_for(name, summary));
     }
     if rows.is_empty() {
-        println!("(nothing)");
+        out!("(nothing)");
     }
     0
 }
@@ -409,13 +460,13 @@ fn cmd_search(v: &Vault, text: &str, limit: i64) -> i32 {
 fn cmd_show(v: &Vault, r: &str) -> i32 {
     let nid = match resolve(v, r) {
         Ok(Some(n)) => n,
-        Ok(None) => { println!("(no node for {})", py_repr(r)); return 1; }
+        Ok(None) => { out!("(no node for {})", py_repr(r)); return 1; }
         Err(rc) => return rc,
     };
     let p = v.path_for(&nid);
     // the id is the path, not a line in the file; said here so a session
     // reading this has it to copy
-    println!("{nid}\n{}", std::fs::read_to_string(&p).unwrap_or_default());
+    out!("{nid}\n{}", std::fs::read_to_string(&p).unwrap_or_default());
     let Ok(con) = index::build_index(v, &v.root.join(".index.db")) else { return 0 };
     let back: Vec<(String, String)> = (|| {
         let mut stmt = con.prepare("SELECT src, rel FROM edges WHERE dst=?").ok()?;
@@ -424,9 +475,9 @@ fn cmd_show(v: &Vault, r: &str) -> i32 {
         Some(out)
     })().unwrap_or_default();
     if !back.is_empty() {
-        println!("referred to by:");
+        out!("referred to by:");
         for (src, rel) in back {
-            println!("  {src} --{rel}-->");
+            out!("  {src} --{rel}-->");
         }
     }
     0
@@ -439,12 +490,12 @@ fn cmd_show(v: &Vault, r: &str) -> i32 {
 fn summary_or_die(text: &str, flag: &str) -> Result<String, i32> {
     let t = one_line(text);
     if t.is_empty() {
-        println!("({flag} is empty)");
+        out!("({flag} is empty)");
         return Err(1);
     }
     let n = t.chars().count();
     if n > memory::SUMMARY_MAX {
-        println!("({flag} is {n} characters; the cap is {}. It is the index line \
+        out!("({flag} is {n} characters; the cap is {}. It is the index line \
                   — say the thing in a phrase, and put the rest in --body.)",
                  memory::SUMMARY_MAX);
         return Err(1);
@@ -462,7 +513,7 @@ fn date_or_die(s: &str, flag: &str) -> Result<String, i32> {
     static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(||
         regex::Regex::new(r"^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2})?$").unwrap());
     if !RE.is_match(s) {
-        println!("({flag} must be a date, YYYY-MM-DD; got {}. It says when, not who.)",
+        out!("({flag} must be a date, YYYY-MM-DD; got {}. It says when, not who.)",
                  py_repr(s));
         return Err(1);
     }
@@ -507,12 +558,30 @@ fn existing(v: &Vault, kind: &str, name: &str, when: &str, whose: &str, open_onl
     }
     if hits.len() > 1 {
         let listed: Vec<String> = hits.iter().map(|(id, sh)| format!("{id} ({sh})")).collect();
-        println!("({} is already more than one {kind}: {}. Say which, by id — \
-                  `--id <id>` on entity, the id itself elsewhere — or --new for another.)",
-                 py_repr(name), listed.join("; "));
+        let ways = match kind {
+            "trajectory" => "`mem advance <id>` moves one, \
+                             `mem rename <id> --summary \"...\"` tells them apart, or --new opens another",
+            "event" | "preference" => "`mem rename <id> --summary \"...\"` tells them apart, \
+                                       or --new makes another",
+            _ => "`--id <id>` updates one, `mem rename <id> \"<new name>\"` tells them apart, \
+                  or --new makes another",
+        };
+        out!("({} is already more than one {kind}: {}. {ways}.)", py_repr(name), listed.join("; "));
         return Err(1);
     }
     Ok(hits.into_iter().next().map(|(id, _)| id))
+}
+
+/// What was stored, which is not always what was passed: an existing name is
+/// kept, the clock's date rewritten, a struck line refused.
+fn stored(v: &Vault, nid: &str) -> (memory::fm::Meta, String) {
+    let text = std::fs::read_to_string(v.path_for(nid)).unwrap_or_default();
+    memory::fm::load(&text, Some(&v.root))
+}
+
+fn ok_stored(v: &Vault, nid: &str) {
+    let (meta, _) = stored(v, nid);
+    out!("ok {nid}\n  {}", line_for(&memory::fm::label(&meta), meta.get("summary")));
 }
 
 fn stub(v: &Vault, name: &str, kind: &str) -> String {
@@ -534,15 +603,15 @@ fn refs(v: &Vault, wanted: &[(String, &str, &str)]) -> Result<Vec<String>, i32> 
     let mut out: Vec<Item> = Vec::new();
     for (r, mint_kind, prefer) in wanted {
         if py_strip(r).is_empty() {
-            println!("(a blank where a name was expected)");
+            out!("(a blank where a name was expected)");
             return Err(1);
         }
         let nid = match v.resolve(r, prefer) {
             Ok(x) => x,
-            Err(a) => { println!("({a}. Say which, by id.)"); return Err(1); }
+            Err(a) => { out!("({a}. Say which, by id.)"); return Err(1); }
         };
         if nid.is_none() && memory::text::id_shaped(r) {
-            println!("(no node {}; give a name, or an id from an index)", py_repr(r));
+            out!("(no node {}; give a name, or an id from an index)", py_repr(r));
             return Err(1);
         }
         out.push(match nid {
@@ -565,6 +634,34 @@ fn refs(v: &Vault, wanted: &[(String, &str, &str)]) -> Result<Vec<String>, i32> 
     Ok(ids)
 }
 
+/// A name only a renamed node had. It may have been renamed because the name
+/// was wrong, so writing there is unsafe, and minting beside it duplicates.
+fn former_only(v: &Vault, kind: &str, name: &str) -> Result<(), i32> {
+    let want = one_line(name).to_lowercase();
+    let had: Vec<(String, String)> = v.nodes().into_iter()
+        .filter(|n| n.kind() == kind
+                && memory::fm::former_names(&n.body).iter().any(|a| a.to_lowercase() == want))
+        .map(|n| (n.id.clone(), memory::fm::label(&n.meta)))
+        .collect();
+    match had.as_slice() {
+        [] => Ok(()),
+        [(id, now)] => {
+            out!("({} is a name {id} had; it is named {} now. \
+                  --id {id} to update it, or --new for another.)",
+                 py_repr(name), py_repr(now));
+            Err(1)
+        }
+        _ => {
+            let listed: Vec<String> = had.iter()
+                .map(|(id, now)| format!("{id}, named {} now", py_repr(now))).collect();
+            out!("({} is a name more than one {kind} had: {}. \
+                  --id <id> to update one, or --new for another.)",
+                 py_repr(name), listed.join("; "));
+            Err(1)
+        }
+    }
+}
+
 /// A person, place, org, group, thing or topic. The same name again is the same
 /// node, updated — two files for one person is the failure that costs most —
 /// unless --new says it is a second one, as with two people who share a name.
@@ -572,7 +669,7 @@ fn cmd_entity(v: &Vault, kind: &str, name: &str, summary: &str, body: &str,
               new: bool, id: &str) -> i32 {
     let name = match summary_or_die(name, "--name") { Ok(x) => x, Err(rc) => return rc };
     if memory::text::id_shaped(&name) {
-        println!("(--name is the label, not an id: {}. To update a node by id, --id <id>)",
+        out!("(--name is the label, not an id: {}. To update a node by id, --id <id>)",
                  py_repr(&name));
         return 1;
     }
@@ -583,17 +680,21 @@ fn cmd_entity(v: &Vault, kind: &str, name: &str, summary: &str, body: &str,
         match resolve(v, id) {
             Ok(Some(n)) if n.starts_with(&format!("{kind}:")) => Some(n),
             Err(rc) => return rc,
-            _ => { println!("(no {kind} {})", py_repr(id)); return 1; }
+            _ => { out!("(no {kind} {})", py_repr(id)); return 1; }
         }
     } else if new {
         None
     } else {
-        match existing(v, kind, &name, "", "", false) { Ok(x) => x, Err(rc) => return rc }
+        match existing(v, kind, &name, "", "", false) {
+            Ok(None) => match former_only(v, kind, &name) { Ok(()) => None, Err(rc) => return rc },
+            Ok(x) => x,
+            Err(rc) => return rc,
+        }
     };
     let nid = nid.unwrap_or_else(|| v.mint(kind, "", None, &name));
     v.upsert(&nid, kind, &name, &summary, body, &[], &[], &today());
     regen(v);
-    println!("ok {nid}");
+    ok_stored(v, &nid);
     0
 }
 
@@ -611,7 +712,7 @@ fn cmd_event(v: &Vault, summary: &str, body: &str, when: &str, participants: &st
     if !new {
         match existing(v, "event", &summary, &when, "", false) {
             Ok(Some(dup)) => {
-                println!("(already here as {dup}; --new if this is a second one)");
+                out!("(already here as {dup}; --new if this is a second one)");
                 return 1;
             }
             Err(rc) => return rc,
@@ -637,7 +738,7 @@ fn cmd_event(v: &Vault, summary: &str, body: &str, when: &str, participants: &st
     }
     v.upsert(&nid, "event", &summary, &summary, body, &[], &edges, &today());
     regen(v);
-    println!("ok {nid}");
+    ok_stored(v, &nid);
     0
 }
 
@@ -654,7 +755,7 @@ fn cmd_relate(v: &Vault, subject: &str, rel: &str, object: &str, inverse: &str) 
                  &[Edge { rel: inverse.into(), to: sid.clone() }], &today());
     }
     regen(v);
-    println!("ok {sid} --{rel}--> {oid}");
+    out!("ok {sid} --{rel}--> {oid}");
     0
 }
 
@@ -691,7 +792,7 @@ fn cmd_pref(v: &Vault, whose: &str, summary: &str, body: &str, kind: &str,
     v.upsert(&nid, "preference", &summary, &summary, body,
              &[("ptype".to_string(), ptype)], &edges, &today());
     regen(v);
-    println!("ok {nid}");
+    ok_stored(v, &nid);
     0
 }
 
@@ -701,7 +802,7 @@ fn cmd_trajectory(v: &Vault, summary: &str, body: &str, expect: &str, by: &str,
     if !new {
         match existing(v, "trajectory", &summary, "", "", true) {
             Ok(Some(dup)) => {
-                println!("(already open as {dup}; `mem advance` moves it, --new opens a second)");
+                out!("(already open as {dup}; `mem advance` moves it, --new opens a second)");
                 return 1;
             }
             Err(rc) => return rc,
@@ -712,6 +813,7 @@ fn cmd_trajectory(v: &Vault, summary: &str, body: &str, expect: &str, by: &str,
         .map(|a| (a, "thing", "")).collect();
     let about_ids = match refs(v, &wanted) { Ok(x) => x, Err(rc) => return rc };
     let by = match date_or_die(by, "--by") { Ok(x) => x, Err(rc) => return rc };
+    let distance = by_from_today(&by);
     let nid = v.mint("trajectory", "", None, &summary);
     let edges: Vec<Edge> = about_ids.into_iter()
         .map(|a| Edge { rel: "involves".into(), to: a }).collect();
@@ -720,7 +822,10 @@ fn cmd_trajectory(v: &Vault, summary: &str, body: &str, expect: &str, by: &str,
                ("status".into(), "open".into())],
              &edges, &today());
     regen(v);
-    println!("ok {nid}");
+    ok_stored(v, &nid);
+    if let Some(line) = distance {
+        out!("{line}");
+    }
     0
 }
 
@@ -730,7 +835,7 @@ fn cmd_advance(v: &Vault, r: &str, status: &str, by: &str, note: &str) -> i32 {
     let nid = match resolve(v, r) {
         Ok(Some(n)) if n.starts_with("trajectory:") => n,
         Err(rc) => return rc,
-        _ => { println!("(no trajectory for {})", py_repr(r)); return 1; }
+        _ => { out!("(no trajectory for {})", py_repr(r)); return 1; }
     };
     let mut extra: Vec<(String, String)> = Vec::new();
     if !status.is_empty() {
@@ -747,7 +852,19 @@ fn cmd_advance(v: &Vault, r: &str, status: &str, by: &str, note: &str) -> i32 {
     }
     v.upsert(&nid, "trajectory", "", "", note, &extra, &[], &today());
     regen(v);
-    println!("ok {nid} {}", if status.is_empty() { "noted" } else { status });
+    out!("ok {nid} {}", if status.is_empty() { "noted" } else { status });
+    let (_, body) = stored(v, &nid);
+    let held = memory::text::split_lines(&body);
+    let mut shown: BTreeSet<&str> = BTreeSet::new();
+    for line in memory::text::split_lines(note) {
+        let line = line.trim_end();
+        if !line.trim().is_empty() && held.contains(&line) && shown.insert(line) {
+            out!("  {line}");
+        }
+    }
+    if let Some(line) = by_from_today(by) {
+        out!("{line}");
+    }
     0
 }
 
@@ -756,33 +873,40 @@ fn cmd_advance(v: &Vault, r: &str, status: &str, by: &str, note: &str) -> i32 {
 fn cmd_rename(v: &Vault, node: &str, name: &str, summary: &str, because: &str) -> i32 {
     let nid = match resolve(v, node) {
         Ok(Some(n)) => n,
-        Ok(None) => { println!("(no node for {})", py_repr(node)); return 1; }
+        Ok(None) => { out!("(no node for {})", py_repr(node)); return 1; }
         Err(rc) => return rc,
     };
     let name = one_line(name);
     let summary = one_line(summary);
     if name.is_empty() && summary.is_empty() {
-        println!("(give a new name, or --summary, or both)");
+        out!("(give a new name, or --summary, or both)");
         return 1;
     }
     for (text, what) in [(&name, "name"), (&summary, "--summary")] {
         let n = one_line(text).chars().count();
         if !text.is_empty() && n > memory::SUMMARY_MAX {
-            println!("({what} is {n} characters; the cap is {}. It is what every index \
+            out!("({what} is {n} characters; the cap is {}. It is what every index \
                       shows — say it in a phrase.)", memory::SUMMARY_MAX);
             return 1;
         }
     }
     v.rename(&nid, &name, &summary, because, &today());
     regen(v);
+    let kind = nid.split(':').next().unwrap_or("");
+    let named = memory::fm::ENTITY_KINDS.contains(&kind);
+    let (meta, _) = stored(v, &nid);
     let mut out = format!("ok {nid}");
-    if !name.is_empty() {
-        out += &format!(" now named {}", py_repr(&one_line(&name)));
+    if named && !name.is_empty() {
+        out += &format!(" now named {}", py_repr(meta.get("name")));
     }
-    if !summary.is_empty() {
-        out += &format!(" now summarised {}", py_repr(&one_line(&summary)));
+    if !summary.is_empty() || !named {
+        out += &format!(" now summarised {}", py_repr(meta.get("summary")));
     }
-    println!("{out}");
+    if !named && !name.is_empty() && !summary.is_empty() {
+        let a = if kind.starts_with(['a', 'e', 'i', 'o', 'u']) { "an" } else { "a" };
+        out += &format!(" ({a} {kind} is named by its summary; the name given was not kept)");
+    }
+    out!("{out}");
     0
 }
 
@@ -793,7 +917,7 @@ fn cmd_rename(v: &Vault, node: &str, name: &str, summary: &str, because: &str) -
 fn cmd_forget(v: &Vault, r: &str) -> i32 {
     let nid = match resolve(v, r) {
         Ok(Some(n)) => n,
-        Ok(None) => { println!("(no node for {})", py_repr(r)); return 1; }
+        Ok(None) => { out!("(no node for {})", py_repr(r)); return 1; }
         Err(rc) => return rc,
     };
     let back: Vec<(String, String)> = match index::build_index(v, &v.root.join(".index.db")) {
@@ -808,12 +932,12 @@ fn cmd_forget(v: &Vault, r: &str) -> i32 {
     if !back.is_empty() {
         let shown: Vec<String> = back.iter().take(6)
             .map(|(s, r)| format!("{s} --{r}-->")).collect();
-        println!("({nid} is still linked from {}. Retract those first.)", shown.join("; "));
+        out!("({nid} is still linked from {}. Retract those first.)", shown.join("; "));
         return 1;
     }
     let _ = std::fs::remove_file(v.path_for(&nid));
     regen(v);
-    println!("ok forgot {nid}");
+    out!("ok forgot {nid}");
     0
 }
 
@@ -825,13 +949,13 @@ fn cmd_retract(v: &Vault, subject: &str, rel: &str, object: &str, inverse: &str,
                line: &str, because: &str) -> i32 {
     let nid = match resolve(v, subject) {
         Ok(Some(n)) => n,
-        Ok(None) => { println!("(no node for {})", py_repr(subject)); return 1; }
+        Ok(None) => { out!("(no node for {})", py_repr(subject)); return 1; }
         Err(rc) => return rc,
     };
     let oid = if object.is_empty() { String::new() } else {
         match resolve(v, object) {
             Ok(Some(n)) => n,
-            Ok(None) => { println!("(no node for {})", py_repr(object)); return 1; }
+            Ok(None) => { out!("(no node for {})", py_repr(object)); return 1; }
             Err(rc) => return rc,
         }
     };
@@ -874,11 +998,11 @@ fn cmd_retract(v: &Vault, subject: &str, rel: &str, object: &str, inverse: &str,
     }
     if hit == 0 {
         // ok here would be a silent success: nothing matched, so nothing was unsaid
-        println!("(nothing matched, nothing retracted)");
+        out!("(nothing matched, nothing retracted)");
         return 1;
     }
     regen(v);
-    println!("ok retracted {hit}");
+    out!("ok retracted {hit}");
     0
 }
 
@@ -889,13 +1013,17 @@ fn cmd_retract(v: &Vault, subject: &str, rel: &str, object: &str, inverse: &str,
 fn cmd_session(v: &Vault, r: &str, day: &str, with_: &str, last: i64, full: bool) -> i32 {
     if !r.is_empty() {
         let Some(p) = transcript::find(&v.root, r) else {
-            println!("(no session {}: the transcript is gone, or the id is not one)", py_repr(r));
+            out!("(no session {}: the transcript is gone, or the id is not one)", py_repr(r));
             return 1;
         };
-        println!("{}", transcript::render(&transcript::load(&p), full));
+        let ex = transcript::load(&p);
+        let in_progress = !v.session.is_empty() && ex.session == v.session && !ex.answered();
+        out!("{}", transcript::render(&ex, full, in_progress));
         return 0;
     }
     let mut exchanges = transcript::load_all(&v.root);
+    // unanswered, the caller's own exchange reads as an earlier one left silent
+    exchanges.retain(|e| v.session.is_empty() || e.session != v.session);
     if !day.is_empty() {
         exchanges.retain(|e| e.date == day);
     }
@@ -912,14 +1040,14 @@ fn cmd_session(v: &Vault, r: &str, day: &str, with_: &str, last: i64, full: bool
         // which filter emptied it, and no more than that: the days a store does
         // hold would tell a caller asking about the wrong one why it is wrong
         if !day.is_empty() && on_that_day == 0 {
-            println!("(nothing on {day})");
+            out!("(nothing on {day})");
         } else {
-            println!("(no exchanges match)");
+            out!("(no exchanges match)");
         }
         return 1;
     }
     for e in &exchanges {
-        println!("{}", transcript::line(e));
+        out!("{}", transcript::line(e));
     }
     0
 }
@@ -929,19 +1057,22 @@ fn regen(v: &Vault) {
 }
 
 fn main() {
-    // Rust masks SIGPIPE at startup, so a reader that leaves surfaces as EPIPE
-    // and the default handler panics — a crash report, naming a file in the
-    // standard library, for a command that did what was asked. `mem show <id>
-    // | head` is an ordinary thing to type, and twelve calls in round 17 ended
-    // that way. Put the signal back and the process dies quietly, as `cat`
-    // does. What it cannot fix is the log: `log` below runs after the command
-    // returns, and a process killed by a signal runs no further code, so the
-    // call goes unrecorded either way. It already did — the panic unwound past
-    // `log` — but it did so loudly. This makes that loss silent, which is the
-    // price of the fix and the reason the count above was taken first.
-    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     let argv: Vec<String> = std::env::args().skip(1).collect();
-    let cli = Cli::parse();
+    // --help and a malformed call end in clap, and both are calls to log
+    let cli = match Cli::try_parse() {
+        Ok(c) => c,
+        Err(e) => {
+            if e.print().is_err() {
+                CUT.store(true, Ordering::Relaxed);
+            }
+            let rc = e.exit_code();
+            let verb = argv.first().map(String::as_str).unwrap_or("");
+            let known = <Cli as clap::CommandFactory>::command()
+                .get_subcommands().any(|c| c.get_name() == verb);
+            log(if rc == 0 { "help" } else if known { verb } else { "" }, rc, &argv);
+            std::process::exit(rc);
+        }
+    };
     let v = vault();
     // one choke point rather than per-command: every string a session passes
     // goes through restamp, so no free-text field carries a stray date past it
@@ -951,9 +1082,9 @@ fn main() {
         Cmd::Recall { refs, hops, limit } => Cmd::Recall { refs, hops, limit },
         Cmd::Search { text, limit } => Cmd::Search { text: restamp(&text), limit },
         Cmd::Show { r#ref } => Cmd::Show { r#ref: restamp(&r#ref) },
-        // `--by` and `--day` are exempt: what the scrub catches is a session
-        // writing what it takes to be now, while those hold a date somebody
-        // stated and the session copied
+        // `--by` is exempt: a deadline somebody stated can fall on the clock's
+        // date, and one counted from the clock lands after it, out of an exact
+        // match's reach. The verbs that take it say how far from today it lies
         Cmd::Entity { kind, name, summary, body, new, id } => Cmd::Entity {
             kind: restamp(&kind), name: restamp(&name), summary: restamp(&summary),
             body: restamp(&body), new, id: restamp(&id) },
@@ -980,7 +1111,7 @@ fn main() {
             subject: restamp(&subject), rel: restamp(&rel), object: restamp(&object),
             inverse: restamp(&inverse), line: restamp(&line), because: restamp(&because) },
         Cmd::Session { r#ref, day, with_, last, full } => Cmd::Session {
-            r#ref: restamp(&r#ref), day, with_: restamp(&with_), last, full },
+            r#ref: restamp(&r#ref), day: restamp(&day), with_: restamp(&with_), last, full },
         c => c,
     };
     let name = cmd.name();
@@ -1007,7 +1138,7 @@ fn main() {
         Cmd::Session { r#ref, day, with_, last, full } =>
             cmd_session(&v, r#ref, day, with_, *last, *full),
         // what the root instructions tell a session to run
-        Cmd::Help => { let _ = <Cli as clap::CommandFactory>::command().print_help(); println!(); 0 }
+        Cmd::Help => { let _ = <Cli as clap::CommandFactory>::command().print_help(); out!(""); 0 }
     };
     log(name, rc, &argv);
     std::process::exit(rc);

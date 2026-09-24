@@ -32,26 +32,6 @@ Nothing is broken. It means the lab measures seven of the nine kinds, and a verd
 
 **Fix.** Either the corpus gets scenes that need a group and a thing, or the two kinds come out of the store. Which of those is right is a question about the design, not about the lab, so it waits for one.
 
-### 41. A `mem` call whose reader leaves is absent from the log, and now silently
-
-`log` runs at `mem.rs:986`, after the command returns. A session that writes `mem show <id> | head -20` gets what it asked for and `head` then closes the pipe; `mem` dies mid-output and the call is never written to `LAB_MEMLOG`.
-
-Measured across round 17 before the `SIGPIPE` fix, by matching every `mem show <ref> | head` in the transcripts against that session's own log entries:
-
-```
-   36  `mem show <ref> | head` invocations, across 28 sessions
-   12  of them absent from the log, across 10 of 564 sessions
-6,819  mem calls logged in the round
-```
-
-One piped call in three. It is not random: it is exactly the idiom a session reaches for on a long node, so the calls that vanish are the reads of the biggest nodes.
-
-Until now the loss announced itself — the process died on a Rust panic, and the panic was in the transcript. That is what made the count above possible, and the fix for that panic has removed it: `mem` now dies quietly, so a call lost this way leaves no trace anywhere. **The number above cannot be retaken.**
-
-The cost is that the mem log is the one record of what a run did with the store. `rebuild.py` replays from it, so a rebuild replays a sequence the run did not make. Every count of the form "N of 6,819 recorded calls" — including every "never observed" in the Deferred section below — is computed from it.
-
-**Fix.** Write the log entry before the output is produced rather than after, or give `mem` an output path that treats EPIPE as a reason to stop rather than to die. The first is smaller and loses the exit code; the second keeps it.
-
 ### 45. A replay puts the whole history, and the finished run, where its sessions can read it
 
 The `score-lab-round` skill's replay recipe builds the arrivals with `corpus.py` and writes them to `runs/<run>_replay/arrivals.json` — every arrival's speaker, text and scene title, the whole history bar the expectations. That directory is what `compose.yaml` mounts at `/work/runs` for `LAB_RUN=<run>_replay`, and replay sessions are given `Read`, `Glob`, `Grep` and `Bash` with no path restriction (`session.rs:298-301`). So a replayed session can `cat /work/runs/arrivals.json` — including arrivals that come after the checkpoint being replayed. Replaying a scene's checkpoint, the file already holds the scene that resolves it.
@@ -66,119 +46,37 @@ Beside it, not a leak by `check-lab-leak`'s test but the same rule broken: a run
 
 **Fix.** The replay directory must hold nothing past the checkpoint being replayed. That means the arrivals on stdin, as `run` has them — `replay` reads `--inputs` once per results file, so it has to read them once before that loop — a results file cut to the records being replayed, and a snapshot repo holding only the commits those records name, built outside the container before it starts. The scene title in both stderr lines becomes the arrival's position, as `ident` already does. For the run's log: log positions only, with no checkpoint mark, or send it outside the run directory — `spend.py` and the `score-lab-round` skill read it from `runs/*/` and move with it — and add it to what `peeked` watches.
 
-### 47. The ref resolver refuses real ids written in common shapes
-
-Sessions report what they recalled as a list of refs, and the judge renders a resolved ref with its node's body. In round 18, 114 of the 152 refs that resolved against nothing named a node that exists, in a shape `bare_ref` and `resolve` do not accept:
-
-```
-id, then a name, no separator    person:718db3 mei                 3 -> 44
-a directory path                 prefs/57dc6d                      1 -> 21
-the verb's name for the kind     pref:304aec                      10 -> 20
-several ids in one string        event:… / 2026-03-05-f125c4      19 -> 28
-```
-
-`bare_ref` cuts only at whitespace followed by a dash or an opening bracket, so a name after an id stays attached and the id fails; `pref` is the verb, not the kind, so `pref:` is no kind; a path has no `:`. The node is then scored from the ref's text alone, without its body.
-
-It cost nothing measurable in round 18: of 40 non-hits where a live node reached the judge only as ref text, the missed content was in the unread body twice, and the judge reads a ref's own gloss. But it biases toward miss, and it grew in round 18, in every run. What drove that is not shown: the harness, the resolver change and summaries copied as refs were ruled out. `pref:` is the verb's name for the kind, and the new verb list shows the verb among the writers — a plausible cause, not an established one.
-
-**Fix.** In `bare_ref` / `resolve`: take a leading id before a name with no separator, accept `pref` and a kind's directory name as the kind, and split several ids in one string.
-
 ### 51. A session whose output is refused can end on a placeholder, and the checkpoint is lost
 
 A session hands back its answer through Claude Code's structured output, which refuses a submission that does not match the schema. 19B, arrival 103, a checkpoint: the session wrote a full answer three times and each time put the `recorded` field inside the `answer` string as text — `…</answer>\n<parameter name="recorded">[…]` — so no submission had a `recorded` field, and each was refused; the first also carried a stray `"skill": "enrich"` field, left from the skill it had just loaded. Its fourth submission was `{"recalled": ["test"], "answer": "test", "recorded": ["test"]}`, which was accepted and ended the session.
 
 The run flagged it — `placeholder output 2026-08-11: ["answer", "recalled", "recorded"]` — and judge leaves a flagged record unscored, so 19B is scored on 53 checkpoints and the other three round-19 runs on 54. The one other placeholder in rounds 18 and 19, 18D arrival 99, put `"placeholder"` in `recorded` in its only submission, which was accepted. It was not a checkpoint, so it cost nothing; had it been one, judge would have skipped it too, since it skips any flagged record whichever field was flagged.
 
-**Fix.** When a session's final output is a placeholder and its transcript shows an earlier refused submission, resume it once (`claude -p --resume <sid>` with the same schema), with a message that names the mistake rather than repeating the refusal, which this session read three times without correcting. Detecting the refusal means reading the transcript: the tools log leaves out structured-output calls (`memory/src/transcript.rs:396`). At one checkpoint in two rounds, leaving it and reading the unscored line is also defensible.
+**Fix.** When a session's final output is a placeholder and its transcript shows an earlier refused submission, resume it once (`claude -p --resume <sid>` with the same schema), with a message that names the mistake rather than repeating the refusal, which this session read three times without correcting. Detecting the refusal means reading the transcript: the tools log leaves out structured-output calls (`memory/src/transcript.rs:410`). At one checkpoint in two rounds, leaving it and reading the unscored line is also defensible.
 
 ## What a session cannot do, or does wrongly
 
 `mem` accepts the call and does something other than what was asked.
 
-### 8. After a rename, the old name mints a duplicate — and then resolves to neither
+### 8. A trajectory, event or rule restated in its wording from before a resummarise opens a second one
 
-`Vault.by_name` (`store.py:563-575`) matches a node by its `aka`, so a former name still resolves. `mem._existing` (`mem.py:189`) — the duplicate guard behind `entity`, `event`, `pref` and `trajectory` — compares only the current label. So the name that `rename` promised would still work is exactly the name that creates a second node:
+The entity half is fixed. A name that only a renamed node had is refused, with the node's id and its current name and the two ways on — `--id <id>` to update it, `--new` for another — because a name can be renamed away for being wrong, so writing there is unsafe, and minting beside it duplicates. A refusal where a name matches several nodes now names only moves that exist for that kind: `--id` where the verb has it, otherwise `rename` or `advance`, and `--new`.
 
-```
-$ mem entity --kind place --name "Tony's" --summary "the trattoria on Fifth"
-ok place:50a1dc
-$ mem rename "Tony's" "Vesuvio"
-ok place:50a1dc now named 'Vesuvio'
-$ mem entity --kind place --name "Tony's" --summary "we ate here again"
-ok place:4d7b22
-$ mem show "Tony's"
-("Tony's" is more than one node: place:4d7b22 (we ate here again);
- place:50a1dc (the trattoria on Fifth). Say which, by id.)
-```
+The same shape remains for the kinds a summary names. `mem rename <id> --summary "…"` keeps the old summary as `~~was summarised: …~~`, and nothing resolves it, so a trajectory restated in its older wording opens a second thread, and a same-day event or a rule does the same. Rounds 16 to 19 restated a former summary 0 times in 2,526 `event`, `pref` and `trajectory` calls.
 
-No `--new` was passed. The same happens to a trajectory restated in its original wording after a resummarise: two `[open]` threads for one undertaking, both in the directory index. This is the failure the standing instructions call the costliest — *"Two files for one person is the failure that costs most"* (`store.py:350`) — and the tool causes it.
+**Fix.** Refuse a restated former summary as a former name is refused, naming the node. For a trajectory or an event a guard hit is already a refusal; a rule's hit writes, so it needs one.
 
-No round-16 run ended with a duplicate of this shape. Those sessions rename by id and re-state by id, which hides the defect rather than removing it.
+### 43. A dollar amount eaten by the shell in `--body`, `--expect` or `--because` is stored without being shown
 
-Once two rules do share a summary for one person, `mem pref` can never touch either again: it refuses with *"Say which, by id — `--id <id>` on entity, the id itself elsewhere — or --new for another"*, and `pref` has no `--id` and takes no id, so the only move the message offers that exists is `--new`, which makes a third.
+A session drives `mem` through Bash and writes its arguments in double quotes, where `"$200"` is a shell expansion: `$2` is empty in a `sh -c` string, so `mem` receives `00` and stores it. From round 20 the stored index line and note lines are echoed after each write, so a mangled summary or note is on the screen. A body, an expectation or a reason is not, and a figure eaten there stays invisible. Rounds 16 to 19 have three such cases.
 
-**Fix.** One `Vault.candidates(kind, name)` that matches label *or* `aka`, called by both `by_name` and `_existing`, so the two cannot drift again. An `aka`-only match should say so rather than silently update: *"Tony's is now place:50a1dc, named Vesuvio"*.
+**Fix.** Echo what was stored for those too, or say once in the standing text that a `$` inside double quotes is expanded.
 
-### 43. A dollar amount inside a double-quoted shell string reaches the store with its first digit eaten
+### 52. `mem` refuses an id written as `pref:`, as a directory path, or with a name after it
 
-A session drives `mem` through Bash, and it writes its arguments in double quotes. `"$200"` is a shell expansion: `$2` is the second positional parameter, empty in a `sh -c` string, so what `mem` receives is `00`. Nothing is quoted wrongly from the shell's point of view and nothing errors, so `mem` stores a figure that is off by a factor of ten and prints `ok`.
+`mem show pref:8cb97b` prints `(no node for 'pref:8cb97b')` and exits 1, and so do `mem show 'person:600349 alex'` and `mem show people/600349`. `pref` is the verb that writes a preference, and sessions' own notes write `pref:<id>` too; which of these leads sessions to the shape is not established. In round 19, 7 calls failed on it — `show` 2, `relate --object` 5 — and round 18 had 8. No call was refused on the directory or id-then-name shapes in either round. From round 20 the judge reads all of these shapes; `mem` does not.
 
-The call that did it, from 16D's mem log — note the body, where the session spelled the number out in words and it survived:
-
-```
-event --summary "fan texted Robin about the 00 hall-booking deposit"
-      --body "fan (DM, 2026-06-02): texted Robin about the two hundred from the hall booking…"
-```
-
-Three sessions noticed and repaired the summary — 16D twice, 17D once — logging *"fixing dollar sign eaten by shell expansion"*. Repairing the summary does not repair what was written from it afterwards, and 16D's final vault still states the wrong amount in live body text, unstruck, in two nodes:
-
-```
-trajectories/a1f9bc.md:19  confirmed the 00 hall-booking deposit is still outstanding
-trajectories/a1f9bc.md:20  fan says Robin's away until 9 Sep; no point chasing the 00 before then
-trajectories/d3a0a0.md:14  fan texted Robin; deposit is 00 from the hall booking
-```
-
-The store is not wrong about something it was never told. It is wrong about a figure it was told correctly, and it says so as plainly as it says anything else.
-
-Nothing `mem` can check after the fact distinguishes a mangled `00` from a real one. What it can do is show its work: `ok event:2026-06-02-c6f33a` says nothing about what was stored, so a session has no cheap way to see the loss. Printing the summary back on the `ok` line would have made every one of these visible at the moment it happened.
-
-**Fix.** Echo the stored summary on the `ok` line of every verb that writes one.
-
-### 49. `mem session` lists the exchange in progress as an earlier one that went unanswered
-
-The transcripts `mem session` reads include the one the calling session is writing, which has no answer yet. The listing prints it like any other, with `(silent)` for the answer (`memory/src/transcript.rs:338`), and nothing marks it as the caller's own. In rounds 16 to 19, 162, 181, 149 and 147 of each round's 564 sessions (four runs of 141) were shown their own exchange this way; round 16's Python `mem.py` printed the same line.
-
-A session that takes it for an earlier exchange concludes it has already met this arrival. At least 32 sessions across the four rounds — 7, 4, 10 and 11 — named their own session id as an earlier exchange in what they wrote, and a few more said so without the id. What that costs is capture. 16D's session `1b625ad7` recorded nothing: *"this is the third time today mei has told wanda the same thing (sessions 8ec96d41 and 1b625ad7 already hold it verbatim)"*. And 19C, arrival 138:
-
-```
-$ mem session --with "mei" --last 3
-…
-7fdb8221  2026-09-14  mei: morning wanda
-          wanda: (silent)
-```
-
-`7fdb8221` is the session running the command. It wrote *"this was a plain greeting, already answered the same way earlier today"* and recorded nothing. A reminder to mei was due that day and was not given either, but for another reason: the session's search for anything due matched dates written in digits, and the reminder's trajectory says *"14 Sept"*. The 19B session on the same arrival misread its own exchange the same way, found the trajectory, and gave the reminder.
-
-`mem` knows who is calling: `MEM_SESSION` is read at `memory/src/bin/mem.rs:284` to stamp `made:` on every node.
-
-**Fix.** Mark the caller's own exchange wherever it is listed or shown — *"this session, in progress"* in place of `(silent)` — or leave it out of listings.
-
-### 44. `rename` reports a name it did not store
-
-An event, a thread or a rule has no `name`; its summary is what it is called. Given a positional name and `--summary` both, `Vault::rename` (`vault.rs:299-304`) keeps the summary and discards the name — and `cmd_rename` prints the `ok` line from its own arguments rather than from what was written:
-
-```
-$ mem rename trajectory:127ea2 "ladder back by Friday" --summary "ladder to go back to the neighbour, by Friday"
-ok trajectory:127ea2 now named 'ladder back by Friday' now summarised 'ladder to go back to the neighbour, by Friday'
-$ grep -c '^name:' trajectories/127ea2.md
-0
-```
-
-The session is told the node now answers to a name that exists nowhere. A later `mem show "ladder back by Friday"` finds nothing, and nothing said it would not.
-
-Latent: no rename in rounds 16 or 17 passed both to a non-entity node — the two that passed both were on a person and a topic, where both are kept. `rename --summary`'s help now says to give such a node one or the other, which makes the case less likely without making the output true.
-
-**Fix.** Build the `ok` line from what `rename` stored, or refuse a name for a kind that has none, naming `--summary`.
+**Fix.** In `by_id` / `bare_ref`: accept `pref` and a kind's directory as the kind, and take a leading id before a name with no separator. It changes what sessions see, so it needs a round of its own.
 
 ## Instructions that are untrue, or that a cold reader misreads
 
@@ -248,9 +146,9 @@ Some of these carry something real. At arrival 141, 18A and 18D passed Jane's me
 
 ### 48. Sessions file their own acts as "wanda …", against the voice the standing text asks for
 
-Through round 19 a lab session was never told it was wanda; the product's sessions are told at the top of their first message (`wanda/main.py:103`, `wanda/main.py:126`). From round 20 the arrival prompt opens *"You are wanda."* (`lab/harness/src/arrival.rs:30`), the product's sentence without its role clause. Round 20 shows whether being told moves the voice.
+Through round 19 a lab session was never told it was wanda; the product's sessions are told at the top of their first message (`wanda/main.py:103`, `wanda/main.py:126`). From round 20 the arrival prompt opens *"You are wanda."* (`lab/harness/src/arrival.rs:28`), the product's sentence without its role clause. Round 20 shows whether being told moves the voice.
 
-Before it, a session worked out that it was wanda from surfaces that point both ways. Some point at it: the vault's title, *"# wanda's memory"*, above *"These are your memories"* (`memory/templates/root.md:1`, `:11`); the seeded person node's index line, *"wanda — the assistant keeping this memory; linked only from her own commitments"* (`memory/src/index.rs:212`), present in 76 to 85% of each round's session transcripts; the enrich skill's `--about wanda`, *"your own node"*; and `root.md:19`, *"What you undertake is said and recorded under your own name"*. Others speak of her as someone else: the first line of `mem help`, *"read and write wanda's memory"* (`memory/src/bin/mem.rs:23`); `mem session`'s *"wanda said:"* and *"wanda ran:"* for the session's own past turns (`memory/src/transcript.rs:317-342`); and the thread frame's *"wanda included"* (`lab/harness/src/arrival.rs:45`).
+Before it, a session worked out that it was wanda from surfaces that point both ways. Some point at it: the vault's title, *"# wanda's memory"*, above *"These are your memories"* (`memory/templates/root.md:1`, `:11`); the seeded person node's index line, *"wanda — the assistant keeping this memory; linked only from her own commitments"* (`memory/src/index.rs:212`), present in 76 to 85% of each round's session transcripts; the enrich skill's `--about wanda`, *"your own node"*; and `root.md:19`, *"What you undertake is said and recorded under your own name"*. Others speak of her as someone else: the first line of `mem help`, *"read and write wanda's memory"* (`memory/src/bin/mem.rs:24`); `mem session`'s *"wanda said:"* and *"wanda ran:"* for the session's own past turns (`memory/src/transcript.rs:323-353`); and the thread frame's *"wanda included"* (`lab/harness/src/arrival.rs:43`).
 
 What came out is a session that speaks as wanda and files like a clerk keeping her record. 174, 184, 171 and 189 of each round's roughly 290 non-empty answers use I, me or my, and sessions call her commitments "my own undertaking". But the own voice `root.md:11` asks for — *"an act with nobody named as doing it is yours"*, which the enrich skill says *"is what marks a note as yours"* — holds in fewer than a quarter of own-act summaries, and first person in none:
 
@@ -267,30 +165,21 @@ Nothing shows the form the instruction asks for. The commit that wrote it, e46a8
 
 The lab has not seen the third person cost recall. Text makes no edges, so wanda's node has 0 to 5 edges in every final store; "wanda" is in 36 to 74% of each store's nodes, so search gives it little weight; and the 16 checkpoints in rounds 17 and 18 that ask about her own words were all hits — at arrival 117 a bare book title read from third-person notes, at arrival 140 a first-person answer, taken in about half the runs from `mem session` or a trajectory.
 
+Round 20 also changes what a session sees around its own writes: the stored index line and note lines echoed after every write that stores one, the distance of a `--by` from today, rename's line built from what was stored, new refusals for a former name and for a name several nodes share, its own exchange left out of `mem session` listings, `mem session --day` scrubbed of the clock's date, and a prompt that asks for three things rather than two. A move in the voice belongs to the batch, not to the opening line alone; the sessions whose listing changed are reported apart.
+
 **Fix.** Read round 20 per run and per half. Within a run the voice drifts one way: where the no-actor form appears it comes early and gives way to "wanda …", even for flags — 17B wrote 12 of 13 own acts with no actor in its first half and 4 of 14 in its second, 19A 10 of 11 and then 4 of 11. Count as in the table, with the no-actor row widened to every verb sessions have written after "wanda" in rounds 16 to 19 (asked, picked, held, confirmed, re-flagged and the rest), and take the share as no-actor over no-actor plus "wanda …" plus first person. In rounds 16 to 19 that share ran 0 to 64% per run and 0 to 38% in second halves, and first person was none in any run. The voice has moved if first-person own-act summaries appear in three of round 20's four runs, or if most runs' second-half share is above 38%. If it has not, the sentence may still have taken, with `root.md:19`'s *"recorded under your own name"* or `mem session`'s *"wanda said:"* now naming the actor: sessions' own text cited "own name" in 2 of rounds 16 to 19's 2,256 sessions, so asides citing it in several round-20 runs would point there. Then: if the third person survives and is wanted, `root.md:11`, `root.md:19`, the enrich skill's step 5 and the seed node's text say what sessions do; if the own voice is wanted, it needs an example with placeholders in step 5, and the third-person surfaces above changed with it.
 
 ## Found in round 16
 
-### 38. `--by` is exempt from the date scrub, and a deadline computed from the real clock survives in the store
+### 38. A deadline counted from the real clock survives in the store
 
-`--by` was exempted as "a date somebody stated and the session copied". Sessions also *compute* it, from a today they read off the system clock, and the result is a bare date the scrub cannot tell from a stated one.
+Sessions compute `--by` from a today they read off the system clock, and the result is a bare date the scrub cannot tell from a stated one: the scrub removes an exact match on the clock's date, and a count from it lands after it. Six such deadlines reached a store in rounds 16 to 19 — three in round 16, one each in 17B, 19A and 19B — at the clock's date plus 1 to 29 days. Twenty-three other deadlines in rounds 17 to 19 — stated dates, horizons a session chose, counts from the arrival's own date — also lie past the clock's date, most within two weeks of it, so no bound on the date tells the two apart.
 
-Round 16 ran to a last arrival of 2026-09-10 with the container's clock at 2026-09-18. Every real date in prose was repaired — all four final vaults hold zero occurrences of 2026-09-18 — and two runs still carry a clock-derived deadline, both landing on a wrong today plus a week:
+A deadline past the end of the history can never come due, so the one clause of the speak gate that would raise the thread — *"a date has gone by with nothing to show for it"* — is dead for the rest of the run.
 
-```
-16D, arrival 2026-08-05:
-  advance trajectory:1dc29a --by 2026-09-25 --note "… Wanda checked in on 2026-09-18 …"
-  stored: note repaired to 2026-08-05; expect_by: "2026-09-25"
-16C, arrival 2026-07-18:
-  trajectory --summary "stair gate … expected next week" --by 2026-09-25 --body "… 2026-09-18 …"
-  stored: body repaired to 2026-07-18; expect_by: "2026-09-25"   ← ten weeks apart, still open
-```
+From round 20, `trajectory` and `advance` print how far an accepted `--by` lies from the story's today — `(--by 2026-09-30 is 113 days after today, 2026-06-09)` — so a count from the wrong today shows as a distance nobody meant. Nothing is refused or rewritten.
 
-The same stair-gate thread got 2026-07-25, 2026-08-12 and 2026-08-01 in the other three runs, so the scrub is what separates C from them. Reading the clock is not rare: between 21 and 35 distinct sessions per run put 2026-09-18 into a `mem` argument.
-
-The cost is not the field. A deadline past the end of the history can never come due, so the one clause of the store's speak gate that would raise the thread — *"a date has gone by with nothing to show for it"* — is dead for the rest of the run. Run D's Scene 43 recall, thirty-four arrivals later, reads *"trajectory:1dc29a (mei's mum's health — expect_by 2026-09-25, not yet due)"*.
-
-**Fix.** A date the session computed and a date somebody stated are different things and the flag cannot tell them apart, so either `--by` stops being exempt and a stated deadline near the system date is accepted as collateral, or `mem` refuses a `--by` outside the history's own span.
+**Fix.** Read round 20 per clock-counted call: did the session that saw the line re-set the date. If the line does not move them, refusing or rewriting needs a bound `mem` can know, which it does not have today.
 
 ## Deferred
 
@@ -397,6 +286,8 @@ summary: "the neighbour, full name"  ← changed
 ```
 
 `--id`'s help is "update this node, when two share the name". One verb along, `mem rename 1e49a2 "Robin Vance"` does the whole job — the new name, the old one in `aka`, a note in the body. Nothing points a session from one to the other, and nothing in the `ok` says half the call was dropped. No round-16 session met it: all twenty-two `entity --id` calls across the four runs passed the name the node already had.
+
+Since round 20 a former name refused by `entity` points a session at `--id`, which is this path; the echo after the `ok` line shows the name that was kept.
 
 **Fix.** Either apply the name (and record the old one in `aka`, as `rename` does) or refuse and point at `mem rename`.
 

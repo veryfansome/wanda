@@ -37,10 +37,9 @@ clap = { version = "4.6.7", features = ["derive"] }
 # abi3 so one build serves every Python 3.9 and later rather than being tied
 # to the interpreter that compiled it
 pyo3 = { version = "0.27", features = ["extension-module", "abi3-py39"], optional = true }
-# dladdr, to ask the dynamic linker where the module was loaded from, and
-# signal, to put SIGPIPE back the way every other command in the image has it.
+# dladdr, for the module to ask the dynamic linker where it was loaded from.
 # Not optional: `sha2` and `getrandom` both pull it in regardless, so naming it
-# here costs nothing and the binary needs it as much as the module does.
+# here costs nothing.
 libc = "0.2"
 
 [build-dependencies]

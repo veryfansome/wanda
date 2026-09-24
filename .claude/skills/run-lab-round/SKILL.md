@@ -25,7 +25,7 @@ This skill stops when the four logs print their stats line. Scoring and reading 
 
 **The directories, by hand.** `mkdir -p runs/$LAB_RUN/transcripts`. Both are bind-mount sources, and Docker creating a missing one fails the whole command: `error while creating mount source path '.../runs/16A': chown ...: permission denied`.
 
-**The leak check.** A session that can read the history is not a measurement. `python3 lab/lint.py --structural-only` is exact and free and exits non-zero on anything it finds; the `check-lab-leak` skill is the reading that finds what the exact checks cannot.
+**The leak check.** A session that can read the history is not a measurement. The `check-lab-leak` skill is that reading, over what the build staged; run it after the build and before the round. `python3 lab/lint.py --structural-only` is free and exits non-zero on anything it finds, but it checks only the history itself — what did not parse, a checkpoint with nothing to measure, dates and markers that can drift — and reads none of what a session can reach.
 
 # The shape of the command, and why
 
