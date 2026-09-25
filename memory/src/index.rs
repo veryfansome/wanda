@@ -168,7 +168,7 @@ pub fn regenerate_indexes(vault: &Vault) -> rusqlite::Result<()> {
         lines.push(format!("- `{d}/` \u{2014} {}{extra}", rows.len()));
     }
     lines.push(String::new());
-    lines.push("Nothing else loads until I read a file in its directory.".into());
+    lines.push("Nothing else loads until a file in its directory is read.".into());
     let _ = std::fs::write(vault.root.join("CLAUDE.md"), lines.join("\n") + "\n");
 
     for (d, rows) in dirs.iter_mut() {
@@ -187,7 +187,7 @@ pub fn regenerate_indexes(vault: &Vault) -> rusqlite::Result<()> {
             out.push(format!("- `{}`{}  {}", local_id(nid), marks(status), line_for(name, summary)));
         }
         if rows.len() > INDEX_CAP_LINES {
-            out.push(format!("- \u{2026} {} more; `mem search` finds them", rows.len() - INDEX_CAP_LINES));
+            out.push(format!("- \u{2026} {} more, use `mem search`", rows.len() - INDEX_CAP_LINES));
         }
         let _ = std::fs::write(p.join("CLAUDE.md"), out.join("\n") + "\n");
     }

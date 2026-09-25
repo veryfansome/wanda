@@ -1,8 +1,12 @@
-"""wanda's own texts are written in her voice, the first person: what opens
-and continues her sessions, the paragraph in her system prompt, her triage
-rules, her skills, the help `wanda slack` prints, and the vault's standing
-texts. A text here that says "you", or names her from outside as "wanda",
-"she" or "the bot", fails."""
+"""Nothing wanda reads as her own addresses her or names her from outside:
+what opens and continues her sessions, the paragraph in her system prompt,
+her triage rules, her skills, the help `wanda slack` prints, and the vault's
+standing texts. Who she is, how she conducts herself and what she says are
+in the first person. A procedure, a tool to use or a step to take, is a bare
+imperative with no pronoun, and a paragraph or list item holding one carries
+no first-person word, so that nobody else can be read as giving her the
+order. A text here that says "you", or names her as "wanda", "she" or "the
+bot", fails."""
 
 import argparse
 import re
@@ -13,6 +17,7 @@ import pytest
 from wanda import slack_cli
 from wanda.main import (
     ANCHOR,
+    HOW_TO_REPLY,
     addressed_to_me,
     agent_seed_prompt,
     conversation_seed_prompt,
@@ -23,6 +28,7 @@ from wanda.triage import build_batch_prompt
 ROOT = Path(__file__).resolve().parent.parent
 SECOND_PERSON = re.compile(r"\byou(?:rs?|rself|rselves|['’](?:d|ll|re|ve))?\b", re.IGNORECASE)
 THIRD_PERSON = re.compile(r"\b(?:wanda|she|her|hers|herself|the bot)\b", re.IGNORECASE)
+FIRST_PERSON = re.compile(r"\bI\b|\b(?i:me|my|mine|myself)\b")
 # Not her voice: code, which is commands and flags; words in quotation marks,
 # which are someone else's; her own "I am wanda"; and the program she runs.
 NOT_VOICE = re.compile(
@@ -74,14 +80,97 @@ TEXTS = texts()
 
 
 @pytest.mark.parametrize("text", [t for _, t in TEXTS], ids=[n for n, _ in TEXTS])
-def test_her_texts_are_in_the_first_person(text):
+def test_no_text_addresses_her_or_names_her_from_outside(text):
     prose = NOT_VOICE.sub(" ", text)
     for pattern, what in ((SECOND_PERSON, "says you"), (THIRD_PERSON, "names her from outside")):
         hit = pattern.search(prose)
         assert hit is None, (
             f"{what}: {hit.group(0)!r} in {prose[max(0, hit.start() - 60):hit.end() + 60]!r}. "
-            "This is one of wanda's own texts, written as I / me / my; a person's words go in quotes"
+            "This is one of wanda's own texts: who she is and how she acts say I / me / my, "
+            "a procedure is a bare imperative, and a person's words go in quotes"
         )
+
+
+def section(path: str, heading: str) -> str:
+    text = (ROOT / path).read_text()
+    found = re.search(rf"^{re.escape(heading)}\n(.*?)(?=^#{{1,6}} |\Z)", text, re.MULTILINE | re.DOTALL)
+    assert found and found.group(1).strip(), f"{path} has no {heading!r} section"
+    return found.group(1)
+
+
+def steps(path: str, heading: str) -> str:
+    found = re.findall(r"^\d+\. .*$", section(path, heading), re.MULTILINE)
+    assert found, f"{path} has no numbered steps under {heading!r}"
+    return "\n".join(found)
+
+
+def description(path: str) -> str:
+    found = re.search(r"\A---\n.*?^description: (.+?)$.*?^---$", (ROOT / path).read_text(),
+                      re.MULTILINE | re.DOTALL)
+    assert found, f"{path} has no description"
+    return found.group(1)
+
+
+def procedures() -> list[tuple[str, str]]:
+    """The texts whose role is fixed by where they sit: how to reply, the triage
+    batch's instruction, when to use each skill, slack-reply's Sending and
+    Reading more context sections, and the follow-up's numbered steps. The
+    steps are checked without the rest of their section, because a paragraph
+    of conduct follows them there. Which sentence elsewhere is a procedure is
+    a reading of it, and is not checked here."""
+    found = [
+        ("how to reply", HOW_TO_REPLY),
+        ("triage batch instruction", build_batch_prompt([EMAIL])[0].split("\n\n")[0]),
+    ]
+    for path in sorted(ROOT.glob("skills/*/SKILL.md")):
+        rel = str(path.relative_to(ROOT))
+        found.append((f"{rel} description", description(rel)))
+    for rel, heading in (("skills/slack-reply/SKILL.md", "## Sending"),
+                         ("skills/slack-reply/SKILL.md", "## Reading more context")):
+        found.append((f"{rel} {heading}", section(rel, heading)))
+    rel, heading = "skills/slack-triage-followup/SKILL.md", "## Working the task"
+    found.append((f"{rel} {heading} steps", steps(rel, heading)))
+    found.append(("retract steps", steps("memory/templates/retract.md", "# Unsaying something")))
+    enrich = steps("memory/templates/enrich.md", "# Before finishing").splitlines()
+    found.append(("enrich steps 1-4", "\n".join(s for s in enrich if not s.startswith("5. "))))
+    found.append(("root.md Before finishing", section("memory/templates/root.md", "## Before finishing")))
+    prompt = lab_prompt_steps()
+    if prompt is not None:
+        found.append(("the lab prompt's steps", prompt))
+    return found
+
+
+def lab_prompt_steps() -> str | None:
+    """The lab prompt after the arrival: its steps, as a session reads them."""
+    arrival = ROOT / "lab" / "harness" / "src" / "arrival.rs"
+    if not arrival.exists():
+        return None
+    lit = re.search(r'pub const PROMPT: &str = "(.*?)";', arrival.read_text(), re.DOTALL)
+    assert lit, "the lab's PROMPT is gone from arrival.rs"
+    text = re.sub(r"\\\n\s*", "", lit.group(1)).replace("\\n", "\n")
+    return text.split("{arrival}", 1)[1]
+
+
+PROCEDURES = procedures()
+
+
+@pytest.mark.parametrize("text", [t for _, t in PROCEDURES], ids=[n for n, _ in PROCEDURES])
+def test_procedures_carry_no_first_person_word(text):
+    prose = NOT_VOICE.sub(" ", text)
+    hit = FIRST_PERSON.search(prose)
+    assert hit is None, (
+        f"{hit.group(0)!r} in {prose[max(0, hit.start() - 60):hit.end() + 60]!r}. A procedure is a "
+        "bare imperative; it names what it acts on as the answer, the prompt, this session, "
+        "or in the passive"
+    )
+
+
+@pytest.mark.parametrize("seed", [
+    agent_seed_prompt(EMAIL, "x"),
+    conversation_seed_prompt({"kind": "dm", "text": "hi"}, "(none)", "alice"),
+], ids=["email seed", "conversation seed"])
+def test_the_seeds_keep_the_procedure_in_its_own_paragraph(seed):
+    assert f"\n\n{HOW_TO_REPLY}\n" in seed
 
 
 def test_every_text_is_read():

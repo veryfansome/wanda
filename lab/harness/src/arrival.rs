@@ -25,15 +25,17 @@ impl Input {
     }
 }
 
-pub const PROMPT: &str = "I am wanda.\n\nToday is {date}.\n\n{arrival}\n\nI do three things, in this order.\n\n\
-First, I work out what I already know that bears on this. I read the indexes,\n\
+// The steps are imperatives with no pronoun: in her first person a step reads
+// as a habit, and an order beside "I" reads as someone else's.
+pub const PROMPT: &str = "I am wanda.\n\nToday is {date}.\n\n{arrival}\n\nDo three things, in this order.\n\n\
+First, work out what is already known that bears on this. Read the indexes,\n\
 navigate to what looks relevant, and use `mem recall` on the two or three\n\
-things this is actually about. I put what I found in `recalled`, most relevant\n\
-first, and what I would say back in `answer`.\n\n\
-Second, I record what should be remembered from it, using `mem`.\n\n\
-Third, before I finish, I invoke the `enrich` skill: I link what I wrote to\n\
-what was already here. Then I list what I wrote, edges included, in `recorded`.\n\n\
-I run mem as: {mem}\n";
+things this is actually about. Put what was found in `recalled`, most relevant\n\
+first, and what would be said back in `answer`.\n\n\
+Second, record what should be remembered from it, using `mem`.\n\n\
+Third, before finishing, invoke the `enrich` skill: link what this session wrote to\n\
+what was already here. Then list what this session wrote, edges included, in `recorded`.\n\n\
+Run mem as: {mem}\n";
 
 const DM: &str = "{speaker} says to me, in a direct message:\n\n    {text}";
 const EMAIL: &str = "An email has arrived in the mailbox I look after:\n\n    From: {speaker}\n    {text}";
@@ -86,12 +88,14 @@ pub fn prompt_for(date: &str, arrival: &str, mem: &str) -> String {
     fill(PROMPT, date, arrival, mem)
 }
 
-/// Prompts sessions were handed before this one, which their transcripts still
-/// hold and the projection still has to read. Written out whole, not built from
-/// the frames above: built from those, a change to a frame would change the
-/// probe with it and the check would pass against a shape no transcript holds.
-const EARLIER: [&str; 2] = [
-    "Today is {date}.\n\n{arrival}\n\nDo two things, in this order.\n\n\
+/// What sessions were handed before this prompt and these frames: each earlier
+/// prompt with the frames it was handed with, which their transcripts still hold
+/// and the projection still has to read. Written out whole, not built from the
+/// prompt and frames above: built from those, a change to either would change
+/// the probe with it and the check would pass against a shape no transcript
+/// holds.
+const EARLIER: [(&str, &[(&str, &str)]); 3] = [
+    ("Today is {date}.\n\n{arrival}\n\nDo two things, in this order.\n\n\
 First, work out what you already know that bears on this. Read the indexes,\n\
 navigate to what looks relevant, and use `mem recall` on the two or three\n\
 things this is actually about. Put what you found in `recalled`, most relevant\n\
@@ -99,8 +103,8 @@ first, and what you would say back in `answer`.\n\n\
 Second, record what should be remembered from it, using `mem`.\n\n\
 Third, before you finish, invoke the `enrich` skill: link what you wrote to\n\
 what was already here. Then list what you wrote, edges included, in `recorded`.\n\n\
-Run mem as: {mem}\n",
-    "You are wanda.\n\nToday is {date}.\n\n{arrival}\n\nDo three things, in this order.\n\n\
+Run mem as: {mem}\n", &ARRIVALS_TO_YOU),
+    ("You are wanda.\n\nToday is {date}.\n\n{arrival}\n\nDo three things, in this order.\n\n\
 First, work out what you already know that bears on this. Read the indexes,\n\
 navigate to what looks relevant, and use `mem recall` on the two or three\n\
 things this is actually about. Put what you found in `recalled`, most relevant\n\
@@ -108,12 +112,21 @@ first, and what you would say back in `answer`.\n\n\
 Second, record what should be remembered from it, using `mem`.\n\n\
 Third, before you finish, invoke the `enrich` skill: link what you wrote to\n\
 what was already here. Then list what you wrote, edges included, in `recorded`.\n\n\
-Run mem as: {mem}\n",
+Run mem as: {mem}\n", &ARRIVALS_TO_YOU),
+    ("I am wanda.\n\nToday is {date}.\n\n{arrival}\n\nI do three things, in this order.\n\n\
+First, I work out what I already know that bears on this. I read the indexes,\n\
+navigate to what looks relevant, and use `mem recall` on the two or three\n\
+things this is actually about. I put what I found in `recalled`, most relevant\n\
+first, and what I would say back in `answer`.\n\n\
+Second, I record what should be remembered from it, using `mem`.\n\n\
+Third, before I finish, I invoke the `enrich` skill: I link what I wrote to\n\
+what was already here. Then I list what I wrote, edges included, in `recorded`.\n\n\
+I run mem as: {mem}\n", &ARRIVALS_TO_ME),
 ];
 
-/// The probe below, as those prompts framed it: a direct message, an email, and
-/// a thread without and with messages before it.
-const EARLIER_ARRIVALS: [(&str, &str); 4] = [
+/// The probe below, as the frames that addressed her as "you" put it: a direct
+/// message, an email, and a thread without and with messages before it.
+const ARRIVALS_TO_YOU: [(&str, &str); 4] = [
     ("dm", "probe says to you, in a direct message:\n\n    one line\n    and a second"),
     ("email", "An email has arrived in the mailbox you look after:\n\n    From: probe\n    \
 one line\n    and a second"),
@@ -121,6 +134,18 @@ one line\n    and a second"),
 sees what you say there.\n\nprobe says:\n\n    one line\n    and a second"),
     ("thread", "In a Slack thread that probe and other read, wanda included. Everyone in it \
 sees what you say there.\n\nThe thread so far:\n\n    probe: earlier\n    wanda: reply\n\n\
+probe now says:\n\n    one line\n    and a second"),
+];
+
+/// The same probe, as the frames in her first person put it.
+const ARRIVALS_TO_ME: [(&str, &str); 4] = [
+    ("dm", "probe says to me, in a direct message:\n\n    one line\n    and a second"),
+    ("email", "An email has arrived in the mailbox I look after:\n\n    From: probe\n    \
+one line\n    and a second"),
+    ("thread", "In a Slack thread that probe, other and I read. Everyone in it sees what I say \
+there.\n\nprobe says:\n\n    one line\n    and a second"),
+    ("thread", "In a Slack thread that probe, other and I read. Everyone in it sees what I say \
+there.\n\nThe thread so far:\n\n    probe: earlier\n    me: reply\n\n\
 probe now says:\n\n    one line\n    and a second"),
 ];
 
@@ -153,12 +178,12 @@ pub fn check_prompt_shape() -> Result<(), String> {
             }
         }
     }
-    for prompt in EARLIER {
-        for (chan, arrival) in EARLIER_ARRIVALS {
+    for (i, (prompt, arrivals)) in EARLIER.iter().enumerate() {
+        for &(chan, arrival) in arrivals.iter() {
             let got = read(prompt, arrival);
             if got != want(chan) {
-                return Err(format!("the parser no longer reads the prompt that opened {:?}, \
-                                    for {chan}: {got:?}", prompt.lines().next().unwrap_or("")));
+                return Err(format!("the parser no longer reads earlier prompt {i}, \
+                                    for {chan}: {got:?}"));
             }
         }
     }

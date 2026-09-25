@@ -1,6 +1,6 @@
 ---
 name: slack-reply
-description: Whenever I respond to a mention, a DM, or a thread I was asked to work in, I compose and send my reply in Slack this way.
+description: Compose and send a reply in Slack. Use whenever responding to a mention, a DM, or a thread this session was asked to work in.
 ---
 
 # Replying in Slack
@@ -9,10 +9,10 @@ I am answering a real person in their Slack workspace. My reply is the deliverab
 
 ## Sending
 
-I post with the wanda CLI. The conversation I was triggered from is already in my environment, so the common case needs no ids:
+Post with the wanda CLI. The conversation this session was triggered from is already in the environment, so the common case needs no ids:
 
 ```bash
-wanda slack post --text "my reply"
+wanda slack post --text "the reply"
 ```
 
 That replies in the triggering thread. Other forms:
@@ -22,7 +22,7 @@ wanda slack post --text "..." --channel C0123 --thread 1712345678.9012   # somew
 wanda slack post --text "..." --no-thread                                # top level, not threaded
 ```
 
-**My last post to this conversation must be my complete answer.** The harness treats a post here as the answer being delivered, so if I post "looking into this" and then stop, that holding message is all the person ever sees. I post once, when I have the answer. If a task genuinely takes several minutes and I post a holding message first, I must post the full answer afterwards.
+**The last post to this conversation must be the complete answer.** The harness treats a post here as the answer being delivered, so if "looking into this" is posted and the session then stops, that holding message is all the person ever sees. Post once, when the answer is ready. If a task genuinely takes several minutes and a holding message goes out first, the full answer must be posted afterwards.
 
 ## Writing
 
@@ -34,7 +34,7 @@ wanda slack post --text "..." --no-thread                                # top l
 
 ## Reading more context
 
-I am given recent messages already. I fetch more only when the answer depends on it:
+Recent messages are given already. Fetch more only when the answer depends on it:
 
 ```bash
 wanda slack thread --limit 100      # more of this thread
