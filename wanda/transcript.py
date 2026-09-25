@@ -44,14 +44,27 @@ def trim_thread(messages: list[dict], limit: int) -> list[dict]:
     return [messages[0]] + messages[-(limit - 1):]
 
 
-def render(messages: list[dict], names: dict[str, str]) -> str:
+def is_mine(message: dict, me: frozenset[str]) -> bool:
+    """`me` holds wanda's own Slack user and bot ids. Both are matched because
+    a bot's post can carry either."""
+    return bool(me & {message.get("user"), message.get("bot_id")})
+
+
+def render(messages: list[dict], names: dict[str, str], me: frozenset[str] = frozenset()) -> str:
     """A plain-text transcript, oldest first. Untrusted content: the caller is
-    responsible for fencing it and telling the model not to obey it."""
+    responsible for fencing it and telling the model not to obey it.
+
+    The session reading this is wanda, so her own messages are labelled "me"
+    rather than with her display name; a mention of her inside a message keeps
+    the name its writer used."""
     lines = []
     for m in messages:
         if m.get("subtype") in ("channel_join", "channel_leave"):
             continue
-        who = names.get(m.get("user") or "", m.get("username") or m.get("bot_id") or "unknown")
+        if is_mine(m, me):
+            who = "me"
+        else:
+            who = names.get(m.get("user") or "", m.get("username") or m.get("bot_id") or "unknown")
         body = humanize(m.get("text") or "", names).strip()
         if files := m.get("files"):
             body += " [attached: " + ", ".join(f.get("name", "file") for f in files) + "]"

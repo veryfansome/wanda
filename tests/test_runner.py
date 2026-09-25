@@ -103,3 +103,29 @@ def test_nonzero_exit_is_error(tmp_path):
     fake = make_fake_claude(tmp_path, "cat > /dev/null\necho '{\"is_error\": false}'\nexit 3")
     rr = run(RunnerService(fake).run("x", model="m", max_budget_usd=1, timeout_s=10))
     assert not rr.ok and rr.exit_code == 3
+
+
+def recording_claude(tmp_path):
+    """A fake CLI that writes each argument it was given on its own line."""
+    args = tmp_path / "args"
+    fake = make_fake_claude(
+        tmp_path,
+        f'cat > /dev/null\nfor a in "$@"; do printf "%s\\n" "$a"; done > {args}\n'
+        'echo \'{"type":"result","is_error":false,"result":"ok","session_id":"s1"}\'',
+    )
+    return fake, args
+
+
+def test_append_system_prompt_reaches_the_cli_as_one_argument(tmp_path):
+    fake, args = recording_claude(tmp_path)
+    text = 'I am wanda. "I" means me.'
+    rr = run(RunnerService(fake).run("x", model="m", max_budget_usd=1, timeout_s=10,
+                                     append_system_prompt=text))
+    argv = args.read_text().splitlines()
+    assert rr.ok and argv[argv.index("--append-system-prompt") + 1] == text
+
+
+def test_no_append_system_prompt_unless_given(tmp_path):
+    fake, args = recording_claude(tmp_path)
+    run(RunnerService(fake).run("x", model="m", max_budget_usd=1, timeout_s=10))
+    assert "--append-system-prompt" not in args.read_text().splitlines()

@@ -120,13 +120,21 @@ impl Vault {
     /// The node called this, by label, case and spacing aside. `None` if no
     /// node is; `Ambiguous` if more than one is — unless `kind` picks exactly
     /// one of them out, as `--place` does when an org carries the same name.
+    /// Her own two names are never ambiguous: they find her node, and a
+    /// namesake is reached by its id.
     pub fn by_name(&self, name: &str, kind: &str) -> Result<Option<String>, Ambiguous> {
         let want = one_line(name).to_lowercase();
         if want.is_empty() {
             return Ok(None);
         }
+        let nodes = self.nodes();
+        if crate::is_self_name(&want) {
+            if let Some(me) = me_in(&nodes) {
+                return Ok(Some(nodes[me].id.clone()));
+            }
+        }
         let mut hits: Vec<Node> = Vec::new();
-        for n in self.nodes() {
+        for n in nodes {
             let label = fm::label(&n.meta).to_lowercase();
             let former: Vec<String> = fm::former_names(&n.body).iter()
                 .map(|a| a.to_lowercase()).collect();
@@ -152,6 +160,12 @@ impl Vault {
                     .collect(),
             }),
         }
+    }
+
+    /// The assistant's own node, if this vault has exactly one.
+    pub fn me(&self) -> Option<String> {
+        let nodes = self.nodes();
+        me_in(&nodes).map(|i| nodes[i].id.clone())
     }
 
     /// The id this vault gave a node of this kind and name in this session, by
@@ -408,6 +422,23 @@ impl Vault {
         let _ = std::fs::write(&p, text);
         p
     }
+}
+
+/// The one person labelled `SELF_LABEL`; failing that, the one person labelled
+/// with her name, which is how an older vault labels her node.
+fn me_in(nodes: &[Node]) -> Option<usize> {
+    for label in [crate::SELF_LABEL, crate::SELF_NAME] {
+        let found: Vec<usize> = (0..nodes.len())
+            .filter(|&i| nodes[i].kind() == "person"
+                    && fm::label(&nodes[i].meta).to_lowercase() == label)
+            .collect();
+        match found.as_slice() {
+            [] => continue,
+            [one] => return Some(*one),
+            _ => return None,
+        }
+    }
+    None
 }
 
 /// `t[:cap]` by characters, which is what Python slices.

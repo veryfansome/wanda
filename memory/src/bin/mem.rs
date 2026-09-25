@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Parser)]
-#[command(name = "mem", about = "read and write wanda's memory", disable_help_subcommand = true)]
+#[command(name = "mem", about = "read and write my memory", disable_help_subcommand = true)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -29,7 +29,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// expand from things you have identified
+    /// expand from things I have identified
     Recall {
         #[arg(required = true)]
         refs: Vec<String>,
@@ -38,7 +38,7 @@ enum Cmd {
         #[arg(long, default_value_t = LIMIT)]
         limit: i64,
     },
-    /// full text, when you do not know the name
+    /// full text, when I do not know the name
     Search {
         text: String,
         #[arg(long, default_value_t = 10)]
@@ -153,7 +153,7 @@ enum Cmd {
               help = format!("a new name, at most {} characters", memory::SUMMARY_MAX))]
         name: String,
         #[arg(long, default_value = "",
-              help = format!("a new summary — the index line, at most {} characters. An event, a trajectory or a preference is named by its summary: give it one or the other, not both", memory::SUMMARY_MAX))]
+              help = format!("a new summary — the index line, at most {} characters. An event, a trajectory or a preference is named by its summary: a new name or a new summary, not both", memory::SUMMARY_MAX))]
         summary: String,
         #[arg(long, default_value = "")]
         because: String,
@@ -180,7 +180,7 @@ enum Cmd {
         #[arg(long, default_value = "")]
         because: String,
     },
-    /// an exchange from the transcripts: what was said both ways, and what you did
+    /// an exchange from the transcripts: what was said both ways, and what I did
     Session {
         /// a session id, or a prefix of one
         #[arg(default_value = "")]
@@ -387,7 +387,7 @@ fn resolve(v: &Vault, r: &str) -> Result<Option<String>, i32> {
     match v.resolve(r, "") {
         Ok(x) => Ok(x),
         Err(a) => {
-            out!("({a}. Say which, by id.)");
+            out!("({a}. An id says which.)");
             Err(1)
         }
     }
@@ -404,7 +404,7 @@ fn cmd_recall(v: &Vault, refs: &[String], hops: i64, limit: i64) -> i32 {
         match v.resolve(r, "") {
             Ok(Some(nid)) => { seeds.insert(nid); }
             Ok(None) => { complaints.insert(format!("(no node for {})", py_repr(r))); }
-            Err(a) => { complaints.insert(format!("({a}. Say which, by id.)")); }
+            Err(a) => { complaints.insert(format!("({a}. An id says which.)")); }
         }
     }
     // sorted, so that what a session reads is the same whichever order it named
@@ -495,8 +495,8 @@ fn summary_or_die(text: &str, flag: &str) -> Result<String, i32> {
     }
     let n = t.chars().count();
     if n > memory::SUMMARY_MAX {
-        out!("({flag} is {n} characters; the cap is {}. It is the index line \
-                  — say the thing in a phrase, and put the rest in --body.)",
+        out!("({flag} is {n} characters; the cap is {}. It is the index line: \
+                  the thing in a phrase, and the rest in --body.)",
                  memory::SUMMARY_MAX);
         return Err(1);
     }
@@ -593,13 +593,16 @@ fn stub(v: &Vault, name: &str, kind: &str) -> String {
 /// (reference, kind to mint, kind to prefer) → node ids.
 ///
 /// A name nobody has recorded gets a stub — an edge to a node nobody created is
-/// a dangling edge, invisible until traversal quietly returns nothing. Every
-/// reference is resolved before any stub is minted, so a refusal on the last
-/// leaves nothing behind from the first; the same new name twice gets one stub.
+/// a dangling edge, invisible until traversal quietly returns nothing. Her own
+/// names are the exception: they find her node, or seed it in a vault without
+/// one, since a stub under either would be a second self of whatever kind the
+/// flag mints. Every reference is resolved before any stub is minted, so a
+/// refusal on the last leaves nothing behind from the first; the same new name
+/// twice gets one stub.
 /// An id that names no node is refused: there is nothing to guess from a
 /// mistyped hash, and minting a person called `34432f` is worse.
 fn refs(v: &Vault, wanted: &[(String, &str, &str)]) -> Result<Vec<String>, i32> {
-    enum Item { Have(String), Mint(String, String) }
+    enum Item { Have(String), Mint(String, String), Me }
     let mut out: Vec<Item> = Vec::new();
     for (r, mint_kind, prefer) in wanted {
         if py_strip(r).is_empty() {
@@ -608,14 +611,15 @@ fn refs(v: &Vault, wanted: &[(String, &str, &str)]) -> Result<Vec<String>, i32> 
         }
         let nid = match v.resolve(r, prefer) {
             Ok(x) => x,
-            Err(a) => { out!("({a}. Say which, by id.)"); return Err(1); }
+            Err(a) => { out!("({a}. An id says which.)"); return Err(1); }
         };
         if nid.is_none() && memory::text::id_shaped(r) {
-            out!("(no node {}; give a name, or an id from an index)", py_repr(r));
+            out!("(no node {}; a name goes here, or an id from an index)", py_repr(r));
             return Err(1);
         }
         out.push(match nid {
             Some(n) => Item::Have(n),
+            None if memory::is_self_name(r) => Item::Me,
             None => Item::Mint(one_line(r), mint_kind.to_string()),
         });
     }
@@ -624,6 +628,7 @@ fn refs(v: &Vault, wanted: &[(String, &str, &str)]) -> Result<Vec<String>, i32> 
     for item in out {
         match item {
             Item::Have(n) => ids.push(n),
+            Item::Me => ids.push(index::seed(v, &today())),
             Item::Mint(name, kind) => {
                 let key = (name.to_lowercase(), kind.clone());
                 let id = minted.entry(key).or_insert_with(|| stub(v, &name, &kind)).clone();
@@ -662,9 +667,22 @@ fn former_only(v: &Vault, kind: &str, name: &str) -> Result<(), i32> {
     }
 }
 
+/// Her node is the one person labelled "me". Beside a second, hers could not be
+/// told apart, and every later "me" would be refused as ambiguous.
+fn not_mine(v: &Vault) -> i32 {
+    match v.me() {
+        Some(me) => out!("('{}' is my own node, {me}; no other person takes that name)",
+                         memory::SELF_LABEL),
+        None => out!("('{}' names my own node and no other person)", memory::SELF_LABEL),
+    }
+    1
+}
+
 /// A person, place, org, group, thing or topic. The same name again is the same
 /// node, updated — two files for one person is the failure that costs most —
 /// unless --new says it is a second one, as with two people who share a name.
+/// A person named by either of her own names is her node, seeded if the vault
+/// lacks it, and a second person labelled "me" is refused.
 fn cmd_entity(v: &Vault, kind: &str, name: &str, summary: &str, body: &str,
               new: bool, id: &str) -> i32 {
     let name = match summary_or_die(name, "--name") { Ok(x) => x, Err(rc) => return rc };
@@ -676,6 +694,9 @@ fn cmd_entity(v: &Vault, kind: &str, name: &str, summary: &str, body: &str,
     let summary = if summary.is_empty() { String::new() } else {
         match summary_or_die(summary, "--summary") { Ok(x) => x, Err(rc) => return rc }
     };
+    if kind == "person" && new && name.to_lowercase() == memory::SELF_LABEL {
+        return not_mine(v);
+    }
     let nid = if !id.is_empty() {
         match resolve(v, id) {
             Ok(Some(n)) if n.starts_with(&format!("{kind}:")) => Some(n),
@@ -684,6 +705,12 @@ fn cmd_entity(v: &Vault, kind: &str, name: &str, summary: &str, body: &str,
         }
     } else if new {
         None
+    } else if kind == "person" && memory::is_self_name(&name) {
+        match v.by_name(&name, "person") {
+            Ok(Some(n)) if n.starts_with("person:") => Some(n),
+            Ok(_) => Some(index::seed(v, &today())),
+            Err(a) => { out!("({a}. An id says which.)"); return 1; }
+        }
     } else {
         match existing(v, kind, &name, "", "", false) {
             Ok(None) => match former_only(v, kind, &name) { Ok(()) => None, Err(rc) => return rc },
@@ -879,14 +906,26 @@ fn cmd_rename(v: &Vault, node: &str, name: &str, summary: &str, because: &str) -
     let name = one_line(name);
     let summary = one_line(summary);
     if name.is_empty() && summary.is_empty() {
-        out!("(give a new name, or --summary, or both)");
+        out!("(no new name and no --summary; rename takes one or both)");
         return 1;
+    }
+    let to_own_label = name.to_lowercase() == memory::SELF_LABEL;
+    if v.me().as_deref() == Some(nid.as_str()) {
+        // the standing texts name her node "me"; under another label every
+        // index would show her as someone else
+        if !name.is_empty() && !to_own_label {
+            out!("({nid} is my own node; the one name it takes is '{}', and its summary \
+                  can change)", memory::SELF_LABEL);
+            return 1;
+        }
+    } else if to_own_label && nid.starts_with("person:") {
+        return not_mine(v);
     }
     for (text, what) in [(&name, "name"), (&summary, "--summary")] {
         let n = one_line(text).chars().count();
         if !text.is_empty() && n > memory::SUMMARY_MAX {
             out!("({what} is {n} characters; the cap is {}. It is what every index \
-                      shows — say it in a phrase.)", memory::SUMMARY_MAX);
+                      shows: the thing in a phrase.)", memory::SUMMARY_MAX);
             return 1;
         }
     }
@@ -920,6 +959,11 @@ fn cmd_forget(v: &Vault, r: &str) -> i32 {
         Ok(None) => { out!("(no node for {})", py_repr(r)); return 1; }
         Err(rc) => return rc,
     };
+    // once her node is gone, a person labelled "wanda" would be taken for her
+    if v.me().as_deref() == Some(nid.as_str()) {
+        out!("({nid} is my own node; it stays)");
+        return 1;
+    }
     let back: Vec<(String, String)> = match index::build_index(v, &v.root.join(".index.db")) {
         Ok(con) => {
             let mut stmt = con.prepare("SELECT src, rel FROM edges WHERE dst=?").unwrap();
@@ -932,7 +976,8 @@ fn cmd_forget(v: &Vault, r: &str) -> i32 {
     if !back.is_empty() {
         let shown: Vec<String> = back.iter().take(6)
             .map(|(s, r)| format!("{s} --{r}-->")).collect();
-        out!("({nid} is still linked from {}. Retract those first.)", shown.join("; "));
+        out!("({nid} is still linked from {}; `mem forget` takes it once those are retracted.)",
+             shown.join("; "));
         return 1;
     }
     let _ = std::fs::remove_file(v.path_for(&nid));
@@ -1062,7 +1107,16 @@ fn main() {
     let cli = match Cli::try_parse() {
         Ok(c) => c,
         Err(e) => {
-            if e.print().is_err() {
+            // clap ends every refusal with an order to the reader, and nothing
+            // mem prints addresses her
+            let text = e.render().to_string()
+                .replace("For more information, try '--help'.", "'--help' says more.");
+            let wrote = if e.use_stderr() {
+                write!(std::io::stderr(), "{text}")
+            } else {
+                write!(std::io::stdout(), "{text}")
+            };
+            if wrote.is_err() {
                 CUT.store(true, Ordering::Relaxed);
             }
             let rc = e.exit_code();

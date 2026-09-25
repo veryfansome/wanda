@@ -211,6 +211,10 @@ pub fn dump(meta: &Meta, kind: &str, former: &[String]) -> String {
     if ENTITY_KINDS.contains(&kind) {
         let mut cand = vec![one_line(meta.get("name"))];
         cand.extend(former.iter().map(|a| one_line(a)));
+        // her own node answers to her name as well as to its label
+        if kind == "person" && cand[0].to_lowercase() == crate::SELF_LABEL {
+            cand.push(crate::SELF_NAME.to_string());
+        }
         for a in cand {
             if !a.is_empty() && !aliases.contains(&a) {
                 aliases.push(a);

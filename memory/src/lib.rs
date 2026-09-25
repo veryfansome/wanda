@@ -17,3 +17,16 @@ pub mod vault;
 /// The index line's cap, in characters. Over it a write is refused rather
 /// than cut: the session that has the context rewrites it.
 pub const SUMMARY_MAX: usize = 140;
+
+/// The label of the node a vault keeps for the assistant keeping it. Its text
+/// is in her voice, and so is its label.
+pub const SELF_LABEL: &str = "me";
+/// Her name, which is what everyone else calls her: written anywhere a name
+/// goes, it finds the same node as `SELF_LABEL` rather than making a second.
+pub const SELF_NAME: &str = "wanda";
+
+/// Whether a name, as a session wrote it, names the assistant's own node.
+pub fn is_self_name(name: &str) -> bool {
+    let n = text::one_line(name).to_lowercase();
+    n == SELF_LABEL || n == SELF_NAME
+}

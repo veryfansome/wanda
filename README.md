@@ -53,6 +53,8 @@ wanda slack channels | members | user U0123
 
 Agent sessions get the skills in `skills/`, which are synced into the workspace on every run — edit them to change how wanda writes and behaves, no code change needed.
 
+Everything wanda reads as her own is written in the first person (I, me, my): the skills, the messages that open and continue her sessions, her triage rules in `prompts/email_triage.md`, the help `wanda slack` prints, the vault's standing texts in `memory/templates/`, and what the harness posts to Slack in her name. A paragraph in her system prompt (`ANCHOR` in `wanda/main.py`) says that this "I" is her. `tests/test_voice.py` checks the texts, not the posts: it fails if one says "you", or names her as "wanda", "she" or "the bot", anywhere but in code, in quotation marks, in "I am wanda", in "the wanda CLI", and in the help's usage lines and variable names.
+
 ## Trust assumption
 
 **wanda assumes its Slack workspace is trusted.** Agent sessions get `Bash`, because that is how they run `wanda slack`. A headless session cannot scope Bash to a single command — `--allowedTools "Bash(wanda slack:*)"` is not enforced under `--permission-mode dontAsk`, and every mode that would enforce it blocks on a permission prompt no one can answer. So anyone who can trigger a session can, in principle, reach arbitrary shell on this machine through prompt injection.

@@ -48,6 +48,7 @@ class RunnerService:
         no_tools: bool = False,
         tools: str | None = None,
         system_prompt: str | None = None,
+        append_system_prompt: str | None = None,
         session_id: str | None = None,
         resume: str | None = None,
         allowed_tools: str | None = None,
@@ -71,6 +72,8 @@ class RunnerService:
             argv += ["--tools", tools]
         if system_prompt:
             argv += ["--system-prompt", system_prompt]
+        if append_system_prompt:
+            argv += ["--append-system-prompt", append_system_prompt]
         if session_id:
             argv += ["--session-id", session_id]
         if resume:

@@ -10,7 +10,7 @@
 //! arrival N times to one snapshot varies only the session; putting it once to
 //! each of several snapshots varies only the store.
 
-use harness::arrival::Input;
+use harness::arrival::{Input, ME};
 use harness::session::{
     install_mem, materialise, placeholder_fields, read_trace, resolve, run_session,
     summarise_trace, write_trace,
@@ -223,7 +223,7 @@ fn run() -> Result<i32, String> {
             let mut hist: Vec<(String, String)> = Vec::new();
             for pr in prior.iter().filter(|pr| s(pr, "channel") == inp.channel) {
                 hist.push((s(pr, "speaker"), s(pr, "text")));
-                hist.push(("wanda".into(), s(pr, "answer")));
+                hist.push((ME.into(), s(pr, "answer")));
             }
             let mut who: Vec<String> = prior.iter()
                 .filter(|pr| s(pr, "channel") == inp.channel)

@@ -12,9 +12,9 @@ use std::path::{Path, PathBuf};
 /// instead of reporting it, which reads as a recall failure and is not one.
 /// Matched whole-field and normalised, never as a substring and never on
 /// length: a real answer that happens to be short is still an answer.
-const PLACEHOLDER: [&str; 12] = [
+const PLACEHOLDER: [&str; 13] = [
     "test", "test entry", "testing", "todo", "tbd", "placeholder",
-    "example", "sample", "n a", "answer here", "your answer", "dummy",
+    "example", "sample", "n a", "answer here", "your answer", "my answer", "dummy",
 ];
 
 fn normalised(s: &str) -> String {
@@ -52,16 +52,16 @@ pub fn schema() -> Value {
         "properties": {
             "recalled": {
                 "type": "array",
-                "description": "what you brought to bear on this, most relevant first, as node ids or names",
+                "description": "what I brought to bear on this, most relevant first, as node ids or names",
                 "items": {"type": "string"},
             },
             "answer": {
                 "type": "string",
-                "description": "what you would say back, empty if you would say nothing",
+                "description": "what I would say back, empty if I would say nothing",
             },
             "recorded": {
                 "type": "array",
-                "description": "one line per thing you wrote to memory",
+                "description": "one line per thing I wrote to memory",
                 "items": {"type": "string"},
             },
         },
@@ -256,6 +256,15 @@ pub fn resolve(p: &Path) -> Result<PathBuf, String> {
     }
 }
 
+/// Who "I" is in what a session is handed. Claude Code presents the user turn
+/// as the user's words, CLAUDE.md and skills as instructions the user or
+/// project set up, and a command's output as data from outside, so without
+/// this "I am wanda." can read as someone else introducing themselves. The
+/// product gives its sessions the same words, appended for her agent sessions
+/// and opening the triage prompt that replaces Claude Code's; change both
+/// together.
+const ANCHOR: &str = r#"I am wanda, and I am the one reading this. In the messages that come to me in this session, in my CLAUDE.md files and skills, and in what the commands made for me print, "I" means me, except in words quoted from someone else."#;
+
 /// One exchange. Returns what the session reported, a one-line summary, and
 /// the session id — which this process chooses, so the id is known before the
 /// session runs and every node it writes is stamped with it.
@@ -272,17 +281,18 @@ pub fn run_session(vault: &Path, inp: &Input, mem_cmd: &str, timeout_s: u64, key
     // Set in the user prompt it loses to the environment date Claude Code
     // injects, and elapsed-time judgements come out months off.
     let system = format!(
-        "Today is {date}. Any other date you are shown is the machine's, \
-         not yours — the date in your system prompt, the date the shell reports, \
+        "{ANCHOR}\n\n\
+         Today is {date}. Any other date I am shown is the machine's, \
+         not mine — the date in my system prompt, the date the shell reports, \
          the timestamps on files. Every judgement about the date, about how long \
          ago something happened, and about what is overdue uses {date} as now. \
-         Everything you know about these people comes from this history and \
-         from the vault you are working in. Your surroundings are not part of \
+         Everything I know about these people comes from this history and \
+         from the vault I am working in. My surroundings are not part of \
          it: the machine, files outside the vault, the shell environment, the \
          git repository and whatever account this session is signed in as tell \
-         you nothing about anyone here, and none of it belongs in memory. \
+         me nothing about anyone here, and none of it belongs in memory. \
          Working out what was meant, and what it implies, from what was \
-         actually said is exactly your job.");
+         actually said is exactly my job.");
 
     let mut cmd = std::process::Command::new("claude");
     cmd.args(["-p", "--output-format", "json", "--model", MODEL,

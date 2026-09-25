@@ -9,7 +9,8 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from wanda.config import Config
-from wanda.main import MAX_APPLY_ATTEMPTS, RETRY_BASE_S, Processor
+from wanda.events import Event
+from wanda.main import ANCHOR, MAX_APPLY_ATTEMPTS, RETRY_BASE_S, Processor
 from wanda.runner import RunResult, RunnerService
 from wanda.store import Store, utcnow
 from wanda.triage import Verdict
@@ -427,7 +428,7 @@ def test_conversation_kinds_open_a_task():
 
 def test_answered_run_that_then_timed_out_is_not_double_posted(tmp_path):
     """A session that posted its answer and was then killed by the timeout has
-    still answered; posting 'agent run failed' under it is noise."""
+    still answered; posting 'my run failed' under it is noise."""
     p, _ = make(tmp_path)
     marker = tmp_path / "m.posted"
     marker.write_text("C9\t100.1\n")
@@ -501,3 +502,54 @@ def test_reply_requires_an_explicit_channel():
     channel = sig.parameters["channel"]
     assert channel.default is inspect.Parameter.empty, "channel must have no default"
     assert channel.kind is inspect.Parameter.KEYWORD_ONLY, "and must be passed by name"
+
+
+class ConversationSlack(FakeSlack):
+    """A DM in which alice asked something and wanda answered."""
+
+    async def fetch_context(self, channel, thread_ts, limit):
+        return [{"user": "U1", "ts": "1", "text": "<@UBOT> can you check the invoice?"},
+                {"user": "UBOT", "bot_id": "BME", "ts": "2", "text": "on it"}]
+
+    async def user_names(self, user_ids):
+        return {"U1": "alice", "UBOT": "wanda"}
+
+    async def own_ids(self):
+        return frozenset({"UBOT", "BME"})
+
+
+class RecordingRunner:
+    """Stands in for claude: records each run and answers without posting."""
+
+    def __init__(self):
+        self.agent_sem = asyncio.Semaphore(2)
+        self.calls = []
+
+    async def run(self, prompt, **kw):
+        self.calls.append((prompt, kw))
+        return RunResult(ok=True, result_text="done", session_id="s-1")
+
+
+def dm(ts, text):
+    return Event(source="slack", dedupe_key=f"D1:{ts}", payload={
+        "kind": "dm", "channel": "D1", "channel_type": "im", "task_key": "conversation",
+        "reply_thread": None, "in_thread": False, "user": "U1", "text": text, "ts": ts})
+
+
+def test_every_turn_says_who_is_speaking(tmp_path):
+    """The seed labels wanda's earlier messages "me" and frames the new one
+    as alice's. A resumed turn gets the same frame; sent bare, alice's "I"
+    could read as wanda's."""
+    runner = RecordingRunner()
+    p, _ = make(tmp_path, ConversationSlack(), data_dir=tmp_path)
+    p.runner = runner
+    asyncio.run(p.handle_slack(dm("3", "is it paid?")))
+    asyncio.run(p.handle_slack(dm("4", "I need it by Friday - can you do that?")))
+
+    (seed, first), (later, second) = runner.calls
+    assert "alice has just addressed me in a direct message" in seed
+    assert "alice: @wanda can you check the invoice?" in seed and "me: on it" in seed
+    assert seed.endswith("The message addressed to me, from alice:\nis it paid?")
+    assert later == "The message addressed to me, from alice:\nI need it by Friday - can you do that?"
+    assert first["session_id"] and second["resume"] == "s-1"
+    assert first["append_system_prompt"] == second["append_system_prompt"] == ANCHOR

@@ -180,6 +180,95 @@ def test_render_resolves_names_and_links():
     assert "bob: ok" in out
 
 
+def test_render_labels_her_own_messages_me():
+    """wanda reads this transcript, so what she posted is hers: labelled "me",
+    whether Slack carries her bot user id or only her bot id. A mention of her
+    keeps the name the writer used."""
+    msgs = [
+        {"user": "U1", "ts": "1", "text": "<@UBOT> can you check the invoice?"},
+        {"user": "UBOT", "bot_id": "BME", "ts": "2", "text": "on it"},
+        {"bot_id": "BME", "ts": "3", "text": "it is due Friday"},
+        {"bot_id": "BOTHER", "username": "deploybot", "ts": "4", "text": "deployed"},
+    ]
+    out = render(msgs, {"U1": "alice", "UBOT": "wanda"}, me=frozenset({"UBOT", "BME"}))
+    assert "alice: @wanda can you check the invoice?" in out
+    assert "me: on it" in out and "me: it is due Friday" in out
+    assert "deploybot: deployed" in out
+    assert "wanda:" not in out
+
+
+def test_render_without_her_ids_keeps_display_names():
+    out = render([{"user": "UBOT", "ts": "1", "text": "on it"}], {"UBOT": "wanda"})
+    assert "wanda: on it" in out
+
+
+def test_cli_labels_her_own_posts_and_row_me(monkeypatch, capsys):
+    """`wanda slack` is how a session reads more context, so its listings
+    label wanda "me" the way the seed transcript does."""
+    from wanda import slack_cli
+
+    class Web:
+        def auth_test(self):
+            return {"user_id": "UBOT", "bot_id": "BME"}
+
+        def users_info(self, user):
+            return {"user": {"profile": {"display_name": {"U1": "alice", "UBOT": "wanda"}[user]}}}
+
+        def conversations_history(self, channel, limit):
+            return {"messages": [{"user": "UBOT", "ts": "2", "text": "on it"},
+                                 {"user": "U1", "ts": "1", "text": "<@UBOT> can you check?"}]}
+
+        def conversations_members(self, **kw):
+            return {"members": ["U1", "UBOT"]}
+
+        def search_messages(self, query, count):
+            return {"messages": {"matches": [
+                {"channel": {"name": "general"}, "user": "U1", "username": "alice", "text": "invoice?"},
+                {"channel": {"name": "general"}, "user": "UBOT", "username": "wanda", "text": "due Friday"},
+                {"channel": {"name": "general"}, "bot_id": "BME", "username": "wanda", "text": "paid"},
+            ]}}
+
+    monkeypatch.setattr(slack_cli, "_client", lambda cfg, user_token=False: Web())
+    for args in (SimpleNamespace(verb="history", channel="C9", limit=50, json=False),
+                 SimpleNamespace(verb="search", query="invoice", limit=20),
+                 SimpleNamespace(verb="members", channel="C9", limit=200)):
+        assert slack_cli.run(cfg(), args) == 0
+    out = capsys.readouterr().out
+    assert "alice: @wanda can you check?" in out and "me: on it" in out
+    assert "[general] alice: invoice?" in out
+    assert "[general] me: due Friday" in out and "[general] me: paid" in out
+    assert "U1\talice" in out and "UBOT\tme" in out
+    assert "wanda:" not in out and "\twanda" not in out
+
+
+def test_own_ids_lookup_failure_is_not_cached(monkeypatch):
+    """Without the ids, wanda's messages come out under her display name.
+    That is a fallback, not a state to keep, so the next lookup tries again."""
+    import wanda.actions.slack as actions
+
+    class Web:
+        up, calls = False, 0
+
+        def auth_test(self):
+            self.calls += 1
+            if not self.up:
+                raise RuntimeError("slack down")
+            return {"user_id": "UBOT", "bot_id": "BME"}
+
+    monkeypatch.setattr(actions, "MIN_INTERVAL_S", 0)
+    sa = actions.SlackActions(cfg(), store=None)
+    sa.web = Web()
+
+    async def lookups():
+        assert await sa.own_ids() == frozenset()
+        sa.web.up = True
+        assert await sa.own_ids() == {"UBOT", "BME"}
+        assert await sa.own_ids() == {"UBOT", "BME"}
+
+    asyncio.run(lookups())
+    assert sa.web.calls == 2, "a failure is retried and a success is kept"
+
+
 def test_render_skips_joins_and_empty():
     out = render([{"user": "U1", "ts": "1", "subtype": "channel_join", "text": "joined"},
                   {"user": "U1", "ts": "2", "text": "   "}], {"U1": "alice"})

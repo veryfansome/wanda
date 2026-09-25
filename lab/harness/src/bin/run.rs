@@ -6,7 +6,7 @@
 //! nothing else. Every session is a Claude Code session with the vault as its
 //! working directory and `mem` as its only way into the store.
 
-use harness::arrival::{check_prompt_shape, Input};
+use harness::arrival::{check_prompt_shape, Input, ME};
 use harness::session::{
     install_mem, placeholder_fields, read_trace, resolve, run_session, summarise_trace,
     write_session_config, write_trace,
@@ -339,7 +339,7 @@ fn run() -> Result<i32, String> {
         if !inp.thread().is_empty() {
             let t = threads.entry(inp.thread().to_string()).or_default();
             t.push((inp.speaker.clone(), inp.text.clone()));
-            t.push(("wanda".into(), answer.clone()));
+            t.push((ME.into(), answer.clone()));
         }
         n_inputs += 1;
         eprintln!("[{i}/{total}] {} {:6} {} {} | {}",

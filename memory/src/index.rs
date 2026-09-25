@@ -168,7 +168,7 @@ pub fn regenerate_indexes(vault: &Vault) -> rusqlite::Result<()> {
         lines.push(format!("- `{d}/` \u{2014} {}{extra}", rows.len()));
     }
     lines.push(String::new());
-    lines.push("Nothing else loads until you read a file in its directory.".into());
+    lines.push("Nothing else loads until I read a file in its directory.".into());
     let _ = std::fs::write(vault.root.join("CLAUDE.md"), lines.join("\n") + "\n");
 
     for (d, rows) in dirs.iter_mut() {
@@ -187,34 +187,43 @@ pub fn regenerate_indexes(vault: &Vault) -> rusqlite::Result<()> {
             out.push(format!("- `{}`{}  {}", local_id(nid), marks(status), line_for(name, summary)));
         }
         if rows.len() > INDEX_CAP_LINES {
-            out.push(format!("- \u{2026} {} more, use `mem search`", rows.len() - INDEX_CAP_LINES));
+            out.push(format!("- \u{2026} {} more; `mem search` finds them", rows.len() - INDEX_CAP_LINES));
         }
         let _ = std::fs::write(p.join("CLAUDE.md"), out.join("\n") + "\n");
     }
     Ok(())
 }
 
-/// The one node a vault starts with: wanda herself.
+/// The one node a vault starts with: wanda herself, labelled `me`, and its id.
 ///
-/// What she said and did is not marked on a node — the notes are hers and in
-/// her voice, so an act with nobody named as doing it is hers. The only edges
-/// to this node are from her own commitments, which are few and are what she
-/// must be held to; an edge from everything she ever said would make her the
-/// best-connected node in the store within a month and warp every recall
-/// through her.
-pub fn seed(vault: &Vault, date: &str) {
-    if matches!(vault.by_name("wanda", ""), Ok(Some(_))) {
-        return;
+/// What she said and did is not marked on a node — the notes are hers and she
+/// writes her own acts in the first person. The only edges to this node are
+/// from her own commitments, which are few and are what she must be held to;
+/// an edge from everything she ever said would make her the best-connected
+/// node in the store within a month and warp every recall through her.
+///
+/// A vault that has her node already is left as it is, whichever of her names
+/// it is labelled with: both resolve to it.
+pub fn seed(vault: &Vault, date: &str) -> String {
+    if let Some(nid) = vault.me() {
+        return nid;
     }
-    let nid = vault.mint("person", "", None, "wanda");
+    // a rebuild takes the id the original store gave her node, whichever
+    // label it had there, so recorded calls that name that id still land
+    let nid = vault.oracle.as_ref().and_then(|o| o.me()).filter(|n| !vault.exists(n))
+        .unwrap_or_else(|| vault.mint("person", "", None, crate::SELF_LABEL));
+    let name = crate::SELF_NAME;
     vault.upsert(
-        &nid, "person", "wanda",
-        "the assistant keeping this memory; linked only from her own commitments",
-        "wanda \u{2014} the assistant keeping this memory. These notes are hers, in \
-         her voice: an act with nobody named as doing it is hers. Linked only \
-         from her own commitments, so she is not the hub of all she has touched.",
+        &nid, "person", crate::SELF_LABEL,
+        &format!("my name is {name}, the assistant keeping this memory; linked only \
+                  from my own commitments"),
+        &format!("My name is {name}, the assistant keeping this memory. These notes \
+                  are mine, in my own voice: what I did, I write in the first person, \
+                  with \"I\" as the one who did it. Linked only from my own \
+                  commitments, so I am not the hub of all I have touched."),
         &[], &[], date,
     );
+    nid
 }
 
 /// One colour per top-level directory. Taken from the vault rather than from a

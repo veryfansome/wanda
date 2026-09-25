@@ -64,6 +64,7 @@ class SlackActions:
         self._pace = asyncio.Lock()
         self._last_call = 0.0
         self._user_cache: dict[str, str] = {}
+        self._own_ids: frozenset[str] = frozenset()
 
     async def _call(self, method: str, /, **kwargs):
         async with self._pace:
@@ -85,7 +86,7 @@ class SlackActions:
             f"From: {esc_inline(row['from_addr'])}\nSubject: {esc_inline(row['subject'])}\n"
             f"_{esc(verdict.reason)}_\n"
             f"```{snippet}```\n"
-            f"Reply in this thread to have wanda work on it."
+            f"Reply in this thread to have me work on it."
         )
         resp = await self._call(
             "chat_postMessage",
@@ -154,6 +155,18 @@ class SlackActions:
                 break
         return trim_thread(msgs, limit)  # keeps the parent plus the newest
 
+    async def own_ids(self) -> frozenset[str]:
+        """The bot user id and bot id wanda posts under. Empty when auth.test
+        fails, which leaves her messages under her display name rather than
+        costing the session its whole context; a failure is not cached."""
+        if not self._own_ids:
+            try:
+                auth = await self._call("auth_test")
+                self._own_ids = frozenset(i for i in (auth.get("user_id"), auth.get("bot_id")) if i)
+            except Exception:
+                log.warning("could not look up wanda's own Slack ids")
+        return self._own_ids
+
     async def user_names(self, user_ids: set[str]) -> dict[str, str]:
         """Resolve ids to display names, cached for the process lifetime."""
         for uid in user_ids - self._user_cache.keys():
@@ -171,7 +184,7 @@ class SlackActions:
     async def alert(self, text: str) -> None:
         await self._call(
             "chat_postMessage", channel=self.cfg.email_triage_slack_channel_id,
-            text=truncate_text(f"⚠️ wanda: {text}"),
+            text=truncate_text(f"⚠️ {text}"),
         )
 
     # --- daily digest ---

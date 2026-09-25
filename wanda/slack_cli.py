@@ -13,7 +13,7 @@ from slack_sdk.http_retry.builtin_handlers import RateLimitErrorRetryHandler
 
 from wanda.config import Config
 from wanda.tls import ssl_context
-from wanda.transcript import render, trim_thread, user_ids_in
+from wanda.transcript import is_mine, render, trim_thread, user_ids_in
 
 # Set by the harness for an agent session, so `post` can default to the
 # conversation that triggered it and record that a reply was sent.
@@ -47,11 +47,21 @@ def _names(web: WebClient, messages: list[dict]) -> dict[str, str]:
     return names
 
 
+def _own_ids(web: WebClient) -> frozenset[str]:
+    """See SlackActions.own_ids: without them the listing still prints, with
+    wanda's messages under her display name."""
+    try:
+        auth = web.auth_test()
+    except SlackApiError:
+        return frozenset()
+    return frozenset(i for i in (auth.get("user_id"), auth.get("bot_id")) if i)
+
+
 def _emit(messages: list[dict], web: WebClient, as_json: bool) -> None:
     if as_json:
         print(json.dumps(messages, indent=2))
     else:
-        print(render(messages, _names(web, messages)))
+        print(render(messages, _names(web, messages), me=_own_ids(web)))
 
 
 def add_parser(sub: argparse._SubParsersAction) -> None:
@@ -79,7 +89,7 @@ def add_parser(sub: argparse._SubParsersAction) -> None:
     v.add_argument("query")
     v.add_argument("--limit", type=int, default=20)
 
-    verbs.add_parser("channels", help="list channels the bot is in")
+    verbs.add_parser("channels", help="list channels I am in")
 
     v = verbs.add_parser("members", help="list members of a channel")
     v.add_argument("--channel")
@@ -142,9 +152,11 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
 
         elif verb == "search":
             resp = _client(cfg, user_token=True).search_messages(query=args.query, count=args.limit)
+            own = _own_ids(web)
             for m in (resp.get("messages") or {}).get("matches") or []:
                 ch = (m.get("channel") or {}).get("name", "?")
-                print(f"[{ch}] {m.get('username') or m.get('user')}: {(m.get('text') or '')[:300]}")
+                who = "me" if is_mine(m, own) else m.get("username") or m.get("user")
+                print(f"[{ch}] {who}: {(m.get('text') or '')[:300]}")
 
         elif verb == "channels":
             resp = web.users_conversations(types="public_channel,private_channel,im,mpim", limit=200)
@@ -167,8 +179,9 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
                     break
             total = len(ids)
             shown = ids[:args.limit]  # one users.info call each; keep it bounded
+            own = _own_ids(web)
             for uid, name in _names(web, [{"user": i} for i in shown]).items():
-                print(f"{uid}\t{name}")
+                print(f"{uid}\t{'me' if uid in own else name}")
             if len(shown) < total or cursor:
                 print(f"… showing {len(shown)} of {total}{'+' if cursor else ''} members")
 

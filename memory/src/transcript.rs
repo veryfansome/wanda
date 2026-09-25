@@ -1,5 +1,5 @@
 //! A projection of a session's native transcript: who said what, what wanda
-//! did, what she answered.
+//! did, what she answered — rendered for her, so in her voice.
 //!
 //! Claude Code keeps a transcript of every session it runs, as JSONL under
 //! `~/.claude/projects/<cwd, slashes to dashes>/<session id>.jsonl`, and prunes
@@ -28,18 +28,19 @@ pub fn project_dir(vault: &Path) -> PathBuf {
     PathBuf::from(home).join(".claude").join("projects").join(key)
 }
 
-// the shape of an arriving prompt, as the harness writes it. The harness checks
-// at startup that what it writes is what this reads, so the two cannot drift apart.
+// the shape of an arriving prompt, as the harness writes it now and as it wrote
+// it for transcripts still on disk. The harness checks at startup that this
+// reads every one of those, so the two cannot drift apart.
 static PROMPT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
-    r"(?s)^(?:You are wanda\.\s*\n\n)?Today is (\d{4}-\d{2}-\d{2})\.\s*\n\n(.*?)\n\nDo (?:two|three) things").unwrap());
+    r"(?s)^(?:(?:You are|I am) wanda\.\s*\n\n)?Today is (\d{4}-\d{2}-\d{2})\.\s*\n\n(.*?)\n\n(?:Do (?:two|three)|I do three) things").unwrap());
 static DM_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
-    r"(?s)^(.+?) says to you, in a direct message:\n\n(.*)$").unwrap());
+    r"(?s)^(.+?) says to (?:you|me), in a direct message:\n\n(.*)$").unwrap());
 static EMAIL_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
     r"(?s)^An email has arrived[^\n]*\n\n\s*From: (.+?)\n(.*)$").unwrap());
 // the thread so far is rendered above the new message; only that new message is
 // this exchange's input
 static THREAD_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(concat!(
-    r"(?s)^In a Slack thread that .+? read, wanda included\.[^\n]*\n\n",
+    r"(?s)^In a Slack thread that .+? (?:read, wanda included|and I read)\.[^\n]*\n\n",
     r"(?:The thread so far:\n\n.*?\n\n)?([^\n]+?) (?:now )?says:\n\n(.*)$")).unwrap());
 
 /// (stated date, channel, speaker, text). A prompt not in this shape comes back
@@ -299,6 +300,11 @@ fn result_text(c: Option<&Value>) -> String {
     }
 }
 
+/// The label on a prompt that did not parse, which is shown whole. A prompt
+/// opens in her own voice, so under "someone said" it would read as another
+/// person claiming to be her.
+const UNPARSED: &str = "the opening message";
+
 /// What a session sees: the exchange's own date, and times of day only — a
 /// timestamp's date is never rendered, whatever day the reader is on.
 /// `in_progress` marks the caller's own exchange while it has not answered.
@@ -315,31 +321,35 @@ pub fn render(ex: &Exchange, full: bool, in_progress: bool) -> String {
         head += " \u{b7} this session, in progress";
     }
     let mut out = vec![head, String::new()];
-    let who = if ex.speaker.is_empty() { "someone" } else { &ex.speaker };
+    let who = match (ex.speaker.is_empty(), ex.date.is_empty()) {
+        (false, _) => format!("{} said", ex.speaker),
+        (true, true) => UNPARSED.to_string(),
+        (true, false) => "someone said".to_string(),
+    };
     for t in &ex.turns {
         match t.kind.as_str() {
-            "said" => out.push(format!("{}  {who} said: {}", t.at, t.text)),
+            "said" => out.push(format!("{}  {who}: {}", t.at, t.text)),
             "did" => {
-                out.push(format!("{}  wanda ran: {}", t.at,
+                out.push(format!("{}  I ran: {}", t.at,
                     if full { t.text.clone() } else { take_chars(&t.text, 300) }));
                 if !t.result.is_empty() {
                     out.push(format!("          \u{2192} {}", t.result));
                 }
             }
-            "aside" => out.push(format!("{}  wanda (aside): {}", t.at,
+            "aside" => out.push(format!("{}  I (aside): {}", t.at,
                 if full { t.text.clone() } else { take_chars(&t.text, 200) })),
-            "answered" => out.push(format!("{}  wanda said: {}", t.at,
+            "answered" => out.push(format!("{}  I said: {}", t.at,
                 if t.text.is_empty() { "(nothing)" } else { &t.text })),
             _ => {}
         }
     }
     if !ex.turns.iter().any(|t| t.kind == "answered") {
-        out.push(format!("          wanda said: {}", if !ex.answer.is_empty() {
+        out.push(format!("          I said: {}", if !ex.answer.is_empty() {
             &ex.answer
         } else if in_progress {
             "(nothing yet \u{2014} this session is in progress)"
         } else {
-            "(nothing \u{2014} the session did not answer)"
+            "(nothing \u{2014} I did not answer)"
         }));
     }
     out.join("\n")
@@ -350,10 +360,14 @@ pub fn line(ex: &Exchange) -> String {
     let said = take_chars(&one_line(&ex.text), 70);
     let ans = take_chars(&one_line(&ex.answer), 70);
     let ans = if ans.is_empty() { "(silent)".to_string() } else { ans };
-    format!("{}  {}  {}: {said}\n          wanda: {ans}",
+    format!("{}  {}  {}: {said}\n          me: {ans}",
         take_chars(&ex.session, 8),
         if ex.date.is_empty() { "----------" } else { &ex.date },
-        if ex.speaker.is_empty() { "?" } else { &ex.speaker })
+        match (ex.speaker.is_empty(), ex.date.is_empty()) {
+            (false, _) => ex.speaker.as_str(),
+            (true, true) => UNPARSED,
+            (true, false) => "?",
+        })
 }
 
 /// A session id, or an unambiguous prefix of one.
