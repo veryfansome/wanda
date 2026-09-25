@@ -104,3 +104,4 @@ def test_the_lab_hands_its_sessions_the_same_anchor():
     lab = re.search(r'const ANCHOR: &str = r#"(.*?)"#;', session.read_text(), re.DOTALL)
     assert lab, "the lab's ANCHOR is gone from session.rs"
     assert lab.group(1) == ANCHOR, "the lab's anchor and the product's have drifted apart"
+

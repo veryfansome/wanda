@@ -140,7 +140,7 @@ def conversation_seed_prompt(p: dict, transcript: str, asker: str) -> str:
         where = "a thread in a Slack channel" if p.get("in_thread") else "a Slack channel"
     return (
         f"I am wanda, a helpful assistant in my owner's Slack workspace. "
-        f"{asker} has just addressed me in {where}.\n"
+        f"{sanitize(asker)} has just addressed me in {where}.\n"
         f"{UNTRUSTED_NOTE}"
         f"{HOW_TO_REPLY}\n"
         "Recent conversation, oldest first:\n"

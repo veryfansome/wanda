@@ -82,7 +82,7 @@ def add_parser(sub: argparse._SubParsersAction) -> None:
     v = verbs.add_parser("post", help="post a message")
     v.add_argument("--text", required=True)
     v.add_argument("--channel")
-    v.add_argument("--thread", help="thread ts to reply in; omit to post at top level")
+    v.add_argument("--thread", help=f"thread ts to reply in (default: ${ENV_THREAD}; --no-thread posts at top level)")
     v.add_argument("--no-thread", action="store_true", help="post to the channel, not the thread")
 
     v = verbs.add_parser("search", help="search messages (needs WANDA_SLACK_USER_TOKEN)")
