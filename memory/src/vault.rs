@@ -292,12 +292,14 @@ impl Vault {
     /// The id is opaque, so nothing else in the vault has to change — no file
     /// moves, no edge is rewritten — and what it used to say is kept in the
     /// body, struck, with the date and reason, so the file still says what it
-    /// used to be called. When the summary was the name, it follows the name.
+    /// used to be called. A node named by its summary takes a new name as its
+    /// summary.
+    /// Returns the struck line written, if one was.
     pub fn rename(&self, old: &str, new_name: &str, summary: &str, because: &str, when: &str)
-        -> String
+        -> Option<String>
     {
         let src = self.path_for(old);
-        let Ok(text) = std::fs::read_to_string(&src) else { return old.to_string() };
+        let text = std::fs::read_to_string(&src).ok()?;
         let (mut meta, body) = fm::load(&text, Some(&self.root));
         let kind = old.split(':').next().unwrap_or("").to_string();
         let entity = fm::ENTITY_KINDS.contains(&kind.as_str());
@@ -318,7 +320,8 @@ impl Vault {
         }
         let mut notes: Vec<String> = Vec::new();
         let mut changed = false;
-        if !new_name.is_empty() && new_name != old_name {
+        let renamed = !new_name.is_empty() && new_name != old_name;
+        if renamed {
             meta.set("name", new_name.clone());
             // the struck line below is the whole record: `by_name` reads the
             // old name back out of it, so a session that knew this node by the
@@ -333,9 +336,10 @@ impl Vault {
             changed = true;
         }
         if notes.is_empty() && !changed {
-            return old.to_string();
+            return None;
         }
-        let verb = if new_name.is_empty() { "resummarised" } else { "renamed" };
+        let verb = if renamed { "renamed" } else { "resummarised" };
+        let because = one_line(because);
         let why = if because.is_empty() {
             format!(" ({verb} {when})")
         } else {
@@ -345,13 +349,13 @@ impl Vault {
         let body = if notes.is_empty() {
             body
         } else if crate::text::py_strip(&body).is_empty() {
-            note + "\n"
+            note.clone() + "\n"
         } else {
             format!("{}\n\n{note}\n", body.trim_end_matches(crate::text::is_py_space))
         };
         let former = fm::former_names(&body);
         let _ = std::fs::write(&src, format!("{}\n\n{body}", fm::dump(&meta, &kind, &former)));
-        old.to_string()
+        (!notes.is_empty()).then_some(note)
     }
 
     /// Write or update a node. `name` is its label; `summary` is its index

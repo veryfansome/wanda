@@ -617,17 +617,18 @@ fn live_lines(body: &str) -> Vec<String> {
 /// How much of a body a write prints back, in characters.
 const BODY_SHOWN: usize = 1600;
 
-/// The body as it reads after a write passed lines to a node whose body had
-/// live lines, the added ones marked: a result that cannot be seen is read as
-/// a replaced body, and a line restating another shows beside it. Past
-/// BODY_SHOWN, the first line (what the node is), the added ones and the newest
-/// that fit (where it stands) are shown, and each gap is marked.
+/// The body as it reads after a write passed lines to it, the added ones
+/// marked: a shell expands `$` inside double quotes, so what was stored is not
+/// always what was typed; a result that cannot be seen is read as a replaced
+/// body; and a line restating another shows beside it. Past BODY_SHOWN, the
+/// first line (what the node is), the added ones and the newest that fit
+/// (where it stands) are shown, and each gap is marked.
 fn echo_body(v: &Vault, nid: &str, taken: &[Taken]) {
     let (_, body) = stored(v, nid);
     let lines = live_lines(&body);
     let added: Vec<&str> = taken.iter().filter_map(|t| t.added.as_deref())
         .filter(|a| !a.starts_with("~~")).collect();
-    if taken.is_empty() || lines.len() <= added.len() {
+    if taken.is_empty() || lines.is_empty() {
         return;
     }
     let n = lines.len();
@@ -896,6 +897,7 @@ fn cmd_event(v: &Vault, summary: &str, body: &str, when: &str, participants: &st
     let taken = v.upsert(&nid, "event", &summary, &summary, body, &[], &edges, &today());
     regen(v);
     ok_stored(v, &nid);
+    echo_body(v, &nid, &taken);
     say_left(&taken);
     0
 }
@@ -959,6 +961,10 @@ fn cmd_pref(v: &Vault, whose: &str, summary: &str, body: &str, kind: &str,
 fn cmd_trajectory(v: &Vault, summary: &str, body: &str, expect: &str, by: &str,
                   about: &str, new: bool) -> i32 {
     let summary = match summary_or_die(summary, "--summary") { Ok(x) => x, Err(rc) => return rc };
+    if py_strip(expect).is_empty() {
+        out!("(--expect is empty)");
+        return 1;
+    }
     if !new {
         match existing(v, "trajectory", &summary, "", "", true) {
             Ok(Some(dup)) => {
@@ -983,6 +989,9 @@ fn cmd_trajectory(v: &Vault, summary: &str, body: &str, expect: &str, by: &str,
                          &edges, &today());
     regen(v);
     ok_stored(v, &nid);
+    let (meta, _) = stored(v, &nid);
+    out!("  expect: {}", meta.get("expect"));
+    echo_body(v, &nid, &taken);
     say_left(&taken);
     if let Some(line) = distance {
         out!("{line}");
@@ -1058,7 +1067,7 @@ fn cmd_rename(v: &Vault, node: &str, name: &str, summary: &str, because: &str) -
             return 1;
         }
     }
-    v.rename(&nid, &name, &summary, because, &today());
+    let note = v.rename(&nid, &name, &summary, because, &today());
     regen(v);
     let kind = nid.split(':').next().unwrap_or("");
     let named = memory::fm::ENTITY_KINDS.contains(&kind);
@@ -1075,6 +1084,9 @@ fn cmd_rename(v: &Vault, node: &str, name: &str, summary: &str, because: &str) -
         out += &format!(" ({a} {kind} is named by its summary; the name given was not kept)");
     }
     out!("{out}");
+    if let Some(note) = note {
+        out!("  {note}");
+    }
     0
 }
 
@@ -1133,6 +1145,7 @@ fn cmd_retract(v: &Vault, subject: &str, rel: &str, object: &str, inverse: &str,
             Err(rc) => return rc,
         }
     };
+    let because = one_line(because);
     let why = if because.is_empty() {
         format!(" (retracted {})", today())
     } else {
@@ -1182,7 +1195,7 @@ fn cmd_retract(v: &Vault, subject: &str, rel: &str, object: &str, inverse: &str,
     // every line holding the text is struck, and a line can carry more than
     // the claim that was meant
     for l in &struck {
-        out!("  - {l}");
+        out!("  - ~~{l}~~{why}");
     }
     0
 }
@@ -1358,7 +1371,7 @@ fn cmd_amend(v: &Vault, r: &str, line: &str, with: &str, because: &str) -> i32 {
     let _ = std::fs::write(&path, format!("{}\n\n{joined}\n",
         memory::fm::dump(&meta, &kind, &memory::fm::former_names(&joined))));
     regen(v);
-    out!("ok {nid} amended\n  - {old}\n  + {with}");
+    out!("ok {nid} amended\n  - ~~{old}~~{why}\n  + {with}");
     // what the new line drops was a claim put right, and it can stand in the
     // summary, the name or other nodes too. What it keeps was not corrected, and
     // pointing at it elsewhere would say it was. A --line that is the whole line

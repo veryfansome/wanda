@@ -66,12 +66,6 @@ The same shape remains for the kinds a summary names. `mem rename <id> --summary
 
 **Fix.** Refuse a restated former summary as a former name is refused, naming the node. For a trajectory or an event a guard hit is already a refusal; a rule's hit writes, so it needs one.
 
-### 43. A dollar amount eaten by the shell in `--body`, `--expect` or `--because` is stored without being shown
-
-A session drives `mem` through Bash and writes its arguments in double quotes, where `"$200"` is a shell expansion: `$2` is empty in a `sh -c` string, so `mem` receives `00` and stores it. From round 20 the stored index line and note lines are echoed after each write, so a mangled summary or note is on the screen. A body, an expectation or a reason is not, and a figure eaten there stays invisible. Rounds 16 to 19 have three such cases.
-
-**Fix.** Echo what was stored for those too, or say once in the standing text that a `$` inside double quotes is expanded.
-
 ### 52. `mem` refuses an id written as `pref:`, as a directory path, or with a name after it
 
 `mem show pref:8cb97b` prints `(no node for 'pref:8cb97b')` and exits 1, and so do `mem show 'person:600349 alex'` and `mem show people/600349`. `pref` is the verb that writes a preference, and sessions' own notes write `pref:<id>` too; which of these leads sessions to the shape is not established. In round 19, 7 calls failed on it — `show` 2, `relate --object` 5 — and round 18 had 8. No call was refused on the directory or id-then-name shapes in either round. From round 20 the judge reads all of these shapes; `mem` does not.
@@ -102,9 +96,9 @@ Recalling from four of the ten people in the store returns eight per cent of it.
 
 **Fix.** Say that both cap their output and that `--limit` raises it; print how many were cut.
 
-### 33. `--because` is undocumented, and discarded on an edge retraction and on `forget`
+### 33. `--because` is undocumented, and discarded on an edge retraction, on `forget` and on a first summary
 
-The retract skill says *"Give the same `--because` each time, dated, saying who corrected it and when"*. On an edge retraction and on `forget`, the reason reaches nowhere in the store: `cmd_retract` builds the sentence and then uses it only on a struck body line, and `cmd_forget` unlinks the file.
+The retract skill says *"Give the same `--because` each time, dated, saying who corrected it and when"*. On an edge retraction and on `forget`, the reason reaches nowhere in the store: `cmd_retract` builds the sentence and then uses it only on a struck body line, and `cmd_forget` unlinks the file. A `rename` that gives a node its first summary strikes nothing, so its reason goes the same way.
 
 ```
 $ mem retract --subject person:d7a42f --rel parent_of --object 92e268 --inverse child_of \
@@ -117,7 +111,7 @@ $ grep -rn "corrected this" <vault>      → nothing
 
 It survives in the session transcript, which is the belt — but the store, which is what a later session reads, keeps nothing. Across round 16 that is 47 reasons written and thrown away: all 20 of the successful edge-only retractions carried a `--because`, and 27 of the 42 `forget` calls did.
 
-`--because` has no help text on any verb — `mem retract --help` and `mem forget --help` both show a bare `--because BECAUSE`. Where it *is* kept — `--line` and `rename` — `mem` already prefixes its own date, so following the skill literally produces the date twice:
+`--because` has no help text on any verb but `amend` — `mem retract --help` and `mem forget --help` both show only `--because <BECAUSE>  [default: ""]`. Where it *is* kept — `--line`, `rename` and `amend` — `mem` already prefixes its own date, so following the skill literally produces the date twice:
 
 ```
 ~~was summarised: mei's mother~~ (resummarised 2026-09-10: fan corrected this on 2026-06-21)
