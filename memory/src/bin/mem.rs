@@ -14,11 +14,15 @@ use memory::recall::{self, HOPS, LIMIT};
 use memory::transcript;
 use memory::fm::Edge;
 use memory::text::{line_for, marks, one_line, py_repr, py_strip};
-use memory::vault::Vault;
+use memory::vault::{Taken, Vault};
 use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+/// `--body` on the verbs that update a node already here.
+const ADD_HELP: &str = "what the summary does not hold. On a node already here, only what is \
+                        new: it goes below the lines the body has, which stay as they are";
 
 #[derive(Parser)]
 #[command(name = "mem", about = "read and write my memory", disable_help_subcommand = true)]
@@ -57,7 +61,7 @@ enum Cmd {
         #[arg(long, default_value = "",
               help = format!("the index line: one line, at most {} characters", memory::SUMMARY_MAX))]
         summary: String,
-        #[arg(long, default_value = "")]
+        #[arg(long, default_value = "", hide_default_value = true, help = ADD_HELP)]
         body: String,
         /// a second node with a name one already has: two different people, one name
         #[arg(long)]
@@ -71,7 +75,9 @@ enum Cmd {
         #[arg(long, required = true,
               help = format!("the index line: one line, at most {} characters", memory::SUMMARY_MAX))]
         summary: String,
-        #[arg(long, default_value = "")]
+        #[arg(long, default_value = "", hide_default_value = true,
+              help = "what the summary does not hold. An event is written once; a line of one \
+                      already here is corrected with `mem amend`")]
         body: String,
         /// when it happened, if not today
         #[arg(long, default_value = "", value_name = "YYYY-MM-DD")]
@@ -105,7 +111,7 @@ enum Cmd {
         #[arg(long, required = true,
               help = format!("the index line: one line, at most {} characters", memory::SUMMARY_MAX))]
         summary: String,
-        #[arg(long, default_value = "")]
+        #[arg(long, default_value = "", hide_default_value = true, help = ADD_HELP)]
         body: String,
         /// what sort of rule. A new rule is a preference unless told
         /// otherwise; a restated rule keeps the kind it has
@@ -121,7 +127,9 @@ enum Cmd {
         #[arg(long, required = true,
               help = format!("the index line: one line, at most {} characters", memory::SUMMARY_MAX))]
         summary: String,
-        #[arg(long, default_value = "")]
+        #[arg(long, default_value = "", hide_default_value = true,
+              help = "what the summary does not hold. What is new later goes below it with \
+                      `mem advance --note`")]
         body: String,
         /// what would close it
         #[arg(long, required = true)]
@@ -143,7 +151,8 @@ enum Cmd {
         /// a revised date this should resolve by; not who
         #[arg(long, default_value = "", value_name = "YYYY-MM-DD")]
         by: String,
-        #[arg(long, default_value = "")]
+        #[arg(long, default_value = "", hide_default_value = true,
+              help = "what is new: it goes below the lines the body has, which stay as they are")]
         note: String,
     },
     /// give a node a new name or summary; its id and every edge to it stay
@@ -156,6 +165,19 @@ enum Cmd {
               help = format!("a new summary — the index line, at most {} characters. An event, a trajectory or a preference is named by its summary: a new name or a new summary, not both", memory::SUMMARY_MAX))]
         summary: String,
         #[arg(long, default_value = "")]
+        because: String,
+    },
+    /// edit one line of a node's body that is wrong as written: the whole line as it should read takes its place, and the old one stays, struck
+    Amend {
+        node: String,
+        /// text found in the one live body line to replace
+        #[arg(long, required = true)]
+        line: String,
+        /// the whole line as it should read, not only the words that change
+        #[arg(long, required = true, value_name = "LINE")]
+        with: String,
+        /// kept beside the old line, with the date
+        #[arg(long, default_value = "", hide_default_value = true)]
         because: String,
     },
     /// remove a node that should never have existed; refused while anything links to it
@@ -174,8 +196,8 @@ enum Cmd {
         object: String,
         #[arg(long, default_value = "")]
         inverse: String,
-        /// strike a body line containing this text
-        #[arg(long, default_value = "")]
+        /// strike every body line containing this text
+        #[arg(long, default_value = "", hide_default_value = true)]
         line: String,
         #[arg(long, default_value = "")]
         because: String,
@@ -215,6 +237,7 @@ impl Cmd {
             Cmd::Trajectory { .. } => "trajectory",
             Cmd::Advance { .. } => "advance",
             Cmd::Rename { .. } => "rename",
+            Cmd::Amend { .. } => "amend",
             Cmd::Forget { .. } => "forget",
             Cmd::Retract { .. } => "retract",
             Cmd::Session { .. } => "session",
@@ -584,6 +607,111 @@ fn ok_stored(v: &Vault, nid: &str) {
     out!("ok {nid}\n  {}", line_for(&memory::fm::label(&meta), meta.get("summary")));
 }
 
+fn live_lines(body: &str) -> Vec<String> {
+    memory::text::split_lines(body).into_iter()
+        .map(|l| l.trim_end().to_string())
+        .filter(|l| !l.trim().is_empty() && !l.starts_with("~~"))
+        .collect()
+}
+
+/// How much of a body a write prints back, in characters.
+const BODY_SHOWN: usize = 1600;
+
+/// The body as it reads after a write passed lines to a node whose body had
+/// live lines, the added ones marked: a result that cannot be seen is read as
+/// a replaced body, and a line restating another shows beside it. Past
+/// BODY_SHOWN, the first line (what the node is), the added ones and the newest
+/// that fit (where it stands) are shown, and each gap is marked.
+fn echo_body(v: &Vault, nid: &str, taken: &[Taken]) {
+    let (_, body) = stored(v, nid);
+    let lines = live_lines(&body);
+    let added: Vec<&str> = taken.iter().filter_map(|t| t.added.as_deref())
+        .filter(|a| !a.starts_with("~~")).collect();
+    if taken.is_empty() || lines.len() <= added.len() {
+        return;
+    }
+    let n = lines.len();
+    out!("  body, {n} line{}:", if n == 1 { "" } else { "s" });
+    let new = |l: &String| added.iter().any(|a| *a == l);
+    let size = |l: &String| l.chars().count();
+    let mut keep = vec![false; n];
+    let mut used = 0usize;
+    for i in 0..n {
+        if i == 0 || new(&lines[i]) {
+            keep[i] = true;
+            used += size(&lines[i]);
+        }
+    }
+    for i in (1..n).rev() {
+        if !keep[i] && used + size(&lines[i]) <= BODY_SHOWN {
+            keep[i] = true;
+            used += size(&lines[i]);
+        }
+    }
+    for i in 0..n {
+        if keep[i] {
+            out!("{}{}", if new(&lines[i]) { "  + " } else { "    " }, lines[i]);
+        } else if keep[i - 1] {
+            out!("    [\u{2026}]");
+        }
+    }
+}
+
+/// What a write was passed and did not take as passed, and why. Otherwise the
+/// only place it shows is the file, and a write that meant to replace the body
+/// reads as one that did.
+fn say_left(taken: &[Taken]) {
+    let clipped = |t: &str| py_repr(&memory::text::clip(t, 80));
+    for a in taken.iter().filter_map(|t| t.added.as_deref()).filter(|a| a.starts_with("~~")) {
+        let hidden = past_note(a);
+        if hidden.is_empty() {
+            out!("  (written as passed, struck, so no reader takes it as part of the body: {})",
+                 clipped(a));
+        } else {
+            out!("  (written as passed, and a line that opens with ~~ is struck whole, so the \
+                  text after its note is hidden with it: {})", clipped(hidden));
+        }
+    }
+    if taken.iter().any(|t| t.held) {
+        if taken.iter().any(|t| t.added.is_some()) {
+            out!("  (the rest of what was passed is in the body already, and was not added again)");
+        } else {
+            out!("  (what was passed is in the body already, and was not added again)");
+        }
+    }
+    let mut said = BTreeSet::new();
+    for u in taken.iter().flat_map(|t| t.unsaid.iter()) {
+        if said.insert(u) {
+            out!("  ({} earlier, and not added again: {})", u.1, clipped(&u.0));
+        }
+    }
+}
+
+/// What a struck line carries after its closing `~~` and the note in brackets
+/// that follows it.
+fn past_note(line: &str) -> &str {
+    let inner = line.trim_start_matches('~');
+    let Some((_, rest)) = inner.split_once("~~") else { return "" };
+    let rest = rest.trim_start();
+    if !rest.starts_with('(') {
+        return rest.trim();
+    }
+    let mut depth = 0usize;
+    for (i, c) in rest.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return rest[i + 1..].trim();
+                }
+            }
+            _ => {}
+        }
+    }
+    ""
+}
+
 fn stub(v: &Vault, name: &str, kind: &str) -> String {
     let nid = v.mint(kind, "", None, name);
     v.upsert(&nid, kind, name, "", "", &[], &[], &today());
@@ -719,9 +847,11 @@ fn cmd_entity(v: &Vault, kind: &str, name: &str, summary: &str, body: &str,
         }
     };
     let nid = nid.unwrap_or_else(|| v.mint(kind, "", None, &name));
-    v.upsert(&nid, kind, &name, &summary, body, &[], &[], &today());
+    let taken = v.upsert(&nid, kind, &name, &summary, body, &[], &[], &today());
     regen(v);
     ok_stored(v, &nid);
+    echo_body(v, &nid, &taken);
+    say_left(&taken);
     0
 }
 
@@ -763,9 +893,10 @@ fn cmd_event(v: &Vault, summary: &str, body: &str, when: &str, participants: &st
     if !place_id.is_empty() {
         edges.push(Edge { rel: "at".into(), to: place_id });
     }
-    v.upsert(&nid, "event", &summary, &summary, body, &[], &edges, &today());
+    let taken = v.upsert(&nid, "event", &summary, &summary, body, &[], &edges, &today());
     regen(v);
     ok_stored(v, &nid);
+    say_left(&taken);
     0
 }
 
@@ -816,10 +947,12 @@ fn cmd_pref(v: &Vault, whose: &str, summary: &str, body: &str, kind: &str,
     if !about_id.is_empty() {
         edges.push(Edge { rel: "concerns".into(), to: about_id });
     }
-    v.upsert(&nid, "preference", &summary, &summary, body,
-             &[("ptype".to_string(), ptype)], &edges, &today());
+    let taken = v.upsert(&nid, "preference", &summary, &summary, body,
+                         &[("ptype".to_string(), ptype)], &edges, &today());
     regen(v);
     ok_stored(v, &nid);
+    echo_body(v, &nid, &taken);
+    say_left(&taken);
     0
 }
 
@@ -844,12 +977,13 @@ fn cmd_trajectory(v: &Vault, summary: &str, body: &str, expect: &str, by: &str,
     let nid = v.mint("trajectory", "", None, &summary);
     let edges: Vec<Edge> = about_ids.into_iter()
         .map(|a| Edge { rel: "involves".into(), to: a }).collect();
-    v.upsert(&nid, "trajectory", &summary, &summary, body,
-             &[("expect".into(), expect.to_string()), ("expect_by".into(), by),
-               ("status".into(), "open".into())],
-             &edges, &today());
+    let taken = v.upsert(&nid, "trajectory", &summary, &summary, body,
+                         &[("expect".into(), expect.to_string()), ("expect_by".into(), by),
+                           ("status".into(), "open".into())],
+                         &edges, &today());
     regen(v);
     ok_stored(v, &nid);
+    say_left(&taken);
     if let Some(line) = distance {
         out!("{line}");
     }
@@ -877,18 +1011,13 @@ fn cmd_advance(v: &Vault, r: &str, status: &str, by: &str, note: &str) -> i32 {
     if status == "closed" {
         extra.push(("closed".into(), today()));
     }
-    v.upsert(&nid, "trajectory", "", "", note, &extra, &[], &today());
+    let taken = v.upsert(&nid, "trajectory", "", "", note, &extra, &[], &today());
     regen(v);
     out!("ok {nid} {}", if status.is_empty() { "noted" } else { status });
-    let (_, body) = stored(v, &nid);
-    let held = memory::text::split_lines(&body);
-    let mut shown: BTreeSet<&str> = BTreeSet::new();
-    for line in memory::text::split_lines(note) {
-        let line = line.trim_end();
-        if !line.trim().is_empty() && held.contains(&line) && shown.insert(line) {
-            out!("  {line}");
-        }
+    for line in taken.iter().filter_map(|t| t.added.as_deref()) {
+        out!("  {line}");
     }
+    say_left(&taken);
     if let Some(line) = by_from_today(by) {
         out!("{line}");
     }
@@ -1014,6 +1143,7 @@ fn cmd_retract(v: &Vault, subject: &str, rel: &str, object: &str, inverse: &str,
         pairs.push((oid.clone(), inverse.to_string(), nid.clone()));
     }
     let mut hit = 0usize;
+    let mut struck: Vec<String> = Vec::new();
     for (src, rel, dst) in pairs {
         let path = v.path_for(&src);
         let Ok(text) = std::fs::read_to_string(&path) else { continue };
@@ -1029,6 +1159,7 @@ fn cmd_retract(v: &Vault, subject: &str, rel: &str, object: &str, inverse: &str,
             lines = lines.into_iter().map(|l| {
                 if l.to_lowercase().contains(&needle) && !l.starts_with("~~") {
                     hit += 1;
+                    struck.push(l.clone());
                     format!("~~{l}~~{why}")
                 } else {
                     l
@@ -1048,7 +1179,313 @@ fn cmd_retract(v: &Vault, subject: &str, rel: &str, object: &str, inverse: &str,
     }
     regen(v);
     out!("ok retracted {hit}");
+    // every line holding the text is struck, and a line can carry more than
+    // the claim that was meant
+    for l in &struck {
+        out!("  - {l}");
+    }
     0
+}
+
+/// One line of a body, corrected: the line as it should read goes in the old
+/// one's place, and the old one stays there, struck, with the date and the
+/// reason. In place, because a body is its facts in the order they were
+/// learned, and a reader with room for only part of it keeps the first line
+/// and the newest; a correction written last would read as the latest news.
+///
+/// One line, found by text in it: a correction is to one fact, and one line
+/// standing in for several would lose the rest. Struck lines, the summary, the
+/// name and the edges are not touched, and a retracted line does not come back
+/// this way (`says_again`).
+fn cmd_amend(v: &Vault, r: &str, line: &str, with: &str, because: &str) -> i32 {
+    let nid = match resolve(v, r) {
+        Ok(Some(n)) => n,
+        Ok(None) => { out!("(no node for {})", py_repr(r)); return 1; }
+        Err(rc) => return rc,
+    };
+    if py_strip(line).is_empty() {
+        out!("(--line is empty; nothing was written)");
+        return 1;
+    }
+    let parts = memory::text::split_lines(with).into_iter()
+        .filter(|l| !py_strip(l).is_empty()).count();
+    if parts > 1 {
+        out!("(--with is {parts} lines, and takes the place of one; nothing was written)");
+        return 1;
+    }
+    let with = one_line(with);
+    if with.is_empty() {
+        out!("(--with is empty; nothing was written)");
+        return 1;
+    }
+    // `~~was named: X~~` anywhere in a body gives the node a name it never had
+    if with.contains("~~") {
+        out!("(--with holds \"~~\", which marks a struck line; nothing was written)");
+        return 1;
+    }
+    let clipped = |t: &str| py_repr(&memory::text::clip(t, 80));
+    let path = v.path_for(&nid);
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let (meta, body) = memory::fm::load(&text, Some(&v.root));
+    let lines: Vec<String> = memory::text::split_lines(&body).into_iter()
+        .filter(|l| !py_strip(l).is_empty()).map(|l| l.to_string()).collect();
+    let needle = line.to_lowercase();
+    let holds = |l: &str| l.to_lowercase().contains(&needle);
+    let hits: Vec<usize> = (0..lines.len())
+        .filter(|&i| !lines[i].starts_with("~~") && holds(&lines[i])).collect();
+    let at = match hits.as_slice() {
+        [one] => *one,
+        [] => {
+            let also = if holds(meta.get("summary")) {
+                format!(". It is in the summary, which `mem rename {nid} --summary \"...\"` \
+                         changes")
+            } else if holds(meta.get("name")) {
+                format!(". It is in the name, which `mem rename {nid} \"<new name>\"` changes")
+            } else if lines.iter().any(|l| l.starts_with("~~") && holds(l)) {
+                ". It is in a struck line, and a struck line stays as it is".to_string()
+            } else {
+                String::new()
+            };
+            out!("(--line matches no live body line on {nid}; nothing was written{also})");
+            return 1;
+        }
+        many => {
+            out!("(--line matches {} live body lines on {nid}, and amend replaces one; nothing \
+                  was written. Pass text found in only one of them; a line that a longer one \
+                  repeats is amended after the longer one:)", many.len());
+            for &i in many {
+                out!("  - {}", lines[i]);
+            }
+            return 1;
+        }
+    };
+    let old = lines[at].trim_end().to_string();
+    // shown whole: what the shell or the date scrub changed in --with can be
+    // anywhere in the line
+    if one_line(&old) == with {
+        out!("(--with arrived reading exactly as the line does; nothing was written:)\n  = {old}");
+        return 1;
+    }
+    for l in lines.iter().filter(|l| l.starts_with("~~")) {
+        let (said, how) = memory::vault::struck_parts(l);
+        if how == "retracted" && says_again(&with, said) {
+            out!("({} was retracted from {nid}, and amend does not bring it back; nothing was \
+                  written)", clipped(said));
+            return 1;
+        }
+    }
+    let others: Vec<String> = lines.iter().enumerate()
+        .filter(|&(i, l)| i != at && !l.starts_with("~~"))
+        .map(|(_, l)| one_line(l)).collect();
+    if let Some(l) = others.iter().find(|l| **l == with) {
+        out!("(--with is a line {nid} already holds, {}; nothing was written. amend does not \
+              remove a line: one that was never true is retracted, and one that says the same \
+              in other words can stay)", clipped(l));
+        return 1;
+    }
+    let (rest, cut) = past_fronts(&with, &others);
+    if let Some(front) = cut.first() {
+        out!("(--with opens with a line {nid} already holds, {}, which stays; nothing was \
+              written. Without what the body already says, --with reads:)\n  + {rest}",
+             clipped(front));
+        return 1;
+    }
+    // only the new words, as a substitution takes them, would replace the whole
+    // line and lose the rest of it. A whole line keeps the old one's text on one
+    // side of the match; where the match reaches an end of the line, one at least
+    // as long that keeps the matched text there counts too. A --with that is the
+    // line as it would read, less the fronts other lines hold, loses nothing
+    if let Some((s, e)) = find_ci(&old, line) {
+        // a side with no word in it, such as the stop a --line ends short of,
+        // keeps nothing of the line
+        let side = |t: &str| if t.chars().any(char::is_alphanumeric) { one_line(t) }
+                             else { String::new() };
+        let (head, tail) = (side(&old[..s]), side(&old[e..]));
+        let swap = |w: &str| one_line(&format!("{}{w}{}", &old[..s], &old[e..]));
+        if swap(&with) == one_line(&old) {
+            // the shell or the date scrub turned --with into the text --line found
+            if past_fronts(&one_line(&old), &others).0 != with {
+                out!("(--with arrived reading exactly as the text --line found, so the line \
+                      would read as it does; nothing was written:)\n  = {old}");
+                return 1;
+            }
+        } else {
+            let found = one_line(&old[s..e]).to_lowercase();
+            let w = with.to_lowercase();
+            let long = with.chars().count() >= one_line(&old).chars().count();
+            let opens = if head.is_empty() { long && w.starts_with(&found) }
+                        else { w.starts_with(&head.to_lowercase()) };
+            let ends = if tail.is_empty() { long && w.ends_with(&found) }
+                       else { w.ends_with(&tail.to_lowercase()) };
+            if !(opens || ends) && !(head.is_empty() && tail.is_empty()) {
+                // a --with ending in the stop that follows the match would show it twice
+                let put = match old[e..].chars().next() {
+                    Some(c) if matches!(c, '.' | '!' | '?' | '\u{2026}') =>
+                        with.strip_suffix(c).unwrap_or(&with),
+                    _ => &with,
+                };
+                let (shown, cut) = past_fronts(&swap(put), &others);
+                if shown != with {
+                    out!("(--with takes the place of the whole line, and keeps none of it around \
+                          {}; nothing was written. With only that text replaced{}, the line \
+                          reads:)\n  + {shown}\n(when --with is already the whole line as it \
+                          should read, pass the whole old line as --line)", clipped(line),
+                         if cut.is_empty() { "" }
+                         else { ", and what other lines say taken off its front" });
+                    return 1;
+                }
+            }
+        }
+    }
+    let because = one_line(because);
+    let why = if because.is_empty() {
+        format!(" (amended {})", today())
+    } else {
+        format!(" (amended {}: {because})", today())
+    };
+    let mut kept = lines.clone();
+    kept[at] = format!("~~{old}~~{why}");
+    kept.insert(at + 1, with.clone());
+    let joined = kept.join("\n");
+    // struck, a line opening "was named:" or "was summarised:" reads as a former
+    // name or summary
+    if memory::fm::former_labels(&joined) != memory::fm::former_labels(&lines.join("\n")) {
+        out!("(struck, that line would read as a former name or summary of {nid}, which it \
+              never had; nothing was written)");
+        return 1;
+    }
+    let kind = nid.split(':').next().unwrap_or("").to_string();
+    let _ = std::fs::write(&path, format!("{}\n\n{joined}\n",
+        memory::fm::dump(&meta, &kind, &memory::fm::former_names(&joined))));
+    regen(v);
+    out!("ok {nid} amended\n  - {old}\n  + {with}");
+    // what the new line drops was a claim put right, and it can stand in the
+    // summary, the name or other nodes too. What it keeps was not corrected, and
+    // pointing at it elsewhere would say it was. A --line that is the whole line
+    // is held whole nowhere else, so what was dropped is searched for, or the
+    // text --line found where that is shorter and dropped too
+    let (said, _) = past_fronts(&one_line(&old), &others);
+    let gone = dropped(&said, &with);
+    if gone.is_empty() {
+        return 0;
+    }
+    let (claim, words) = if !holds(&with) && line.chars().count() < gone.chars().count() {
+        (line, false)
+    } else {
+        (gone, true)
+    };
+    let wrong = claim.to_lowercase();
+    // as whole words: a word or two dropped from a line is inside many longer ones
+    let says = |l: &str| {
+        let l = l.to_lowercase();
+        l.match_indices(&wrong).any(|(i, m)| !words
+            || !(l[..i].ends_with(char::is_alphanumeric)
+                 || l[i + m.len()..].starts_with(char::is_alphanumeric)))
+    };
+    if says(meta.get("summary")) {
+        out!("  (the summary still says {}; `mem rename {nid} --summary \"...\"` changes it)",
+             clipped(meta.get("summary")));
+    }
+    if memory::fm::ENTITY_KINDS.contains(&kind.as_str()) && says(meta.get("name")) {
+        out!("  (the name still says {}; `mem rename {nid} \"<new name>\"` changes it)",
+             clipped(meta.get("name")));
+    }
+    let elsewhere: Vec<String> = v.nodes().into_iter()
+        .filter(|n| n.id != nid)
+        .filter(|n| says(n.meta.get("summary"))
+                || memory::text::split_lines(&n.body).iter()
+                       .any(|l| !l.starts_with("~~") && says(l)))
+        .map(|n| n.id).collect();
+    if !elsewhere.is_empty() {
+        const SHOWN: usize = 8;
+        let more = elsewhere.len().saturating_sub(SHOWN);
+        out!("  ({} is also in {}{})", clipped(claim),
+             elsewhere.iter().take(SHOWN).cloned().collect::<Vec<_>>().join(", "),
+             if more > 0 { format!(", and {more} more") } else { String::new() });
+    }
+    0
+}
+
+/// Where `needle` first occurs in `hay`, case aside, as byte offsets into
+/// `hay`: the same match as `hay.to_lowercase().contains(..)`, placed.
+fn find_ci(hay: &str, needle: &str) -> Option<(usize, usize)> {
+    let want = needle.to_lowercase();
+    for (s, _) in hay.char_indices() {
+        let mut low = String::new();
+        for (j, c) in hay[s..].char_indices() {
+            low.extend(c.to_lowercase());
+            if !want.starts_with(&low) {
+                break;
+            }
+            if low.len() == want.len() {
+                return Some((s, s + j + c.len_utf8()));
+            }
+        }
+    }
+    None
+}
+
+/// `text` with the other lines it opens with taken off its front, longest
+/// first, as `upsert`'s guard does; and what was taken off.
+fn past_fronts(text: &str, others: &[String]) -> (String, Vec<String>) {
+    let mut rest = text.to_string();
+    let mut cut = Vec::new();
+    while let Some(front) = others.iter()
+        .filter(|l| memory::vault::opens_with(&rest, l))
+        .max_by_key(|l| l.len())
+    {
+        rest = rest[front.len()..].trim_start_matches(memory::text::is_py_space).to_string();
+        cut.push(front.clone());
+    }
+    (rest, cut)
+}
+
+/// The words of `old` between those it shares with `new` at the start and at
+/// the end, case and the punctuation around a word aside.
+fn dropped<'a>(old: &'a str, new: &str) -> &'a str {
+    let key = |w: &str| w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
+    let words: Vec<&str> = old.split(' ').collect();
+    let a: Vec<String> = words.iter().map(|w| key(w)).collect();
+    let b: Vec<String> = new.split(' ').map(key).collect();
+    let front = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
+    let back = a[front..].iter().rev().zip(b[front..].iter().rev())
+        .take_while(|(x, y)| x == y).count();
+    if front + back == words.len() {
+        return "";
+    }
+    let start: usize = words[..front].iter().map(|w| w.len() + 1).sum();
+    let end = old.len() - words[words.len() - back..].iter().map(|w| w.len() + 1).sum::<usize>();
+    old[start..end].trim_matches(|c: char| !c.is_alphanumeric())
+}
+
+/// Some run of whole sentences in `with` reads as `said`, a struck line's
+/// text, case, spacing and a final stop aside. A `;`, or a stop run straight
+/// into a capital, ends a sentence too; a comma does not, so reported speech
+/// passes.
+fn says_again(with: &str, said: &str) -> bool {
+    let norm = |t: &str| one_line(t).to_lowercase()
+        .trim_end_matches(['.', '!', '?', '\u{2026}']).trim_end().to_string();
+    let said = norm(said);
+    if said.is_empty() {
+        return false;
+    }
+    let mut starts = vec![0usize];
+    let mut ends = Vec::new();
+    for (i, c) in with.char_indices() {
+        let start = if c == ';' {
+            i + 1
+        } else if memory::text::is_py_space(c) && memory::vault::ends_sentence(&with[..i]) {
+            i + c.len_utf8()
+        } else if c.is_uppercase() && memory::vault::ends_sentence(&with[..i]) {
+            i
+        } else {
+            continue;
+        };
+        ends.push(i);
+        starts.push(start);
+    }
+    ends.push(with.len());
+    starts.iter().any(|&s| ends.iter().any(|&e| e > s && norm(&with[s..e]) == said))
 }
 
 /// An exchange, or a list of them, from the transcripts Claude Code keeps. This
@@ -1159,6 +1596,9 @@ fn main() {
         Cmd::Rename { node, name, summary, because } => Cmd::Rename {
             node: restamp(&node), name: restamp(&name),
             summary: restamp(&summary), because: restamp(&because) },
+        Cmd::Amend { node, line, with, because } => Cmd::Amend {
+            node: restamp(&node), line: restamp(&line), with: restamp(&with),
+            because: restamp(&because) },
         Cmd::Forget { r#ref, because } => Cmd::Forget {
             r#ref: restamp(&r#ref), because: restamp(&because) },
         Cmd::Retract { subject, rel, object, inverse, line, because } => Cmd::Retract {
@@ -1186,6 +1626,7 @@ fn main() {
         Cmd::Advance { r#ref, status, by, note } => cmd_advance(&v, r#ref, status, by, note),
         Cmd::Rename { node, name, summary, because } =>
             cmd_rename(&v, node, name, summary, because),
+        Cmd::Amend { node, line, with, because } => cmd_amend(&v, node, line, with, because),
         Cmd::Forget { r#ref, .. } => cmd_forget(&v, r#ref),
         Cmd::Retract { subject, rel, object, inverse, line, because } =>
             cmd_retract(&v, subject, rel, object, inverse, line, because),

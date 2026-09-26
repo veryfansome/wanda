@@ -355,7 +355,8 @@ impl Vault {
     }
 
     /// Write or update a node. `name` is its label; `summary` is its index
-    /// line, one line, at most SUMMARY_MAX; `body` is a line to append.
+    /// line, one line, at most SUMMARY_MAX; `body` is lines to add below the
+    /// ones the node has. Returns what became of each non-blank line of `body`.
     #[allow(clippy::too_many_arguments)]
     pub fn upsert(
         &self,
@@ -367,7 +368,7 @@ impl Vault {
         meta_extra: &[(String, String)],
         add_edges: &[Edge],
         date: &str,
-    ) -> PathBuf {
+    ) -> Vec<Taken> {
         let p = self.path_for(nid);
         let (mut meta, old_body) = match std::fs::read_to_string(&p) {
             Ok(t) => fm::load(&t, Some(&self.root)),
@@ -403,25 +404,114 @@ impl Vault {
         }
         let mut lines: Vec<String> = crate::text::split_lines(&old_body)
             .into_iter().filter(|l| !l.trim().is_empty()).map(|s| s.to_string()).collect();
-        // a line that has been retracted must not come back the next time the
-        // same sentence is written, or a correction lasts until the next mention
-        let struck: Vec<String> = lines.iter().filter(|l| l.starts_with("~~"))
-            .map(|l| l.trim_start_matches('~').split("~~").next().unwrap_or("").trim().to_string())
-            .collect();
+        // what the body says already: each live line, and each struck line's text
+        // with how it was struck (`struck_parts`)
+        let mut said: Vec<(String, Option<String>)> = lines.iter().map(|l| {
+            if l.starts_with("~~") {
+                let (text, how) = struck_parts(l);
+                (text.to_string(), Some(how.to_string()))
+            } else {
+                (l.clone(), None)
+            }
+        }).collect();
+        let mut taken = Vec::new();
         for new_line in crate::text::split_lines(body) {
             let new_line = new_line.trim_end();
-            if !new_line.trim().is_empty()
-                && !lines.iter().any(|l| l == new_line)
-                && !struck.iter().any(|s| s == new_line.trim())
-            {
-                lines.push(new_line.to_string());
+            if new_line.trim().is_empty() {
+                continue;
             }
+            let mut t = Taken::default();
+            // a line the file holds, or one struck from it, is not written again,
+            // or a retraction lasts until the next mention. Checked before any
+            // front is cut, or a shorter line's front would go and the rest of it
+            // be written
+            let mut rest = if t.held_back(new_line, &lines, &said) { "" } else { new_line };
+            // a line that repeats the body and adds a fact keeps only the fact,
+            // or each such line repeats all above it. Longest front first, so a
+            // line opening with two earlier lines, or with a struck one, loses all
+            // it repeats
+            while let Some((front, how)) = said.iter()
+                .filter(|(s, _)| opens_with(rest, s))
+                .max_by_key(|(s, _)| s.len())
+            {
+                match how {
+                    None => t.held = true,
+                    Some(how) => t.unsaid.push((front.clone(), how.clone())),
+                }
+                rest = rest[front.len()..].trim_start_matches(crate::text::is_py_space);
+            }
+            if !rest.is_empty() && !t.held_back(rest, &lines, &said) {
+                lines.push(rest.to_string());
+                if !rest.starts_with("~~") {
+                    said.push((rest.to_string(), None));
+                }
+                t.added = Some(rest.to_string());
+            }
+            taken.push(t);
         }
         let joined = lines.join("\n");
         let text = format!("{}\n\n{joined}\n", fm::dump(&meta, kind, &fm::former_names(&joined)));
         let _ = std::fs::write(&p, text);
-        p
+        taken
     }
+}
+
+/// What became of one line `upsert` was passed.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Taken {
+    /// what was written for it: the line, or what was left of it once its
+    /// front was found in the body already
+    pub added: Option<String>,
+    /// some or all of it is in the body already, and was not written again
+    pub held: bool,
+    /// parts of it struck from the body earlier and not written again, each as
+    /// it read, with how it was struck (`struck_parts`)
+    pub unsaid: Vec<(String, String)>,
+}
+
+impl Taken {
+    /// `text` is a line the file holds, or the text of a struck one, and is
+    /// not written. Which one is noted.
+    fn held_back(&mut self, text: &str, lines: &[String], said: &[(String, Option<String>)]) -> bool {
+        if lines.iter().any(|l| l == text) {
+            self.held = true;
+            return true;
+        }
+        let struck = said.iter().find(|(s, how)| how.is_some() && s == text.trim());
+        if let Some((s, Some(how))) = struck {
+            self.unsaid.push((s.clone(), how.clone()));
+            return true;
+        }
+        false
+    }
+}
+
+/// A struck line's text as it read before it was struck, and the word its note
+/// opens with: `retracted` or `amended` for a line those struck, `struck` for
+/// any other.
+pub fn struck_parts(line: &str) -> (&str, &str) {
+    let inner = line.trim_start_matches('~');
+    let (text, note) = inner.split_once("~~").unwrap_or((inner, ""));
+    let word = note.trim_start().trim_start_matches('(').split(' ').next().unwrap_or("");
+    let how = if matches!(word, "retracted" | "amended") { word } else { "struck" };
+    (text.trim(), how)
+}
+
+/// `text` opens with `said`, a finished sentence, and goes on after whitespace.
+/// A phrase never counts: it can open a longer sentence that says something
+/// else, and a line extending a struck phrase is usually its correction.
+pub fn opens_with(text: &str, said: &str) -> bool {
+    !said.is_empty()
+        && ends_sentence(said)
+        && text.len() > said.len()
+        && text.starts_with(said)
+        && text[said.len()..].starts_with(crate::text::is_py_space)
+}
+
+/// Ends at a full stop, question mark, exclamation mark or ellipsis, before
+/// any closing quotes or brackets.
+pub fn ends_sentence(s: &str) -> bool {
+    s.trim_end_matches(['"', '\'', '\u{2019}', '\u{201d}', ')', ']']).ends_with(['.', '!', '?', '\u{2026}'])
 }
 
 /// The one person labelled `SELF_LABEL`; failing that, the one person labelled

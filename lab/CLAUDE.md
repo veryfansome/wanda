@@ -19,7 +19,7 @@ Procedure lives in skills, invoked deliberately. `run-lab-round` launches a roun
 
 What runs a round is Rust, in two crates. `memory/` is the store and the `mem` CLI a session drives — markdown with YAML frontmatter, a derived SQLite/FTS index, the generated `CLAUDE.md` surfaces, and the projection of a session's transcript that `mem session` shows. `lab/harness/` is the instrument: `run` replays the arrivals one session each, snapshotting the store before every one, and `replay` puts one arrival to a frozen store N times to split a recall failure from a capture failure. The Python left here reads a finished run, or prepares one.
 
-The `mem` verbs are `recall search show entity event relate pref trajectory advance rename forget retract session help`.
+The `mem` verbs are `recall search show entity event relate pref trajectory advance rename amend forget retract session help`.
 
 ## The layout
 
