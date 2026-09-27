@@ -96,9 +96,9 @@ Recalling from four of the ten people in the store returns eight per cent of it.
 
 **Fix.** Say that both cap their output and that `--limit` raises it; print how many were cut.
 
-### 33. `--because` is undocumented, and discarded on an edge retraction, on `forget` and on a first summary
+### 33. `--because` has help text only on `amend`, and is discarded on an edge retraction, on `forget` and on a rename that only sets a first summary
 
-The retract skill says *"Give the same `--because` each time, dated, saying who corrected it and when"*. On an edge retraction and on `forget`, the reason reaches nowhere in the store: `cmd_retract` builds the sentence and then uses it only on a struck body line, and `cmd_forget` unlinks the file. A `rename` that gives a node its first summary strikes nothing, so its reason goes the same way.
+The retract skill says *"Give the same `--because` each time, dated, saying who corrected it and when"*. On an edge retraction and on `forget`, the reason reaches nowhere in the store: `cmd_retract` builds the sentence and then uses it only on a struck body line, and `cmd_forget` unlinks the file. A `rename` that only gives a node its first summary strikes nothing, so its reason goes the same way.
 
 ```
 $ mem retract --subject person:d7a42f --rel parent_of --object 92e268 --inverse child_of \

@@ -614,7 +614,8 @@ fn live_lines(body: &str) -> Vec<String> {
         .collect()
 }
 
-/// How much of a body a write prints back, in characters.
+/// How much of a body a write prints back, in characters. The first line and
+/// the added ones are shown whatever their size, and count against it.
 const BODY_SHOWN: usize = 1600;
 
 /// The body as it reads after a write passed lines to it, the added ones
@@ -965,6 +966,7 @@ fn cmd_trajectory(v: &Vault, summary: &str, body: &str, expect: &str, by: &str,
         out!("(--expect is empty)");
         return 1;
     }
+    let by = match date_or_die(by, "--by") { Ok(x) => x, Err(rc) => return rc };
     if !new {
         match existing(v, "trajectory", &summary, "", "", true) {
             Ok(Some(dup)) => {
@@ -978,7 +980,6 @@ fn cmd_trajectory(v: &Vault, summary: &str, body: &str, expect: &str, by: &str,
     let wanted: Vec<(String, &str, &str)> = list_of(about).into_iter()
         .map(|a| (a, "thing", "")).collect();
     let about_ids = match refs(v, &wanted) { Ok(x) => x, Err(rc) => return rc };
-    let by = match date_or_die(by, "--by") { Ok(x) => x, Err(rc) => return rc };
     let distance = by_from_today(&by);
     let nid = v.mint("trajectory", "", None, &summary);
     let edges: Vec<Edge> = about_ids.into_iter()
@@ -1024,7 +1025,7 @@ fn cmd_advance(v: &Vault, r: &str, status: &str, by: &str, note: &str) -> i32 {
     regen(v);
     out!("ok {nid} {}", if status.is_empty() { "noted" } else { status });
     for line in taken.iter().filter_map(|t| t.added.as_deref()) {
-        out!("  {line}");
+        out!("  + {line}");
     }
     say_left(&taken);
     if let Some(line) = by_from_today(by) {
@@ -1085,7 +1086,7 @@ fn cmd_rename(v: &Vault, node: &str, name: &str, summary: &str, because: &str) -
     }
     out!("{out}");
     if let Some(note) = note {
-        out!("  {note}");
+        out!("  + {note}");
     }
     0
 }
@@ -1133,6 +1134,10 @@ fn cmd_forget(v: &Vault, r: &str) -> i32 {
 /// about the removal: what is true now is recorded as a fact.
 fn cmd_retract(v: &Vault, subject: &str, rel: &str, object: &str, inverse: &str,
                line: &str, because: &str) -> i32 {
+    if !line.is_empty() && py_strip(line).is_empty() {
+        out!("(--line is empty; nothing was written)");
+        return 1;
+    }
     let nid = match resolve(v, subject) {
         Ok(Some(n)) => n,
         Ok(None) => { out!("(no node for {})", py_repr(subject)); return 1; }

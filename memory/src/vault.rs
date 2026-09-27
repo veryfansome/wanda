@@ -293,7 +293,7 @@ impl Vault {
     /// moves, no edge is rewritten — and what it used to say is kept in the
     /// body, struck, with the date and reason, so the file still says what it
     /// used to be called. A node named by its summary takes a new name as its
-    /// summary.
+    /// summary when no summary is given with it.
     /// Returns the struck line written, if one was.
     pub fn rename(&self, old: &str, new_name: &str, summary: &str, because: &str, when: &str)
         -> Option<String>
