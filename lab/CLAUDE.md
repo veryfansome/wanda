@@ -41,7 +41,7 @@ runs/16A/transcripts/-work-runs-vault/   every session's transcript, mounted out
 runs/16A/run16A.log                      the run's own stderr, and its last line is the run's cost
 ```
 
-The mem log has one line per invocation: the arguments as `mem` received them, after the shell, its exit code, and the date and session it ran under. From round 20, `"cut": true` marks a call whose reader left before the output ended, as `head` does, and the call still ran to the end; a `--help` answer is logged as `help` with the verb in its arguments; and a call the argument parser refused has exit code 2, which `mem` itself never returns. Earlier logs have none of these — about a hundred calls a run in round 19, and a few piped ones — and `help` there is only the bare listing.
+The mem log has one line per invocation: the arguments as `mem` received them, after the shell, its exit code, and the date and session it ran under. From round 20, `"cut": true` marks a call whose reader left before the output ended, as `head` does, and the call still ran to the end; a `--help` answer is logged as `help` with the verb in its arguments; and a call the argument parser refused has exit code 2, which `mem` itself never returns. Earlier logs have none of these — about a hundred calls a run in round 19, and a few piped ones — and `help` there is only the bare listing. From round 23, an argument that is not UTF-8 is logged with U+FFFD standing for the bytes that were not; before, such a call left no line.
 
 `judge.py` puts `scored16A.md` beside them. `rebuild.py` writes to `runs/16A_debug/vault` — beside the run, never inside it, because a run's directory is mounted whole into whatever session runs against it next.
 

@@ -1003,6 +1003,10 @@ fn cmd_trajectory(v: &Vault, summary: &str, body: &str, expect: &str, by: &str,
 /// Move an existing trajectory rather than opening a second one for the same
 /// thing.
 fn cmd_advance(v: &Vault, r: &str, status: &str, by: &str, note: &str) -> i32 {
+    if py_strip(note).is_empty() && status.is_empty() && by.is_empty() {
+        out!("(--note, --status and --by are all empty; nothing was written)");
+        return 1;
+    }
     let nid = match resolve(v, r) {
         Ok(Some(n)) if n.starts_with("trajectory:") => n,
         Err(rc) => return rc,
@@ -1163,6 +1167,7 @@ fn cmd_retract(v: &Vault, subject: &str, rel: &str, object: &str, inverse: &str,
     let mut hit = 0usize;
     let mut struck: Vec<String> = Vec::new();
     for (src, rel, dst) in pairs {
+        let had = hit;
         let path = v.path_for(&src);
         let Ok(text) = std::fs::read_to_string(&path) else { continue };
         let (mut meta, body) = memory::fm::load(&text, Some(&v.root));
@@ -1183,6 +1188,9 @@ fn cmd_retract(v: &Vault, subject: &str, rel: &str, object: &str, inverse: &str,
                     l
                 }
             }).collect();
+        }
+        if hit == had {
+            continue;
         }
         let kept: Vec<String> = lines.into_iter().filter(|l| !py_strip(l).is_empty()).collect();
         let kind = src.split(':').next().unwrap_or("").to_string();
@@ -1557,7 +1565,9 @@ fn regen(v: &Vault) {
 }
 
 fn main() {
-    let argv: Vec<String> = std::env::args().skip(1).collect();
+    // args() panics on an argument that is not UTF-8, before the call is logged
+    let argv: Vec<String> = std::env::args_os().skip(1)
+        .map(|a| a.to_string_lossy().into_owned()).collect();
     // --help and a malformed call end in clap, and both are calls to log
     let cli = match Cli::try_parse() {
         Ok(c) => c,

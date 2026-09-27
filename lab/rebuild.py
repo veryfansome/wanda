@@ -272,7 +272,11 @@ def main() -> int:
                # the standing text a vault is given, for whichever mem is running
                "MEM_TEMPLATES": str(ROOT.parent / "memory" / "templates")}
         env.pop("LAB_MEMLOG", None)
-        p = subprocess.run([*mem_cmd, *c["argv"]],
+        # the log holds U+FFFD for bytes that were not UTF-8; an invalid byte there is
+        # refused again, where the logged text can parse and write
+        passed = ([os.fsencode(a).replace("\ufffd".encode(), b"\xff") for a in c["argv"]]
+                  if c["rc"] == 2 else c["argv"])
+        p = subprocess.run([*mem_cmd, *passed],
                            capture_output=True, text=True, env=env, cwd=str(out))
         n += 1
         trace.write(json.dumps({"i": n, "key": key, "cmd": c["cmd"], "argv": c["argv"],
