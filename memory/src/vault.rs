@@ -5,7 +5,7 @@
 //! repeats either, because a second copy could only ever disagree with the first.
 
 use crate::fm::{self, Edge, Meta};
-use crate::text::{bare_ref, is_hash_id, is_local_id, one_line, py_repr};
+use crate::text::{is_hash_id, one_line, py_repr};
 use crate::SUMMARY_MAX;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -29,6 +29,27 @@ impl std::fmt::Display for Ambiguous {
             .collect();
         write!(f, "{} is more than one node: {}", py_repr(&self.name), shown.join("; "))
     }
+}
+
+/// Whether the call a reference is read for only reads, or writes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Slot { Reading, Writing }
+
+/// Why a value named no node.
+#[derive(Clone, Debug)]
+pub enum Miss {
+    Nothing,
+    /// a spelling of a kind with no id or name after it ("" for `entity`)
+    KindAlone { kind: String, spelling: String },
+    /// a kind written, and no node of it with that id, or with the id-like
+    /// text after it
+    NoneById { kind: String },
+    NoneByName { kind: String, name: String },
+    /// a kind written, and the id is another kind's node
+    WrongKind { kind: String, id: String, node: String },
+    /// a kind written, and the name is one node of another kind
+    WrongKindName { kind: String, name: String, node: String },
+    Ambiguous(Ambiguous),
 }
 
 pub struct Node {
@@ -194,53 +215,204 @@ impl Vault {
         hits.into_iter().min_by_key(|n| rank(n))
     }
 
-    fn by_id(&self, r: &str) -> Option<String> {
-        // a probe, not a claim: nothing with whitespace is an id, and any
-        // complaint about a probe means "not a node"
-        if r.is_empty() || r.chars().any(|c| c.is_whitespace()) {
-            return None;
+    /// Every node id on disk, from the kind directories' listings.
+    fn all_ids(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for (k, d) in fm::KIND_DIR {
+            let Ok(rd) = std::fs::read_dir(self.root.join(d)) else { continue };
+            let mut names: Vec<String> = rd.flatten()
+                .filter_map(|e| e.file_name().to_str().map(str::to_string))
+                .filter(|n| n.ends_with(".md") && n != "CLAUDE.md").collect();
+            names.sort();
+            out.extend(names.iter().map(|n| format!("{k}:{}", n.trim_end_matches(".md"))));
         }
-        let lower = r.to_lowercase();
-        let (kind, local) = match lower.rsplit_once(':') {
-            Some((k, l)) => (k.to_string(), l.to_string()),
-            None => (String::new(), lower.clone()),
+        out
+    }
+
+    /// Whether any node of this kind is stored, the condition under which its
+    /// directory's index is written.
+    pub fn has_nodes(&self, kind: &str) -> bool {
+        self.all_ids().iter().any(|id| id.split(':').next() == Some(kind))
+    }
+
+    fn ambiguous(&self, ids: &[String], name: &str) -> Ambiguous {
+        let nodes = self.nodes();
+        Ambiguous {
+            name: name.to_string(),
+            candidates: ids.iter().map(|id| match nodes.iter().find(|n| &n.id == id) {
+                Some(n) => (id.clone(), fm::label(&n.meta), n.meta.get("summary").to_string()),
+                None => (id.clone(), String::new(), String::new()),
+            }).collect(),
+        }
+    }
+
+    /// An id under `kind`, or under each kind in turn: the exact id, then, for
+    /// six characters with no date, the node whose id ends in them.
+    fn by_id(&self, kind: Option<&str>, local: &str, written: &str)
+        -> Result<Option<String>, Ambiguous>
+    {
+        let kinds: Vec<&str> = match kind {
+            Some(k) => vec![k],
+            None => fm::KIND_DIR.iter().map(|(k, _)| *k).collect(),
         };
-        if !is_local_id(&local) {
-            return None;
-        }
-        if !kind.is_empty() {
-            let known = fm::KIND_DIR.iter().any(|(k, _)| *k == kind);
-            return if known && self.exists(&lower) { Some(lower) } else { None };
-        }
-        for (k, _) in fm::KIND_DIR {
+        for k in &kinds {
             let cand = format!("{k}:{local}");
             if self.exists(&cand) {
-                return Some(cand);
+                return Ok(Some(cand));
             }
         }
-        None
+        if local.len() == 6 {
+            let tail = format!("-{local}");
+            let hits: Vec<String> = self.all_ids().into_iter()
+                .filter(|id| kinds.iter().any(|k| id.split(':').next() == Some(*k)))
+                .filter(|id| id.ends_with(&tail))
+                .collect();
+            match hits.len() {
+                0 => {}
+                1 => return Ok(Some(hits[0].clone())),
+                _ => return Err(self.ambiguous(&hits, written)),
+            }
+        }
+        Ok(None)
     }
 
-    /// An id, a bare id without its kind, or a name — possibly with a gloss
-    /// stuck to it, since a session reports `person:7f3a2c - the neighbour` to
-    /// a reader as well as to a tool.
-    pub fn resolve(&self, r: &str, kind: &str) -> Result<Option<String>, Ambiguous> {
-        let r = r.trim();
-        if let Some(nid) = self.by_id(r) {
-            return Ok(Some(nid));
+    /// `<kind>:<name>` looked up among that kind's nodes, and, when none is so
+    /// named, among the others, the one found there taken only where the slot
+    /// reads; with no kind written, by_name.
+    fn by_spelled_name(&self, kind: &str, name: &str, prefer: &str, slot: Slot)
+        -> Result<Option<String>, Miss>
+    {
+        if kind.is_empty() {
+            return self.by_name(name, prefer).map_err(Miss::Ambiguous);
+        }
+        let want = one_line(name).to_lowercase();
+        if want.is_empty() {
+            return Ok(None);
+        }
+        let nodes = self.nodes();
+        if kind == "person" && crate::is_self_name(&want) {
+            if let Some(me) = me_in(&nodes) {
+                return Ok(Some(nodes[me].id.clone()));
+            }
+        }
+        let (same, others): (Vec<&Node>, Vec<&Node>) = nodes.iter()
+            .filter(|n| named(n, &want)).partition(|n| n.kind() == kind);
+        let ids = |ns: &[&Node]| -> Vec<String> { ns.iter().map(|n| n.id.clone()).collect() };
+        match (same.len(), others.len(), slot) {
+            (1, _, _) => Ok(Some(same[0].id.clone())),
+            (0, 0, _) => Ok(None),
+            (0, 1, Slot::Reading) => Ok(Some(others[0].id.clone())),
+            (0, 1, Slot::Writing) => Err(Miss::WrongKindName {
+                kind: kind.to_string(), name: name.to_string(), node: others[0].id.clone() }),
+            (0, _, _) => Err(Miss::Ambiguous(self.ambiguous(&ids(&others), name))),
+            _ => Err(Miss::Ambiguous(self.ambiguous(&ids(&same), name))),
+        }
+    }
+
+    /// The node a value names, or why none: an id, bare or with any spelling of
+    /// its kind and anything after it; a name; a kind and a name. Where the
+    /// kind written is not the kind of the node an id or a name belongs to,
+    /// that node is used where the slot only reads, and the value is refused
+    /// where it writes: either part may be the wrong one, and an edge written
+    /// to the node nobody meant is silent.
+    pub fn find(&self, r: &str, prefer: &str, slot: Slot) -> Result<String, Miss> {
+        let owned = crate::text::unbracket(r);
+        let r = owned.as_str();
+        if r.is_empty() {
+            return Err(Miss::Nothing);
         }
         let head = r.split_whitespace().next().unwrap_or("");
-        if head != r && (head.contains(':') || is_hash_id(head)) {
-            if let Some(nid) = self.by_id(&bare_ref(r)) {
-                return Ok(Some(nid));
+        let mut miss = Miss::Nothing;
+        if let Some((kind, local)) = crate::text::id_word(head) {
+            match self.by_id(kind, &local, head) {
+                Ok(Some(n)) => return Ok(n),
+                Err(a) => return Err(Miss::Ambiguous(a)),
+                Ok(None) => {}
+            }
+            if let Some(k) = kind {
+                miss = Miss::NoneById { kind: k.to_string() };
+                match self.by_id(None, &local, head) {
+                    Ok(Some(n)) if slot == Slot::Reading => return Ok(n),
+                    Ok(Some(n)) => return Err(Miss::WrongKind {
+                        kind: k.to_string(), id: local, node: n }),
+                    Err(a) => return Err(Miss::Ambiguous(a)),
+                    Ok(None) => {}
+                }
+            }
+        } else if let Some(nid) = crate::text::legacy_word(head) {
+            if self.exists(&nid) {
+                return Ok(nid);
+            }
+        } else if head == r && crate::text::is_local_id(&head.to_lowercase()) {
+            let local = head.to_lowercase();
+            for (k, _) in fm::KIND_DIR {
+                let cand = format!("{k}:{local}");
+                if self.exists(&cand) {
+                    return Ok(cand);
+                }
             }
         }
-        self.by_name(r, kind)
+        match self.by_name(r, prefer) {
+            Ok(Some(n)) => return Ok(n),
+            Err(a) => return Err(Miss::Ambiguous(a)),
+            Ok(None) => {}
+        }
+        if let Some((kind, spelling)) = crate::text::kind_alone(r) {
+            return Err(Miss::KindAlone { kind: kind.to_string(), spelling });
+        }
+        if let Some((kind, rest)) = crate::text::spelled(r) {
+            let rest = rest.trim();
+            if !is_hash_id(rest) && !crate::text::hash_md(rest) {
+                if let Some(n) = self.by_spelled_name(kind, rest, prefer, slot)? {
+                    return Ok(n);
+                }
+                if !kind.is_empty() {
+                    miss = if crate::text::id_like(rest) {
+                        Miss::NoneById { kind: kind.to_string() }
+                    } else {
+                        Miss::NoneByName { kind: kind.to_string(), name: rest.to_string() }
+                    };
+                }
+            }
+        }
+        Err(miss)
     }
 
-    /// A fresh id for a new node: random, short, dated if it is an event.
-    /// Unique across every kind, so a bare id names one node; `taken` is for a
-    /// batch that mints before it writes.
+    /// A value holding a comma, in a slot that takes a list, tried whole only
+    /// as a name: a name with a comma in it is still found, and anything else
+    /// is split.
+    pub fn find_whole_name(&self, r: &str) -> Result<Option<String>, Miss> {
+        let owned = crate::text::unbracket(r);
+        let r = owned.as_str();
+        match self.by_name(r, "") {
+            Ok(Some(n)) => return Ok(Some(n)),
+            Err(a) => return Err(Miss::Ambiguous(a)),
+            Ok(None) => {}
+        }
+        if let Some((kind, rest)) = crate::text::spelled(r) {
+            let rest = rest.trim();
+            if !is_hash_id(rest) && !crate::text::hash_md(rest) {
+                return self.by_spelled_name(kind, rest, "", Slot::Writing);
+            }
+        }
+        Ok(None)
+    }
+
+    /// `find` where the slot only reads, with every miss but an ambiguous one
+    /// as none.
+    pub fn resolve(&self, r: &str, kind: &str) -> Result<Option<String>, Ambiguous> {
+        match self.find(r, kind, Slot::Reading) {
+            Ok(n) => Ok(Some(n)),
+            Err(Miss::Ambiguous(a)) => Err(a),
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// A fresh id for a new node: random, short, dated if it is an event. A
+    /// drawn id is unique across every kind and ends in six characters no id
+    /// on disk ends in, so from then on a bare id, or an event's six characters
+    /// without its date, names one node; a replay takes the recorded id as it
+    /// is. `taken` is for a batch that mints before it writes.
     pub fn mint(&self, kind: &str, when: &str, taken: Option<&mut Vec<String>>, name: &str) -> String {
         if let (Some(oracle), false) = (&self.oracle, name.is_empty()) {
             let order: Vec<String> = self.oracle_order.as_ref()
@@ -268,7 +440,7 @@ impl Vault {
             } else {
                 random_hex6()
             };
-            if !h.chars().any(|c| c.is_ascii_digit()) {
+            if !h.chars().any(|c| c.is_ascii_digit()) || self.all_ids().iter().any(|id| id.ends_with(&h)) {
                 continue;
             }
             let local = if when.is_empty() { h.clone() } else { format!("{when}-{h}") };
@@ -518,6 +690,12 @@ pub fn ends_sentence(s: &str) -> bool {
     s.trim_end_matches(['"', '\'', '\u{2019}', '\u{201d}', ')', ']']).ends_with(['.', '!', '?', '\u{2026}'])
 }
 
+/// The node's label, or a name it had, is this one, lower case.
+fn named(n: &Node, want: &str) -> bool {
+    fm::label(&n.meta).to_lowercase() == want
+        || fm::former_names(&n.body).iter().any(|a| a.to_lowercase() == want)
+}
+
 /// The one person labelled `SELF_LABEL`; failing that, the one person labelled
 /// with her name, which is how an older vault labels her node.
 fn me_in(nodes: &[Node]) -> Option<usize> {
@@ -565,5 +743,228 @@ fn collect_md(dir: &Path, parts: &mut Vec<String>, out: &mut Vec<(Vec<String>, P
             out.push((parts.clone(), p));
         }
         parts.pop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const DAY: &str = "2031-01-10";
+
+    /// A vault in a fresh directory, removed when the test ends.
+    struct Store(Vault);
+
+    impl Drop for Store {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0.root);
+        }
+    }
+
+    impl std::ops::Deref for Store {
+        type Target = Vault;
+        fn deref(&self) -> &Vault { &self.0 }
+    }
+
+    /// A node of every kind, with a topic of each of three shapes and two events
+    /// (one whose summary starts with a number that reads as an id).
+    fn store(tag: &str) -> Store {
+        let root = std::env::temp_dir().join(format!("mem-find-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let v = Vault::new(root);
+        v.upsert("person:1a2b3c", "person", "Alpha", "a neighbour", "", &[], &[], DAY);
+        v.upsert("topic:4d5e6f", "topic", "garden plans", "", "", &[], &[], DAY);
+        v.upsert("topic:5e6f7a", "topic", "Events", "", "", &[], &[], DAY);
+        v.upsert("topic:6f7a8b", "topic", "rain, wind", "", "", &[], &[], DAY);
+        v.upsert("event:2031-01-02-7a8b9c", "event", "the kettle descaling",
+                 "the kettle descaling", "", &[], &[], DAY);
+        v.upsert("event:2031-01-03-8b9c0d", "event", "123456 steps a day", "123456 steps a day",
+                 "", &[], &[], DAY);
+        v.upsert("preference:9c0d1e", "preference", "tea rule", "tea rule", "", &[], &[], DAY);
+        v.upsert("place:3a4b5c", "place", "the lido", "", "", &[], &[], DAY);
+        v.upsert("org:4b5c6d", "org", "the lido trust", "", "", &[], &[], DAY);
+        v.upsert("group:5c6d7e", "group", "the choir", "", "", &[], &[], DAY);
+        v.upsert("thing:6d7e8f", "thing", "the ladder", "", "", &[], &[], DAY);
+        v.upsert("trajectory:7e8f9a", "trajectory", "the roof repair", "the roof repair", "",
+                 &[], &[], DAY);
+        Store(v)
+    }
+
+    fn found(v: &Vault, r: &str, slot: Slot) -> String {
+        v.find(r, "", slot).unwrap_or_else(|m| panic!("{r}: {m:?}"))
+    }
+
+    #[test]
+    fn an_id_in_any_spelling() {
+        let v = store("spell");
+        for r in ["preference:9c0d1e", "pref:9c0d1e", "prefs:9c0d1e", "prefs/9c0d1e",
+                  "./prefs/9c0d1e.md", "PREFERENCES:9c0d1e", "[[9c0d1e]]", "entity:1a2b3c",
+                  "9c0d1e", "pref:9c0d1e (the tea one)", "[[9c0d1e]] (a note)"] {
+            let want = if r.contains("1a2b3c") { "person:1a2b3c" } else { "preference:9c0d1e" };
+            assert_eq!(found(&v, r, Slot::Writing), want, "{r}");
+        }
+    }
+
+    #[test]
+    fn every_spelling_with_an_id_and_a_name() {
+        let v = store("every");
+        let named: [(&str, &str, &str); 10] = [
+            ("person", "person:1a2b3c", "Alpha"),
+            ("place", "place:3a4b5c", "the lido"),
+            ("org", "org:4b5c6d", "the lido trust"),
+            ("group", "group:5c6d7e", "the choir"),
+            ("thing", "thing:6d7e8f", "the ladder"),
+            ("topic", "topic:4d5e6f", "garden plans"),
+            ("event", "event:2031-01-02-7a8b9c", "the kettle descaling"),
+            ("preference", "preference:9c0d1e", "tea rule"),
+            ("trajectory", "trajectory:7e8f9a", "the roof repair"),
+            ("", "person:1a2b3c", "Alpha"),
+        ];
+        // written out here rather than read from fm::SPELLINGS, so a wrong entry
+        // there fails
+        let spellings: [(&str, &str); 23] = [
+            ("person", "person"), ("persons", "person"), ("people", "person"),
+            ("place", "place"), ("places", "place"), ("org", "org"), ("orgs", "org"),
+            ("group", "group"), ("groups", "group"), ("thing", "thing"), ("things", "thing"),
+            ("topic", "topic"), ("topics", "topic"), ("event", "event"), ("events", "event"),
+            ("preference", "preference"), ("preferences", "preference"),
+            ("pref", "preference"), ("prefs", "preference"),
+            ("trajectory", "trajectory"), ("trajectories", "trajectory"),
+            ("entity", ""), ("entities", ""),
+        ];
+        let mut table: Vec<_> = fm::SPELLINGS.to_vec();
+        let mut want = spellings.to_vec();
+        table.sort();
+        want.sort();
+        assert_eq!(table, want);
+        for (spelling, kind) in spellings {
+            let (_, id, name) = named.iter().find(|(k, _, _)| *k == kind).unwrap();
+            let local = id.split(':').nth(1).unwrap();
+            for sep in [":", "/"] {
+                assert_eq!(found(&v, &format!("{spelling}{sep}{local}"), Slot::Writing), *id,
+                           "{spelling}{sep}<id>");
+                assert_eq!(found(&v, &format!("{spelling}{sep}{name}"), Slot::Writing), *id,
+                           "{spelling}{sep}<name>");
+            }
+        }
+    }
+
+    #[test]
+    fn an_event_by_its_six_characters() {
+        let v = store("tail");
+        assert_eq!(found(&v, "7a8b9c", Slot::Writing), "event:2031-01-02-7a8b9c");
+        assert_eq!(found(&v, "event:7a8b9c", Slot::Writing), "event:2031-01-02-7a8b9c");
+        v.upsert("event:2031-01-05-7a8b9c", "event", "a second", "a second", "", &[], &[], DAY);
+        assert!(matches!(v.find("7a8b9c", "", Slot::Reading), Err(Miss::Ambiguous(_))));
+        v.upsert("thing:7a8b9c", "thing", "a shadow", "", "", &[], &[], DAY);
+        assert_eq!(found(&v, "7a8b9c", Slot::Reading), "thing:7a8b9c", "an exact id comes first");
+    }
+
+    #[test]
+    fn a_wrong_kind_is_read_and_not_written() {
+        let v = store("wrong");
+        assert_eq!(found(&v, "topic:9c0d1e", Slot::Reading), "preference:9c0d1e");
+        assert!(matches!(v.find("topic:9c0d1e", "", Slot::Writing),
+                         Err(Miss::WrongKind { ref node, .. }) if node == "preference:9c0d1e"));
+        assert_eq!(found(&v, "topic:7a8b9c", Slot::Reading), "event:2031-01-02-7a8b9c");
+        assert!(matches!(v.find("topic:7a8b9c", "", Slot::Writing), Err(Miss::WrongKind { .. })));
+        assert_eq!(found(&v, "topic:Alpha", Slot::Reading), "person:1a2b3c");
+        assert!(matches!(v.find("topic:Alpha", "", Slot::Writing),
+                         Err(Miss::WrongKindName { ref node, .. }) if node == "person:1a2b3c"));
+        v.upsert("place:2b3c4d", "place", "Alpha", "", "", &[], &[], DAY);
+        for slot in [Slot::Reading, Slot::Writing] {
+            assert!(matches!(v.find("topic:Alpha", "", slot), Err(Miss::Ambiguous(_))));
+        }
+    }
+
+    #[test]
+    fn a_kind_and_a_name() {
+        let v = store("name");
+        assert_eq!(found(&v, "topic:garden plans", Slot::Writing), "topic:4d5e6f");
+        assert_eq!(found(&v, "topics/Garden Plans", Slot::Writing), "topic:4d5e6f");
+        assert_eq!(found(&v, "[[Alpha]]", Slot::Writing), "person:1a2b3c");
+        assert_eq!(found(&v, "event:the kettle descaling", Slot::Writing), "event:2031-01-02-7a8b9c");
+        assert_eq!(found(&v, "./topics/garden plans", Slot::Writing), "topic:4d5e6f");
+        v.upsert("event:2031-01-04-2c3d4e", "event", "Descaling", "Descaling", "", &[], &[], DAY);
+        assert_eq!(found(&v, "event:descaling", Slot::Writing), "event:2031-01-04-2c3d4e");
+        assert_eq!(found(&v, "person:alpha", Slot::Writing), "person:1a2b3c",
+                   "a legacy-shaped id with no such file is read as a name");
+        assert_eq!(found(&v, "entity:Alpha", Slot::Writing), "person:1a2b3c");
+        for r in ["topic:greenhouse", "topic:greenhouse plans", "event:the tap repair", "event:gutters"] {
+            assert!(matches!(v.find(r, "", Slot::Writing), Err(Miss::NoneByName { .. })), "{r}");
+        }
+        for r in ["event:2031-04-26-", "topic:topic:3c4d5e", "event:2031-09-20-*x*", "topic:_last",
+                  "topic:0d1e2f", "topics/0d1e2f.md"] {
+            assert!(matches!(v.find(r, "", Slot::Writing), Err(Miss::NoneById { .. })), "{r}");
+        }
+    }
+
+    #[test]
+    fn a_kind_alone_and_names_that_look_like_one() {
+        let v = store("alone");
+        assert_eq!(found(&v, "Events", Slot::Reading), "topic:5e6f7a", "a label is found first");
+        v.upsert("topic:0a1b2c", "topic", "Event: school fair", "", "", &[], &[], DAY);
+        assert_eq!(found(&v, "Event: school fair", Slot::Writing), "topic:0a1b2c");
+        v.upsert("topic:1b2c3d", "topic", "Things/odds and ends", "", "", &[], &[], DAY);
+        assert_eq!(found(&v, "Things/odds and ends", Slot::Writing), "topic:1b2c3d");
+        for (r, want) in [("people", "person"), ("people:", "person"), ("topics/", "topic"),
+                          ("pref:*", "preference"), ("entity", "")] {
+            assert!(matches!(v.find(r, "", Slot::Reading),
+                             Err(Miss::KindAlone { ref kind, .. }) if kind == want), "{r}");
+        }
+        assert!(["person", "topic", "preference"].iter().all(|k| v.has_nodes(k)));
+    }
+
+    #[test]
+    fn a_kind_alone_with_no_nodes_of_it() {
+        let root = std::env::temp_dir().join(format!("mem-find-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let v = Store(Vault::new(root));
+        v.upsert("person:1a2b3c", "person", "Alpha", "", "", &[], &[], DAY);
+        for r in ["groups", "groups:", "groups/", "groups*"] {
+            assert!(matches!(v.find(r, "", Slot::Reading),
+                             Err(Miss::KindAlone { ref kind, .. }) if kind == "group"), "{r}");
+        }
+        assert!(!v.has_nodes("group"));
+    }
+
+    #[test]
+    fn names_stay_names() {
+        let v = store("names");
+        assert_eq!(found(&v, "123456 steps a day", Slot::Reading), "event:2031-01-03-8b9c0d",
+                   "a first word that reads as an id and names nothing falls through to a name");
+        assert_eq!(found(&v, "rain, wind", Slot::Reading), "topic:6f7a8b");
+        for r in ["Re: invoice", "Acme - east branch", "flight BA2490", "garden/shed plans"] {
+            assert!(matches!(v.find(r, "", Slot::Writing), Err(Miss::Nothing)), "{r}");
+        }
+    }
+
+    #[test]
+    fn a_legacy_id_bare_or_with_its_kind() {
+        let v = store("legacy");
+        v.upsert("person:oldname", "person", "Someone Old", "", "", &[], &[], DAY);
+        assert_eq!(found(&v, "oldname", Slot::Writing), "person:oldname");
+        assert_eq!(found(&v, "person:oldname", Slot::Writing), "person:oldname");
+    }
+
+    #[test]
+    fn a_list_is_tried_whole_as_a_name_first() {
+        let v = store("whole");
+        assert_eq!(v.find_whole_name("rain, wind").unwrap(), Some("topic:6f7a8b".into()));
+        assert_eq!(v.find_whole_name("topic:rain, wind").unwrap(), Some("topic:6f7a8b".into()));
+        assert_eq!(v.find_whole_name("topic:4d5e6f,topic:6f7a8b").unwrap(), None);
+        assert_eq!(v.find_whole_name("Alpha, garden plans").unwrap(), None);
+        assert!(matches!(v.find_whole_name("topic:Alpha"), Err(Miss::WrongKindName { .. })));
+    }
+
+    #[test]
+    fn resolve_reads_and_keeps_its_signature() {
+        let v = store("resolve");
+        assert_eq!(v.resolve("pref:9c0d1e", "").unwrap(), Some("preference:9c0d1e".into()));
+        assert_eq!(v.resolve("topic:9c0d1e", "").unwrap(), Some("preference:9c0d1e".into()));
+        assert_eq!(v.resolve("people", "").unwrap(), None);
+        assert_eq!(v.resolve("nobody here", "").unwrap(), None);
     }
 }

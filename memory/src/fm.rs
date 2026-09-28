@@ -51,6 +51,29 @@ fn schema_fields(kind: &str) -> Option<Vec<&'static str>> {
     }
 }
 
+/// Every way a reference may spell a kind, case aside: singular, plural,
+/// directory, and `pref`, the verb that writes a preference. `entity` names no
+/// one kind, so it reads as no kind written.
+pub const SPELLINGS: [(&str, &str); 23] = [
+    ("person", "person"), ("persons", "person"), ("people", "person"),
+    ("place", "place"), ("places", "place"),
+    ("org", "org"), ("orgs", "org"),
+    ("group", "group"), ("groups", "group"),
+    ("thing", "thing"), ("things", "thing"),
+    ("topic", "topic"), ("topics", "topic"),
+    ("event", "event"), ("events", "event"),
+    ("preference", "preference"), ("preferences", "preference"),
+    ("pref", "preference"), ("prefs", "preference"),
+    ("trajectory", "trajectory"), ("trajectories", "trajectory"),
+    ("entity", ""), ("entities", ""),
+];
+
+/// The kind a spelling names: "" for `entity`, None for a word that is not one.
+pub fn spelled_kind(s: &str) -> Option<&'static str> {
+    let l = s.to_lowercase();
+    SPELLINGS.iter().find(|(sp, _)| *sp == l).map(|(_, k)| *k)
+}
+
 pub fn dir_for(kind: &str) -> Option<&'static str> {
     KIND_DIR.iter().find(|(k, _)| *k == kind).map(|(_, d)| *d)
 }

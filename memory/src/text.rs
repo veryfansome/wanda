@@ -180,29 +180,6 @@ pub fn py_repr(s: &str) -> String {
 use regex::Regex;
 use std::sync::LazyLock;
 
-/// `person:7f3a2c - the neighbour` and `event:x (2026-01-01)` are an id with a
-/// gloss written for a human reader. Cut the gloss.
-///
-/// Only ever applied to something already shaped like an id: a bare name may
-/// legitimately contain a dash or a bracket, and `Acme - east branch` is not
-/// `Acme`.
-static GLOSS: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\s+(?:[\u{2014}\u{2013}(\[]|-\s)").unwrap());
-
-pub fn bare_ref(r: &str) -> String {
-    let t = r.trim();
-    // the Python pattern ends `.*$`, and `.` does not cross a newline: a gloss
-    // with a line break after it is not a gloss, and the reference is returned
-    // whole. Only a marker whose tail stays on one line cuts.
-    for m in GLOSS.find_iter(t) {
-        let tail = &t[m.start()..];
-        if !tail.trim_end_matches('\n').contains('\n') {
-            return t[..m.start()].trim().to_string();
-        }
-    }
-    t.to_string()
-}
-
 static HASH_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(?:\d{4}-\d{2}-\d{2}-)?([0-9a-f]{6})$").unwrap());
 static LOCAL_RE: LazyLock<Regex> =
@@ -254,6 +231,158 @@ pub fn id_shaped(r: &str) -> bool {
     };
     is_hash_id(local)
         || (crate::fm::KIND_DIR.iter().any(|(k, _)| *k == kind) && is_local_id(local))
+}
+
+fn strip_dot(r: &str) -> &str {
+    r.strip_prefix("./").unwrap_or(r)
+}
+
+/// `<spelling>:<rest>` or `<spelling>/<rest>`: the kind ("" for `entity`) and
+/// the rest, which may be empty.
+pub fn spelled(r: &str) -> Option<(&'static str, &str)> {
+    let t = strip_dot(r.trim());
+    let i = t.find([':', '/'])?;
+    let k = crate::fm::spelled_kind(&t[..i])?;
+    Some((k, &t[i + 1..]))
+}
+
+/// A spelling with nothing after it but `:`, `/` or `*`: the kind, and the
+/// spelling as written.
+pub fn kind_alone(r: &str) -> Option<(&'static str, String)> {
+    let t = strip_dot(r.trim()).trim_end_matches('*');
+    let t = t.strip_suffix(':').or_else(|| t.strip_suffix('/')).unwrap_or(t);
+    crate::fm::spelled_kind(t).map(|k| (k, t.to_string()))
+}
+
+/// `[[` and `]]` off a value they wrap, one pair with none inside, and off its
+/// first word: edges are stored as `[[<id>]]`, and `show` prints them so.
+pub fn unbracket(r: &str) -> String {
+    let t = r.trim();
+    if let Some(x) = t.strip_prefix("[[").and_then(|x| x.strip_suffix("]]")) {
+        if !x.contains('[') && !x.contains(']') {
+            return x.trim().to_string();
+        }
+    }
+    let end = t.find(char::is_whitespace).unwrap_or(t.len());
+    if let Some(x) = t[..end].strip_prefix("[[").and_then(|x| x.strip_suffix("]]")) {
+        if !x.is_empty() {
+            return format!("{x}{}", &t[end..]);
+        }
+    }
+    t.to_string()
+}
+
+/// A word read as an id: the kind written (None for none, or `entity`) and the
+/// local part, lower case, without `./`, `.md` or brackets.
+pub fn id_word(word: &str) -> Option<(Option<&'static str>, String)> {
+    let w = word.to_lowercase();
+    let w = w.strip_prefix("[[").and_then(|x| x.strip_suffix("]]")).unwrap_or(&w);
+    let w = strip_dot(w);
+    let (kind, local) = match w.find([':', '/']) {
+        Some(i) => {
+            let k = crate::fm::spelled_kind(&w[..i])?;
+            ((!k.is_empty()).then_some(k), &w[i + 1..])
+        }
+        None => (None, w),
+    };
+    let local = local.strip_suffix(".md").unwrap_or(local);
+    is_hash_id(local).then(|| (kind, local.to_string()))
+}
+
+/// A kind and a local part that is not a hash, as ids once were: `person:alpha`.
+pub fn legacy_word(word: &str) -> Option<String> {
+    let w = word.to_lowercase();
+    let (k, local) = spelled(&w)?;
+    let local = local.strip_suffix(".md").unwrap_or(local);
+    if k.is_empty() || is_hash_id(local) || !is_local_id(local) {
+        return None;
+    }
+    Some(format!("{k}:{local}"))
+}
+
+/// A hash id with `.md` after it.
+pub fn hash_md(r: &str) -> bool {
+    r.to_lowercase().strip_suffix(".md").is_some_and(is_hash_id)
+}
+
+static DATE_START: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\d{4}-\d{2}-\d{2}").unwrap());
+
+/// The rest after a spelling reads as a mistyped id rather than a name: its
+/// first word starts with a date, holds a glob, path, kind, variable,
+/// placeholder or list character (`* / : $ _ < > { } ,`), or is hex and dashes
+/// with a digit.
+pub fn id_like(rest: &str) -> bool {
+    let w = rest.split_whitespace().next().unwrap_or("").to_lowercase();
+    DATE_START.is_match(&w)
+        || w.contains(['*', ':', '/', '_', '$', '<', '>', '{', '}', ','])
+        || (!w.is_empty() && w.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+            && w.chars().any(|c| c.is_ascii_digit()))
+}
+
+/// Items of a list, split at the commas outside `(…)` and `[[…]]`, so a note
+/// with a comma in it stays with its item. A closer with no opener is text; an
+/// opener never closed keeps the rest in one item.
+pub fn list_outside(text: &str) -> Vec<String> {
+    let cs: Vec<char> = text.chars().collect();
+    let (mut paren, mut square) = (0usize, 0usize);
+    let (mut items, mut cur) = (Vec::new(), String::new());
+    let mut i = 0;
+    while i < cs.len() {
+        let pair = |a: char| i + 1 < cs.len() && cs[i] == a && cs[i + 1] == a;
+        if pair('[') {
+            square += 1;
+            cur.push_str("[[");
+            i += 2;
+            continue;
+        }
+        if pair(']') {
+            square = square.saturating_sub(1);
+            cur.push_str("]]");
+            i += 2;
+            continue;
+        }
+        match cs[i] {
+            '(' => paren += 1,
+            ')' => paren = paren.saturating_sub(1),
+            ',' if paren == 0 && square == 0 => {
+                items.push(std::mem::take(&mut cur));
+                i += 1;
+                continue;
+            }
+            _ => {}
+        }
+        cur.push(cs[i]);
+        i += 1;
+    }
+    items.push(cur);
+    items.iter().map(|x| py_strip(x).to_string()).filter(|x| !x.is_empty()).collect()
+}
+
+static DATED_ID: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\d{4}-\d{2}-\d{2}-([0-9a-f]{6})(?:$|[^0-9a-z])").unwrap());
+
+/// A value written to point at a node, which a slot that mints refuses rather
+/// than mints when it names nothing: a node minted from it would be named after
+/// the pointer, not the thing.
+pub fn reference_shaped(r: &str) -> bool {
+    let t = py_strip(r);
+    let lower = t.to_lowercase();
+    let head = lower.split_whitespace().next().unwrap_or("");
+    let head = head.strip_prefix("[[").and_then(|x| x.strip_suffix("]]")).unwrap_or(head);
+    let (kind, local) = match head.rfind([':', '/']) {
+        Some(i) => (&head[..i], &head[i + 1..]),
+        None => ("", head),
+    };
+    let local = local.strip_suffix(".md").unwrap_or(local);
+    let first_word_id = is_hash_id(local)
+        || (crate::fm::spelled_kind(kind).is_some_and(|k| !k.is_empty()) && is_local_id(local));
+    t.starts_with('/')
+        || t.contains("[[")
+        || t.contains("]]")
+        || kind_alone(t).is_some()
+        || spelled(t).is_some()
+        || first_word_id
+        || DATED_ID.captures_iter(&lower).any(|c| c[1].chars().any(|ch| ch.is_ascii_digit()))
 }
 
 /// `json.dumps(v)`: the same bytes, including the space after each `,` and `:`
@@ -325,4 +454,87 @@ fn esc(s: &str, ascii: bool) -> String {
     }
     out.push('"');
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kinds_are_spelled_many_ways() {
+        assert_eq!(spelled("pref:1a2b3c"), Some(("preference", "1a2b3c")));
+        assert_eq!(spelled("people/1a2b3c"), Some(("person", "1a2b3c")));
+        assert_eq!(spelled("./topics/1a2b3c.md"), Some(("topic", "1a2b3c.md")));
+        assert_eq!(spelled("Entity:Alpha"), Some(("", "Alpha")));
+        assert_eq!(spelled("Re: invoice"), None);
+        assert_eq!(spelled("garden/shed plans"), None);
+    }
+
+    #[test]
+    fn a_kind_alone() {
+        assert_eq!(kind_alone("people"), Some(("person", "people".to_string())));
+        assert_eq!(kind_alone("pref:*"), Some(("preference", "pref".to_string())));
+        assert_eq!(kind_alone("topics/"), Some(("topic", "topics".to_string())));
+        assert_eq!(kind_alone("topic:kettle"), None);
+        assert_eq!(kind_alone("*"), None);
+    }
+
+    #[test]
+    fn a_word_as_an_id() {
+        assert_eq!(id_word("pref:1a2b3c"), Some((Some("preference"), "1a2b3c".into())));
+        assert_eq!(id_word("./events/2031-01-02-7a8b9c.md"),
+                   Some((Some("event"), "2031-01-02-7a8b9c".into())));
+        assert_eq!(id_word("[[1a2b3c]]"), Some((None, "1a2b3c".into())));
+        assert_eq!(id_word("entity:1a2b3c"), Some((None, "1a2b3c".into())));
+        assert_eq!(id_word("abcdef"), None, "six letters are a word");
+        assert_eq!(id_word("person:alpha"), None);
+        assert_eq!(legacy_word("person:alpha"), Some("person:alpha".into()));
+        assert_eq!(legacy_word("person:1a2b3c"), None);
+    }
+
+    #[test]
+    fn brackets_come_off_a_wrapped_value_and_a_first_word() {
+        assert_eq!(unbracket("[[1a2b3c]]"), "1a2b3c");
+        assert_eq!(unbracket("[[Alpha Beta]]"), "Alpha Beta");
+        assert_eq!(unbracket("[[1a2b3c]] (a note)"), "1a2b3c (a note)");
+        assert_eq!(unbracket("[[a]] and [[b]]"), "a and [[b]]");
+        assert_eq!(unbracket("Alpha [[x]]"), "Alpha [[x]]");
+    }
+
+    #[test]
+    fn what_after_a_kind_reads_as_a_mistyped_id() {
+        for rest in ["2031-04-26-", "2031-04-15-0d1e2f3", "2031-09-20-*x*", "_last",
+                     "topic:3c4d5e", "0d1e2f", "x,Alpha", "$HOME", "<id>"] {
+            assert!(id_like(rest), "{rest}");
+        }
+        for rest in ["kettle", "garden plans", "Alpha Beta", "Filing"] {
+            assert!(!id_like(rest), "{rest}");
+        }
+    }
+
+    #[test]
+    fn a_list_splits_outside_brackets() {
+        assert_eq!(list_outside("a, b"), ["a", "b"]);
+        assert_eq!(list_outside("1a2b3c (a, b)"), ["1a2b3c (a, b)"]);
+        assert_eq!(list_outside("1a2b3c (a, b), 4d5e6f"), ["1a2b3c (a, b)", "4d5e6f"]);
+        assert_eq!(list_outside("1a2b3c (a (b, c), d), 4d5e6f"), ["1a2b3c (a (b, c), d)", "4d5e6f"]);
+        assert_eq!(list_outside("1a2b3c (a, b"), ["1a2b3c (a, b"]);
+        assert_eq!(list_outside("a), b"), ["a)", "b"]);
+        assert_eq!(list_outside("[[x, y]], z"), ["[[x, y]]", "z"]);
+        assert!(list_outside(" , ").is_empty());
+    }
+
+    #[test]
+    fn what_is_never_minted() {
+        for r in ["events/2031-03-25-0e1f2a", "event:2031-09-20-*x*", "event-2031-09-07-1f2a3b",
+                  "topic:_last", "topic:", "event:", "/dev/fd/63", "[[1a2b3c]]", "[[Alpha]]",
+                  "Alpha [[x]]", "1a2b3c beta", "people", "entity:Alpha", "topics/kettle",
+                  "[[1a2b3c]] (a note)", "[[Alpha]] (a note)"] {
+            assert!(reference_shaped(r), "{r}");
+        }
+        for r in ["Alpha", "Acme - east branch", "flight BA2490", "Re: invoice",
+                  "garden/shed plans", "Event planning"] {
+            assert!(!reference_shaped(r), "{r}");
+        }
+    }
 }

@@ -66,12 +66,6 @@ The same shape remains for the kinds a summary names. `mem rename <id> --summary
 
 **Fix.** Refuse a restated former summary as a former name is refused, naming the node. For a trajectory or an event a guard hit is already a refusal; a rule's hit writes, so it needs one.
 
-### 52. `mem` refuses an id written as `pref:`, as a directory path, or with a name after it
-
-`mem show pref:8cb97b` prints `(no node for 'pref:8cb97b')` and exits 1, and so do `mem show 'person:600349 alex'` and `mem show people/600349`. `pref` is the verb that writes a preference, and sessions' own notes write `pref:<id>` too; which of these leads sessions to the shape is not established. In round 19, 7 calls failed on it — `show` 2, `relate --object` 5 — and round 18 had 8. No call was refused on the directory or id-then-name shapes in either round. From round 20 the judge reads all of these shapes; `mem` does not.
-
-**Fix.** In `by_id` / `bare_ref`: accept `pref` and a kind's directory as the kind, and take a leading id before a name with no separator. It changes what sessions see, so it needs a round of its own.
-
 ## Instructions that are untrue, or that a cold reader misreads
 
 A session has no context but what it is handed, and these are what it is handed.
@@ -224,17 +218,19 @@ The root index correctly stops listing `orgs/`, so the stale file is reachable o
 
 *Deferred as an edge case.* Cannot fire in a run: `seed` creates all nine kind directories before the first session, so the mkdir is always a no-op.
 
-The wrong-case half of this entry is closed. `Vault::by_id` lower-cases the ref and probes with the lower-cased string, so `place:E1F872`, `PLACE:E1F872` and `Place:e1f872` all resolve to `place:e1f872`, and an unknown kind is refused before anything touches the disk — `known && self.exists(&lower)` short-circuits. No capitalised directory can be created any more.
+The wrong-case half of this entry is closed. `text::id_word` lower-cases the ref and maps every spelling of a kind to the kind itself, so `place:E1F872`, `PLACE:E1F872`, `places/e1f872` and `Place:e1f872` all resolve to `place:e1f872`, and a word that is no kind's spelling is not read as an id at all. Only a canonical `<kind>:<local>` reaches `exists`, so no capitalised or misspelled directory can be created.
 
 What remains is that asking where a node *would* live creates the directory. `path_for` mkdirs the kind directory before checking whether the file is there, so a read probe for a kind with no nodes leaves an empty one behind:
 
 ```
 $ ls -A            (a bare vault)
 $ mem show "place:aaaaaa"
-(no node for 'place:aaaaaa')          rc=1
+(no place is named 'aaaaaa'; there are no places yet, and `mem search` finds by other words)   rc=1
 $ ls -A
 places
 ```
+
+An id with a kind written, when no node of that kind has it, is looked up under every kind (a node the id names under another kind is read by `show` and `recall` and refused by a write), so `mem show "place:1a2b3c"` in a bare vault leaves all nine directories behind, as a bare id always has.
 
 It cannot fire in a run. `seed` creates all nine kind directories before the first session, so every one already exists and the mkdir is a no-op. Kept as it is deliberately through the port: the behaviour is in every run that has been scored, and the code says so where it lives.
 

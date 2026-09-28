@@ -5,8 +5,11 @@
 //! What to recall from, and what is worth recording, are the session's
 //! decisions.
 //!
-//! Arguments are names, not ids, because names are what a session reads in an
-//! index. Anything unresolved is created rather than refused.
+//! Arguments are names or ids: names because they are what a session reads in
+//! an index, and ids in any spelling an index or a path shows. Where a flag
+//! names who or what a record involves, a plain name that is not a node is
+//! created; a value written as a reference that names nothing is refused
+//! everywhere.
 
 use clap::{Parser, Subcommand};
 use memory::index;
@@ -14,7 +17,7 @@ use memory::recall::{self, HOPS, LIMIT};
 use memory::transcript;
 use memory::fm::Edge;
 use memory::text::{line_for, marks, one_line, py_repr, py_strip};
-use memory::vault::{Taken, Vault};
+use memory::vault::{Miss, Slot, Taken, Vault};
 use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::PathBuf;
@@ -117,6 +120,7 @@ enum Cmd {
         /// otherwise; a restated rule keeps the kind it has
         #[arg(long, value_parser = ["mail-disposition","preference","etiquette"])]
         kind: Option<String>,
+        /// names, comma-separated: what the rule concerns
         #[arg(long, default_value = "")]
         about: String,
         #[arg(long)]
@@ -403,16 +407,81 @@ fn iso_now() -> String {
     format!("{day}T{:02}:{:02}:{:02}.{ms:03}+00:00", t / 3600, (t % 3600) / 60, t % 60)
 }
 
-/// resolve, with an ambiguous name refused out loud: the candidates are printed
-/// and the command stops, because putting the fact on the wrong one is worse
-/// than asking.
-fn resolve(v: &Vault, r: &str) -> Result<Option<String>, i32> {
-    match v.resolve(r, "") {
-        Ok(x) => Ok(x),
-        Err(a) => {
-            out!("({a}. An id says which.)");
-            Err(1)
+/// find, with every miss but a plain one refused out loud: an ambiguous name
+/// has its candidates printed and the command stops, because putting the fact
+/// on the wrong one is worse than asking.
+fn resolve(v: &Vault, r: &str, slot: Slot) -> Result<Option<String>, i32> {
+    match v.find(r, "", slot) {
+        Ok(n) => Ok(Some(n)),
+        Err(Miss::Nothing) => Ok(None),
+        Err(m) => { out!("{}", miss_text(v, r, &m, false)); Err(1) }
+    }
+}
+
+fn plural(kind: &str) -> &'static str {
+    match kind {
+        "person" => "people", "place" => "places", "org" => "orgs", "group" => "groups",
+        "thing" => "things", "topic" => "topics", "event" => "events",
+        "preference" => "preferences", "trajectory" => "trajectories", _ => "nodes",
+    }
+}
+
+fn dir_of(kind: &str) -> &str {
+    memory::fm::dir_for(kind).unwrap_or(kind)
+}
+
+/// Where the nodes of a kind are listed, or that there are none.
+fn listed(v: &Vault, kind: &str) -> String {
+    if v.has_nodes(kind) {
+        format!("{}/CLAUDE.md lists the {}", dir_of(kind), plural(kind))
+    } else {
+        format!("there are no {} yet", plural(kind))
+    }
+}
+
+/// The same, as a sentence of its own.
+fn listed_sentence(v: &Vault, kind: &str) -> String {
+    if v.has_nodes(kind) {
+        format!("{}/CLAUDE.md lists the {}.", dir_of(kind), plural(kind))
+    } else {
+        format!("There are no {} yet.", plural(kind))
+    }
+}
+
+/// What a miss says. A mistyped id gets no maker, since there is nothing to
+/// guess from it; a name in a slot that mints does, where one command makes it.
+fn miss_text(v: &Vault, r: &str, m: &Miss, minting: bool) -> String {
+    let labelled = |n: &str| {
+        let (meta, _) = stored(v, n);
+        line_for(&memory::fm::label(&meta), meta.get("summary"))
+    };
+    match m {
+        Miss::Nothing => format!("(no node for {})", py_repr(r)),
+        Miss::Ambiguous(a) => format!("({a}. An id says which.)"),
+        Miss::KindAlone { kind, spelling } if kind.is_empty() => format!(
+            "({} names no one kind; person, place, org, group, thing or topic goes before \
+             the id or name)", py_repr(spelling)),
+        Miss::KindAlone { kind, spelling } => {
+            let tail = if v.has_nodes(kind) { format!("{}/CLAUDE.md lists them", dir_of(kind)) }
+                       else { format!("there are no {} yet", plural(kind)) };
+            format!("({} is a kind, with no id or name after it; {tail})", py_repr(spelling))
         }
+        Miss::NoneById { kind } => format!(
+            "(no {kind} {}; {}, and `mem search` finds by other words)",
+            py_repr(r.trim()), listed(v, kind)),
+        Miss::NoneByName { kind, name } if minting
+                && memory::fm::ENTITY_KINDS.contains(&kind.as_str()) => format!(
+            "(no {kind} is named {}; `mem search` finds by other words, and \
+             `mem entity --kind {kind} --name {}` makes one)", py_repr(name), py_repr(name)),
+        Miss::NoneByName { kind, name } => format!(
+            "(no {kind} is named {}; {}, and `mem search` finds by other words)",
+            py_repr(name), listed(v, kind)),
+        Miss::WrongKind { kind, id, node } => format!(
+            "(no {kind} has the id {}; that id, with any kind or none, is {node} ({}), and \
+             nothing was written. {})", py_repr(id), labelled(node), listed_sentence(v, kind)),
+        Miss::WrongKindName { kind, name, node } => format!(
+            "(no {kind} is named {}; that name is {node} ({}), and nothing was written. {})",
+            py_repr(name), labelled(node), listed_sentence(v, kind)),
     }
 }
 
@@ -424,10 +493,9 @@ fn cmd_recall(v: &Vault, refs: &[String], hops: i64, limit: i64) -> i32 {
     let mut seeds: BTreeSet<String> = BTreeSet::new();
     let mut complaints: BTreeSet<String> = BTreeSet::new();
     for r in refs {
-        match v.resolve(r, "") {
-            Ok(Some(nid)) => { seeds.insert(nid); }
-            Ok(None) => { complaints.insert(format!("(no node for {})", py_repr(r))); }
-            Err(a) => { complaints.insert(format!("({a}. An id says which.)")); }
+        match v.find(r, "", Slot::Reading) {
+            Ok(nid) => { seeds.insert(nid); }
+            Err(m) => { complaints.insert(miss_text(v, r, &m, false)); }
         }
     }
     // sorted, so that what a session reads is the same whichever order it named
@@ -481,7 +549,7 @@ fn cmd_search(v: &Vault, text: &str, limit: i64) -> i32 {
 }
 
 fn cmd_show(v: &Vault, r: &str) -> i32 {
-    let nid = match resolve(v, r) {
+    let nid = match resolve(v, r, Slot::Reading) {
         Ok(Some(n)) => n,
         Ok(None) => { out!("(no node for {})", py_repr(r)); return 1; }
         Err(rc) => return rc,
@@ -729,8 +797,9 @@ fn stub(v: &Vault, name: &str, kind: &str) -> String {
 /// flag mints. Every reference is resolved before any stub is minted, so a
 /// refusal on the last leaves nothing behind from the first; the same new name
 /// twice gets one stub.
-/// An id that names no node is refused: there is nothing to guess from a
-/// mistyped hash, and minting a person called `34432f` is worse.
+/// A value written to point at a node — an id, a kind before a name, a kind
+/// alone, a directory path, brackets, a filesystem path — that names nothing is
+/// refused: a stub would be a node named after the pointer.
 fn refs(v: &Vault, wanted: &[(String, &str, &str)]) -> Result<Vec<String>, i32> {
     enum Item { Have(String), Mint(String, String), Me }
     let mut out: Vec<Item> = Vec::new();
@@ -739,14 +808,15 @@ fn refs(v: &Vault, wanted: &[(String, &str, &str)]) -> Result<Vec<String>, i32> 
             out!("(a blank where a name was expected)");
             return Err(1);
         }
-        let nid = match v.resolve(r, prefer) {
-            Ok(x) => x,
-            Err(a) => { out!("({a}. An id says which.)"); return Err(1); }
+        let nid = match v.find(r, prefer, Slot::Writing) {
+            Ok(n) => Some(n),
+            Err(Miss::Nothing) if memory::text::reference_shaped(r) => {
+                out!("(no node {}; a name goes here, or an id from an index)", py_repr(r));
+                return Err(1);
+            }
+            Err(Miss::Nothing) => None,
+            Err(m) => { out!("{}", miss_text(v, r, &m, true)); return Err(1); }
         };
-        if nid.is_none() && memory::text::id_shaped(r) {
-            out!("(no node {}; a name goes here, or an id from an index)", py_repr(r));
-            return Err(1);
-        }
         out.push(match nid {
             Some(n) => Item::Have(n),
             None if memory::is_self_name(r) => Item::Me,
@@ -828,7 +898,7 @@ fn cmd_entity(v: &Vault, kind: &str, name: &str, summary: &str, body: &str,
         return not_mine(v);
     }
     let nid = if !id.is_empty() {
-        match resolve(v, id) {
+        match resolve(v, id, Slot::Writing) {
             Ok(Some(n)) if n.starts_with(&format!("{kind}:")) => Some(n),
             Err(rc) => return rc,
             _ => { out!("(no {kind} {})", py_repr(id)); return 1; }
@@ -925,12 +995,26 @@ fn cmd_pref(v: &Vault, whose: &str, summary: &str, body: &str, kind: &str,
             about: &str, new: bool) -> i32 {
     let summary = match summary_or_die(summary, "--summary") { Ok(x) => x, Err(rc) => return rc };
     let mut wanted = vec![(whose.to_string(), "person", "person")];
-    if !about.is_empty() {
+    // a list, as trajectory --about is, split only when the whole value names
+    // nothing, so a name with a comma in it is still found
+    if about.contains(',') {
+        match v.find_whole_name(about) {
+            Ok(Some(n)) => wanted.push((n, "topic", "")),
+            Ok(None) => {
+                let items = memory::text::list_outside(about);
+                if items.is_empty() {
+                    out!("(a blank where a name was expected)");
+                    return 1;
+                }
+                wanted.extend(items.into_iter().map(|a| (a, "topic", "")));
+            }
+            Err(m) => { out!("{}", miss_text(v, about, &m, true)); return 1; }
+        }
+    } else if !about.is_empty() {
         wanted.push((about.to_string(), "topic", ""));
     }
     let ids = match refs(v, &wanted) { Ok(x) => x, Err(rc) => return rc };
     let whose_id = ids[0].clone();
-    let about_id = if about.is_empty() { String::new() } else { ids[1].clone() };
     let found = if new { None } else {
         match existing(v, "preference", &summary, "", &whose_id, false) {
             Ok(x) => x, Err(rc) => return rc }
@@ -947,9 +1031,7 @@ fn cmd_pref(v: &Vault, whose: &str, summary: &str, body: &str, kind: &str,
         else { String::new() };
     let nid = found.unwrap_or_else(|| v.mint("preference", "", None, &summary));
     let mut edges = vec![Edge { rel: "whose".into(), to: whose_id }];
-    if !about_id.is_empty() {
-        edges.push(Edge { rel: "concerns".into(), to: about_id });
-    }
+    edges.extend(ids[1..].iter().map(|a| Edge { rel: "concerns".into(), to: a.clone() }));
     let taken = v.upsert(&nid, "preference", &summary, &summary, body,
                          &[("ptype".to_string(), ptype)], &edges, &today());
     regen(v);
@@ -1007,7 +1089,7 @@ fn cmd_advance(v: &Vault, r: &str, status: &str, by: &str, note: &str) -> i32 {
         out!("(--note, --status and --by are all empty; nothing was written)");
         return 1;
     }
-    let nid = match resolve(v, r) {
+    let nid = match resolve(v, r, Slot::Writing) {
         Ok(Some(n)) if n.starts_with("trajectory:") => n,
         Err(rc) => return rc,
         _ => { out!("(no trajectory for {})", py_repr(r)); return 1; }
@@ -1041,7 +1123,7 @@ fn cmd_advance(v: &Vault, r: &str, status: &str, by: &str, note: &str) -> i32 {
 /// A new name, or a new summary, on the same node. The id stays, so nothing
 /// else changes; what it used to say is kept in the body, struck.
 fn cmd_rename(v: &Vault, node: &str, name: &str, summary: &str, because: &str) -> i32 {
-    let nid = match resolve(v, node) {
+    let nid = match resolve(v, node, Slot::Writing) {
         Ok(Some(n)) => n,
         Ok(None) => { out!("(no node for {})", py_repr(node)); return 1; }
         Err(rc) => return rc,
@@ -1100,7 +1182,7 @@ fn cmd_rename(v: &Vault, node: &str, name: &str, summary: &str, because: &str) -
 /// leave it in every index. Refused while anything links to it: unlink first,
 /// so nothing is left dangling.
 fn cmd_forget(v: &Vault, r: &str) -> i32 {
-    let nid = match resolve(v, r) {
+    let nid = match resolve(v, r, Slot::Writing) {
         Ok(Some(n)) => n,
         Ok(None) => { out!("(no node for {})", py_repr(r)); return 1; }
         Err(rc) => return rc,
@@ -1142,13 +1224,13 @@ fn cmd_retract(v: &Vault, subject: &str, rel: &str, object: &str, inverse: &str,
         out!("(--line is empty; nothing was written)");
         return 1;
     }
-    let nid = match resolve(v, subject) {
+    let nid = match resolve(v, subject, Slot::Writing) {
         Ok(Some(n)) => n,
         Ok(None) => { out!("(no node for {})", py_repr(subject)); return 1; }
         Err(rc) => return rc,
     };
     let oid = if object.is_empty() { String::new() } else {
-        match resolve(v, object) {
+        match resolve(v, object, Slot::Writing) {
             Ok(Some(n)) => n,
             Ok(None) => { out!("(no node for {})", py_repr(object)); return 1; }
             Err(rc) => return rc,
@@ -1224,7 +1306,7 @@ fn cmd_retract(v: &Vault, subject: &str, rel: &str, object: &str, inverse: &str,
 /// name and the edges are not touched, and a retracted line does not come back
 /// this way (`says_again`).
 fn cmd_amend(v: &Vault, r: &str, line: &str, with: &str, because: &str) -> i32 {
-    let nid = match resolve(v, r) {
+    let nid = match resolve(v, r, Slot::Writing) {
         Ok(Some(n)) => n,
         Ok(None) => { out!("(no node for {})", py_repr(r)); return 1; }
         Err(rc) => return rc,
@@ -1665,4 +1747,67 @@ fn main() {
     };
     log(name, rc, &argv);
     std::process::exit(rc);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A vault in a fresh directory with one topic and one person and nothing
+    /// else, removed when the test ends.
+    struct Store(Vault);
+
+    impl Drop for Store {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0.root);
+        }
+    }
+
+    fn store(tag: &str) -> Store {
+        let root = std::env::temp_dir().join(format!("mem-miss-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let v = Vault::new(root);
+        v.upsert("topic:4d5e6f", "topic", "garden plans", "", "", &[], &[], "2031-01-10");
+        v.upsert("person:1a2b3c", "person", "Alpha", "", "", &[], &[], "2031-01-10");
+        Store(v)
+    }
+
+    fn by_name(kind: &str, name: &str) -> Miss {
+        Miss::NoneByName { kind: kind.into(), name: name.into() }
+    }
+
+    #[test]
+    fn the_maker_only_for_an_entity_kind_where_the_slot_mints() {
+        let v = store("maker");
+        let v = &v.0;
+        assert!(miss_text(v, "topic:greenhouse", &by_name("topic", "greenhouse"), true)
+            .contains("`mem entity --kind topic --name 'greenhouse'` makes one"));
+        assert!(!miss_text(v, "topic:greenhouse", &by_name("topic", "greenhouse"), false)
+            .contains("makes one"));
+        assert!(!miss_text(v, "event:gutters", &by_name("event", "gutters"), true)
+            .contains("makes one"));
+    }
+
+    #[test]
+    fn a_kind_with_nodes_points_at_its_index_and_one_without_says_so() {
+        let v = store("index");
+        let v = &v.0;
+        let alone = |k: &str, sp: &str| Miss::KindAlone { kind: k.into(), spelling: sp.into() };
+        assert_eq!(miss_text(v, "topics", &alone("topic", "topics"), false),
+                   "('topics' is a kind, with no id or name after it; topics/CLAUDE.md lists them)");
+        assert_eq!(miss_text(v, "groups", &alone("group", "groups"), false),
+                   "('groups' is a kind, with no id or name after it; there are no groups yet)");
+        let by_id = |k: &str| Miss::NoneById { kind: k.into() };
+        assert!(miss_text(v, "group:0d1e2f", &by_id("group"), false)
+            .contains("; there are no groups yet, and `mem search` finds by other words)"));
+        assert!(miss_text(v, "topic:0d1e2f", &by_id("topic"), false)
+            .contains("; topics/CLAUDE.md lists the topics, and `mem search`"));
+        let wrong = |k: &str| Miss::WrongKind { kind: k.into(), id: "1a2b3c".into(),
+                                                node: "person:1a2b3c".into() };
+        assert!(miss_text(v, "group:1a2b3c", &wrong("group"), false)
+            .ends_with("and nothing was written. There are no groups yet.)"));
+        assert!(miss_text(v, "topic:1a2b3c", &wrong("topic"), false)
+            .ends_with("and nothing was written. topics/CLAUDE.md lists the topics.)"));
+    }
 }
