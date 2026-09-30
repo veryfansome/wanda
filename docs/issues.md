@@ -90,29 +90,6 @@ Recalling from four of the ten people in the store returns eight per cent of it.
 
 **Fix.** Say that both cap their output and that `--limit` raises it; print how many were cut.
 
-### 33. `--because` has help text only on `amend`, and is discarded on an edge retraction, on `forget` and on a rename that only sets a first summary
-
-The retract skill says *"Give the same `--because` each time, dated, saying who corrected it and when"*. On an edge retraction and on `forget`, the reason reaches nowhere in the store: `cmd_retract` builds the sentence and then uses it only on a struck body line, and `cmd_forget` unlinks the file. A `rename` that only gives a node its first summary strikes nothing, so its reason goes the same way.
-
-```
-$ mem retract --subject person:d7a42f --rel parent_of --object 92e268 --inverse child_of \
-      --because "fan corrected this on 2026-06-21; they are not related"
-ok retracted 2
-$ mem forget "a stray" --because "fan corrected this on 2026-06-21; it was never a thing"
-ok forgot thing:8e0d57
-$ grep -rn "corrected this" <vault>      → nothing
-```
-
-It survives in the session transcript, which is the belt — but the store, which is what a later session reads, keeps nothing. Across round 16 that is 47 reasons written and thrown away: all 20 of the successful edge-only retractions carried a `--because`, and 27 of the 42 `forget` calls did.
-
-`--because` has no help text on any verb but `amend` — `mem retract --help` and `mem forget --help` both show only `--because <BECAUSE>  [default: ""]`. Where it *is* kept — `--line`, `rename` and `amend` — `mem` already prefixes its own date, so following the skill literally produces the date twice:
-
-```
-~~was summarised: mei's mother~~ (resummarised 2026-09-10: fan corrected this on 2026-06-21)
-```
-
-**Fix.** Decide what `--because` is for now that a retraction removes rather than annotates; document it or remove it. Drop "dated" from the skill.
-
 ### 50. The exchange rule contradicts itself on a flag, and questions put to wanda are still filed
 
 `root.md:9`: *"That someone asked you something, greeted you, or was told something is in the session transcript for a month, and is not a node; a node is what came out of it."* The next paragraph, `root.md:11`, says *"what you suggested, flagged, promised or did is as much a fact as what you were told"*, and the enrich skill's step 5 files *"a suggestion, a claim, or a flag — the fact of it, as an event"*. A flag is someone being told something, so on wanda's own tellings the standing text says two things. Sessions follow step 5 and file their flags; no example shows where a flag stops being an exchange.

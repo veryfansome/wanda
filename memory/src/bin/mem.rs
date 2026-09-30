@@ -168,7 +168,8 @@ enum Cmd {
         #[arg(long, default_value = "",
               help = format!("a new summary — the index line, at most {} characters. An event, a trajectory or a preference is named by its summary: a new name or a new summary, not both", memory::SUMMARY_MAX))]
         summary: String,
-        #[arg(long, default_value = "")]
+        /// kept beside the old name or summary, struck, with the date. A rename that strikes nothing, such as a first summary, keeps none
+        #[arg(long, default_value = "", hide_default_value = true)]
         because: String,
     },
     /// edit one line of a node's body that is wrong as written: the whole line as it should read takes its place, and the old one stays, struck
@@ -185,11 +186,7 @@ enum Cmd {
         because: String,
     },
     /// remove a node that should never have existed; refused while anything links to it
-    Forget {
-        r#ref: String,
-        #[arg(long, default_value = "")]
-        because: String,
-    },
+    Forget { r#ref: String },
     /// unsay something that was never true
     Retract {
         #[arg(long, required = true)]
@@ -203,7 +200,8 @@ enum Cmd {
         /// strike every body line containing this text
         #[arg(long, default_value = "", hide_default_value = true)]
         line: String,
-        #[arg(long, default_value = "")]
+        /// kept beside each line --line strikes, with the date. A retract without --line keeps none, and takes no --because
+        #[arg(long, default_value = "", hide_default_value = true)]
         because: String,
     },
     /// an exchange from the transcripts: what was said both ways, and what I did
@@ -1220,6 +1218,10 @@ fn cmd_forget(v: &Vault, r: &str) -> i32 {
 /// about the removal: what is true now is recorded as a fact.
 fn cmd_retract(v: &Vault, subject: &str, rel: &str, object: &str, inverse: &str,
                line: &str, because: &str) -> i32 {
+    if line.is_empty() && !one_line(because).is_empty() {
+        out!("(a retract without --line keeps no reason, so it takes no --because; nothing was retracted)");
+        return 1;
+    }
     if !line.is_empty() && py_strip(line).is_empty() {
         out!("(--line is empty; nothing was written)");
         return 1;
@@ -1709,8 +1711,7 @@ fn main() {
         Cmd::Amend { node, line, with, because } => Cmd::Amend {
             node: restamp(&node), line: restamp(&line), with: restamp(&with),
             because: restamp(&because) },
-        Cmd::Forget { r#ref, because } => Cmd::Forget {
-            r#ref: restamp(&r#ref), because: restamp(&because) },
+        Cmd::Forget { r#ref } => Cmd::Forget { r#ref: restamp(&r#ref) },
         Cmd::Retract { subject, rel, object, inverse, line, because } => Cmd::Retract {
             subject: restamp(&subject), rel: restamp(&rel), object: restamp(&object),
             inverse: restamp(&inverse), line: restamp(&line), because: restamp(&because) },
@@ -1737,7 +1738,7 @@ fn main() {
         Cmd::Rename { node, name, summary, because } =>
             cmd_rename(&v, node, name, summary, because),
         Cmd::Amend { node, line, with, because } => cmd_amend(&v, node, line, with, because),
-        Cmd::Forget { r#ref, .. } => cmd_forget(&v, r#ref),
+        Cmd::Forget { r#ref } => cmd_forget(&v, r#ref),
         Cmd::Retract { subject, rel, object, inverse, line, because } =>
             cmd_retract(&v, subject, rel, object, inverse, line, because),
         Cmd::Session { r#ref, day, with_, last, full } =>
@@ -1809,5 +1810,49 @@ mod tests {
             .ends_with("and nothing was written. There are no groups yet.)"));
         assert!(miss_text(v, "topic:1a2b3c", &wrong("topic"), false)
             .ends_with("and nothing was written. topics/CLAUDE.md lists the topics.)"));
+    }
+
+    fn edge(rel: &str, to: &str) -> Edge {
+        Edge { rel: rel.into(), to: to.into() }
+    }
+
+    fn read(v: &Vault, nid: &str) -> String {
+        std::fs::read_to_string(v.path_for(nid)).unwrap()
+    }
+
+    #[test]
+    fn a_retract_without_line_refuses_a_reason_and_takes_a_blank_one() {
+        let v = store("because");
+        let v = &v.0;
+        v.upsert("person:1a2b3c", "person", "Alpha", "", "Alpha keeps bees.", &[],
+                 &[edge("owns", "topic:4d5e6f")], "2031-01-10");
+        v.upsert("topic:4d5e6f", "topic", "garden plans", "", "", &[],
+                 &[edge("owned_by", "person:1a2b3c")], "2031-01-10");
+        let before = (read(v, "person:1a2b3c"), read(v, "topic:4d5e6f"));
+        // an edge named by --rel, one named by --object and --inverse alone, and a
+        // --line of only spaces, refused as empty whatever the reason
+        assert_eq!(cmd_retract(v, "Alpha", "owns", "garden plans", "", "", "y"), 1);
+        assert_eq!(cmd_retract(v, "Alpha", "", "garden plans", "owned_by", "", "y"), 1);
+        assert_eq!(cmd_retract(v, "Alpha", "", "", "", " ", "y"), 1);
+        assert_eq!((read(v, "person:1a2b3c"), read(v, "topic:4d5e6f")), before);
+        assert_eq!(cmd_retract(v, "Alpha", "owns", "garden plans", "", "", "  "), 0);
+        assert!(!read(v, "person:1a2b3c").contains("owns"));
+    }
+
+    #[test]
+    fn a_retract_with_line_keeps_its_reason_beside_the_struck_line() {
+        let v = store("kept");
+        let v = &v.0;
+        v.upsert("person:1a2b3c", "person", "Alpha", "", "Alpha grows beans.", &[], &[], "2031-01-10");
+        assert_eq!(cmd_retract(v, "Alpha", "", "", "", "beans", "Beta said"), 0);
+        let text = read(v, "person:1a2b3c");
+        assert!(text.contains("~~Alpha grows beans.~~ (retracted"), "{text}");
+        assert!(text.contains(": Beta said)"), "{text}");
+    }
+
+    #[test]
+    fn forget_takes_no_reason() {
+        let refused = Cli::try_parse_from(["mem", "forget", "x", "--because", "y"]).err();
+        assert_eq!(refused.map(|e| e.kind()), Some(clap::error::ErrorKind::UnknownArgument));
     }
 }

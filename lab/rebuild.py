@@ -236,7 +236,19 @@ def main() -> int:
     # recording made under the old tool still replays under the new one;
     # the value is how many arguments each took
     REMOVED = {"relate": {"--permanence": 1, "--source": 1},
-               "trajectory": {"--closes": 1, "--actor": 1}, "event": {"--actor": 1}}
+               "trajectory": {"--closes": 1, "--actor": 1}, "event": {"--actor": 1},
+               "forget": {"--because": 1}}
+
+    # the value of --line, in both spellings clap takes: read by token alone,
+    # `--line=<v>` would look absent and a reason the call kept would be stripped
+    def line_of(argv: list[str]) -> str:
+        for a, b in zip(argv, argv[1:] + [""]):
+            if a == "--line":
+                return b
+            if a.startswith("--line="):
+                return a[len("--line="):]
+        return ""
+
     # what each call printed, normalised so that two runs under different
     # output directories still compare. Exit codes alone assert almost
     # nothing: recall exits 0 whatever it ranks, and recall is a third of the
@@ -253,6 +265,11 @@ def main() -> int:
         ran_date, ran_session = ran_on(c)
         # stripped of the flag clap refused it for, a refused call would replay as a write
         argv, gone = [], {} if c["rc"] == 2 else REMOVED.get(c["cmd"], {})
+        # a retract without --line that went through kept no reason. At rc 1 it
+        # may have been refused for giving one, and stripped it would replay as
+        # a write
+        if c["cmd"] == "retract" and c["rc"] == 0 and not line_of(c["argv"]):
+            gone = {**gone, "--because": 1}
         skip = 0
         for a in c["argv"]:
             if skip:

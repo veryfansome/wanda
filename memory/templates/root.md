@@ -67,7 +67,7 @@ What I myself said and did is not in the store unless I filed it. The exchange i
     mem show "<name or id>"               one node and its edges
     mem session <session>                 one exchange; take it from a node's `made:`
     mem session --with "<name>" --last 3  recent exchanges, what was said both ways
-    mem retract --subject <id> --rel <relation> --object <id> --because "..."
+    mem retract --subject <id> --rel <relation> --object <id>
     mem rename <id> "<new name>" --because "..."
 
 Names resolve wherever an id does. An id is the short code in front of an index line — six characters, with a date in front of it for an event — and it can be passed bare, without the kind.
