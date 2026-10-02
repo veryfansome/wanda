@@ -11,9 +11,10 @@ decided is kept; only the tool's behaviour is new.
 Ids are the one thing a replay cannot reproduce by itself — they are minted
 at random, and a session's later calls name the ids its earlier calls got —
 so the original vault is the oracle: a node of the same kind and name, made
-in the same session, gets the id it had. Every call whose exit code differs
-from the recorded one is listed, since that is where the current code
-disagrees with what the run did.
+in the same session, gets the id it had, and a node the run forgot gets the
+one printed by the tool call it was made in. Every call whose exit code
+differs from the recorded one is listed, since that is where the current
+code disagrees with what the run did.
 
     python3 lab/rebuild.py --from runs/15A/vault15A --out /tmp/vault15A_debug
 """
@@ -26,7 +27,8 @@ import os
 import re
 import subprocess
 import sys
-from datetime import date
+import tempfile
+from datetime import date, datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -100,7 +102,8 @@ def main() -> int:
                     help="where to build; default is <run>_debug/vault beside the run, "
                          "because a run's own directory is mounted whole into any "
                          "session run against it later")
-    ap.add_argument("--transcripts", default="", help="the run's transcript dir, for `mem session` calls")
+    ap.add_argument("--transcripts", default="",
+                    help="the run's transcript dir, for `mem session` calls and the mint order")
     ap.add_argument("--mem", default="", metavar="PATH",
                     help="the mem to replay with; default is the one the build staged. "
                          "Point it at another build and the diff says how the two differ")
@@ -154,10 +157,12 @@ def main() -> int:
     # `ok <id>` lines mem printed back, in sequence. Two nodes of one name in
     # one session are told apart by this, and without it they can be given each
     # other's bodies — with the id set still matching, so the node line at the
-    # end reads as success either way. Transcripts are pruned after thirty days,
-    # which makes the empty case the normal future state of every stored run. A
-    # rebuild may proceed without them, because refusing would make an old run
-    # unrebuildable, but it may not stay quiet about it.
+    # end reads as success either way. A node the run forgot is not in the
+    # original vault either, and the `ok` line of the call that made it is the
+    # only record of which call that was, so each tool call's span, from its use
+    # to its result, is kept with the ids its result printed. A rebuild may
+    # proceed without a session's transcript, because refusing would make an
+    # old run unrebuildable, but it may not stay quiet about it.
     #
     # Which sessions to look for is the memlog's question, not the arrival
     # log's: `ran_on` below takes each call's session from the call itself and
@@ -166,41 +171,73 @@ def main() -> int:
     # still name it, so counting arrivals would skip the session that most needs
     # an order and report full coverage.
     order: dict[str, list[str]] = {}
+    # per session, each tool call's span and the ids its result printed
+    spans: dict[str, list[tuple]] = {}
+    # an id only where it is whole, as `mem` draws it: a `mem session` listing
+    # is cut at its 240th character, which can fall inside one
+    ok_id = re.compile(r"\bok ((?:person|place|org|group|thing|topic|event|preference|trajectory)"
+                       r":(?:\d{4}-\d\d-\d\d-)?[0-9a-f]{6})(?![0-9a-f])")
+
+    def stamp(ts: str) -> float:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+
     tdir = Path(transcripts)
     want = {c.get("session") or session_of.get(c.get("input_key", ""), "")
             for c in calls}
     want.discard("")
-    absent = 0
     if not tdir.is_dir():
         # a file where a directory should be is a different mistake from
         # nothing being there, and the one an operator would chase first
         what = "is not a directory" if tdir.exists() else "is not there"
-        print(f"{tdir} {what}: replaying with no mint order, so two nodes of "
-              f"one name in one session may swap bodies", file=sys.stderr)
+        print(f"{tdir} {what}, so no transcript is read", file=sys.stderr)
     else:
         for sid in sorted(want):
             f = tdir / f"{sid}.jsonl"
             if not f.exists():
-                absent += 1
                 continue
             ids: list[str] = []
+            began: dict[str, float] = {}
+            spans[sid] = []
             for line in f.read_text().splitlines():
                 try:
                     d = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if d.get("type") != "user":
-                    continue
-                for b in (d.get("message") or {}).get("content") or []:
-                    if isinstance(b, dict) and b.get("type") == "tool_result":
+                m = d.get("message")
+                for b in (m.get("content") if isinstance(m, dict) else None) or []:
+                    if not isinstance(b, dict):
+                        continue
+                    if b.get("type") == "tool_use" and d.get("timestamp"):
+                        began[b.get("id")] = stamp(d["timestamp"])
+                    elif b.get("type") == "tool_result" and d.get("type") == "user":
                         c = b.get("content")
                         c = c if isinstance(c, str) else " ".join(x.get("text", "") for x in c or [] if isinstance(x, dict))
-                        ids += [x for x in re.findall(r"\bok ((?:person|place|org|group|thing|topic|event|preference|trajectory):[0-9a-f-]+)", c)
-                                if x not in ids]
+                        got = ok_id.findall(c)
+                        ids += [x for x in got if x not in ids]
+                        if b.get("tool_use_id") in began and d.get("timestamp"):
+                            spans[sid].append((began[b["tool_use_id"]], stamp(d["timestamp"]), got))
             order[sid] = ids
-        if absent:
-            print(f"{absent} of {len(want)} sessions have no transcript in {tdir}: "
-                  f"replaying those with no mint order", file=sys.stderr)
+    absent = sorted(want - set(order))
+    if absent:
+        print(f"{len(absent)} of {len(want)} sessions have no transcript in {tdir}: replaying "
+              f"those with no mint order, so two nodes of one name in one of them may swap "
+              f"bodies, and a node the run forgot there does not get the id it had",
+              file=sys.stderr)
+
+    def printed(c: dict, sid: str) -> list[str] | None:
+        """The ids printed by the tool call a recorded call ran inside: the span
+        its time falls in, or within half a second of, a margin between the
+        transcript's clock and the log's that no recorded call has needed so
+        far; several where calls ran side by side. None where its session was
+        read and no span of it is the call's."""
+        t = stamp(c["ts"]) if c.get("ts") else None
+        held = [] if t is None else \
+            [s for s in spans.get(sid, []) if s[0] <= t <= s[1]] or \
+            [s for s in spans.get(sid, []) if s[0] - 0.5 <= t <= s[1] + 0.5]
+        if not held:
+            return None if sid in spans else []
+        return [x for s in held for x in s[2]]
+
     order_path = out / ".oracle-order.json"
     order_path.write_text(json.dumps(order))
 
@@ -227,6 +264,26 @@ def main() -> int:
         return hashlib.sha256(mem_path.read_bytes()).hexdigest()[:16]
 
     mem_before = mem_digest()
+
+    def takes_offer() -> bool:
+        """Whether the mem replaying takes an id a call is offered, asked once of
+        an empty vault. One built before calls were offered ids draws instead,
+        and every node the run forgot then rebuilds as if its tool call printed
+        none, which nothing else in the output says. A probe that fails tells
+        nothing, so it is not reported as either."""
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "oracle").mkdir()
+            (Path(d) / "order.json").write_text(json.dumps({"\0": ["person:0a1b2c"]}))
+            env = {**os.environ, "MEM_VAULT": str(Path(d) / "vault"),
+                   "MEM_ORACLE": str(Path(d) / "oracle"),
+                   "MEM_ORACLE_ORDER": str(Path(d) / "order.json"),
+                   "MEM_TEMPLATES": str(ROOT.parent / "memory" / "templates")}
+            env.pop("LAB_MEMLOG", None)
+            p = subprocess.run([*mem_cmd, "entity", "--kind", "person", "--name", "probe"],
+                               capture_output=True, text=True, env=env, cwd=d)
+            return p.returncode != 0 or "person:0a1b2c" in p.stdout
+
+    offer_taken = takes_offer()
 
     vault = S.Vault(out, oracle=S.Vault(src), oracle_order=order)
     S.seed(vault, ran_on(calls[0])[0] if calls else "")
@@ -260,9 +317,26 @@ def main() -> int:
     trace_path = out.parent / f"{out.name}-calls.jsonl"
     trace = trace_path.open("w")
     mismatches, n = [], 0
+    # what each call is offered: the ids printed by the tool call it ran
+    # inside, less every id the rebuild has held, since a node forgotten here
+    # is off the disk and its id, printed again, would go to the next node of
+    # its kind. A call the run refused printed none, so it is offered none the
+    # original vault lacks; any there are another call's in its command
+    kept = {nid for nid, _, _ in S.Vault(src).nodes()}
+    spent: set[str] = set()
+    offered, unplaced = None, 0
     for c in calls:
         key = c["input_key"]
         ran_date, ran_session = ran_on(c)
+        spent |= {f.stem for f in out.glob("*/*.md")}
+        got = printed(c, ran_session)
+        unplaced += got is None
+        offer = [x for x in got or []
+                 if x.split(":", 1)[1] not in spent and (c["rc"] == 0 or x in kept)]
+        if offer != offered:
+            # under a key no session can have: see `oracle_order` in vault.rs
+            order_path.write_text(json.dumps({**order, "\0": offer}))
+            offered = offer
         # stripped of the flag clap refused it for, a refused call would replay as a write
         argv, gone = [], {} if c["rc"] == 2 else REMOVED.get(c["cmd"], {})
         # a retract without --line that went through kept no reason. At rc 1 it
@@ -327,7 +401,7 @@ def main() -> int:
         print(f"the implementation changed while this ran ({mem_before} -> {mem_after}): "
               f"the store is part one and part the other, and this result says nothing",
               file=sys.stderr)
-    before = {nid for nid, _, _ in S.Vault(src).nodes()}
+    before = kept
     after = {nid for nid, _, _ in vault.nodes()}
     # the differences, in a form two implementations can be diffed on. The
     # count moves with the corpus and says nothing by itself; what a port has
@@ -344,8 +418,8 @@ def main() -> int:
         print(f"  … {len(mismatches) - 40} more")
     print(f"differences written to {diff_path}")
     # said whatever happened, so a report can never imply an oracle it did not
-    # have. `blank` is a session the run recorded no id for, which has no
-    # transcript to look for rather than a missing one.
+    # have. A session the run recorded no id for has no transcript to look for,
+    # so it is left out of `want` rather than counted as missing.
     # `order` counts transcripts opened; `carrying` counts the ones that held
     # an id to order by. A session that wrote nothing has an empty order, and
     # so does a whole run that only read — a smoke run can be one. What cannot
@@ -360,17 +434,27 @@ def main() -> int:
               f"order, though the log records {wrote} successful writes: the "
               f"transcript shape has changed, or these are not this run's",
               file=sys.stderr)
+    if unplaced:
+        print(f"{unplaced} recorded calls fell in no tool call of their session, so were "
+              f"offered no id: a session ended while a tool call ran, the transcript shape "
+              f"has changed, or these are not this run's", file=sys.stderr)
+    if not offer_taken:
+        print(f"{mem_path} does not take the ids a call is offered, as a mem built before "
+              f"they were does not: a node the run forgot, or one removed with the shell, "
+              f"rebuilds as if its tool call printed none", file=sys.stderr)
     where = str(tdir) if tdir.is_dir() else \
         f"{tdir} ({'not a directory' if tdir.exists() else 'absent'})"
     print(f"mint order: {len(order)} of {len(want)} sessions read from {where}, "
-          f"{carrying} carrying one")
+          f"{carrying} carrying one"
+          + (f"; no transcript for {len(absent)}: {', '.join(absent)}" if absent else ""))
     print(f"{n} calls traced to {trace_path}; {len(files)} files hashed to {vault_path_out}")
     print(f"nodes: {len(before)} in {src.name}, {len(after)} in {out.name}; "
           f"{len(before & after)} with the same id, {len(after - before)} new, {len(before - after)} missing")
-    for nid in sorted(before - after)[:10]:
-        print(f"  missing: {nid}")
-    for nid in sorted(after - before)[:10]:
-        print(f"  new:     {nid}")
+    for label, ids in (("missing:", sorted(before - after)), ("new:    ", sorted(after - before))):
+        for nid in ids[:10]:
+            print(f"  {label} {nid}")
+        if len(ids) > 10:
+            print(f"  … {len(ids) - 10} more {label.rstrip(': ')}")
     return 0
 
 

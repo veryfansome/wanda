@@ -76,9 +76,16 @@ pub struct Vault {
     /// Never set when wanda is the one writing.
     pub oracle: Option<Box<Vault>>,
     /// And, per session, the order those ids were minted in — two nodes of one
-    /// name made in one session are told apart by which came first.
+    /// name made in one session are told apart by which came first. Under
+    /// `ORACLE_CALL`, the ids printed by the tool call the call being replayed
+    /// ran in, which is where a node the oracle no longer holds takes its id
+    /// from.
     pub oracle_order: Option<HashMap<String, Vec<String>>>,
 }
+
+/// The key `oracle_order` holds the call's ids under. No session id can be it,
+/// since an environment variable cannot hold a NUL.
+const ORACLE_CALL: &str = "\0";
 
 impl Vault {
     pub fn new(root: impl Into<PathBuf>) -> Self {
@@ -414,15 +421,42 @@ impl Vault {
     /// without its date, names one node; a replay takes the recorded id as it
     /// is. `taken` is for a batch that mints before it writes.
     pub fn mint(&self, kind: &str, when: &str, taken: Option<&mut Vec<String>>, name: &str) -> String {
+        self.mint_shown(kind, when, taken, name, true)
+    }
+
+    /// `mint`, told whether the call making the node prints its id as `ok <id>`.
+    /// A stub made from a name is not, but for a relate's subject; where the
+    /// oracle names such a stub, an id its tool call printed that the oracle
+    /// lacks is taken to be another node's, so a replay keeps the oracle's.
+    /// Live, `shown` is not read.
+    pub fn mint_shown(&self, kind: &str, when: &str, taken: Option<&mut Vec<String>>, name: &str,
+                      shown: bool) -> String {
         if let (Some(oracle), false) = (&self.oracle, name.is_empty()) {
-            let order: Vec<String> = self.oracle_order.as_ref()
-                .and_then(|m| m.get(&self.session)).cloned().unwrap_or_default();
+            let printed = |key: &str| self.oracle_order.as_ref()
+                .and_then(|m| m.get(key)).cloned().unwrap_or_default();
+            let (order, call) = (printed(&self.session), printed(ORACLE_CALL));
             let n = order.len();
-            let nid = oracle.id_of(kind, name, &self.session,
-                &|n| self.exists(n),
-                &|x| order.iter().position(|o| o == x).unwrap_or(n));
-            if let Some(nid) = nid {
-                return nid;
+            let rank = |x: &str| order.iter().position(|o| o == x).unwrap_or(n);
+            let nid = oracle.id_of(kind, name, &self.session, &|n| self.exists(n), &rank);
+            // a node the run forgot is not in the oracle, so its id is one the
+            // tool call it was made in printed: the first there of this kind,
+            // and of this date for an event, that neither vault holds. A node
+            // the oracle names keeps its id where that tool call printed the id
+            // too, since the calls in one are not told apart; where its session
+            // never printed it, as with a node whose output its command sent
+            // elsewhere; or where its making call does not print its id. The
+            // oracle's ids are listed, not looked up, since a lookup makes the
+            // kind's directory in the run's own vault
+            let kept = oracle.all_ids();
+            let gone = call.iter().find(|x| !kept.contains(x)
+                && x.split_once(':').is_some_and(|(k, local)| k == kind
+                    && (kind != "event" || local.starts_with(&format!("{when}-"))))
+                && !self.exists(x));
+            match (gone, nid) {
+                (Some(g), Some(h)) if shown && !call.contains(&h) && rank(&h) < n => return g.clone(),
+                (Some(g), None) => return g.clone(),
+                (_, Some(h)) => return h,
+                (None, None) => {}
             }
         }
         // A replay mints from a digest rather than a random source, because
@@ -966,5 +1000,99 @@ mod tests {
         assert_eq!(v.resolve("topic:9c0d1e", "").unwrap(), Some("preference:9c0d1e".into()));
         assert_eq!(v.resolve("people", "").unwrap(), None);
         assert_eq!(v.resolve("nobody here", "").unwrap(), None);
+    }
+
+    /// A store written by session `s1`, in a fresh directory.
+    fn by_s1(tag: &str) -> Store {
+        let root = std::env::temp_dir().join(format!("mem-mint-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut v = Vault::new(root);
+        v.session = "s1".into();
+        Store(v)
+    }
+
+    /// A rebuild of `run` by session `s1`, with the ids `s1` printed, in order,
+    /// and those the tool call being replayed printed.
+    fn rebuild_of(run: &Vault, tag: &str, order: &[&str], call: &[&str]) -> Store {
+        let mut v = by_s1(tag);
+        let ids = |xs: &[&str]| xs.iter().map(|x| x.to_string()).collect();
+        v.0.oracle = Some(Box::new(Vault::new(run.root.clone())));
+        v.0.oracle_order = Some(HashMap::from(
+            [("s1".to_string(), ids(order)), (ORACLE_CALL.to_string(), ids(call))]));
+        v
+    }
+
+    #[test]
+    fn a_forgotten_node_takes_the_id_its_call_printed() {
+        let run = by_s1("forgot-run");
+        let (forgot, again) = ("event:2031-01-02-1a2b3c", "event:2031-01-02-2b3c4d");
+        run.upsert(again, "event", "lunch", "lunch", "", &[], &[], DAY);
+        let order = [forgot, again];
+        let v = rebuild_of(&run, "forgot", &order, &[forgot]);
+        assert_eq!(v.mint("event", "2031-01-02", None, "lunch"), forgot,
+                   "not the id of the node made again later");
+        let v = rebuild_of(&run, "again", &order, &[again]);
+        assert_eq!(v.mint("event", "2031-01-02", None, "lunch"), again);
+        let v = rebuild_of(&run, "both", &order, &[forgot, again]);
+        assert_eq!(v.mint("event", "2031-01-02", None, "lunch"), again,
+                   "the call printed the id the oracle names as well");
+        let v = rebuild_of(&run, "none", &order, &[]);
+        assert_eq!(v.mint("event", "2031-01-02", None, "lunch"), again);
+    }
+
+    #[test]
+    fn a_forgotten_id_is_read_by_kind_and_date_alone() {
+        let run = by_s1("kind-run");
+        let call = ["person:3c4d5e", "event:2031-01-03-4d5e6f", "event:2031-01-02-5e6f7a",
+                    "event:2031-01-02-6f7a8b"];
+        let v = rebuild_of(&run, "kind", &call, &call);
+        assert_eq!(v.mint("event", "2031-01-02", None, "anything"), "event:2031-01-02-5e6f7a");
+        v.upsert("event:2031-01-02-5e6f7a", "event", "anything", "anything", "", &[], &[], DAY);
+        assert_eq!(v.mint("event", "2031-01-02", None, "else"), "event:2031-01-02-6f7a8b",
+                   "one held here is passed over");
+        assert_eq!(v.mint("person", "", None, "Alpha"), "person:3c4d5e");
+        let topic = v.mint("topic", "", None, "garden");
+        assert!(topic.starts_with("topic:") && !call.contains(&topic.as_str()), "{topic}");
+        assert!(!run.root.join("events").exists(), "the run's vault is listed, never written");
+    }
+
+    #[test]
+    fn a_node_the_oracle_names_keeps_its_id_where_its_session_never_printed_it() {
+        let run = by_s1("names-run");
+        run.upsert("person:7a8b9c", "person", "Alpha", "", "", &[], &[], DAY);
+        let other = "person:8b9c0d";
+        let v = rebuild_of(&run, "names", &[other], &[other]);
+        assert_eq!(v.mint("person", "", None, "Alpha"), "person:7a8b9c",
+                   "made beside another node, its output sent elsewhere");
+        let v = rebuild_of(&run, "names-later", &[other, "person:7a8b9c"], &[other]);
+        assert_eq!(v.mint("person", "", None, "Alpha"), other);
+        let v = rebuild_of(&run, "names-earlier", &["person:7a8b9c", other], &[other]);
+        assert_eq!(v.mint("person", "", None, "Alpha"), other,
+                   "printed by an earlier call, which the rebuild did not make it in");
+    }
+
+    #[test]
+    fn a_stub_its_call_does_not_print_keeps_the_id_the_oracle_names() {
+        let run = by_s1("stub-run");
+        run.upsert("person:7a8b9c", "person", "Alpha", "", "", &[], &[], DAY);
+        let other = "person:8b9c0d";
+        let v = rebuild_of(&run, "stub", &[other, "person:7a8b9c"], &[other]);
+        assert_eq!(v.mint_shown("person", "", None, "Alpha", false), "person:7a8b9c",
+                   "its session printed it later, restating it");
+        assert_eq!(v.mint_shown("person", "", None, "Beta", false), other,
+                   "a stub the run forgot takes what its tool call printed");
+    }
+
+    #[test]
+    fn live_a_mint_ignores_what_it_is_offered_or_told() {
+        let mut v = by_s1("live");
+        let offered = vec!["person:8b9c0d".to_string()];
+        v.0.oracle_order = Some(HashMap::from(
+            [("s1".to_string(), offered.clone()), (ORACLE_CALL.to_string(), offered)]));
+        for shown in [true, false] {
+            let id = v.mint_shown("person", "", None, "Alpha", shown);
+            assert!(id.starts_with("person:") && id != "person:8b9c0d", "{id}");
+        }
     }
 }

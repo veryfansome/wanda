@@ -780,8 +780,8 @@ fn past_note(line: &str) -> &str {
     ""
 }
 
-fn stub(v: &Vault, name: &str, kind: &str) -> String {
-    let nid = v.mint(kind, "", None, name);
+fn stub(v: &Vault, name: &str, kind: &str, shown: bool) -> String {
+    let nid = v.mint_shown(kind, "", None, name, shown);
     v.upsert(&nid, kind, name, "", "", &[], &[], &today());
     nid
 }
@@ -798,8 +798,11 @@ fn stub(v: &Vault, name: &str, kind: &str) -> String {
 /// A value written to point at a node — an id, a kind before a name, a kind
 /// alone, a directory path, brackets, a filesystem path — that names nothing is
 /// refused: a stub would be a node named after the pointer.
-fn refs(v: &Vault, wanted: &[(String, &str, &str)]) -> Result<Vec<String>, i32> {
-    enum Item { Have(String), Mint(String, String), Me }
+/// `shown` counts the leading references whose id the command prints as
+/// `ok <id>`, a relate's subject: where the oracle names a stub no such line
+/// prints, a replay gives it the oracle's id.
+fn refs(v: &Vault, wanted: &[(String, &str, &str)], shown: usize) -> Result<Vec<String>, i32> {
+    enum Item { Have(String), Mint(String, String, bool), Me }
     let mut out: Vec<Item> = Vec::new();
     for (r, mint_kind, prefer) in wanted {
         if py_strip(r).is_empty() {
@@ -818,7 +821,7 @@ fn refs(v: &Vault, wanted: &[(String, &str, &str)]) -> Result<Vec<String>, i32> 
         out.push(match nid {
             Some(n) => Item::Have(n),
             None if memory::is_self_name(r) => Item::Me,
-            None => Item::Mint(one_line(r), mint_kind.to_string()),
+            None => Item::Mint(one_line(r), mint_kind.to_string(), out.len() < shown),
         });
     }
     let mut minted: std::collections::HashMap<(String, String), String> = Default::default();
@@ -827,9 +830,9 @@ fn refs(v: &Vault, wanted: &[(String, &str, &str)]) -> Result<Vec<String>, i32> 
         match item {
             Item::Have(n) => ids.push(n),
             Item::Me => ids.push(index::seed(v, &today())),
-            Item::Mint(name, kind) => {
+            Item::Mint(name, kind, s) => {
                 let key = (name.to_lowercase(), kind.clone());
-                let id = minted.entry(key).or_insert_with(|| stub(v, &name, &kind)).clone();
+                let id = minted.entry(key).or_insert_with(|| stub(v, &name, &kind, s)).clone();
                 ids.push(id);
             }
         }
@@ -951,7 +954,7 @@ fn cmd_event(v: &Vault, summary: &str, body: &str, when: &str, participants: &st
     if !place.is_empty() {
         wanted.push((place.to_string(), "place", "place"));
     }
-    let ids = match refs(v, &wanted) { Ok(x) => x, Err(rc) => return rc };
+    let ids = match refs(v, &wanted, 0) { Ok(x) => x, Err(rc) => return rc };
     let (people, place_id) = if place.is_empty() {
         (&ids[..], String::new())
     } else {
@@ -973,7 +976,7 @@ fn cmd_event(v: &Vault, summary: &str, body: &str, when: &str, participants: &st
 
 fn cmd_relate(v: &Vault, subject: &str, rel: &str, object: &str, inverse: &str) -> i32 {
     let ids = match refs(v, &[(subject.to_string(), "person", ""),
-                              (object.to_string(), "person", "")]) {
+                              (object.to_string(), "person", "")], 1) {
         Ok(x) => x, Err(rc) => return rc };
     let (sid, oid) = (ids[0].clone(), ids[1].clone());
     let skind = sid.split(':').next().unwrap_or("").to_string();
@@ -1011,7 +1014,7 @@ fn cmd_pref(v: &Vault, whose: &str, summary: &str, body: &str, kind: &str,
     } else if !about.is_empty() {
         wanted.push((about.to_string(), "topic", ""));
     }
-    let ids = match refs(v, &wanted) { Ok(x) => x, Err(rc) => return rc };
+    let ids = match refs(v, &wanted, 0) { Ok(x) => x, Err(rc) => return rc };
     let whose_id = ids[0].clone();
     let found = if new { None } else {
         match existing(v, "preference", &summary, "", &whose_id, false) {
@@ -1059,7 +1062,7 @@ fn cmd_trajectory(v: &Vault, summary: &str, body: &str, expect: &str, by: &str,
     }
     let wanted: Vec<(String, &str, &str)> = list_of(about).into_iter()
         .map(|a| (a, "thing", "")).collect();
-    let about_ids = match refs(v, &wanted) { Ok(x) => x, Err(rc) => return rc };
+    let about_ids = match refs(v, &wanted, 0) { Ok(x) => x, Err(rc) => return rc };
     let distance = by_from_today(&by);
     let nid = v.mint("trajectory", "", None, &summary);
     let edges: Vec<Edge> = about_ids.into_iter()
@@ -1848,6 +1851,26 @@ mod tests {
         let text = read(v, "person:1a2b3c");
         assert!(text.contains("~~Alpha grows beans.~~ (retracted"), "{text}");
         assert!(text.contains(": Beta said)"), "{text}");
+    }
+
+    #[test]
+    fn a_relate_prints_its_subject_so_a_stub_there_takes_the_id_its_call_printed() {
+        // the run's relate made "Ari Cole" a stub and printed it; the run forgot
+        // it, and the session made the name again, which is what the oracle holds
+        let (forgot, again) = ("person:5e6f7a", "person:6f7a8b");
+        let mut run = store("relate-run");
+        run.0.session = "s1".into();
+        run.0.upsert(again, "person", "Ari Cole", "", "", &[], &[], "2031-01-10");
+        let mut v = store("relate");
+        v.0.session = "s1".into();
+        v.0.oracle = Some(Box::new(Vault::new(run.0.root.clone())));
+        let ids = |xs: &[&str]| xs.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        // "\0" is the key `rebuild.py` writes the replayed call's ids under
+        v.0.oracle_order = Some(std::collections::HashMap::from(
+            [("s1".to_string(), ids(&[forgot, again])), ("\0".to_string(), ids(&[forgot]))]));
+        assert_eq!(cmd_relate(&v.0, "Ari Cole", "knows", "Alpha", ""), 0);
+        assert!(v.0.path_for(forgot).exists() && read(&v.0, forgot).contains("Ari Cole"),
+                "not {again}, the name made again later");
     }
 
     #[test]

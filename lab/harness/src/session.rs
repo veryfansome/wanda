@@ -298,7 +298,7 @@ pub fn run_session(vault: &Path, inp: &Input, mem_cmd: &str, timeout_s: u64, key
     cmd.args(["-p", "--output-format", "json", "--model", MODEL,
               "--json-schema", &memory::text::py_json(&schema()),
               // the transcript Claude Code writes under this id is the belt:
-              // what was said both ways and every mem call, kept for a month.
+              // what was said both ways and every mem call, kept in the run's directory.
               // A node the session writes carries the id as `made:`.
               "--session-id", &sid,
               "--append-system-prompt", &system,
