@@ -116,7 +116,9 @@ pub fn materialise(snaps: &Path, sha: &str, dest: &Path, regenerate: bool, for_s
     // its own repo, or the session inherits this project's CLAUDE.md and memory
     std::process::Command::new("git").args(["init", "-q"]).current_dir(dest).status()?;
     if regenerate {
-        let _ = index::regenerate_indexes(&Vault::new(dest));
+        let v = Vault::new(dest);
+        let _ = index::regenerate_indexes(&v);
+        v.written().map_err(std::io::Error::other)?;
     }
     if for_session {
         write_session_config(dest);

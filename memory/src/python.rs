@@ -131,16 +131,25 @@ fn one_line(t: &str) -> String {
     text::one_line(t)
 }
 
+/// A write the vault could not make, raised: one `Vault` serves a whole
+/// rebuild, and after a failed write it makes no other, so every later call
+/// on it would otherwise do nothing and say nothing.
+fn written(vault: &vault::Vault) -> PyResult<()> {
+    vault.written().map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
+}
+
 #[pyfunction]
 #[pyo3(signature = (vault, date=""))]
-fn seed(vault: PyRef<'_, PyVault>, date: &str) {
+fn seed(vault: PyRef<'_, PyVault>, date: &str) -> PyResult<()> {
     index::seed(&vault.inner, date);
+    written(&vault.inner)
 }
 
 #[pyfunction]
 fn regenerate_indexes(vault: PyRef<'_, PyVault>) -> PyResult<()> {
     index::regenerate_indexes(&vault.inner)
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+    written(&vault.inner)
 }
 
 #[pyfunction]

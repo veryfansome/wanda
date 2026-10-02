@@ -81,6 +81,9 @@ pub struct Vault {
     /// ran in, which is where a node the oracle no longer holds takes its id
     /// from.
     pub oracle_order: Option<HashMap<String, Vec<String>>>,
+    /// The first write to this vault that could not be made: its path in the
+    /// vault and the error.
+    failed: std::sync::OnceLock<String>,
 }
 
 /// The key `oracle_order` holds the call's ids under. No session id can be it,
@@ -89,7 +92,61 @@ const ORACLE_CALL: &str = "\0";
 
 impl Vault {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Vault { root: root.into(), session: String::new(), oracle: None, oracle_order: None }
+        Vault { root: root.into(), session: String::new(), oracle: None, oracle_order: None,
+                failed: std::sync::OnceLock::new() }
+    }
+
+    /// A file in the vault written whole (`write_whole`). After one write has
+    /// failed no other is made, so a call stops writing at the file it could
+    /// not write, as a call killed there would, and `failed` says which.
+    pub fn write(&self, path: &Path, text: &str) {
+        self.keep(path, || {
+            // a directory that could not be made is the cause, and the file
+            // missing from it only the symptom
+            if let Some(d) = path.parent() {
+                std::fs::create_dir_all(d)?;
+            }
+            write_whole(path, text)
+        });
+    }
+
+    /// A node file removed, a failure kept as `write` keeps one.
+    pub fn remove(&self, path: &Path) {
+        self.keep(path, || std::fs::remove_file(path));
+    }
+
+    fn keep(&self, path: &Path, made: impl FnOnce() -> std::io::Result<()>) {
+        if self.failed.get().is_some() {
+            return;
+        }
+        if let Err(e) = made() {
+            let at = path.strip_prefix(&self.root).unwrap_or(path);
+            let _ = self.failed.set(format!("{}: {e}", at.display()));
+        }
+    }
+
+    /// A node file a write has to read first and could not, kept as that
+    /// write's failure: rewritten from what was read, the node would lose
+    /// what could not be.
+    pub fn unreadable(&self, path: &Path, e: std::io::Error) {
+        self.keep(path, || Err(e));
+    }
+
+    /// The first write that could not be made, as `<path in the vault>: <error>`.
+    pub fn failed(&self) -> Option<&str> {
+        self.failed.get().map(String::as_str)
+    }
+
+    /// The failed write as an error, for whoever keeps one `Vault` across
+    /// calls, as the lab's rebuild does: after one failure every later write
+    /// is skipped, and a caller that did not ask would go on writing nothing
+    /// and saying nothing.
+    pub fn written(&self) -> Result<(), String> {
+        match self.failed() {
+            None => Ok(()),
+            Some(what) => Err(format!("the store could not be written at {what}; \
+                                       nothing after that was written")),
+        }
     }
 
     /// The vault held for one call, until the file returned is closed: shared
@@ -538,7 +595,17 @@ impl Vault {
         -> Option<String>
     {
         let src = self.path_for(old);
-        let text = std::fs::read_to_string(&src).ok()?;
+        let text = match std::fs::read_to_string(&src) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            // a node there that cannot be read cannot be renamed, and printing
+            // `ok` would say it was: the call fails as a write the store
+            // cannot take
+            Err(e) => {
+                self.keep(&src, || Err(e));
+                return None;
+            }
+        };
         let (mut meta, body) = fm::load(&text, Some(&self.root));
         let kind = old.split(':').next().unwrap_or("").to_string();
         let entity = fm::ENTITY_KINDS.contains(&kind.as_str());
@@ -593,7 +660,7 @@ impl Vault {
             format!("{}\n\n{note}\n", body.trim_end_matches(crate::text::is_py_space))
         };
         let former = fm::former_names(&body);
-        let _ = write_whole(&src, &format!("{}\n\n{body}", fm::dump(&meta, &kind, &former)));
+        self.write(&src, &format!("{}\n\n{body}", fm::dump(&meta, &kind, &former)));
         (!notes.is_empty()).then_some(note)
     }
 
@@ -615,7 +682,16 @@ impl Vault {
         let p = self.path_for(nid);
         let (mut meta, old_body) = match std::fs::read_to_string(&p) {
             Ok(t) => fm::load(&t, Some(&self.root)),
-            Err(_) => (Meta::default(), String::new()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Meta::default(), String::new()),
+            // a node there that cannot be read would be replaced by what this
+            // call knows of it, losing its history and edges, since
+            // `write_whole` replaces the file by renaming over it, which needs
+            // only the directory: the call fails as a write the store cannot
+            // take
+            Err(e) => {
+                self.keep(&p, || Err(e));
+                return Vec::new();
+            }
         };
         let entity = fm::ENTITY_KINDS.contains(&kind);
         if !name.is_empty() && entity {
@@ -694,7 +770,7 @@ impl Vault {
         }
         let joined = lines.join("\n");
         let text = format!("{}\n\n{joined}\n", fm::dump(&meta, kind, &fm::former_names(&joined)));
-        let _ = write_whole(&p, &text);
+        self.write(&p, &text);
         taken
     }
 }
@@ -802,11 +878,16 @@ fn random_hex6() -> String {
 /// takes its name, so a reader finds the old text or the new and never one cut
 /// short. The name does not end in `.md`, so a file left by a call killed
 /// part way is not read as a node.
-pub fn write_whole(path: &Path, text: &str) -> std::io::Result<()> {
+fn write_whole(path: &Path, text: &str) -> std::io::Result<()> {
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     let part = path.with_file_name(format!(".{name}.part"));
-    std::fs::write(&part, text)?;
-    std::fs::rename(&part, path)
+    let made = std::fs::write(&part, text).and_then(|()| std::fs::rename(&part, path));
+    if made.is_err() {
+        // what never took the name is nothing a reader wants, and on a full
+        // disk it holds space the next write needs
+        let _ = std::fs::remove_file(&part);
+    }
+    made
 }
 
 fn collect_md(dir: &Path, parts: &mut Vec<String>, out: &mut Vec<(Vec<String>, PathBuf)>) {
@@ -1072,6 +1153,33 @@ mod tests {
         let after = std::fs::File::open(&v.root).unwrap();
         assert!(after.try_lock_shared().is_err(), "held once had");
         drop(writing);
+    }
+
+    #[test]
+    fn a_vault_kept_across_calls_reports_its_failed_write_after_each() {
+        use crate::index::{regenerate_indexes, set_templates};
+        set_templates(PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/templates")));
+        let v = store("written");
+        regenerate_indexes(&v).unwrap();
+        assert_eq!(v.written(), Ok(()));
+        let root = v.root.join("CLAUDE.md");
+        // a directory where the people index's text goes before it takes the name
+        let part = v.root.join("people").join(".CLAUDE.md.part");
+        std::fs::create_dir(&part).unwrap();
+        regenerate_indexes(&v).unwrap();
+        let e = v.written().unwrap_err();
+        assert!(e.starts_with("the store could not be written at people/CLAUDE.md: "), "{e}");
+        assert!(e.ends_with("; nothing after that was written"), "{e}");
+        std::fs::remove_dir(&part).unwrap();
+        // the block gone, the same vault still writes nothing, and says so again
+        std::fs::write(&root, "stale\n").unwrap();
+        regenerate_indexes(&v).unwrap();
+        assert_eq!(v.written(), Err(e));
+        assert_eq!(std::fs::read_to_string(&root).unwrap(), "stale\n");
+        let fresh = Vault::new(v.root.clone());
+        regenerate_indexes(&fresh).unwrap();
+        assert_eq!(fresh.written(), Ok(()));
+        assert_ne!(std::fs::read_to_string(&root).unwrap(), "stale\n");
     }
 
     #[test]

@@ -148,6 +148,9 @@ fn run() -> Result<i32, String> {
     let vault = Vault::new(&vault_path);
     index::seed(&vault, &inputs[0].date);
     index::regenerate_indexes(&vault).map_err(|e| e.to_string())?;
+    // a store that could not take the seeded node or its indexes would
+    // otherwise be handed to every session as though it had
+    vault.written()?;
     let mem_cmd = install_mem(&std::env::current_exe().map_err(|e| e.to_string())?
         .parent().unwrap_or(Path::new(".")).join("mem"));
 

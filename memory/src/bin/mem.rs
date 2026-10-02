@@ -952,7 +952,9 @@ fn cmd_entity(v: &Vault, kind: &str, name: &str, summary: &str, body: &str,
     };
     let nid = nid.unwrap_or_else(|| v.mint(kind, "", None, &name));
     let taken = v.upsert(&nid, kind, &name, &summary, body, &[], &[], &today());
-    regen(v);
+    if let Err(rc) = regen(v) {
+        return rc;
+    }
     ok_stored(v, &nid);
     echo_body(v, &nid, &taken);
     say_left(&taken);
@@ -998,7 +1000,9 @@ fn cmd_event(v: &Vault, summary: &str, body: &str, when: &str, participants: &st
         edges.push(Edge { rel: "at".into(), to: place_id });
     }
     let taken = v.upsert(&nid, "event", &summary, &summary, body, &[], &edges, &today());
-    regen(v);
+    if let Err(rc) = regen(v) {
+        return rc;
+    }
     ok_stored(v, &nid);
     echo_body(v, &nid, &taken);
     say_left(&taken);
@@ -1017,7 +1021,9 @@ fn cmd_relate(v: &Vault, subject: &str, rel: &str, object: &str, inverse: &str) 
         v.upsert(&oid, &okind, "", "", "", &[],
                  &[Edge { rel: inverse.into(), to: sid.clone() }], &today());
     }
-    regen(v);
+    if let Err(rc) = regen(v) {
+        return rc;
+    }
     out!("ok {sid} --{rel}--> {oid}");
     0
 }
@@ -1066,7 +1072,9 @@ fn cmd_pref(v: &Vault, whose: &str, summary: &str, body: &str, kind: &str,
     edges.extend(ids[1..].iter().map(|a| Edge { rel: "concerns".into(), to: a.clone() }));
     let taken = v.upsert(&nid, "preference", &summary, &summary, body,
                          &[("ptype".to_string(), ptype)], &edges, &today());
-    regen(v);
+    if let Err(rc) = regen(v) {
+        return rc;
+    }
     ok_stored(v, &nid);
     echo_body(v, &nid, &taken);
     say_left(&taken);
@@ -1102,7 +1110,9 @@ fn cmd_trajectory(v: &Vault, summary: &str, body: &str, expect: &str, by: &str,
                          &[("expect".into(), expect.to_string()), ("expect_by".into(), by),
                            ("status".into(), "open".into())],
                          &edges, &today());
-    regen(v);
+    if let Err(rc) = regen(v) {
+        return rc;
+    }
     ok_stored(v, &nid);
     let (meta, _) = stored(v, &nid);
     out!("  expect: {}", meta.get("expect"));
@@ -1140,7 +1150,9 @@ fn cmd_advance(v: &Vault, r: &str, status: &str, by: &str, note: &str) -> i32 {
         extra.push(("closed".into(), today()));
     }
     let taken = v.upsert(&nid, "trajectory", "", "", note, &extra, &[], &today());
-    regen(v);
+    if let Err(rc) = regen(v) {
+        return rc;
+    }
     out!("ok {nid} {}", if status.is_empty() { "noted" } else { status });
     for line in taken.iter().filter_map(|t| t.added.as_deref()) {
         out!("  + {line}");
@@ -1187,7 +1199,9 @@ fn cmd_rename(v: &Vault, node: &str, name: &str, summary: &str, because: &str) -
         }
     }
     let note = v.rename(&nid, &name, &summary, because, &today());
-    regen(v);
+    if let Err(rc) = regen(v) {
+        return rc;
+    }
     let kind = nid.split(':').next().unwrap_or("");
     let named = memory::fm::ENTITY_KINDS.contains(&kind);
     let (meta, _) = stored(v, &nid);
@@ -1240,8 +1254,10 @@ fn cmd_forget(v: &Vault, r: &str) -> i32 {
              shown.join("; "));
         return 1;
     }
-    let _ = std::fs::remove_file(v.path_for(&nid));
-    regen(v);
+    v.remove(&v.path_for(&nid));
+    if let Err(rc) = regen(v) {
+        return rc;
+    }
     out!("ok forgot {nid}");
     0
 }
@@ -1287,7 +1303,16 @@ fn cmd_retract(v: &Vault, subject: &str, rel: &str, object: &str, inverse: &str,
     for (src, rel, dst) in pairs {
         let had = hit;
         let path = v.path_for(&src);
-        let Ok(text) = std::fs::read_to_string(&path) else { continue };
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            // what cannot be read cannot be retracted from, and passed over it
+            // would leave the other end of an edge retracted alone, as `ok`
+            Err(e) => {
+                v.unreadable(&path, e);
+                break;
+            }
+        };
         let (mut meta, body) = memory::fm::load(&text, Some(&v.root));
         let before = meta.edges.len();
         meta.edges.retain(|e| !(!rel.is_empty() && e.rel == rel
@@ -1312,16 +1337,20 @@ fn cmd_retract(v: &Vault, subject: &str, rel: &str, object: &str, inverse: &str,
         }
         let kept: Vec<String> = lines.into_iter().filter(|l| !py_strip(l).is_empty()).collect();
         let kind = src.split(':').next().unwrap_or("").to_string();
-        let _ = memory::vault::write_whole(&path,
+        v.write(&path,
             &format!("{}\n\n{}\n", memory::fm::dump(&meta, &kind,
                 &memory::fm::former_names(&kept.join("\n"))), kept.join("\n")));
     }
-    if hit == 0 {
-        // ok here would be a silent success: nothing matched, so nothing was unsaid
+    if hit == 0 && v.failed().is_none() {
+        // ok here would be a silent success: nothing matched, so nothing was
+        // unsaid. A node file that could not be read may hold the match, and
+        // `regen` names it
         out!("(nothing matched, nothing retracted)");
         return 1;
     }
-    regen(v);
+    if let Err(rc) = regen(v) {
+        return rc;
+    }
     out!("ok retracted {hit}");
     // every line holding the text is struck, and a line can carry more than
     // the claim that was meant
@@ -1499,9 +1528,11 @@ fn cmd_amend(v: &Vault, r: &str, line: &str, with: &str, because: &str) -> i32 {
         return 1;
     }
     let kind = nid.split(':').next().unwrap_or("").to_string();
-    let _ = memory::vault::write_whole(&path, &format!("{}\n\n{joined}\n",
+    v.write(&path, &format!("{}\n\n{joined}\n",
         memory::fm::dump(&meta, &kind, &memory::fm::former_names(&joined))));
-    regen(v);
+    if let Err(rc) = regen(v) {
+        return rc;
+    }
     out!("ok {nid} amended\n  - ~~{old}~~{why}\n  + {with}");
     // what the new line drops was a claim put right, and it can stand in the
     // summary, the name or other nodes too. What it keeps was not corrected, and
@@ -1678,8 +1709,19 @@ fn cmd_session(v: &Vault, r: &str, day: &str, with_: &str, last: i64, full: bool
     0
 }
 
-fn regen(v: &Vault) {
+/// The indexes made to follow the store, then the call's writes checked: one
+/// the store could not take ends the call with exit 1 and says so, where
+/// printing `ok` would tell the session its words were kept.
+fn regen(v: &Vault) -> Result<(), i32> {
     let _ = index::regenerate_indexes(v);
+    match v.failed() {
+        None => Ok(()),
+        Some(what) => {
+            out!("(the store could not be written at {what}; nothing after that was written, \
+                  and what this call wrote before it stays)");
+            Err(1)
+        }
+    }
 }
 
 fn main() {
