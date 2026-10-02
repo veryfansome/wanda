@@ -92,6 +92,39 @@ impl Vault {
         Vault { root: root.into(), session: String::new(), oracle: None, oracle_order: None }
     }
 
+    /// The vault held for one call, until the file returned is closed: shared
+    /// to read, exclusive to write. A write then never shows half done to
+    /// another call, two writes to one node both land, and a node looked for
+    /// and not found is still not there when the new one is written. The lock
+    /// is the kernel's, on the vault's own directory, so it goes when the
+    /// process does, however it ends. Not had within `within`, it is given up
+    /// with an error of kind `TimedOut`.
+    pub fn lock(&self, exclusive: bool, within: std::time::Duration)
+        -> std::io::Result<std::fs::File>
+    {
+        std::fs::create_dir_all(&self.root)?;
+        let dir = std::fs::File::open(&self.root)?;
+        // a flock that waits cannot be called off, so it waits in a thread,
+        // on a second handle of the open directory; the lock is the open
+        // directory's, so it stays with `dir` when that handle is closed
+        let waiting = dir.try_clone()?;
+        let (taken, wait) = std::sync::mpsc::channel();
+        std::thread::Builder::new().spawn(move || {
+            let r = if exclusive { waiting.lock() } else { waiting.lock_shared() };
+            drop(waiting);
+            let _ = taken.send(r);
+        })?;
+        match wait.recv_timeout(within) {
+            Ok(r) => r.map(|()| dir),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("it stayed busy for {} s", within.as_secs_f32()))),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                Err(std::io::Error::other("the wait for it ended without an answer"))
+            }
+        }
+    }
+
     /// A node's file is its id. An event carries its date inside the id, so the
     /// lookup is exact for every kind: a glob on the stem would also match any
     /// longer file name ending in the same suffix.
@@ -763,8 +796,8 @@ fn random_hex6() -> String {
     hex::encode(b)
 }
 
-/// A file written whole or not at all, for whatever reads the vault as a call
-/// writes it: Claude Code loading CLAUDE.md as a session starts, a session's
+/// A file written whole or not at all, for whatever reads the vault without
+/// holding it: Claude Code loading CLAUDE.md as a session starts, a session's
 /// own Read or Grep, a snapshot. The text goes to a file beside it, which then
 /// takes its name, so a reader finds the old text or the new and never one cut
 /// short. The name does not end in `.md`, so a file left by a call killed
@@ -1004,6 +1037,41 @@ mod tests {
         assert_eq!(v.find_whole_name("topic:4d5e6f,topic:6f7a8b").unwrap(), None);
         assert_eq!(v.find_whole_name("Alpha, garden plans").unwrap(), None);
         assert!(matches!(v.find_whole_name("topic:Alpha"), Err(Miss::WrongKindName { .. })));
+    }
+
+    #[test]
+    fn a_write_keeps_every_other_call_out_and_reads_share() {
+        let v = store("lock");
+        let other = std::fs::File::open(&v.root).unwrap();
+        let writing = v.lock(true, std::time::Duration::from_secs(10)).unwrap();
+        assert!(other.try_lock_shared().is_err(), "a read waits for a write");
+        drop(writing);
+        let reading = v.lock(false, std::time::Duration::from_secs(10)).unwrap();
+        assert!(other.try_lock_shared().is_ok(), "two reads at once");
+        other.unlock().unwrap();
+        assert!(other.try_lock().is_err(), "a write waits for a read");
+        drop(reading);
+        assert!(other.try_lock().is_ok());
+    }
+
+    #[test]
+    fn a_lock_not_had_in_time_is_given_up_and_one_let_go_in_time_is_had() {
+        let v = store("limit");
+        let other = std::fs::File::open(&v.root).unwrap();
+        other.lock().unwrap();
+        let began = std::time::Instant::now();
+        let e = v.lock(false, std::time::Duration::from_millis(300)).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::TimedOut, "{e}");
+        assert!(began.elapsed() >= std::time::Duration::from_millis(300));
+        let letting_go = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            drop(other);
+        });
+        let writing = v.lock(true, std::time::Duration::from_secs(10)).unwrap();
+        letting_go.join().unwrap();
+        let after = std::fs::File::open(&v.root).unwrap();
+        assert!(after.try_lock_shared().is_err(), "held once had");
+        drop(writing);
     }
 
     #[test]

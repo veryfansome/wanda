@@ -246,7 +246,36 @@ impl Cmd {
             Cmd::Help => "help",
         }
     }
+
+    /// How the verb holds the vault for its call: not at all for a verb that does
+    /// not read the vault, shared for one that only reads it, exclusive for any
+    /// other, so a verb added later is held as a write until it is listed here.
+    fn hold(&self) -> Hold {
+        match self {
+            // they read only Claude Code's transcripts, which Claude Code
+            // writes without the lock, or nothing
+            Cmd::Session { .. } | Cmd::Help => Hold::Nothing,
+            Cmd::Recall { .. } | Cmd::Search { .. } | Cmd::Show { .. } => Hold::Shared,
+            _ => Hold::Exclusive,
+        }
+    }
 }
+
+/// How one call holds the vault, from before its verb runs until the process
+/// ends.
+enum Hold {
+    Nothing,
+    Shared,
+    Exclusive,
+}
+
+/// How long a call waits for the vault before it gives up, having read and
+/// written nothing. Under Claude Code's 120 s Bash timeout, past which a
+/// session is told its command did not finish while a call still waiting
+/// would go on to write; far above the hold of a write, which takes tens of
+/// milliseconds, so only a stuck holder or reads that never stop overlapping
+/// reach it.
+const WAIT: std::time::Duration = std::time::Duration::from_secs(90);
 
 /// The date this process was given — the story's, not the clock's.
 fn today() -> String {
@@ -1723,6 +1752,18 @@ fn main() {
         c => c,
     };
     let name = cmd.name();
+    // held until the process exits, and let go by the kernel then
+    let _held = match cmd.hold() {
+        Hold::Nothing => None,
+        h => match v.lock(matches!(h, Hold::Exclusive), WAIT) {
+            Ok(f) => Some(f),
+            Err(e) => {
+                out!("(the store could not be held for this call: {e}; nothing was read or written)");
+                log(name, 1, &argv);
+                std::process::exit(1);
+            }
+        },
+    };
     let rc = match &cmd {
         Cmd::Recall { refs, hops, limit } => cmd_recall(&v, refs, *hops, *limit),
         Cmd::Search { text, limit } => cmd_search(&v, text, *limit),
