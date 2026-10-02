@@ -484,7 +484,7 @@ fn miss_text(v: &Vault, r: &str, m: &Miss, minting: bool) -> String {
 }
 
 fn cmd_recall(v: &Vault, refs: &[String], hops: i64, limit: i64) -> i32 {
-    let con = match index::build_index(v, &v.root.join(".index.db")) {
+    let con = match index::build_index(v) {
         Ok(c) => c,
         Err(_) => return 1,
     };
@@ -521,7 +521,7 @@ fn cmd_recall(v: &Vault, refs: &[String], hops: i64, limit: i64) -> i32 {
 }
 
 fn cmd_search(v: &Vault, text: &str, limit: i64) -> i32 {
-    let Ok(con) = index::build_index(v, &v.root.join(".index.db")) else { return 1 };
+    let Ok(con) = index::build_index(v) else { return 1 };
     let terms: Vec<String> = text.split_whitespace()
         .filter(|t| t.chars().count() > 2)
         .map(|t| format!("\"{t}\"")).collect();
@@ -556,7 +556,7 @@ fn cmd_show(v: &Vault, r: &str) -> i32 {
     // the id is the path, not a line in the file; said here so a session
     // reading this has it to copy
     out!("{nid}\n{}", std::fs::read_to_string(&p).unwrap_or_default());
-    let Ok(con) = index::build_index(v, &v.root.join(".index.db")) else { return 0 };
+    let Ok(con) = index::build_index(v) else { return 0 };
     let back: Vec<(String, String)> = (|| {
         let mut stmt = con.prepare("SELECT src, rel FROM edges WHERE dst=?").ok()?;
         let out = stmt.query_map([&nid], |r| Ok((r.get(0)?, r.get(1)?))).ok()?
@@ -1193,7 +1193,7 @@ fn cmd_forget(v: &Vault, r: &str) -> i32 {
         out!("({nid} is my own node; it stays)");
         return 1;
     }
-    let back: Vec<(String, String)> = match index::build_index(v, &v.root.join(".index.db")) {
+    let back: Vec<(String, String)> = match index::build_index(v) {
         Ok(con) => {
             let mut stmt = con.prepare("SELECT src, rel FROM edges WHERE dst=?").unwrap();
             let out = stmt.query_map([&nid], |x| Ok((x.get(0)?, x.get(1)?))).unwrap()

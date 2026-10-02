@@ -62,14 +62,15 @@ pub fn template(name: &str) -> String {
 /// Build the index from the vault, in the order the files sort in. That order
 /// reaches the generated index lines: rows are sorted by date afterwards, and
 /// the sort is stable, so everything of one date keeps the order it went in.
-pub fn build_index(vault: &Vault, db_path: &Path) -> rusqlite::Result<Connection> {
-    let _ = std::fs::remove_file(db_path);
-    let con = Connection::open(db_path)?;
+///
+/// In memory, so each call has its own: two calls at once share no file to
+/// pull out from under each other, and none is left in the vault.
+pub fn build_index(vault: &Vault) -> rusqlite::Result<Connection> {
+    let con = Connection::open_in_memory()?;
     con.execute_batch(SCHEMA)?;
     // one transaction for the whole build. Left to autocommit, every insert
-    // is its own transaction and fsyncs, which for a store of this size is a
-    // few hundred of them per call and the difference between a command that
-    // takes a fifth of a second and one that takes over a second.
+    // is its own transaction, which in memory still adds a tenth or more to
+    // a call.
     con.execute_batch("BEGIN")?;
     for n in vault.nodes() {
         let body = live_body(&n.body);
@@ -121,7 +122,7 @@ pub fn build_index(vault: &Vault, db_path: &Path) -> rusqlite::Result<Connection
 /// Nodes by kind, and how many edges — the two numbers a run's report carries
 /// about the store it ended with.
 pub fn counts(vault: &Vault) -> rusqlite::Result<(Vec<(String, i64)>, i64)> {
-    let con = build_index(vault, &vault.root.join(".index.db"))?;
+    let con = build_index(vault)?;
     let mut stmt = con.prepare("SELECT kind, count(*) FROM nodes GROUP BY kind")?;
     let by_kind: Vec<(String, i64)> = stmt
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
@@ -142,7 +143,7 @@ pub fn dangling_edges(con: &Connection) -> rusqlite::Result<Vec<(String, String,
 /// Every CLAUDE.md is generated. The root carries the standing instructions and
 /// a map; each directory carries one line per node, newest first, capped.
 pub fn regenerate_indexes(vault: &Vault) -> rusqlite::Result<()> {
-    let con = build_index(vault, &vault.root.join(".index.db"))?;
+    let con = build_index(vault)?;
     // the select has no order, so rows come back in the order they went in
     let mut stmt = con.prepare("SELECT id, kind, name, summary, last_seen, status FROM nodes")?;
     let rows: Vec<(String, String, String, String, String, String)> = stmt
