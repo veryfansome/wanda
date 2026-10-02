@@ -347,25 +347,6 @@ The paths used so far encode identically under both schemes — `/work/runs/vaul
 
 **Fix.** Use Claude Code's encoding in all three places.
 
-### 36. Two `mem` processes in one vault collide on `.index.db`
-
-*Deferred as an edge case.* 0 of 6,406 recorded calls shared a millisecond with another, and the harness runs its sessions one at a time.
-
-`build_index` (`store.py:706`) unlinks and rebuilds `<vault>/.index.db` on every `mem` call, and nothing serialises it — there is no lock anywhere in `lab/`. Two concurrent calls in one vault race: one unlinks while the other is writing.
-
-```
-$ for i in $(seq 1 20); do mem recall mei & mem recall sarah & wait; done
-   21 of the 40 calls died:
-
-  File "lab/store.py", line 710, in build_index
-    con.executescript(SCHEMA)
-sqlite3.OperationalError: table nodes already exists
-```
-
-The lab runs four containers in parallel but each has its own vault, so no run has been affected. Nothing reads a pre-existing `.index.db` — every caller rebuilds it, and `run.py` excludes it from snapshots (`run.py:506`) — so it never needs to be a file at all.
-
-**Fix.** Build it in memory. That also stops writing a file into the vault on every read command, where sessions can see it.
-
 ### 13. `mem search` cannot find a node by a former summary
 
 *Half fixed.* A former **name** is now in the indexed text, so an entity found by the name it used to have is found by `search` as well as by `show` and `recall`. A former **summary** is not, and this is the remaining half.
