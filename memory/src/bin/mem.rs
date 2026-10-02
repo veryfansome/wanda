@@ -1281,8 +1281,8 @@ fn cmd_retract(v: &Vault, subject: &str, rel: &str, object: &str, inverse: &str,
         }
         let kept: Vec<String> = lines.into_iter().filter(|l| !py_strip(l).is_empty()).collect();
         let kind = src.split(':').next().unwrap_or("").to_string();
-        let _ = std::fs::write(&path,
-            format!("{}\n\n{}\n", memory::fm::dump(&meta, &kind,
+        let _ = memory::vault::write_whole(&path,
+            &format!("{}\n\n{}\n", memory::fm::dump(&meta, &kind,
                 &memory::fm::former_names(&kept.join("\n"))), kept.join("\n")));
     }
     if hit == 0 {
@@ -1468,7 +1468,7 @@ fn cmd_amend(v: &Vault, r: &str, line: &str, with: &str, because: &str) -> i32 {
         return 1;
     }
     let kind = nid.split(':').next().unwrap_or("").to_string();
-    let _ = std::fs::write(&path, format!("{}\n\n{joined}\n",
+    let _ = memory::vault::write_whole(&path, &format!("{}\n\n{joined}\n",
         memory::fm::dump(&meta, &kind, &memory::fm::former_names(&joined))));
     regen(v);
     out!("ok {nid} amended\n  - ~~{old}~~{why}\n  + {with}");

@@ -560,7 +560,7 @@ impl Vault {
             format!("{}\n\n{note}\n", body.trim_end_matches(crate::text::is_py_space))
         };
         let former = fm::former_names(&body);
-        let _ = std::fs::write(&src, format!("{}\n\n{body}", fm::dump(&meta, &kind, &former)));
+        let _ = write_whole(&src, &format!("{}\n\n{body}", fm::dump(&meta, &kind, &former)));
         (!notes.is_empty()).then_some(note)
     }
 
@@ -661,7 +661,7 @@ impl Vault {
         }
         let joined = lines.join("\n");
         let text = format!("{}\n\n{joined}\n", fm::dump(&meta, kind, &fm::former_names(&joined)));
-        let _ = std::fs::write(&p, text);
+        let _ = write_whole(&p, &text);
         taken
     }
 }
@@ -761,6 +761,19 @@ fn random_hex6() -> String {
     let mut b = [0u8; 3];
     getrandom::fill(&mut b).expect("a random id");
     hex::encode(b)
+}
+
+/// A file written whole or not at all, for whatever reads the vault as a call
+/// writes it: Claude Code loading CLAUDE.md as a session starts, a session's
+/// own Read or Grep, a snapshot. The text goes to a file beside it, which then
+/// takes its name, so a reader finds the old text or the new and never one cut
+/// short. The name does not end in `.md`, so a file left by a call killed
+/// part way is not read as a node.
+pub fn write_whole(path: &Path, text: &str) -> std::io::Result<()> {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let part = path.with_file_name(format!(".{name}.part"));
+    std::fs::write(&part, text)?;
+    std::fs::rename(&part, path)
 }
 
 fn collect_md(dir: &Path, parts: &mut Vec<String>, out: &mut Vec<(Vec<String>, PathBuf)>) {

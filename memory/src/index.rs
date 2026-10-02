@@ -6,7 +6,7 @@
 
 use crate::fm;
 use crate::text::{clip, line_for, live_body, local_id, marks, split_lines};
-use crate::vault::Vault;
+use crate::vault::{write_whole, Vault};
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 
@@ -170,7 +170,7 @@ pub fn regenerate_indexes(vault: &Vault) -> rusqlite::Result<()> {
     }
     lines.push(String::new());
     lines.push("Nothing else loads until a file in its directory is read.".into());
-    let _ = std::fs::write(vault.root.join("CLAUDE.md"), lines.join("\n") + "\n");
+    let _ = write_whole(&vault.root.join("CLAUDE.md"), &(lines.join("\n") + "\n"));
 
     for (d, rows) in dirs.iter_mut() {
         let p = vault.root.join(d);
@@ -190,7 +190,7 @@ pub fn regenerate_indexes(vault: &Vault) -> rusqlite::Result<()> {
         if rows.len() > INDEX_CAP_LINES {
             out.push(format!("- \u{2026} {} more, use `mem search`", rows.len() - INDEX_CAP_LINES));
         }
-        let _ = std::fs::write(p.join("CLAUDE.md"), out.join("\n") + "\n");
+        let _ = write_whole(&p.join("CLAUDE.md"), &(out.join("\n") + "\n"));
     }
     Ok(())
 }
