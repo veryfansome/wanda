@@ -423,6 +423,18 @@ class Store:
     def mark_run_notified(self, run_id: int) -> None:
         self._exec("UPDATE runs SET notified=1 WHERE id=?", (run_id,))
 
+    def run_notified(self, run_id: int) -> bool:
+        rows = self._query("SELECT notified FROM runs WHERE id=?", (run_id,))
+        return bool(rows and rows[0]["notified"])
+
+    def given_up_runs(self, attempts: int, limit: int = 20) -> list[sqlite3.Row]:
+        """Answers delivery gave up on, newest first, with where each was due."""
+        return self._query(
+            "SELECT r.id, r.started_at, t.slack_channel, t.reply_thread FROM runs r "
+            "JOIN tasks t ON t.id = r.task_id WHERE r.deliver_attempts >= ? ORDER BY r.id DESC LIMIT ?",
+            (attempts, limit),
+        )
+
     def bump_delivery_attempt(self, run_id: int) -> int:
         """Delivery cannot retry forever: an answer for a channel wanda was
         removed from would block every later delivery behind it."""

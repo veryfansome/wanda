@@ -8,6 +8,7 @@ from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 CsvList = Annotated[list[str], NoDecode]
+CsvMap = Annotated[dict[str, str], NoDecode]
 
 
 class Config(BaseSettings):
@@ -22,6 +23,10 @@ class Config(BaseSettings):
         extra="ignore",
     )
 
+    # Off leaves mail alone: no iCloud settings are needed, nothing is read,
+    # and mail rows already in the store are left as they are.
+    email_triage: bool = True
+
     # iCloud IMAP
     icloud_email: str = ""
     icloud_app_password: str = ""
@@ -33,9 +38,17 @@ class Config(BaseSettings):
     slack_bot_token: str = ""
     slack_app_token: str = ""
     email_triage_slack_channel_id: str = ""
-    # Empty = anyone in the workspace may talk to wanda. Set it to restrict
-    # who can trigger agent sessions.
+    # Where failures no one would otherwise see are posted: a private channel's
+    # id, or a person's user id for their DM with wanda. Empty uses the triage
+    # channel.
+    alert_channel: str = ""
+    # Who may start a session. The daemon refuses to start with it empty: a
+    # session has a shell (README, Trust assumption).
     slack_owner_user_ids: CsvList = Field(default_factory=list)
+    # Slack user id to the name the vault knows that person by, "U0123:fan".
+    # A display name can change, and a second spelling of a person in a
+    # session's prompt becomes a second person in the vault.
+    slack_names: CsvMap = Field(default_factory=dict)
     # User token (xoxp-), only needed for `wanda slack search`.
     slack_user_token: str = ""
     slack_context_limit: int = 50
@@ -71,6 +84,11 @@ class Config(BaseSettings):
 
     # daemon
     data_dir: Path = Path("~/.wanda")
+    # Where the run store (wanda.db), its dry-run twin and the daemon's lock
+    # live, when not in the data directory. In Docker a named volume of its
+    # own, which the Mac cannot reach: SQLite's locks do not cross the Mac's
+    # mount, and a read there while the daemon writes can corrupt the store.
+    run_store: str = ""
     idle_timeout_s: int = 720  # re-issue IDLE well under RFC 2177's 29-minute cap
     poll_fallback_s: int = 180
     snippet_bytes: int = 4096
@@ -83,22 +101,40 @@ class Config(BaseSettings):
             return [s.strip() for s in v.split(",") if s.strip()]
         return v
 
+    @field_validator("slack_names", mode="before")
+    @classmethod
+    def _split_pairs(cls, v: object) -> object:
+        if isinstance(v, str):
+            pairs = [s.split(":", 1) for s in v.split(",") if s.strip()]
+            if any(len(p) != 2 or not p[0].strip() or not p[1].strip() for p in pairs):
+                raise ValueError("expected id:name pairs, comma-separated")
+            return {i.strip(): n.strip() for i, n in pairs}
+        return v
+
+    @property
+    def alerts_to(self) -> str:
+        return self.alert_channel or self.email_triage_slack_channel_id
+
     @property
     def expanded_data_dir(self) -> Path:
         return self.data_dir.expanduser()
 
     @property
+    def run_store_dir(self) -> Path:
+        return Path(self.run_store).expanduser() if self.run_store else self.expanded_data_dir
+
+    @property
     def db_path(self) -> Path:
-        return self.expanded_data_dir / "wanda.db"
+        return self.run_store_dir / "wanda.db"
 
     @property
     def dryrun_db_path(self) -> Path:
         """`wanda triage` writes here, never into the daemon's live state."""
-        return self.expanded_data_dir / "dryrun.db"
+        return self.run_store_dir / "dryrun.db"
 
     @property
     def lock_path(self) -> Path:
-        return self.expanded_data_dir / "wanda.lock"
+        return self.run_store_dir / "wanda.lock"
 
     def resolve_claude_bin(self) -> str | None:
         return self.claude_bin or shutil.which("claude")

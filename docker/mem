@@ -1,0 +1,31 @@
+#!/bin/sh
+# The `mem` on the image's PATH: the real one, kept off PATH in ../libexec so
+# that this is the one `mem` to run, with any date variable the caller left
+# unset filled in for this moment in WANDA_TZ. Sessions and the daemon set
+# all three and pass through unchanged. A call run by hand through `exec`
+# sets none, and `mem` without them writes a node with no dates; with
+# MEM_DATE alone it reads its clock in UTC, and of an evening rewrites a
+# mention of tomorrow's date to today's.
+if [ -z "${MEM_DATE:-}" ] || [ -z "${MEM_REAL_DATE:-}" ] || [ -z "${MEM_UTC_OFFSET:-}" ]; then
+  # an unknown zone, a region's directory or a file that is no zone would be
+  # read as UTC without a word; a zone's file starts TZif
+  if [ -z "${WANDA_TZ:-}" ] || [ "$(head -c 4 "/usr/share/zoneinfo/$WANDA_TZ" 2>/dev/null)" != TZif ]; then
+    echo "mem: no date for this call: WANDA_TZ (${WANDA_TZ:-unset}) is not a time zone this machine knows; nothing was run" >&2
+    exit 1
+  fi
+  # one reading of the clock, so the date and the offset are of one moment
+  now=$(TZ=$WANDA_TZ date '+%Y-%m-%d %z') || exit 1
+  day=${now% *}
+  z=${now#* }
+  sign=${z%"${z#?}"}
+  hours=${z#?}
+  hours=${hours%??}
+  minutes=${z#???}
+  # without the leading zero, which arithmetic would read as octal
+  offset=$(( ${hours#0} * 3600 + ${minutes#0} * 60 ))
+  [ "$sign" = "-" ] && offset=-$offset
+  [ -n "${MEM_DATE:-}" ] || export MEM_DATE="$day"
+  [ -n "${MEM_REAL_DATE:-}" ] || export MEM_REAL_DATE="$day"
+  [ -n "${MEM_UTC_OFFSET:-}" ] || export MEM_UTC_OFFSET="$offset"
+fi
+exec "${0%/*}/../libexec/mem" "$@"

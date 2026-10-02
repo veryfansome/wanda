@@ -7,3 +7,7 @@ lab/scored*
 lab/*.log
 lab/*.out
 __pycache__
+.env
+runs
+target
+target-linux

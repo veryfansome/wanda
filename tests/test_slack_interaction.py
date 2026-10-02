@@ -269,6 +269,27 @@ def test_own_ids_lookup_failure_is_not_cached(monkeypatch):
     assert sa.web.calls == 2, "a failure is retried and a success is kept"
 
 
+def test_an_alert_goes_where_set_with_the_harness_mark(monkeypatch):
+    """To WANDA_ALERT_CHANNEL, with a mark of the harness's: an alert is not
+    something she said."""
+    import wanda.actions.slack as actions
+
+    class Web:
+        def __init__(self):
+            self.calls = []
+
+        def chat_postMessage(self, **kw):
+            self.calls.append(kw)
+            return {"ts": "1.1"}
+
+    monkeypatch.setattr(actions, "MIN_INTERVAL_S", 0)
+    sa = actions.SlackActions(cfg(alert_channel="U0FAN"), store=None)
+    sa.web = Web()
+    asyncio.run(sa.alert("the run store could not be opened"))
+    (post,) = sa.web.calls
+    assert post["channel"] == "U0FAN" and post["metadata"]["event_type"] == actions.ALERT_EVENT
+
+
 def test_render_skips_joins_and_empty():
     out = render([{"user": "U1", "ts": "1", "subtype": "channel_join", "text": "joined"},
                   {"user": "U1", "ts": "2", "text": "   "}], {"U1": "alice"})

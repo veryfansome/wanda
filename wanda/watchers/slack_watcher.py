@@ -60,7 +60,8 @@ class SlackWatcher:
             self.client.close()
 
     def _allowed(self, user: str) -> bool:
-        """An empty owner list means anyone in the workspace may talk to wanda."""
+        """Whether `user` may start a session. An empty list would let anyone
+        in, and the daemon refuses to start with one."""
         return not self.cfg.slack_owner_user_ids or user in self.cfg.slack_owner_user_ids
 
     def _handle(self, client: SocketModeClient, req: SocketModeRequest) -> None:

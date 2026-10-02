@@ -26,6 +26,10 @@ SNIPPET_LIMIT = 1500
 TEXT_LIMIT = 3500  # well under Slack's 40k text cap, and headers can be huge
 MISSING_THREAD_ERRORS = {"thread_not_found", "message_not_found", "channel_not_found"}
 MAX_CONTEXT_PAGES = 10  # bounds a very long thread at ~2000 messages
+# The mark the harness posts its alerts with (Slack message metadata). An
+# alert is for the people who keep wanda running, not something she said,
+# and the mark tells it apart.
+ALERT_EVENT = "wanda_alert"
 
 
 def truncate_text(text: str) -> str:
@@ -183,8 +187,9 @@ class SlackActions:
 
     async def alert(self, text: str) -> None:
         await self._call(
-            "chat_postMessage", channel=self.cfg.email_triage_slack_channel_id,
+            "chat_postMessage", channel=self.cfg.alerts_to,
             text=truncate_text(f"⚠️ {text}"),
+            metadata={"event_type": ALERT_EVENT, "event_payload": {"for": "the household"}},
         )
 
     # --- daily digest ---

@@ -1,0 +1,97 @@
+# wanda at home, apart from the lab: its own project name, so nothing the lab's
+# commands do (a `down`, a rebuild, `run --rm`) reaches it. Built from the
+# household's own worktree of its branch, never the lab's checkout, in a
+# directory not named wanda-home: the lab's compose file takes its project
+# name from the directory it is run in. From there:
+#
+#   docker compose -f compose.wanda.yaml up -d --build    start, or upgrade after a merge
+#   docker compose -f compose.wanda.yaml logs -f          what it is doing
+#   docker compose -f compose.wanda.yaml exec wanda /opt/wanda/.venv/bin/wanda doctor --no-smoke
+#   docker compose -f compose.wanda.yaml exec wanda mem recall fan    any `mem` call; a write is dated today
+#   docker compose -f compose.wanda.yaml exec -T wanda timeout 60 mem recall fan
+#       the same without a terminal (a script, an agent's shell): stopping the
+#       client there leaves `mem` waiting in here, and its write lands later
+#   docker compose -f compose.wanda.yaml stop             stop; `start` brings it back
+#
+# The values come from .env, which compose reads for these substitutions and
+# does not mount: the daemon is given what it uses and nothing else of the
+# owner's accounts. Only one daemon may hold the Slack app's connection, so
+# never run `wanda run` on the host beside this, and nothing on the Mac writes
+# ~/wanda-home while it runs, where the daemon's git writes the snapshots.
+#
+# The vault and the run store are the named volumes wanda-home_vault and
+# wanda-home_store. `down -v`, `docker volume prune -a`, a Rancher Desktop
+# factory reset or a switch of container engine deletes them.
+name: wanda-home
+services:
+  wanda:
+    build:
+      context: .
+      dockerfile: wanda.Dockerfile
+    image: wanda-home
+    restart: unless-stopped
+    init: true
+    # shutdown gives running sessions 20 s to settle, and docker's default
+    # would kill the daemon at 10
+    stop_grace_period: 30s
+    environment:
+      CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:?set it in .env}
+      WANDA_SLACK_BOT_TOKEN: ${WANDA_SLACK_BOT_TOKEN:?set it in .env}
+      WANDA_SLACK_APP_TOKEN: ${WANDA_SLACK_APP_TOKEN:?set it in .env}
+      WANDA_ALERT_CHANNEL: ${WANDA_ALERT_CHANNEL:?set it in .env, to a private channel or fan's user id}
+      WANDA_SLACK_OWNER_USER_IDS: ${WANDA_SLACK_OWNER_USER_IDS:?set it in .env}
+      WANDA_SLACK_NAMES: ${WANDA_SLACK_NAMES:?set it in .env, as U0123:fan,U0456:mei}
+      # the household's zone: the local time a session's shell gives, and the
+      # day a `mem` call made by hand dates its writes
+      WANDA_TZ: ${WANDA_TZ:?set it in .env, as America/Los_Angeles}
+      TZ: ${WANDA_TZ}
+      # on: add WANDA_ICLOUD_EMAIL, WANDA_ICLOUD_APP_PASSWORD and
+      # WANDA_EMAIL_TRIAGE_SLACK_CHANNEL_ID here, as above
+      WANDA_EMAIL_TRIAGE: "off"
+      # the model, the timeout and the budget the lab measured sessions with;
+      # a session is shown the budget at every step
+      WANDA_AGENT_MODEL: claude-sonnet-5
+      WANDA_AGENT_TIMEOUT_S: "420"
+      WANDA_AGENT_MAX_BUDGET_USD: "2.50"
+      # a breaker on runs, not on dollars: sessions are on the subscription
+      WANDA_DAILY_COST_CAP_USD: "1000"
+      WANDA_DATA_DIR: /srv/wanda/home
+      WANDA_VAULT: /srv/wanda/vault
+      WANDA_RUN_STORE: /srv/wanda/store
+      # so a `mem` run with `exec` reads the vault a session reads
+      MEM_VAULT: /srv/wanda/vault
+      MEM_TRANSCRIPTS: /home/wanda/.claude/projects/-srv-wanda-vault
+    volumes:
+      # the vault, on a volume of its own: a `mem` call there takes hundredths
+      # of a second, and seconds on the Mac's mount
+      - type: volume
+        source: vault
+        target: /srv/wanda/vault
+      # the run store, on a volume of its own, which the Mac cannot open:
+      # SQLite's locks do not cross the Mac's mount, and a read there while
+      # the daemon writes can corrupt the store or lose its writes
+      - type: volume
+        source: store
+        target: /srv/wanda/store
+      # the vault's snapshots, on the Mac, where they outlive the volumes. A
+      # missing directory refuses to start rather than becoming an empty one.
+      - type: bind
+        source: ~/wanda-home
+        target: /srv/wanda/home
+        bind:
+          create_host_path: false
+      # the transcripts `mem session` reads, kept beside them
+      - type: bind
+        source: ~/wanda-home/transcripts
+        target: /home/wanda/.claude/projects
+        bind:
+          create_host_path: false
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+
+volumes:
+  vault:
+  store:

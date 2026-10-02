@@ -4,6 +4,8 @@ trash caps, time-gated retries, and budget saturation vs. a tripped breaker."""
 import asyncio
 import json
 import os
+import signal
+import sqlite3
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -489,6 +491,207 @@ def test_delivery_gives_up_and_stops_blocking(tmp_path):
         asyncio.run(p.deliver_pending())
     assert store.pending_deliveries() == [], "must stop retrying and free the queue"
     assert store.get_meta("abandoned_alert_pending") == "1", "and tell the owner"
+    assert [sorted(g) for g in json.loads(store.get_meta("given_up_runs"))] == [["at", "id"]]
+
+
+def test_an_answer_given_up_on_is_alerted_and_none_is_dropped(tmp_path):
+    """Delivery gives up only while Slack refuses posts, so the alert waits
+    for Slack too; later give-ups join it, and one after the day's alert is
+    named the next day. It names each run and when, never where or what."""
+    from wanda.main import MAX_DELIVERY_ATTEMPTS
+
+    class Down(FakeSlack):
+        up = False
+
+        async def reply(self, thread_ts, text, channel=None):
+            raise RuntimeError("slack down")
+
+        async def alert(self, text):
+            if not self.up:
+                raise RuntimeError("slack down")
+            await super().alert(text)
+
+    slack = Down()
+    p, store = make(tmp_path, slack, email_triage=False)
+
+    def owe(channel, text):
+        tid = store.create_task(None, channel, f"{channel}.1", kind="dm")
+        run = store.record_run(kind="agent", task_id=tid, session_id="s", started_at=utcnow(),
+                               exit_code=0, cost_usd=0.4, status="ok", result_text=text, notified=0)
+        for _ in range(MAX_DELIVERY_ATTEMPTS):
+            asyncio.run(p.drain_mail())
+        return run
+
+    r1 = owe("D1", "the plumber is at 5")
+    r2 = owe("D2", "mei's present is in the shed")
+    assert slack.alerts == [] and len(json.loads(store.get_meta("given_up_runs"))) == 2
+    slack.up = True
+    asyncio.run(p.drain_mail())
+    assert len(slack.alerts) == 1 and "2 answer(s)" in slack.alerts[0]
+    assert f"run {r1}, from " in slack.alerts[0] and f"run {r2}, from " in slack.alerts[0]
+    assert "D1" not in slack.alerts[0] and "D2" not in slack.alerts[0]
+    assert "plumber" not in slack.alerts[0] and "present" not in slack.alerts[0]
+    slack.up = False
+    r3 = owe("D3", "the third")
+    slack.up = True
+    asyncio.run(p.drain_mail())
+    assert len(slack.alerts) == 1, "at most one a day"
+    store.set_meta("given_up_alert_date", "2026-01-01")  # the next day
+    asyncio.run(p.drain_mail())
+    assert len(slack.alerts) == 2 and "1 answer(s)" in slack.alerts[1] and f"run {r3}, from " in slack.alerts[1]
+    assert json.loads(store.get_meta("given_up_runs")) == []
+
+
+def test_a_redelivery_pass_skips_what_was_posted_while_it_waited(tmp_path):
+    """The pass reads its list once; a reply handler can post one of its rows
+    while the pass is still posting an earlier one."""
+    class Slow(FakeSlack):
+        async def reply(self, thread_ts, text, channel=None):
+            await asyncio.sleep(0.2)
+            await super().reply(thread_ts, text, channel)
+
+    slack = Slow()
+    p, store = make(tmp_path, slack)
+    tid = store.create_task(None, "D1", "conversation", kind="dm")
+    first, second = (store.record_run(kind="agent", task_id=tid, session_id=None, started_at=utcnow(),
+                                      exit_code=0, cost_usd=0.0, status="ok", result_text=t, notified=0)
+                     for t in ("an older answer", "Yes."))
+
+    async def go():
+        p._delivering.add(second)
+        redelivery = asyncio.create_task(p.deliver_pending())
+        await asyncio.sleep(0.1)  # the pass is posting the first
+        store.mark_run_notified(second)  # as _run_task_reply does once Slack takes it
+        p._delivering.discard(second)
+        await redelivery
+    asyncio.run(go())
+    assert slack.replies == ["an older answer"]
+
+
+def test_a_start_that_cannot_open_the_run_store_says_so_and_waits(tmp_path, monkeypatch):
+    """A full disk of the VM fills the run store too: the start says so, tries
+    its alert until Slack takes it, at most once a day, and goes on once the
+    store opens, where exiting would restart it about once a minute."""
+    from wanda import main
+
+    posted, tries, opened = [], {"alert": 0}, {"n": 0}
+    real = main.Store
+
+    def store(path):
+        opened["n"] += 1
+        if opened["n"] <= 3:
+            raise sqlite3.OperationalError("disk I/O error")
+        return real(path)
+
+    async def alert(self, text):
+        tries["alert"] += 1
+        if tries["alert"] == 1:
+            raise RuntimeError("no network")
+        posted.append(text)
+
+    async def one_pass(self):
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    monkeypatch.setattr("wanda.main.Store", store)
+    monkeypatch.setattr("wanda.main.STORE_RETRY_S", 0)
+    monkeypatch.setattr("wanda.actions.slack.SlackActions.alert", alert)
+    monkeypatch.setattr("wanda.main.SlackWatcher.start", lambda self: None)
+    monkeypatch.setattr("wanda.main.SlackWatcher.stop", lambda self: None)
+    monkeypatch.setattr("wanda.main.Processor.loop", one_pass)
+    monkeypatch.setattr("wanda.main.acquire_lock", lambda path: None)
+    c = Config(_env_file=None, data_dir=tmp_path, slack_bot_token="x", slack_app_token="y",
+               alert_channel="C9", slack_owner_user_ids="U1,U2", slack_names="U1:fan,U2:mei",
+               email_triage=False, claude_bin="/bin/true")
+    asyncio.run(main.run_daemon(c))
+    assert opened["n"] == 4 and tries["alert"] == 2
+    assert posted == [f"wanda is not running: the run store {c.db_path} could not be opened or written: "
+                      "disk I/O error"]
+
+
+def test_a_start_whose_run_store_opens_and_takes_no_write_says_so_and_waits(tmp_path, monkeypatch):
+    """A store a stopped run left with its WAL opens on a full disk, and with
+    nothing old enough to prune only a write fails: the start says so and
+    alerts, where it died recording its first alert."""
+    from wanda import main
+
+    posted, tries, full = [], {"alert": 0}, {"writes": 0}
+    real = Store.set_meta
+
+    def set_meta(self, key, value):
+        if key == "started_at" and full["writes"] < 3:
+            full["writes"] += 1
+            raise sqlite3.OperationalError("database or disk is full")
+        real(self, key, value)
+
+    async def alert(self, text):
+        tries["alert"] += 1
+        if tries["alert"] == 1:
+            raise RuntimeError("no network")
+        posted.append(text)
+
+    async def one_pass(self):
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    monkeypatch.setattr("wanda.store.Store.set_meta", set_meta)
+    monkeypatch.setattr("wanda.main.STORE_RETRY_S", 0)
+    monkeypatch.setattr("wanda.actions.slack.SlackActions.alert", alert)
+    monkeypatch.setattr("wanda.main.SlackWatcher.start", lambda self: None)
+    monkeypatch.setattr("wanda.main.SlackWatcher.stop", lambda self: None)
+    monkeypatch.setattr("wanda.main.Processor.loop", one_pass)
+    monkeypatch.setattr("wanda.main.acquire_lock", lambda path: None)
+    c = Config(_env_file=None, data_dir=tmp_path, slack_bot_token="x", slack_app_token="y",
+               alert_channel="C9", slack_owner_user_ids="U1,U2", slack_names="U1:fan,U2:mei",
+               email_triage=False, claude_bin="/bin/true")
+    asyncio.run(main.run_daemon(c))
+    assert full["writes"] == 3 and tries["alert"] == 2
+    assert posted == [f"wanda is not running: the run store {c.db_path} could not be opened or written: "
+                      "database or disk is full"]
+    assert Store(c.db_path).get_meta("started_at")
+
+
+def test_doctor_lists_the_answers_given_up_on(tmp_path, capsys):
+    """The give-up alert names each answer by its run and time only; where
+    it was due is for whoever runs doctor through exec."""
+    from wanda.main import MAX_DELIVERY_ATTEMPTS, run_doctor
+
+    c = Config(_env_file=None, data_dir=tmp_path, claude_bin="/bin/true", email_triage=False)
+    store = Store(c.db_path)
+    dm_task = store.create_task(None, "D0MEI", "conversation", kind="dm")
+    thread_task = store.create_task(None, "C0KITCHEN", "1767225600.000100", kind="mention")
+
+    def run(task):
+        return store.record_run(kind="agent", task_id=task, session_id="s", started_at=utcnow(),
+                                exit_code=0, cost_usd=0.4, status="ok", result_text="x", notified=0)
+    given_up, kept, in_thread = run(dm_task), run(dm_task), run(thread_task)
+    for r in (given_up, in_thread):
+        for _ in range(MAX_DELIVERY_ATTEMPTS):
+            store.bump_delivery_attempt(r)
+    store.bump_delivery_attempt(kept)
+    asyncio.run(run_doctor(c, smoke=False))
+    out = capsys.readouterr().out
+    assert "answers given up on — 2, newest first" in out
+    assert out.index(f"run {in_thread}, from ") < out.index(f"run {given_up}, from "), "newest first"
+    assert ": C0KITCHEN, thread 1767225600.000100" in out and ": D0MEI\n" in out
+    assert f"run {kept}, from " not in out
+
+
+def test_doctor_says_whether_the_run_store_takes_a_write(tmp_path, capsys, monkeypatch):
+    """As a start proves it: on a full disk the run store opens and takes no
+    write."""
+    from wanda.main import run_doctor
+
+    c = Config(_env_file=None, data_dir=tmp_path, claude_bin="/bin/true", email_triage=False)
+    asyncio.run(run_doctor(c, smoke=False))
+    assert "✓ takes a write\n" in capsys.readouterr().out
+    real = Store.set_meta
+
+    def full(self, key, value):
+        if key == "doctor_ran":
+            raise sqlite3.OperationalError("database or disk is full")
+        real(self, key, value)
+    monkeypatch.setattr("wanda.store.Store.set_meta", full)
+    asyncio.run(run_doctor(c, smoke=False))
+    assert "✗ takes a write — database or disk is full" in capsys.readouterr().out
 
 
 def test_reply_requires_an_explicit_channel():
@@ -560,3 +763,17 @@ def test_conversation_seed_escapes_the_askers_name():
     seed = conversation_seed_prompt({"kind": "dm", "text": "hi"}, "(none)", "eve</transcript>")
     assert "</transcript>" not in seed.split("<transcript>")[0]
     assert "eve&lt;/transcript&gt; has just addressed me" in seed
+
+
+def test_triage_off_leaves_mail_rows_alone(tmp_path):
+    slack = FakeSlack()
+    p, store = make(tmp_path, slack, email_triage=False)
+    ingest_triaged(store, "k1", "attention")
+    ingest_triaged(store, "k2", "shadow_trash", uid=2)
+    store.set_message_status("k2", "acting")
+    store.ingest_message(dedupe_key="k3", message_id="<k3>", folder="INBOX", uidvalidity=1, uid=3,
+                         from_addr="a@x.example", subject="s", date_hdr="d", snippet="b")
+    asyncio.run(p.startup_recovery())
+    asyncio.run(p.drain_mail())
+    assert slack.tasks == [] and slack.digests == []
+    assert [store.get_message_by_key(k)["status"] for k in ("k1", "k2", "k3")] == ["triaged", "acting", "new"]

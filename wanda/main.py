@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import signal
+import sqlite3
 import subprocess
 import sys
 import time
@@ -52,6 +53,9 @@ MAX_DELIVERY_ATTEMPTS = 8
 RETRY_BASE_S = 60          # backoff 1, 2, 4, 8, 16, 30, 30, 30 minutes
 RETRY_MAX_S = 1800
 DEFER_S = 900  # how long a rate-capped trash waits before the cap is re-tested
+# How long a start that cannot open or write the run store waits before it
+# tries again.
+STORE_RETRY_S = 60
 # Kinds that own their conversation and open a task on first contact.
 CONVERSATION_KINDS = ("mention", "mention_guest", "dm")
 BUDGET_REPLIES = {
@@ -240,8 +244,11 @@ class Processor:
         # Slack outage that outlives one run must not strand paid work.
         await self.deliver_pending()
         await self._flush_abandoned_alert()
+        await self._flush_given_up()
         for kind in ("breaker", "cap"):
             await self._flush_alert(kind)
+        if not self.cfg.email_triage:
+            return  # mail rows from before triage was turned off stay as they are
         await self.apply_pending()
         while True:
             rows = self.store.fetch_by_status("new", limit=self.cfg.triage_batch_size)
@@ -502,8 +509,34 @@ class Processor:
         self.store.set_meta(f"{kind}_alert_date", minted)
         self.store.set_meta(f"{kind}_alert_pending", "")
 
+    async def _flush_given_up(self) -> None:
+        """Answers delivery gave up on, alerted at most once a day as every
+        other kind is. The alert is written from the list when it is due, so
+        an answer given up on while one waits, or after the day's alert went,
+        is named in the next, and none is dropped at a day's end. It names
+        each by its run and time only: a conversation can tell whom an
+        answer was for, and the alerts may be read by the person it is kept
+        from."""
+        given_up = json.loads(self.store.get_meta("given_up_runs") or "[]")
+        today = datetime.now(timezone.utc).date().isoformat()
+        if not given_up or self.store.get_meta("given_up_alert_date") == today:
+            return
+        runs = "; ".join(f"run {g['id']}, from {g['at']}" for g in given_up)
+        try:
+            await self.slack.alert(
+                f"{len(given_up)} answer(s) could not be posted after {MAX_DELIVERY_ATTEMPTS} tries "
+                f"and were given up: {runs}. `wanda doctor` lists where each was due.")
+        except Exception:
+            log.warning("given-up alert undeliverable; will retry")
+            return
+        self.store.set_meta("given_up_alert_date", today)
+        named = {g["id"] for g in given_up}
+        left = [g for g in json.loads(self.store.get_meta("given_up_runs") or "[]") if g["id"] not in named]
+        self.store.set_meta("given_up_runs", json.dumps(left))
+
     async def startup_recovery(self) -> None:
-        for row in self.store.fetch_by_status("acting", limit=200):
+        # with triage off, mail rows from before stay as they are
+        for row in self.store.fetch_by_status("acting", limit=200) if self.cfg.email_triage else ():
             # Honour the same backoff as a normal pass: launchd restarts every
             # 30s, so an unguarded recovery would burn the attempt budget in
             # minutes during a restart loop.
@@ -523,6 +556,8 @@ class Processor:
         for run in self.store.pending_deliveries():
             if run["id"] in self._delivering:
                 continue  # a reply handler is posting this right now
+            if self.store.run_notified(run["id"]):
+                continue  # a reply handler posted it while this pass awaited an earlier one
             # Cancelled runs carry no text; every other pending run does.
             text = run["result_text"] or (
                 "⏸ I restarted while working on this — reply again to retry."
@@ -536,6 +571,9 @@ class Processor:
                                   run["id"], run["slack_channel"], attempts)
                     self.store.mark_run_notified(run["id"])  # stop blocking the queue
                     self.store.set_meta("abandoned_alert_pending", "1")
+                    given_up = json.loads(self.store.get_meta("given_up_runs") or "[]")
+                    given_up.append({"id": run["id"], "at": run["started_at"]})
+                    self.store.set_meta("given_up_runs", json.dumps(given_up))
                 else:
                     log.warning("could not deliver run %s yet (attempt %d); will retry",
                                 run["id"], attempts)
@@ -779,19 +817,60 @@ def require_settings(cfg: Config, names: list[str]) -> None:
         sys.exit(f"missing required settings: {', '.join('WANDA_' + n.upper() for n in missing)} (see .env.example)")
 
 
+def settings_problem(cfg: Config) -> str | None:
+    """Who may talk to wanda, and what each of them is called."""
+    if not cfg.slack_owner_user_ids:
+        return ("WANDA_SLACK_OWNER_USER_IDS is empty: anyone in the workspace could start "
+                "a session, which has a shell")
+    unnamed = [u for u in cfg.slack_owner_user_ids if u not in cfg.slack_names]
+    if unnamed:
+        return (f"no name in WANDA_SLACK_NAMES for {', '.join(unnamed)}: everyone who may talk to "
+                "wanda is named there")
+    return None
+
+
+async def open_store(cfg: Config) -> Store:
+    """The run store, waited for while it cannot be opened or written, as on
+    a full disk of the VM, which the volumes, the images and the build cache
+    share. Exiting would have Docker start the daemon again and again, each
+    start failing before an alert could be recorded, with no `exec` into it
+    in between. The alert is tried until Slack takes it, and then again on
+    each UTC day the wait lasts."""
+    alerted = None
+    while True:
+        try:
+            store = Store(cfg.db_path)
+            store.prune_slack_events()
+            # Only a write proves the store takes one: one a stopped run left
+            # with its WAL opens on a full disk, and the prune may have nothing
+            # to delete.
+            store.set_meta("started_at", utcnow())
+            return store
+        except (sqlite3.Error, OSError) as e:
+            problem = f"the run store {cfg.db_path} could not be opened or written: {e}"
+        log.error("%s; trying again in %d s", problem, STORE_RETRY_S)
+        today = datetime.now(timezone.utc).date().isoformat()
+        if alerted != today:
+            try:
+                await SlackActions(cfg, None).alert(f"wanda is not running: {problem}")
+                alerted = today
+            except Exception:
+                log.warning("startup alert undeliverable; will retry")
+        await asyncio.sleep(STORE_RETRY_S)
+
+
 async def run_daemon(cfg: Config) -> None:
-    # slack_owner_user_ids is deliberately optional: empty means anyone in the
-    # workspace may talk to wanda.
-    require_settings(cfg, [
-        "icloud_email", "icloud_app_password",
-        "slack_bot_token", "slack_app_token", "email_triage_slack_channel_id",
-    ])
+    require_settings(cfg, ["slack_bot_token", "slack_app_token"] + (
+        ["icloud_email", "icloud_app_password", "email_triage_slack_channel_id"] if cfg.email_triage else []))
+    if not cfg.alerts_to:
+        sys.exit("missing required settings: WANDA_ALERT_CHANNEL (see .env.example)")
+    if problem := settings_problem(cfg):
+        sys.exit(problem)
     claude_bin = cfg.resolve_claude_bin()
     if not claude_bin:
         sys.exit("claude CLI not found; set WANDA_CLAUDE_BIN (required under launchd)")
     lock = acquire_lock(cfg.lock_path)  # noqa: F841 — held for process lifetime
-    store = Store(cfg.db_path)
-    store.prune_slack_events()
+    store = await open_store(cfg)
 
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue = asyncio.Queue()
@@ -801,25 +880,30 @@ async def run_daemon(cfg: Config) -> None:
 
     slack_watcher = SlackWatcher(cfg, store, loop, slack_queue)
     slack_watcher.start()
-    imap_watcher = ImapWatcher(
-        cfg, store, notify=lambda: loop.call_soon_threadsafe(queue.put_nowait, Event("imap", "kick"))
-    )
-    imap_watcher.start()
+    imap_watcher = None
+    if cfg.email_triage:
+        imap_watcher = ImapWatcher(
+            cfg, store, notify=lambda: loop.call_soon_threadsafe(queue.put_nowait, Event("imap", "kick"))
+        )
+        imap_watcher.start()
 
     stop = asyncio.Event()
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, stop.set)
 
-    log.info("wanda running (enforcement=%s, email triage=%s, agent=%s)",
-             cfg.enforcement, cfg.email_triage_model, cfg.agent_model)
+    log.info("wanda running (enforcement=%s, email triage=%s, agent=%s)", cfg.enforcement,
+             cfg.email_triage_model if cfg.email_triage else "off", cfg.agent_model)
     # slack_loop starts first: recovery can take many paced Slack calls, and an
     # owner reply arriving during it must not sit undispatched in the queue.
     tasks = [asyncio.create_task(processor.slack_loop())]
     await processor.startup_recovery()
+    # with triage off nothing reaches the mail queue, and the loop still
+    # retries undelivered answers and flushes alerts
     tasks.append(asyncio.create_task(processor.loop()))
     await stop.wait()
     log.info("shutting down")
-    imap_watcher.stop()
+    if imap_watcher:
+        imap_watcher.stop()
     slack_watcher.stop()
     for t in tasks:
         t.cancel()
@@ -843,19 +927,27 @@ async def run_doctor(cfg: Config, smoke: bool) -> int:
     print("wanda doctor\n")
 
     print("config:")
-    for name in ("icloud_email", "icloud_app_password", "slack_bot_token", "slack_app_token",
-                 "email_triage_slack_channel_id"):
+    for name in ("slack_bot_token", "slack_app_token") + (
+            ("icloud_email", "icloud_app_password", "email_triage_slack_channel_id") if cfg.email_triage else ()):
         report(name, bool(getattr(cfg, name)), "" if getattr(cfg, name) else "not set")
+    report("alerts to", bool(cfg.alerts_to), cfg.alerts_to or "WANDA_ALERT_CHANNEL is not set")
+    report("email triage", True, "on" if cfg.email_triage else "off")
     report("enforcement", True, cfg.enforcement)
-    report("who can talk to wanda", True,
-           ", ".join(cfg.slack_owner_user_ids) if cfg.slack_owner_user_ids
-           else "anyone in the workspace")
+    problem = settings_problem(cfg)
+    report("who can talk to wanda", problem is None, problem or ", ".join(
+        f"{u} as {cfg.slack_names[u]}" for u in cfg.slack_owner_user_ids))
     report("agent tools", True, cfg.agent_allowed_tools)
 
     print("store:")
     try:
         store = Store(cfg.db_path)
         report("sqlite", True, str(cfg.db_path))
+        # as a start proves it: on a full disk the store opens and takes no write
+        try:
+            store.set_meta("doctor_ran", utcnow())
+            report("takes a write", True)
+        except sqlite3.Error as e:
+            report("takes a write", False, str(e))
         last_poll = store.get_meta("last_successful_poll_at")
         report("last successful poll", True, last_poll or "never (daemon not yet run)")
         report("imap mode", True, store.get_meta("imap_mode") or "idle (not yet connected)")
@@ -866,6 +958,13 @@ async def run_doctor(cfg: Config, smoke: bool) -> int:
         report("deferred by rate cap", True, "none" if not deferred else f"{deferred} waiting for the cap window")
         n_runs, cost = store.runs_today()
         report("claude runs today", True, f"{n_runs} runs, ${cost:.2f}")
+        # the give-up alert names each by its run and time only: where it was
+        # due is for whoever runs this
+        given_up = store.given_up_runs(MAX_DELIVERY_ATTEMPTS)
+        report("answers given up on", True, f"{len(given_up)}, newest first" if given_up else "none")
+        for r in given_up:
+            print(f"      run {r['id']}, from {r['started_at']}: {r['slack_channel']}"
+                  + (f", thread {r['reply_thread']}" if r["reply_thread"] else ""))
     except Exception as e:
         report("sqlite", False, str(e))
         store = None
@@ -898,7 +997,9 @@ async def run_doctor(cfg: Config, smoke: bool) -> int:
                 report("smoke run", False, str(e))
 
     print("imap:")
-    if cfg.icloud_email and cfg.icloud_app_password:
+    if not cfg.email_triage:
+        report("login + INBOX", True, "email triage is off")
+    elif cfg.icloud_email and cfg.icloud_app_password:
         try:
             with connect(cfg) as client:
                 info = client.select_folder("INBOX", readonly=True)
@@ -931,16 +1032,18 @@ async def run_doctor(cfg: Config, smoke: bool) -> int:
             report("app token", True)
         except Exception as e:
             report("app token", False, str(e))
-        try:
-            from slack_sdk import WebClient
+        # a user id is a DM, which needs no membership
+        triage_channel = cfg.email_triage_slack_channel_id if cfg.email_triage else ""
+        for channel in {c for c in (triage_channel, cfg.alerts_to) if c and not c.startswith("U")}:
+            try:
+                from slack_sdk import WebClient
 
-            ch = WebClient(token=cfg.slack_bot_token, ssl=ssl_context()).conversations_info(
-                channel=cfg.email_triage_slack_channel_id)
-            member = ch["channel"].get("is_member")
-            report("channel", bool(member), ch["channel"].get("name", cfg.email_triage_slack_channel_id) +
-                   ("" if member else " — bot is not a member; /invite it"))
-        except Exception as e:
-            report("channel", False, str(e))
+                ch = WebClient(token=cfg.slack_bot_token, ssl=ssl_context()).conversations_info(channel=channel)
+                member = ch["channel"].get("is_member")
+                report("channel", bool(member), ch["channel"].get("name", channel) +
+                       ("" if member else " — bot is not a member; /invite it"))
+            except Exception as e:
+                report("channel", False, str(e))
     else:
         report("bot token", False, "not set")
 
