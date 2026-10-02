@@ -419,8 +419,10 @@ fn log(cmd: &str, rc: i32, argv: &[String]) {
     if CUT.load(Ordering::Relaxed) {
         rec["cut"] = serde_json::Value::Bool(true);
     }
+    // one write of the whole line: calls reading at once log at once, and a
+    // line written in pieces can have another's spliced into it
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-        let _ = writeln!(f, "{}", memory::text::py_json_utf8(&rec));
+        let _ = f.write_all(format!("{}\n", memory::text::py_json_utf8(&rec)).as_bytes());
     }
 }
 
