@@ -26,7 +26,7 @@ from wanda.actions.mailbox import MOVED, move_to_trash
 from wanda.actions.slack import SlackActions
 from wanda.config import Config, load_config
 from wanda.events import Event
-from wanda.household import NAMES_EVERY_S, SHUT, Household
+from wanda.household import NAMES_EVERY_S, SHUT, Found, Household, found, memory_said, same, settle, tries
 from wanda.runner import RunnerService, RunResult
 from wanda.store import Store, utcnow
 from wanda.tls import ssl_context
@@ -301,6 +301,10 @@ class Processor:
         # every member's names, read from the run store once; whatever
         # changes them saves the change at once (wanda/household.py)
         self.household = Household.load(store, cfg.slack_owner_user_ids)
+        # the ids whose change of name a session of its own is handing to
+        # memory, from before its try is written until its outcome is: the
+        # re-look leaves them to it
+        self._naming: set[str] = set()
 
     async def loop(self) -> None:
         """Mail pipeline only. Owner commands are consumed by slack_loop on a
@@ -385,6 +389,7 @@ class Processor:
                     last_due = time.monotonic()
                     wakes += await self._due_wakes(now)
                 self._wake(wakes, now)
+                self._hand_names(now)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -424,7 +429,8 @@ class Processor:
         wakes = clock.due_wakes(now, clock.items(due), self.household.askers(),
                                 lambda k: bool(self.store.get_meta(k)),
                                 self._clock_said, lambda item, why: self._lost(item.id, item.by,
-                                                                                 item.asked_by, why))
+                                                                                 item.asked_by, why),
+                                self.household.told_names())
         self.store.set_meta("clock:checked", now.date().isoformat())
         # a wake cut short and released at the start to be woken again: one
         # this check does not wake, since the session cut short closed or
@@ -547,7 +553,7 @@ class Processor:
                 # due.rs marks what is later than the look; one whose time has
                 # come while its wake waits is the clock's to give as well
                 listed = clock.still_to_come(listed, now, self.household.askers(),
-                                             lambda k: bool(self.store.get_meta(k)))
+                                             lambda k: bool(self.store.get_meta(k)), self.household.told_names())
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -805,15 +811,17 @@ class Processor:
     async def _flush_names(self) -> None:
         """The alerts about the household's names that go once per event,
         held in the run store until Slack takes them, all that wait in one
-        message: a run store started afresh beside a vault with history, an
-        allowed id not let in, and a member Slack has stopped showing, each
-        id at most once a UTC day. Each line counts and names no one, since
-        the alerts may be read by anyone in the household; doctor says
-        whose."""
+        message: a run store started afresh beside a vault with history, a
+        change of name memory did not take as the member's alone, an allowed
+        id not let in, and a member Slack has stopped showing, each id at most
+        once a UTC day. Each line counts and names no one, since the alerts
+        may be read by anyone in the household; doctor says whose."""
         now = datetime.now(timezone.utc)
         lost = json.loads(self.store.get_meta("store_lost") or "null")
-        # each event as it stands now: a read can end or replace one while
-        # Slack takes the message, and what is marked is what was said
+        # each event as it stands now: a read or a names session can end or
+        # replace one while Slack takes the message, and what is marked is
+        # what was said
+        strays = [(uid, self.household.rows[uid]["kept"]) for uid in self.household.unalerted_keeps()]
         shut = [(uid, self.household.rows[uid]["out"]) for uid in self.household.unalerted(now)]
         out = [u for u, _ in shut if not self.household.told(u)]
         gone = [u for u, _ in shut if self.household.told(u)]
@@ -821,6 +829,10 @@ class Processor:
         if lost and not lost["alerted"]:
             lines.append("the run store was started afresh beside a vault with history: the names household "
                          "members had before are not known (README, State)")
+        if strays:
+            lines.append(f"{len(strays)} change(s) of a household member's name in Slack were handed to memory, "
+                         "which did not take the new name as theirs alone; sessions use the earlier name; doctor "
+                         "says whose")
         if out:
             lines.append(f"{len(out)} id(s) in WANDA_SLACK_OWNER_USER_IDS are not let in: Slack has no member "
                          "for them, does not show them, or gives no usable name; doctor says whose")
@@ -836,6 +848,10 @@ class Processor:
             return
         if lost and not lost["alerted"]:
             self.store.set_meta("store_lost", json.dumps(lost | {"alerted": True}))
+        for uid, kept in strays:
+            # a keep a names session has made since waits for the next flush
+            kept["alerted"] = True
+            self.household.save(self.store, uid)
         for uid, shown in shut:
             self.household.alerted(uid, shown, now)
             self.household.save(self.store, uid)
@@ -844,13 +860,15 @@ class Processor:
 
     async def names_loop(self) -> None:
         """Every allowed id's name, read again each NAMES_EVERY_S, the start
-        having read them just before. Its own task, outside the sessions'
+        having read them just before, and then each try and kept change
+        looked at again in memory. Its own task, outside the sessions'
         (`_bg`), on a Slack client of its own: a Slack that hangs on a read
         holds back no post, no tick and no session."""
         while True:
             await asyncio.sleep(NAMES_EVERY_S)
             try:
                 await self.read_names(datetime.now(timezone.utc))
+                await self.relook_names(datetime.now(timezone.utc))
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -891,27 +909,272 @@ class Processor:
                 log.exception("names: reading %s failed", uid)
         return failed
 
+    # --- a change of name, handed to memory ---
+
+    def _hand_names(self, now: datetime) -> None:
+        # upkeep, after the tick's wakes: a change of name is handed only in
+        # a minute when no session is running, one at a time, quiet hours or
+        # not, since its session posts nothing
+        if self._bg or self._inflight_runs or (change := self.household.due(self.store, now)) is None:
+            return
+        t = asyncio.create_task(self._names_session(*change, now))
+        self._bg.add(t)
+        t.add_done_callback(self._bg.discard)
+
+    async def _names_session(self, uid: str, old: str, new: str, now: datetime) -> None:
+        """A session of its own, which posts nothing, told that the member
+        sessions know as `old` is `new` in Slack now, and left to decide what
+        that means for memory. A reply's session would spend its answer on
+        it, and the harness renaming the person itself would be the harness
+        rewriting memory. Memory's answer, read once the session has released
+        its slot, decides the name sessions are told from then on (`settle`).
+        The try is written before the session runs, and its run found by its
+        session id, so that a stop, a crash or an answer that could not be
+        read leaves what the start and each refresh round look at again
+        (`relook_names`)."""
+        # a refresh round can land between the tick and this start
+        if self.household.due(self.store, now) != (uid, old, new):
+            return
+        began = time.monotonic()
+
+        def later() -> datetime:
+            # the tick's time, moved on by however long the session has taken:
+            # an outcome is stamped with when it is applied
+            return now + timedelta(seconds=time.monotonic() - began)
+        self._naming.add(uid)
+        try:
+            sid = str(uuid.uuid4())
+            self.household.trying(uid, new, sid, now)
+            self.household.save(self.store, uid)
+            log.info("names: telling memory that %s, known as %s, is %s in Slack now (session %s)",
+                     uid, old, new, sid)
+            # one task for every names session, which no conversation's lock guards
+            self.store.create_task(None, "", "names", kind="names")
+            task = self.store.get_task_by_thread("", "names")
+            run = error = None
+            try:
+                try:
+                    error = await self.memory_turn(task, vault.renamed_text(old, new), now, channel=None,
+                                                   reply_thread=None, owed=False, sid=sid)
+                finally:
+                    # however the runner ends: memory_turn records each run
+                    # under the session it is given, a stop's included
+                    run = self.store.session_run(sid)
+            except asyncio.CancelledError:
+                # A stop reads nothing, since the shutdown waits only so long.
+                # With no run the change is due again at once; with a stop's
+                # run the model may have written, and memory is read first;
+                # after a run that ended, the try stands for the start
+                if run is None:
+                    self.household.stopped(uid, later())
+                elif run["status"] == "cancelled":
+                    self.household.stopped(uid, later(), mid_run=True)
+                self.household.save(self.store, uid)
+                raise
+            except Exception as e:
+                log.exception("names: the session for %s's change raised", uid)
+                error = str(e) or type(e).__name__
+            if run is None:
+                if error in BUDGET_REPLIES:
+                    # refused before the model ran: not a failure
+                    self.household.failed(uid, new, error, later(), counted=False)
+                    self.household.save(self.store, uid)
+                    log.warning("names: the handoff of %s's change to %s was refused (%s); tried again after %s",
+                                uid, new, error, self.household.rows[uid]["tried"]["next"])
+                else:
+                    await self._handoff_failed(uid, new, error or "the session recorded no run", later())
+                return
+            # the run's outcome, whatever was raised after it was recorded
+            await self._after_run(uid, old, new, run, *await self._read_both(old, new, now), later())
+        finally:
+            self._naming.discard(uid)
+
+    async def _read_both(self, old: str, new: str, now: datetime) -> tuple[Found | None, Found | None, str]:
+        """Whom memory finds by each name, or why it could not be read."""
+        try:
+            return await self._people_named(old, now), await self._people_named(new, now), ""
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            return None, None, str(e) or type(e).__name__
+
+    async def _after_run(self, uid: str, old: str, new: str, run, by_old: Found | None, by_new: Found | None,
+                         error: str, now: datetime) -> None:
+        """A try's outcome, from its own run and memory's answer, read after
+        its session or at a re-look. After a run recorded ok, whatever the
+        answer gives applies. After a stop's cancelled run, a timeout or an
+        error, only an advance does, since the model may have renamed the
+        person before the run ended: anything else is a stop, due again at
+        once, or a failed try. An answer that could not be read after a run
+        ok or cancelled is read again at each refresh, the id held meanwhile,
+        since the model may have written; after any other, it is a failed
+        try."""
+        status, sid = run["status"], run["session_id"]
+        if error:
+            if status in ("ok", "cancelled"):
+                self.household.unanswered(uid, "stopped mid-run" if status == "cancelled" else error)
+                self.household.save(self.store, uid)
+                log.warning("names: memory could not be read after %s's session %s: %s; read again at each "
+                            "refresh", uid, sid, error)
+                if now - datetime.fromisoformat(run["ended_at"]) >= timedelta(days=1):
+                    await self._alert_once("names", "memory's answer to a change of a household member's name in "
+                                                    "Slack has not been read for a day after its session; sessions "
+                                                    "go on using the earlier name; doctor says whose")
+            else:
+                await self._handoff_failed(uid, new, f"memory could not be read after the session: {error}", now)
+            return
+        outcome = settle(old, new, by_old, by_new, sid, status == "ok")
+        if status == "ok" or outcome == "advance":
+            self._took(uid, old, new, sid, outcome, by_old, by_new, now)
+        elif status == "cancelled":
+            self.household.stopped(uid, now)
+            self.household.save(self.store, uid)
+            log.info("names: %s's session %s was stopped before memory took %s; it is handed again", uid, sid, new)
+        else:
+            await self._handoff_failed(uid, new, run["error"] or f"the session ended in {status}", now)
+
+    def _took(self, uid: str, old: str, new: str, sid: str, outcome: str, by_old: Found, by_new: Found,
+              now: datetime) -> None:
+        """What memory's answer gives, applied: the new name, told to every
+        session from now on, or a keep of the old one, with what memory said
+        for doctor."""
+        if outcome == "advance":
+            if self.household.advance(uid, new, sid, now):
+                log.info("names: %s is %s to sessions from now on (session %s)", uid, new, sid)
+            else:
+                log.warning("names: %s stays %s to sessions: %s", uid, old, self.household.rows[uid]["slack"]["why"])
+        else:
+            said = memory_said(old, new, by_old, by_new)
+            self.household.keep(uid, new, sid, said, outcome == "keep", now)
+            if outcome == "keep":
+                log.info("names: %s stays %s to sessions: memory keeps that name (%s)", uid, old, said)
+            else:
+                log.warning("names: %s stays %s to sessions: memory did not take %s as theirs alone (%s)",
+                            uid, old, new, said)
+        self.household.save(self.store, uid)
+
+    async def _handoff_failed(self, uid: str, name: str, error: str, now: datetime) -> None:
+        # backed off as `trying` set it, and alerted once a UTC day; doctor
+        # says whose, since the alerts may be read by anyone in the household
+        self.household.failed(uid, name, error, now)
+        self.household.save(self.store, uid)
+        tried = self.household.rows[uid]["tried"]
+        log.warning("names: the handoff of %s's change to %s failed: %s; tried again after %s",
+                    uid, name, error, tried["next"])
+        await self._alert_once("names", f"a change of a household member's name in Slack could not be handed to "
+                                        f"memory ({tries(tried['count'])}); sessions go on using the earlier name; "
+                                        "doctor says whose")
+
+    async def relook_names(self, now: datetime, *, start: bool = False) -> None:
+        """Each allowed id's try and kept change looked at again in memory,
+        with no session: after each round's reads, and at the start before
+        any session runs. An id whose names session is running is left to
+        it, and what a look reads applies only to the try or the keep it was
+        read for. Each look has a guard of its own, so one that raises holds
+        back none of the others."""
+        for uid in self.cfg.slack_owner_user_ids:
+            for look in (self._relook_try, self._relook_kept):
+                try:
+                    await look(uid, now, start)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.exception("names: looking again at %s's change failed", uid)
+
+    async def _relook_try(self, uid: str, now: datetime, start: bool) -> None:
+        """A try. One whose own run awaits its outcome gets the rule it would
+        have had after its session. Any other only advances, which catches a
+        session whose outcome was never learned, as one stopped after it
+        renamed the person and before they set the name back; it ends if not,
+        once Slack no longer shows its name. At the start, one that still
+        reads "did not end" with no run was cut short by a crash, which is
+        alerted as a failed try is, once."""
+        row, told = self.household.rows.get(uid), self.household.told(uid)
+        if uid in self._naming or row is None or told is None or (tried := row["tried"]) is None:
+            return
+        sid, name = tried["session"], tried["name"]
+        awaits = self.household.awaits_memory(self.store, tried)
+        by_old, by_new, error = await self._read_both(told, name, now)
+        # a names session begun meanwhile is the only one to settle its try
+        if uid in self._naming or (row["tried"] or {}).get("session") != sid:
+            return
+        if awaits:
+            await self._after_run(uid, told, name, self.store.session_run(sid), by_old, by_new, error, now)
+            return
+        if error:
+            log.warning("names: memory could not be read for %s's try of %s: %s; read again next round",
+                        uid, name, error)
+        elif settle(told, name, by_old, by_new, sid, False) == "advance":
+            self._took(uid, told, name, sid, "advance", by_old, by_new, now)
+            return
+        if start and tried["error"] == "did not end":
+            await self._handoff_failed(uid, name, "cut short", now)
+        elif not error and not same(row["slack"]["name"] or "", name):
+            self.household.untried(uid)
+            self.household.save(self.store, uid)
+            log.info("names: %s's try of %s ends: memory did not take it, and Slack no longer shows it", uid, name)
+
+    async def _relook_kept(self, uid: str, now: datetime, start: bool) -> None:
+        """A kept change, while Slack shows its name: it advances, as after a
+        run not ok, once a message session has renamed the person; and a keep
+        changes kind when memory's answer does (`Household.kept_again`)."""
+        row, told = self.household.rows.get(uid), self.household.told(uid)
+        if uid in self._naming or row is None or told is None or (kept := row["kept"]) is None:
+            return
+        if not same(row["slack"]["name"] or "", kept["name"]):
+            return
+        by_old, by_new, error = await self._read_both(told, kept["name"], now)
+        # what was read applies only to the keep it was read for, as with a
+        # try: the reads await, and the row is not this look's alone meanwhile
+        if uid in self._naming or row["kept"] is not kept:
+            return
+        if error:
+            log.warning("names: memory could not be read for %s's kept change to %s: %s; read again next round",
+                        uid, kept["name"], error)
+            return
+        outcome = settle(told, kept["name"], by_old, by_new, kept["session"], False)
+        if outcome == "advance":
+            self._took(uid, told, kept["name"], kept["session"], outcome, by_old, by_new, now)
+        elif said := self.household.kept_again(uid, outcome == "keep",
+                                               memory_said(told, kept["name"], by_old, by_new)):
+            self.household.save(self.store, uid)
+            log.info("%s", said)
+
     async def _mem(self, now: datetime, *args: str) -> str:
-        """A `mem` call the daemon makes itself, dated by the tick and bounded,
-        since nothing else would end one held up on the vault's lock. What it
-        says on stderr, such as an item it cannot date, is logged once."""
+        """A `mem` call the daemon makes itself, which fails unless `mem`
+        exits 0. What it says on stderr, such as an item it cannot date, is
+        logged once."""
+        code, out, err = await self._mem_call(now, *args)
+        if code:
+            raise RuntimeError(f"mem {args[0]} failed ({code}): {(err or out)[:300]}")
+        for line in err.splitlines():
+            if line.strip() and line not in self._clock_said:
+                self._clock_said.add(line)
+                log.warning("%s", line)
+        return out
+
+    async def _mem_call(self, now: datetime, *args: str) -> tuple[int, str, str]:
+        """`mem` as the daemon runs it, dated by the time it is given and
+        bounded, since nothing else would end one held up on the vault's lock:
+        its exit code, and what it printed and said on stderr."""
         proc = await asyncio.create_subprocess_exec(
             "mem", *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            env=vault.session_env(self.cfg, "", now))
+            # the household's date, as a session's: a re-look is given UTC's time
+            env=vault.session_env(self.cfg, "", now.astimezone(self.cfg.zone)))
         try:
             out, err = await asyncio.wait_for(proc.communicate(), MEM_TIMEOUT_S)
         except TimeoutError:
             proc.kill()
             await proc.wait()
             raise RuntimeError(f"mem {args[0]} took longer than {MEM_TIMEOUT_S} s") from None
-        if proc.returncode:
-            raise RuntimeError(f"mem {args[0]} failed ({proc.returncode}): "
-                               f"{(err or out).decode()[:300]}")
-        for line in err.decode().splitlines():
-            if line.strip() and line not in self._clock_said:
-                self._clock_said.add(line)
-                log.warning("%s", line)
-        return out.decode()
+        return proc.returncode, out.decode(), err.decode()
+
+    async def _people_named(self, name: str, now: datetime) -> Found:
+        """Whom `mem show "person:<name>"` finds among person nodes. Its exit
+        1 is an answer too: it is how `mem` says the name finds several, or no
+        one."""
+        code, out, _ = await self._mem_call(now, "show", f"person:{name}")
+        return found(code, out)
 
     # --- mail pipeline ---
 
@@ -923,7 +1186,7 @@ class Processor:
         await self._flush_given_up()
         await self._flush_lost()
         await self._flush_names()
-        for kind in ("breaker", "cap", "snapshot", "startup", "clock"):
+        for kind in ("breaker", "cap", "snapshot", "startup", "clock", "names"):
             await self._flush_alert(kind)
         await self._housekeep()
         if not self.cfg.email_triage:
@@ -1541,10 +1804,10 @@ class Processor:
             return None
         return None if arrival is None else (arrival, now)
 
-    async def memory_turn(self, task, arrival: str | None, now: datetime | None, *, channel: str,
+    async def memory_turn(self, task, arrival: str | None, now: datetime | None, *, channel: str | None,
                           reply_thread: str | None, owed: bool, state: dict | None = None,
                           frame: Callable[[], Awaitable[tuple[str, datetime] | None]] | None = None,
-                          more: Additions | None = None) -> str | None:
+                          more: Additions | None = None, sid: str | None = None) -> str | None:
         """One memory session for an arrival, at `now` in the household's zone:
         a fresh `claude -p` with the lab's prompt, tools, schema and
         environment, and its answer, if it has one, posted once. Messages and
@@ -1563,9 +1826,12 @@ class Processor:
         an earlier turn gave is still posted when a later turn fails or runs
         out of time; a session a stop cancels before its answer is recorded
         posts nothing, and the clock settles it at the next start
-        (settle_wakes). Returns what went wrong, or None. A post Slack refuses
-        is not something that went wrong: the run stays owed and is posted
-        later."""
+        (settle_wakes). With no `channel`, as for a change of name handed to
+        memory, nothing is posted at all, and the run is recorded as owing
+        nothing. `sid` is the session's id, made here unless the caller made
+        it, to find the run by. Returns what went wrong, or None. A post Slack
+        refuses is not something that went wrong: the run stays owed and is
+        posted later."""
         state = {} if state is None else state
         reserve = self.cfg.agent_expected_usd
         if (verdict := await self.check_budget(reserve_usd=reserve)) != "ok":
@@ -1574,7 +1840,7 @@ class Processor:
             state["recorded"] = True
             return verdict
         started = utcnow()
-        sid = str(uuid.uuid4())
+        sid = sid or str(uuid.uuid4())
         queued = time.monotonic()
         async with self.runner.agent_sem:
             # apart from the session's own time: with one session at a time,
@@ -1693,12 +1959,13 @@ class Processor:
                     else "timeout" if rr.timed_out else "error"),
             error=truncate(error, 1000) if error else None,
             result_text=text,
-            notified=0 if text else 1,
+            # an answer that reaches no one is kept, and owed to no one
+            notified=0 if text and channel is not None else 1,
         )
         state["recorded"] = True
         # posted before the snapshot, which can wait its turn behind another;
         # _post_run keeps deliver_pending off the run from its first line
-        if text:
+        if text and channel is not None:
             await self._post_run(run_id, text, channel, reply_thread, note=error is not None and not kept)
         if note:
             # after the answer it follows, once; it says the last turn failed,
@@ -1723,12 +1990,13 @@ class Processor:
         log.info("memory session %s in %s: waited %.1f s for a slot, ran %.1f s, %d mem session call(s) "
                  "over every transcript, as written in its commands, and %.1f s in the commands holding them; "
                  "%d added, %d results, %d recalled, %d recorded, %s",
-                 sid, channel, waited, ran, looks.calls, looks.seconds, added,
+                 sid, channel or "no conversation", waited, ran, looks.calls, looks.seconds, added,
                  # a session without a feed prints its last result alone
                  len(rr.results) if more is not None else int(rr.envelope is not None),
                  len((out or {}).get("recalled") or []),
                  len((out or {}).get("recorded") or []),
-                 (f"{len(text)} characters to post" + (f", then failed: {error}" if kept and error else ""))
+                 (f"{len(text)} characters" + (" to post" if channel is not None else ", posted nowhere")
+                  + (f", then failed: {error}" if kept and error else ""))
                  if text else (f"failed: {error}" if error else "silent"))
         if said := await asyncio.to_thread(vault.snapshot, self.cfg, f"after {sid}"):
             log.warning("%s", said)
@@ -2022,6 +2290,9 @@ async def run_daemon(cfg: Config) -> None:
     named = processor.household.told_names()
     if not named and len(failed) == len(cfg.slack_owner_user_ids):
         sys.exit(f"could not read any name from Slack: {failed[0]}; a session is told who is speaking by it")
+    # what a try or a keep left in memory, read before any session runs: a
+    # session stopped or cut short may have renamed the person
+    await processor.relook_names(datetime.now(timezone.utc), start=True)
     log.info("names: %s", ", ".join(processor.household.summary(uid) for uid in cfg.slack_owner_user_ids))
     # before Slack connects, so that no session has run in a DM since the
     # timed wake a stop or a crash cut short there, or the look a crash did

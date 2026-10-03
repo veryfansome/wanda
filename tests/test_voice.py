@@ -112,6 +112,17 @@ def texts() -> list[tuple[str, str]]:
             clock.COME_DUE.format(weekday="Thursday", time="17:10"),
             "`trajectory:aaaaaa`  2026-10-01T17:00, today  I undertook to remind fan at 5",
             "    involves: me; fan", "    asked by: fan", clock.AGAIN.format(speaker="fan")))).arrival("fan")),
+        # under an item asked for under a name the person no longer goes by
+        ("clock, timed undertaking asked under an earlier name", clock.Wake("k", "U1", "\n    ".join((
+            clock.COME_DUE.format(weekday="Thursday", time="17:00"),
+            "`trajectory:aaaaaa`  2026-10-01T17:00, today  I undertook to remind fan at 5",
+            "    involves: me; fan", "    asked by: fan",
+            "    " + clock.ASKED_THEN.format(now="Fan Zhu", asked="fan")))).arrival("Fan Zhu")),
+        # a change of a member's name, handed to memory by a session that reaches no one
+        ("the names frame", vault.renamed_text("fan", "Fan Zhu")),
+        ("the news of a change of name", vault.RENAMED.format(old="fan", new="Fan Zhu")),
+        ("the news of a change of name, unrendered", vault.RENAMED),
+        ("the frame of a session that reaches no one", vault.NOBODY.format(text="(the news)")),
         # the note doctor's command leaves on a reminder it reopens, which the
         # session woken for it reads among the item's notes
         ("doctor's note on a reminder reopened", REOPENED),

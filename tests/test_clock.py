@@ -1512,6 +1512,69 @@ def test_a_look_marks_only_her_own_reminder_one_of_the_household_asked_for():
         hers, hers + mark).splitlines()
 
 
+def renamed(store: Store, uid: str, name: str) -> Household:
+    """The run store once memory has taken `name` for `uid`, which sessions
+    are then told; every name before it still leads to the id."""
+    h = Household.load(store, list(NAMES))
+    h.advance(uid, name, "s-names", datetime(2026, 9, 20, tzinfo=timezone.utc))
+    h.save(store, uid)
+    return h
+
+
+def test_a_reminder_asked_under_an_earlier_name_says_so(tmp_path):
+    """fan asked under his old name, and is Fan Zhu now: his wake is in his
+    DM, and says what she knew him as, spelled as the item prints it. One he
+    asked under the name he has now says nothing of it."""
+    p, store, turns, alerts, mems = processor(tmp_path, FakeSlack(), [SILENT, SILENT])
+    p.household = renamed(store, "U1", "Fan Zhu")
+    item = ("`trajectory:{tid}`  2026-10-01T17:00, today  I undertook to remind fan at 5 to call the plumber\n"
+            "    involves: me; fan\n    asked by: {asked}\n")
+    due = item.format(tid="a24e0d", asked="Fan") + item.format(tid="b35f1e", asked="fan zhu")
+
+    async def mem(now, *args):
+        return due
+    p._mem = mem
+    at5 = datetime(2026, 10, 1, 17, 0, tzinfo=LA)
+    wakes = asyncio.run(p._due_wakes(at5))
+    assert [(w.person, w.asked) for w in wakes] == [("U1", "fan"), ("U1", "fan zhu")]
+    assert wakes[0].text.endswith("\n        asked by: Fan\n        " + clock.ASKED_THEN.format(now="Fan Zhu", asked="Fan"))
+    assert wakes[0].arrival("Fan Zhu").endswith("    asked by: Fan\n        When this was asked, I knew Fan Zhu as "
+                                                "Fan.")
+    assert clock.ASKED_THEN.split("{")[0] not in wakes[1].text
+    assert wakes[1].text.endswith("asked by: fan zhu")
+
+
+def test_a_look_says_which_items_were_asked_under_an_earlier_name(tmp_path):
+    """In fan's look, last under an item he asked as fan, and under one mei
+    asked as mei since she became Mei Chen; not under one asked under its
+    asker's name now."""
+    p, store, turns, alerts, mems = processor(tmp_path, FakeSlack(), [SILENT])
+    renamed(store, "U1", "Fan Zhu")
+    p.household = renamed(store, "U2", "Mei Chen")
+    gift = ("`trajectory:596f2d`  2026-10-01T09:30, today  I undertook to remind fan at 9:30 to ring the bank\n"
+            "    involves: me; fan\n    asked by: fan\n"
+            "    still to come: the clock gives it to fan at 09:30, but only while it is open and timed so\n")
+    tablet = ("`trajectory:6ec742`  2026-10-01T08:00, today  I undertook to remind mei at 8 to give fan his tablet\n"
+              "    involves: me; mei; fan\n    asked by: mei\n")
+    shed = ("`trajectory:94f6cf`  2026-10-01, today  I undertook to remind fan to lock the shed\n"
+            "    involves: me; fan\n    asked by: Fan Zhu\n")
+    listed = "Come due for Fan Zhu after 2026-09-30:\n" + gift + tablet + shed
+    mark = "    still to come: the clock gives it to mei at 08:00, but only while it is open and timed so"
+    six = datetime(2026, 10, 1, 8, 6, tzinfo=LA)
+    got = clock.still_to_come(listed.splitlines(), six, p.household.askers(), lambda k: False,
+                              p.household.told_names())
+    assert got == (
+        "Come due for Fan Zhu after 2026-09-30:\n" + gift + "    When this was asked, I knew Fan Zhu as fan.\n"
+        + tablet + mark + "\n    When this was asked, I knew Mei Chen as mei.\n" + shed).splitlines(), got
+    assert clock.still_to_come(got, six, p.household.askers(), lambda k: False, p.household.told_names()) == got
+    # the look's session is handed it so
+    p._mem = lambda now, *args: asyncio.sleep(0, listed)
+    [look] = clock.morning_wakes(six, {"U1": LOOKS["U1"]}, QUIET, lambda q: None, p.household.told)
+    asyncio.run(p._clock_session(look, six))
+    assert "\n        When this was asked, I knew Fan Zhu as fan.\n" in turns[0][2]
+    assert turns[0][2].endswith("    asked by: Fan Zhu")
+
+
 def test_every_reminder_not_given_is_named_and_none_is_dropped(tmp_path):
     """Two in one UTC day, the second while the first's alert waits for
     Slack, are named together; one after the day's alert is named the next

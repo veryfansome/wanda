@@ -5,7 +5,8 @@ transcripts, reminders and memory keep a name after Slack has moved on. So
 every name sessions have been told for a member is kept in the run store,
 one meta row per member id (`names:<id>`), and a member's change of name in
 Slack waits there, shown by doctor, while sessions go on being told the name
-memory knows them by.
+memory knows them by, until a session of its own has told memory of the
+change and memory's answer gives the new one (`found`, `settle`).
 
 A session is told the newest name in a row's `told`. Slack's name joins it
 at a first sight, at a change of capitals, which `mem` reads as the same
@@ -18,6 +19,7 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone, tzinfo
 
 # How often every allowed id's name is read from Slack. A change waits for
@@ -48,6 +50,18 @@ REFUSALS = ("busy", "breaker")
 # a try's wait after it fails: an hour, doubled each time, up to a day
 FIRST_WAIT = timedelta(hours=1)
 LONGEST_WAIT = timedelta(days=1)
+# What `mem show "person:<name>"` prints (cmd_show and miss_text in
+# memory/src/bin/mem.rs). One node is its id on a line of its own, then its
+# file; several are an ambiguity, each candidate `<kind>:<id> (<summary or
+# label>)`, joined by "; ". A summary is printed as written, so it may hold
+# "; person:… (" or a bracket of its own: a candidate is read only where it
+# opens the list, after "node: ", or follows the one before, after "); ".
+NODE = re.compile(r"[a-z]+:\S+")
+AMBIGUOUS = " is more than one node: "
+CANDIDATE = re.compile(r"(?:node: |\); )([a-z]+):([0-9a-f]{6}) \(")
+# every way it says no person is so named: a mistyped id and the kind alone
+# included, both of which a name's first word can read as
+NO_PERSON = ("(no node for ", "(no person ", "('person' is a kind, with no id or name after it")
 
 
 def spelled(s: str | None) -> str:
@@ -72,6 +86,13 @@ def _at(iso: str) -> datetime:
 
 def _wait(count: int) -> timedelta:
     return min(FIRST_WAIT * 2 ** max(0, count - 1), LONGEST_WAIT)
+
+
+def _uncount(tried: dict) -> None:
+    # a try is counted while it reads "did not end"; one that ends as no
+    # failure is taken back once, however often it is read again
+    if tried["error"] == "did not end":
+        tried["count"] = max(0, tried["count"] - 1)
 
 
 def tries(n: int) -> str:
@@ -111,6 +132,84 @@ def flaw(name: str) -> str | None:
     if [n for c in WAS_NAMED.findall(f"~~was named: {name}~~") if (n := spelled(c))] != [name]:
         return "is misread by mem once a rename strikes it"
     return None
+
+
+# --- what memory says about a name ---
+
+@dataclass(frozen=True)
+class Found:
+    """What `mem show "person:<name>"` found among person nodes."""
+    ids: tuple[str, ...] = ()  # the people it found: none, one or several
+    label: str = ""  # for one: what it is called, read as fm::label reads it
+    made: str = ""  # for one: the session that made it, "" for one made by hand
+    said: str = ""  # what it found, in mem's words, for doctor
+
+
+def _unq(v: str) -> str:
+    """A front matter value as fm::unq reads it: a double-quoted one exactly,
+    an unquoted one as it is."""
+    v = v.strip()
+    if len(v) >= 2 and v[0] == v[-1] == '"':
+        try:
+            return json.loads(v)
+        except ValueError:
+            return v[1:-1]
+    return v
+
+
+def found(code: int, out: str) -> Found:
+    """What `mem show "person:<name>"` answered, with its exit code. `person:`
+    looks among person nodes by label and by a name a rename struck, and with
+    no person so named shows a node of another kind, or lists several, so
+    only a person counts. Raises on any other answer: a busy vault, which
+    wrote and read nothing, or a shape not known here."""
+    text = out.strip()
+    first, _, rest = text.partition("\n")
+    if code == 0 and NODE.fullmatch(first):
+        if not first.startswith("person:"):
+            return Found(said=f"no person, but {first}")
+        meta = {}
+        if rest.startswith("---\n") and "\n---" in rest[4:]:
+            for line in rest[4:4 + rest[4:].index("\n---")].split("\n"):
+                key, sep, value = line.partition(": ")
+                if sep:
+                    meta[key] = _unq(value)
+        label = spelled(meta.get("name") or meta.get("summary"))
+        return Found((first,), label, meta.get("made", ""), f"{first} ({label})")
+    if code == 1 and AMBIGUOUS in first:
+        ids = tuple(f"{kind}:{local}" for kind, local in CANDIDATE.findall(text) if kind == "person")
+        listed = first.partition(AMBIGUOUS)[2].removesuffix(". An id says which.)")
+        return Found(ids, said=listed if ids else f"no person, but {listed}")
+    if code == 1 and first.startswith(NO_PERSON):
+        return Found(said="no one")
+    raise ValueError(f"mem show answered (exit {code}): {text[:300]}")
+
+
+def settle(old: str, new: str, by_old: Found, by_new: Found, sid: str, ran_ok: bool) -> str:
+    """What memory's answer means for a change from `old` to `new` handed to
+    it by session `sid`: "advance", "keep" or "keep, alerted". It advances
+    when the new name finds exactly one person, named it in any capitals,
+    who is also found by the old name, which finds every person named or
+    once named so, or was made by that session while the old name finds no
+    one; and, after a run recorded ok (`ran_ok`), when neither name finds
+    anyone. Otherwise memory kept the old name: by its own choice when the
+    new name finds no one, or only people the old one finds too; and
+    alerted when it finds someone the old one does not, as a second person,
+    an ambiguity a rename made or a namesake already there, which no
+    session can undo, since a struck name keeps answering."""
+    if len(by_new.ids) == 1 and same(by_new.label, new) and (
+            by_new.ids[0] in by_old.ids or (not by_old.ids and sid and by_new.made == sid)):
+        return "advance"
+    if ran_ok and not by_new.ids and not by_old.ids:
+        return "advance"
+    if set(by_new.ids) <= set(by_old.ids):
+        return "keep"
+    return "keep, alerted"
+
+
+def memory_said(old: str, new: str, by_old: Found, by_new: Found) -> str:
+    """Whom memory finds by each name, for doctor's line on a keep."""
+    return f"person:{new} finds {by_new.said}; person:{old} finds {by_old.said}"
 
 
 def _blank() -> dict:
@@ -303,7 +402,7 @@ class Household:
             return None
         return shown
 
-    def _awaits_memory(self, store, tried: dict) -> bool:
+    def awaits_memory(self, store, tried: dict) -> bool:
         """Whether a try's own run was recorded and memory has not yet been
         read for its outcome: an ok run, a run while the try still reads "did
         not end", or a stop's cancelled run while it reads "stopped mid-run",
@@ -326,7 +425,7 @@ class Household:
                 continue
             if self.refusal(uid, new):
                 continue
-            if tried and (self._awaits_memory(store, tried)
+            if tried and (self.awaits_memory(store, tried)
                           or (same(tried["name"], new) and now < _at(tried["next"]))):
                 continue
             return uid, told, new
@@ -363,18 +462,19 @@ class Household:
         row["tried"] = None
 
     def failed(self, uid: str, name: str, error: str, now: datetime, *, counted: bool = True) -> None:
-        """A try that ended with no outcome. Not `counted`, a refusal before
-        the model ran, `error` being the run budget's verdict: its count is
-        taken back and it waits an hour."""
+        """A try that ended with no outcome, its count and wait as `trying`
+        set them. Not `counted`, a refusal before the model ran, `error` being
+        the run budget's verdict: its count is taken back and it waits an
+        hour."""
         row = self._row(uid)
         tried = row["tried"]
         if not tried or not same(tried["name"], name):
-            tried = row["tried"] = {"name": name, "session": "", "at": _iso(now), "count": 1,
-                                    "next": _iso(now + _wait(1))}
-        tried["error"] = error
+            tried = row["tried"] = {"name": name, "session": "", "at": _iso(now), "error": "did not end",
+                                    "count": 1, "next": _iso(now + _wait(1))}
         if not counted:
-            tried["count"] = max(0, tried["count"] - 1)
+            _uncount(tried)
             tried["next"] = _iso(now + FIRST_WAIT)
+        tried["error"] = error
 
     def stopped(self, uid: str, now: datetime, *, mid_run: bool = False) -> None:
         """A stop, which is not a failure: the count is taken back and the
@@ -383,8 +483,42 @@ class Household:
         written."""
         tried = self._row(uid)["tried"]
         if tried:
-            tried.update(count=max(0, tried["count"] - 1), error="stopped mid-run" if mid_run else "stopped",
-                         next=_iso(now))
+            _uncount(tried)
+            tried.update(error="stopped mid-run" if mid_run else "stopped", next=_iso(now))
+
+    def untried(self, uid: str) -> None:
+        """A try memory did not take, for a name Slack no longer shows: there
+        is nothing left to hand."""
+        self._row(uid)["tried"] = None
+
+    def unanswered(self, uid: str, error: str) -> None:
+        """Memory could not be read after the try's own run: not a failure,
+        since the model ran and may have written. The count is taken back,
+        and `error` kept for doctor; `due` holds the id until a read of
+        memory succeeds."""
+        tried = self._row(uid)["tried"]
+        if tried:
+            _uncount(tried)
+            tried["error"] = error
+
+    def kept_again(self, uid: str, plain: bool, said: str) -> str:
+        """A kept change read again with no session, memory still not giving
+        the new name. An alerted keep that memory now keeps by its own
+        choice, as once a second person is forgotten, ends, so a session of
+        its own is told the change again. A plain keep whose new name memory
+        now gives someone else as well becomes an alerted one. Returns what
+        changed, for the log, or ""."""
+        row = self._row(uid)
+        kept = row["kept"]
+        if kept is None or kept["plain"] == plain:
+            return ""
+        if plain:
+            row["kept"] = None
+            return (f"names: {uid}'s change to {kept['name']} is handed again: memory no longer gives that name "
+                    "to someone else")
+        kept.update(plain=False, alerted=False, memory=said)
+        return (f"names: {uid} stays {self.told(uid)} to sessions: memory now gives {kept['name']} to someone else "
+                f"as well ({said})")
 
     # --- the alerts that go once ---
 
@@ -401,6 +535,12 @@ class Household:
         was posted. Either way the id is not alerted again that UTC day."""
         out["alerted"] = True
         self.rows[uid]["out_day"] = _iso(now)[:10]
+
+    def unalerted_keeps(self) -> list[str]:
+        """Each allowed id whose change memory did not take as theirs alone,
+        not yet alerted: once for each such keep."""
+        return [uid for uid in self.allowed if (row := self.rows.get(uid)) and (kept := row["kept"])
+                and not kept["plain"] and not kept["alerted"]]
 
     # --- what the log and doctor say ---
 
@@ -492,12 +632,12 @@ class Household:
 
     def _try_state(self, store, tried: dict, when) -> tuple[bool, str]:
         session, error = tried["session"][:8], tried["error"]
-        # before _awaits_memory: a try still reading "did not end" has had no
+        # before awaits_memory: a try still reading "did not end" has had no
         # memory read, whether or not its run was recorded; its session is
         # running, or a stop or crash cut it short and the next start reads it
         if error == "did not end":
             return False, ": did not end (running now, or the daemon has not started since)"
-        if self._awaits_memory(store, tried):
+        if self.awaits_memory(store, tried):
             if error == "stopped mid-run":
                 return False, f": stopped mid-run (session {session}); memory is read again at each refresh"
             return False, (f": memory's answer could not be read (session {session}): {error}; "

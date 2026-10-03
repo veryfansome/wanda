@@ -1,14 +1,16 @@
 """Each household member's name from Slack, and every name they were told
 by, as the run store keeps them: which name Slack gives can be used, who is
-let in, a change held until it is due, and what doctor shows. No Slack, no
-`mem`: a user record is what users.info returns, and a run is a row."""
+let in, a change held until it is due, what memory's answer about a change
+means, and what doctor shows. No Slack, no `mem`: a user record is what
+users.info returns, a run is a row, and memory's answer is what `mem show`
+printed."""
 
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import pytest
 
-from wanda.household import NAMES_EVERY_S, Household, flaw
+from wanda.household import NAMES_EVERY_S, Found, Household, flaw, found, settle
 from wanda.store import Store, utcnow
 
 T0 = datetime(2026, 10, 4, 15, 0, tzinfo=timezone.utc)
@@ -370,6 +372,23 @@ def test_a_stop_is_due_at_once_and_one_mid_run_waits_for_memory(store):
     assert h.due(store, now + 2 * ROUND) is None
 
 
+def test_a_stop_mid_run_takes_the_count_back_once(store):
+    """However often the re-look reads it again."""
+    h = Household({}, ["U1"])
+    changed(h)
+    now = T0 + ROUND
+    for n in range(2):
+        h.trying("U1", "Fan Zhu", f"s-{n}", now)
+        h.failed("U1", "Fan Zhu", "claude reported an error", now)
+    h.trying("U1", "Fan Zhu", "s-2", now)
+    ran(store, "s-2", "cancelled")
+    h.stopped("U1", now, mid_run=True)
+    assert h.rows["U1"]["tried"]["count"] == 2
+    # the re-look's good read, which does not advance
+    h.stopped("U1", now)
+    assert h.rows["U1"]["tried"]["count"] == 2
+
+
 @pytest.mark.parametrize("status,error,held", [
     ("ok", "did not end", True),
     ("ok", "mem show: the store stayed busy", True),
@@ -590,3 +609,136 @@ def test_doctor_shows_a_keep(store):
     assert shown(h, store, "U1", now) == (False, "sessions say fan, since 07:50; Slack shows Fan Zhu (display name "
                                                  "Fan Zhu, full name empty): memory did not take it as theirs alone "
                                                  "(session s-1aaaaa): two people are Fan Zhu now")
+
+
+# --- what memory says about a name, and what it means ---
+
+def person(pid, name, made='"s-one"', body=""):
+    """`mem show` of one person, as the build printed it."""
+    return (f"{pid}\n---\nname: {name}\nsummary: \"the member\"\ncreated: \"2026-11-20\"\n"
+            + (f"made: {made}\n" if made else "")
+            + f"last_seen: \"2026-11-20\"\naliases: [{name}]\ntags: [\"person\"]\n---\n\n{body}\n")
+
+
+RENAMED = person("person:d1690d", '"Fan Zhu"', body="~~was named: fan~~ (renamed 2026-11-20)\n")
+# summaries printed as written: "; ", " (", another node's id, odd brackets
+TWO = ("('fan' is more than one node: person:44ef1b (a cousin; person:7e9623 (mei) is his aunt); person:854568 "
+       "(the member). An id says which.)")
+THREE = ("('mei' is more than one node: person:3a74c8 (dad :) of two); person:4eb1b4 (z) w); person:7e20eb (x (y). "
+         "An id says which.)")
+UNSUMMED = "('jo' is more than one node: person:047f7c (jo); person:b4e870 (the neighbour). An id says which.)"
+EVENTS = ("('Mei' is more than one node: event:2026-11-20-5554f0 (Mei); event:2026-11-20-5557ce (Mei). An id "
+          "says which.)")
+# a name's first word read as a mistyped id, in an empty vault and beside a person
+MISTYPED = ["fan_zhu", "fan/zhu", "Mei, Chen", "dad2", "fan,zhu", "ab12", "{fan}", "<fan>", "fan*", "$fan",
+            "2026-10 fan", ":", "/", "a1b2c3 x"]
+NOBODY_YET = "there are no people yet, and `mem search` finds by other words)"
+LISTED = "people/CLAUDE.md lists the people, and `mem search` finds by other words)"
+
+
+def test_one_person_is_read_with_its_name_and_the_session_that_made_it():
+    assert found(0, person("person:17b218", '"fan"')) == Found(("person:17b218",), "fan", "s-one",
+                                                                 "person:17b218 (fan)")
+    assert found(0, RENAMED) == Found(("person:d1690d",), "Fan Zhu", "s-one", "person:d1690d (Fan Zhu)")
+    # an older file's unquoted values, and one made by hand, with no session
+    assert found(0, person("person:5e6f70", "Mei Chen", made="s-old")).made == "s-old"
+    assert found(0, person("person:5e6f70", "Mei Chen")).label == "Mei Chen"
+    assert found(0, person("person:5e6f70", '"mei"', made="")).made == ""
+    assert found(0, person("person:5e6f70", '"Mei \\"M\\" Chen"')).label == 'Mei "M" Chen'
+
+
+@pytest.mark.parametrize("out,ids", [
+    (TWO, ("person:44ef1b", "person:854568")),
+    (THREE, ("person:3a74c8", "person:4eb1b4", "person:7e20eb")),
+    (UNSUMMED, ("person:047f7c", "person:b4e870")),
+])
+def test_several_people_are_read_to_their_own_ids_alone(out, ids):
+    assert found(1, out).ids == ids
+
+
+@pytest.mark.parametrize("code,out", [
+    (1, EVENTS),
+    (1, "('Pip' is more than one node: thing:4d5e6f (Pip); thing:5e6f70 (Pip). An id says which.)"),
+    (0, "thing:bae83f\n---\nname: \"dryer\"\n---\n"),
+    (1, f"(no person is named 'Fan Zhu'; {NOBODY_YET}"),
+    (1, f"(no person is named 'Fan Zhu'; {LISTED}"),
+    (1, "('person' is a kind, with no id or name after it; there are no people yet)"),
+    (1, "('person' is a kind, with no id or name after it; people/CLAUDE.md lists them)"),
+    (1, "(no node for '')"),
+] + [(1, f"(no person 'person:{n}'; {tail}") for n in MISTYPED for tail in (NOBODY_YET, LISTED)])
+def test_no_person_is_read_from_every_answer_that_finds_none(code, out):
+    assert found(code, out).ids == ()
+
+
+@pytest.mark.parametrize("code,out", [
+    (1, "(the store could not be held for this call: it stayed busy for 90 s; nothing was read or written)"),
+    (2, "error: unexpected argument '--x' found"),
+    (0, "ok person:17b218"),
+    (1, "person:17b218\n---\n"),
+])
+def test_a_busy_vault_or_an_unknown_answer_raises(code, out):
+    with pytest.raises(ValueError):
+        found(code, out)
+
+
+def one(pid, label, made="s-x"):
+    return Found((pid,), label, made)
+
+
+NONE = Found()
+
+
+@pytest.mark.parametrize("by_old,by_new,ran_ok,outcome", [
+    # fan renamed Fan Zhu, a cousin also fan or not
+    (one("person:aaaaaa", "Fan Zhu"), one("person:aaaaaa", "Fan Zhu"), True, "advance"),
+    (Found(("person:aaaaaa", "person:cccccc")), one("person:aaaaaa", "fan zhu"), True, "advance"),
+    # memory never knew him, and this session made him; after a run ok, neither name finds anyone
+    (NONE, one("person:bbbbbb", "Fan Zhu", "s-1"), False, "advance"),
+    (NONE, NONE, True, "advance"),
+    (NONE, NONE, False, "keep"),
+    # made by another session while memory never knew him: a namesake already there
+    (NONE, one("person:bbbbbb", "Fan Zhu", "s-0"), True, "keep, alerted"),
+    # fan left as he was; fan and a cousin both fan; relabelled Dad
+    (one("person:aaaaaa", "fan"), NONE, True, "keep"),
+    (Found(("person:aaaaaa", "person:cccccc")), NONE, True, "keep"),
+    (one("person:aaaaaa", "Dad"), NONE, True, "keep"),
+    # a second Fan Zhu beside fan, or Fan Zhu already someone else
+    (one("person:aaaaaa", "fan"), one("person:bbbbbb", "Fan Zhu"), True, "keep, alerted"),
+])
+def test_what_memorys_answer_means(by_old, by_new, ran_ok, outcome):
+    assert settle("fan", "Fan Zhu", by_old, by_new, "s-1", ran_ok) == outcome
+
+
+def test_a_change_back_is_read_the_same_way():
+    member = one("person:aaaaaa", "Fan Zhu")
+    # declined: the member keeps Fan Zhu, and fan finds him by his struck line
+    assert settle("Fan Zhu", "fan", member, member, "s-2", True) == "keep"
+    # beside a cousin fan, kept as Fan Zhu or renamed back
+    both = Found(("person:aaaaaa", "person:cccccc"))
+    assert settle("Fan Zhu", "fan", member, both, "s-2", True) == "keep, alerted"
+    assert settle("Fan Zhu", "fan", one("person:aaaaaa", "fan"), both, "s-2", True) == "keep, alerted"
+    # renamed back, alone
+    assert settle("Fan Zhu", "fan", one("person:aaaaaa", "fan"), one("person:aaaaaa", "fan"), "s-2", True) == "advance"
+
+
+def test_an_ambiguitys_first_candidate_counts():
+    """The old name finds the member and a cousin; the new one finds a stray,
+    listed first, and the member. Dropping the first candidate would make it
+    a plain keep."""
+    by_old = found(1, "('fan' is more than one node: person:854568 (the member); person:44ef1b (a cousin). An id "
+                      "says which.)")
+    by_new = found(1, "('Fan Zhu' is more than one node: person:9b1e0a (made in a reply); person:854568 (the "
+                      "member). An id says which.)")
+    assert by_new.ids == ("person:9b1e0a", "person:854568")
+    assert settle("fan", "Fan Zhu", by_old, by_new, "s-1", True) == "keep, alerted"
+    assert settle("fan", "Fan Zhu", by_old, Found(by_new.ids[1:]), "s-1", True) == "keep"
+
+
+def test_a_cousin_once_fan_relabelled_with_the_new_name_is_advanced_onto():
+    """Today's answer, pinned so that a change of rule is deliberate: a
+    person once called by the member's old name, and relabelled with exactly
+    the new one before the change, is among the old name's people."""
+    by_old = found(1, "('fan' is more than one node: person:854568 (the member); person:44ef1b (Fan Zhu). An id "
+                      "says which.)")
+    by_new = found(0, person("person:44ef1b", '"Fan Zhu"', body="~~was named: fan~~ (renamed 2026-11-01)\n"))
+    assert settle("fan", "Fan Zhu", by_old, by_new, "s-1", True) == "advance"

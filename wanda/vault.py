@@ -297,6 +297,33 @@ def added_text(place: str, speaker: str, text: str, when: str) -> str:
             .replace("{text}", _indent(text, 4)))
 
 
+# A session no message started, whose answer reaches no one: the harness's own
+# news for memory. `mem session` reads it back (NOBODY_RE in
+# memory/src/transcript.rs) with no speaker, and shows what was said there as
+# said to no one.
+NOBODY = "No message started this session. What I say now reaches no one.\n\n    {text}"
+# A member's name in Slack has changed; both names are ones everyone in the
+# workspace sees. Its third and fourth sentences are the rule memory's answer
+# is read by once the session ends (settle in wanda/household.py), and change
+# with it.
+RENAMED = ("The person I have known in this Slack as {old} is named {new} there now. It is the same person; "
+           "only the name I take for them from this Slack has changed. When my memory is read after this "
+           "session ends, their messages, and others' mentions of them, start to reach me under {new} if it "
+           "finds exactly one person by the name {new}, named {new}, in any capitals, who is also found by "
+           "the name {old}, or was made in this session while the name {old} finds no one; and, if this "
+           "session ended without failing, also if it finds no one by either name. Otherwise they go on "
+           "reaching me under {old}. What they said before now, and what I hold about them, may name them "
+           "{old}. A note of mine that names them only in its words has no link to them: `mem recall` "
+           "reaches it by neither name, and `mem search` finds it only by a word of three or more characters "
+           "that it holds.")
+
+
+def renamed_text(old: str, new: str) -> str:
+    """What a names session is handed: the change, in the frame of a session
+    whose answer reaches no one."""
+    return NOBODY.format(text=_indent(RENAMED.format(old=old, new=new), 4))
+
+
 def _texts(content) -> list[str]:
     """The words of a message a session was handed: a string, or text blocks
     alone, as a turn's input is; a tool's result is not one."""

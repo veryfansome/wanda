@@ -30,6 +30,11 @@ COME_DUE = "It is {weekday}, {time}, and this has come due:"
 # store holds of that session, a note that the reminder was given among it,
 # can read as given, though nothing reached the person
 AGAIN = "A session I began for this earlier was cut short before anything reached {speaker}."
+# last under an item asked for under a name its asker no longer goes by,
+# `{asked}` as the item gives it and `{now}` the name sessions are told now: a
+# session that cannot tie the two names could take the reminder for someone
+# else's
+ASKED_THEN = "When this was asked, I knew {now} as {asked}."
 
 # One item as `mem due` prints it, whatever its date was written as. The
 # indented lines under it say who and what it involves, any rule it is held
@@ -209,8 +214,20 @@ def missed(now: datetime, looks: dict[str, time], last_look: Callable[[str], str
     return [person for person in looks if last_look(person) != today]
 
 
+def asked_then(item: Item, askers: dict[str, str], told: dict[str, str] | None) -> str:
+    """ASKED_THEN as a line of the item, indented as its own lines are, when
+    the name it was asked under leads to a member whom sessions are now told
+    another name for (`told`, each let-in id's name); "" otherwise."""
+    asked = item.field(ASKED_BY).strip()
+    now = (told or {}).get(askers.get(item.asked_by, ""))
+    if not now or now.lower() == item.asked_by:
+        return ""
+    return "    " + ASKED_THEN.format(now=now, asked=asked)
+
+
 def due_wakes(now: datetime, due: list[Item], askers: dict[str, str], fired: Callable[[str], bool],
-              said: set[str], lost: Callable[[Item, str], None] = lambda item, why: None) -> list[Wake]:
+              said: set[str], lost: Callable[[Item, str], None] = lambda item, why: None,
+              told: dict[str, str] | None = None) -> list[Wake]:
     """Each undertaking of hers whose `--by` carries a time of day that has
     come, for the person who asked for it, at that time whatever the hour, in
     the direct message of the member id `askers` leads their name to. A
@@ -219,7 +236,8 @@ def due_wakes(now: datetime, due: list[Item], askers: dict[str, str], fired: Cal
     have asked, a time no clock shows, or noticed too late) is said once in
     the log, with its id and why; one noticed too late, which the clock was
     to give, is also handed to `lost`, since the reminder asked for was not
-    given."""
+    given. One asked for under a name the person no longer goes by says so
+    under the item (ASKED_THEN, from `told`)."""
     wall = now.replace(tzinfo=None)
     out: list[Wake] = []
 
@@ -255,13 +273,14 @@ def due_wakes(now: datetime, due: list[Item], askers: dict[str, str], fired: Cal
                 lost(item, why)
                 continue
             head = COME_DUE.format(weekday=WEEKDAYS[now.weekday()], time=now.strftime("%H:%M"))
-            out.append(Wake(key, askers[item.asked_by], "\n    ".join((head, *item.lines)), item.id, item.by,
+            lines = item.lines + ((then,) if (then := asked_then(item, askers, told)) else ())
+            out.append(Wake(key, askers[item.asked_by], "\n    ".join((head, *lines)), item.id, item.by,
                             item.asked_by))
     return out
 
 
 def still_to_come(listed: list[str], now: datetime, askers: dict[str, str],
-                  fired: Callable[[str], bool]) -> list[str]:
+                  fired: Callable[[str], bool], told: dict[str, str] | None = None) -> list[str]:
     """A look's list, with each undertaking of hers whose time has come and
     whose wake has not run marked as still to come, as due.rs marks those
     later that day. A look that starts after such a time, while the wake waits
@@ -270,10 +289,14 @@ def still_to_come(listed: list[str], now: datetime, askers: dict[str, str],
     `due_wakes`' own: the clock wakes for it at the next due check. The mark
     says what the clock will do as the look starts: a look still running when
     the reminder's time is LATE gone has been told of a wake the clock can no
-    longer give, and the reminder is kept as not given."""
+    longer give, and the reminder is kept as not given. Any item asked for
+    under a name a member no longer goes by, whoever asked, says so last
+    (ASKED_THEN, from `told`)."""
     wall = now.replace(tzinfo=None)
-    waiting = {}
+    waiting: dict[str, list[str]] = {}
     for item in items("\n".join(listed)):
+        if (then := asked_then(item, askers, told)) and then not in item.lines:
+            waiting.setdefault(item.id, []).append(then)
         if (item.field(STILL_TO_COME) or not TIMED.match(item.by) or item.asked_by not in askers
                 or not any(n in SELF for n in item.involves)):
             continue
@@ -286,18 +309,19 @@ def still_to_come(listed: list[str], now: datetime, askers: dict[str, str],
         if (wall - LATE < at <= wall
                 and not fired(f"clock:due:{item.id}:{item.by}:{item.asked_by}")):
             # the asker as `mem due` printed them, as due.rs's own mark does
-            waiting[item.id] = STILL_TO_COME_LINE.format(asker=item.field(ASKED_BY).strip(), time=item.by[11:])
+            waiting.setdefault(item.id, []).insert(0, STILL_TO_COME_LINE.format(
+                asker=item.field(ASKED_BY).strip(), time=item.by[11:]))
     out: list[str] = []
-    owed = ""
+    owed: list[str] = []
     for line in listed:
         # last under the item, as due.rs puts it: after its own indented lines
         if owed and not line.startswith("    "):
-            out.append(owed)
-            owed = ""
+            out += owed
+            owed = []
         out.append(line)
         if m := DUE.match(line):
-            owed = waiting.get(m["id"], "")
-    return out + ([owed] if owed else [])
+            owed = waiting.get(m["id"], [])
+    return out + owed
 
 
 def first_start(at: time, quiet: tuple[time, time] | None) -> time:

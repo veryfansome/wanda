@@ -104,8 +104,8 @@ def parser():
         body = re.search(rf"static {name}: .*?Regex::new\((.*?)\)\.unwrap\(\)", src, re.DOTALL).group(1)
         return re.compile("".join(re.findall(r'r"(.*?)"', body, re.DOTALL)))
 
-    prompt_re, dm_re, email_re, thread_re, unprompted_re = (
-        regex(n) for n in ("PROMPT_RE", "DM_RE", "EMAIL_RE", "THREAD_RE", "UNPROMPTED_RE"))
+    prompt_re, nobody_re, dm_re, email_re, thread_re, unprompted_re = (
+        regex(n) for n in ("PROMPT_RE", "NOBODY_RE", "DM_RE", "EMAIL_RE", "THREAD_RE", "UNPROMPTED_RE"))
     places = {"a direct message": "dm", "a group direct message": "group dm", "a Slack channel": "channel",
               "a public Slack channel": "public channel", "a Slack thread in a public channel": "public thread"}
 
@@ -114,7 +114,8 @@ def parser():
         if not m:
             return ("", "", "", text.strip())
         when, arrival = m.group(1), m.group(2)
-        for chan, rx in (("dm", dm_re), ("email", email_re), ("thread", thread_re), ("clock", unprompted_re)):
+        for chan, rx in (("nobody", nobody_re), ("dm", dm_re), ("email", email_re), ("thread", thread_re),
+                         ("clock", unprompted_re)):
             if a := rx.match(arrival):
                 named = a.groupdict()
                 lines = [line.removeprefix("    ") for line in
@@ -150,6 +151,19 @@ def test_a_turn_of_several_speakers_is_read_back_as_no_one_persons():
         text = vault.prompt("2026-10-01", vault.arrival_text(
             place, "mei", SAID, ["fan", "mei"], [("16:58", "fan", "remind me at 5")], also=["fan"]))
         assert parser()(text) == ("2026-10-01", chan, "mei (after fan)", SAID)
+
+
+def test_a_session_that_reaches_no_one_is_read_back_with_no_speaker():
+    """The names session's frame, as `mem session` reads it: the channel
+    `nobody`, no speaker, and the news it carries; a clock frame for someone
+    called "no one" is still the clock's."""
+    text = vault.prompt("2026-10-01", vault.renamed_text("fan", "Fan Zhu"))
+    news = vault.RENAMED.format(old="fan", new="Fan Zhu")
+    assert parser()(text) == ("2026-10-01", "nobody", "", news)
+    assert vault.renamed_text("fan", "Fan Zhu") == vault.NOBODY.format(text=news)
+    look = vault.prompt("2026-10-01", "No message started this session. What I say now reaches no one alone, in a "
+                                      "direct message.\n\n    It is Monday, 08:00, and this is my look.")
+    assert parser()(look) == ("2026-10-01", "clock", "no one", "It is Monday, 08:00, and this is my look.")
 
 
 def added_parser():

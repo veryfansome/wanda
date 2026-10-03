@@ -2,10 +2,13 @@
 trash caps, time-gated retries, and budget saturation vs. a tripped breaker."""
 
 import asyncio
+import contextlib
 import json
 import os
+import re
 import signal
 import sqlite3
+import subprocess
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -16,7 +19,7 @@ import pytest
 from wanda.config import Config
 from wanda.events import Event
 from wanda import main, vault
-from wanda.household import Household
+from wanda.household import NAMES_EVERY_S, Household
 from wanda.main import ANCHOR, BUDGET_REPLIES, MAX_APPLY_ATTEMPTS, RETRY_BASE_S, Additions, Processor
 from wanda.runner import RunResult, RunnerService
 from wanda.store import Store, utcnow
@@ -2190,35 +2193,45 @@ def test_the_names_alert_waits_for_slack_and_says_each_event_once(tmp_path):
 
 
 def test_the_names_alert_marks_what_it_said_whatever_a_read_does_meanwhile(tmp_path):
-    """A read while Slack takes the message can end or replace the event it
-    was about, and the flush marks the event it said: an answer showing no
-    one that began meanwhile waits for the next UTC day's."""
-    p, store = make(tmp_path, slack_owner_user_ids="U1,U2,U4", tz="America/Los_Angeles")
-    told(store, {"U1": "fan", "U2": "mei", "U4": "ann"})
+    """A read, a re-look or a names session while Slack takes the message
+    can end or replace the event it was about, and the flush marks the event
+    it said. A keep made meanwhile is alerted by the next flush; an answer
+    showing no one that began meanwhile waits for the next UTC day's."""
+    p, store = make(tmp_path, slack_owner_user_ids="U1,U2,U3,U4", tz="America/Los_Angeles")
+    told(store, {"U1": "fan", "U2": "mei", "U3": "jo", "U4": "ann"})
     p.household = Household.load(store, p.cfg.slack_owner_user_ids)
     now = datetime.now(timezone.utc)
     p.household.unread("U2", "user_not_visible", now)
     p.household.unread("U4", "user_not_visible", now)
+    p.household.keep("U1", "Fan Zhu", "s-1", "two people are Fan Zhu", False, now)
+    p.household.keep("U3", "Jo Li", "s-3", "two people are Jo Li", False, now)
     sent = []
 
     async def alert(text):
         sent.append(text)
         await asyncio.sleep(0)
         if len(sent) == 1:
-            # the refresh reads mei, and Slack now answers that ann's account
-            # is deleted, while the message is in flight
+            # the refresh reads mei and Slack now answers that ann's account
+            # is deleted, a re-look ends fan's keep, and a names session ends
+            # in another keep for jo, while the message is in flight
             p.household.observe("U2", {"profile": {"display_name": "mei"}}, now)
             p.household.unread("U4", "deleted", now)
+            p.household.kept_again("U1", True, "fan stays fan")
+            p.household.keep("U3", "Jo L", "s-4", "two people are Jo L", False, now)
     p.slack.alert = alert
     asyncio.run(p._flush_names())
-    assert len(sent) == 1 and p.household.rows["U2"]["out"] is None
+    assert len(sent) == 1 and p.household.rows["U2"]["out"] is None and p.household.rows["U1"]["kept"] is None
     assert p.household.rows["U4"]["out"]["alerted"] is False
+    assert p.household.unalerted_keeps() == ["U3"]
+    asyncio.run(p._flush_names())
+    assert sent[1:] == ["1 change(s) of a household member's name in Slack were handed to memory, which did not "
+                        "take the new name as theirs alone; sessions use the earlier name; doctor says whose"]
     p.household.unread("U2", "user_not_visible", now)
     asyncio.run(p._flush_names())
-    assert len(sent) == 1, "said once a UTC day"
+    assert len(sent) == 2, "said once a UTC day"
     p.household.rows["U4"]["out_day"] = "2026-01-01"
     asyncio.run(p._flush_names())
-    assert sent[1:] == ["1 household member(s) are no longer shown by Slack, and are let in under the name sessions "
+    assert sent[2:] == ["1 household member(s) are no longer shown by Slack, and are let in under the name sessions "
                         "know; doctor says whose"]
 
 
@@ -2407,3 +2420,999 @@ def test_names_come_from_slack_alone(monkeypatch):
         assert "WANDA_SLACK_NAMES" not in (root / f).read_text(), f
     monkeypatch.setenv("WANDA_SLACK_NAMES", "U1:fan,U2:mei")
     assert Config(_env_file=None, slack_owner_user_ids="U1,U2").slack_owner_user_ids == ["U1", "U2"]
+
+
+# --- a change of name, handed to memory ---
+
+ROUND = timedelta(seconds=NAMES_EVERY_S)
+
+
+class Memory:
+    """Stands in for `mem show "person:<name>"` on a vault of people, each a
+    label, the names a rename struck and the session that made it: found by
+    label or by a struck name, in any capitals, and printed as the build
+    prints one person, several or none. `fail` is what a read raises while
+    it is set, and `hold`, while set, an event each read waits for."""
+
+    def __init__(self, *names):
+        self.people: dict[str, dict] = {}
+        self.fail: Exception | None = None
+        self.hold: asyncio.Event | None = None
+        self.reads: list[str] = []
+        for name in names:
+            self.make(name, "s-hand")
+
+    def make(self, name, made):
+        pid = f"person:{len(self.people) + 1:06x}"
+        self.people[pid] = {"name": name, "was": [], "made": made}
+        return pid
+
+    def named(self, name):
+        return [pid for pid, p in self.people.items() if name.lower() in (n.lower() for n in (p["name"], *p["was"]))]
+
+    def rename(self, old, new):
+        [pid] = [pid for pid, p in self.people.items() if p["name"].lower() == old.lower()]
+        self.people[pid]["was"].append(self.people[pid]["name"])
+        self.people[pid]["name"] = new
+
+    def forget(self, pid):
+        del self.people[pid]
+
+    async def call(self, now, *args):
+        if args[0] != "show":
+            return 0, "", ""  # the clock's due check, with nothing due
+        name = args[1].removeprefix("person:")
+        self.reads.append(name)
+        if self.hold is not None:
+            await self.hold.wait()
+        if self.fail is not None:
+            raise self.fail
+        hits = self.named(name)
+        if len(hits) == 1:
+            p = self.people[hits[0]]
+            return 0, (f"{hits[0]}\n---\nname: {json.dumps(p['name'])}\n" + f"made: {json.dumps(p['made'])}\n"
+                       "---\n\n" + "".join(f"~~was named: {w}~~\n" for w in p["was"])), ""
+        if hits:
+            listed = "; ".join(f"{pid} ({self.people[pid]['name']})" for pid in hits)
+            return 1, f"({name!r} is more than one node: {listed}. An id says which.)\n", ""
+        return 1, (f"(no person is named {name!r}; people/CLAUDE.md lists the people, and `mem search` finds by "
+                   "other words)\n"), ""
+
+
+class Naming(RecordingRunner):
+    """Stands in for claude in a names session: each run does to memory what
+    the next of `acts` does, given the memory and the session's id, and
+    answers, unless the act returns a result of its own; an act may be a
+    coroutine, which the run awaits."""
+
+    def __init__(self, memory, *acts):
+        super().__init__()
+        self.memory, self.acts = memory, list(acts)
+
+    async def run(self, prompt, **kw):
+        self.calls.append((prompt, kw))
+        act = self.acts.pop(0) if self.acts else None
+        out = act(self.memory, kw["session_id"]) if act else None
+        if asyncio.iscoroutine(out):
+            out = await out
+        if isinstance(out, RunResult):
+            return out
+        said = answer("I renamed fan's node to Fan Zhu.")
+        return RunResult(ok=True, structured=said, result_text=json.dumps(said), session_id="ignored")
+
+
+def renames(old="fan", new="Fan Zhu"):
+    return lambda m, sid: m.rename(old, new)
+
+
+def makes(name="Fan Zhu"):
+    return lambda m, sid: m.make(name, sid)
+
+
+def ends(how, then=None):
+    """An act that does `then`, if given, and ends the run as `how`: timed
+    out, or failed."""
+    def act(m, sid):
+        if then:
+            then(m, sid)
+        return RunResult(ok=False, timed_out=how == "timeout", error="timed out after 420s" if how == "timeout"
+                         else "claude reported an error")
+    return act
+
+
+def waits(then=None):
+    """An act that does `then`, if given, and never ends, for a stop."""
+    async def act(m, sid):
+        if then:
+            then(m, sid)
+        await asyncio.Event().wait()
+    return act
+
+
+def names_processor(tmp_path, monkeypatch, memory, *acts, slack=None):
+    """A processor for fan and mei, told since September, whose `mem` is the
+    stand-in memory and whose claude does `acts`; its Slack keeps every alert
+    it is sent."""
+    p, store, snaps = memory_processor(tmp_path, slack or ConversationSlack(), Naming(memory, *acts), monkeypatch)
+    p._mem_call = memory.call
+    return p, store, snaps
+
+
+def shows(p, uid, name, at, *, full=""):
+    """One read of `uid` in which Slack shows `name`."""
+    p.household.observe(uid, {"profile": {"display_name": name, "real_name": full}}, at)
+    p.household.save(p.store, uid)
+
+
+def changed(p, uid="U1", name="Fan Zhu", at=None):
+    """Slack shows `name` for `uid` in two reads a round apart, ending at
+    `at`: a change that is due."""
+    at = at or datetime.now(timezone.utc).replace(microsecond=0)
+    shows(p, uid, name, at - ROUND)
+    shows(p, uid, name, at)
+    return at
+
+
+def hand(p, now):
+    """One idle tick's handoff, run to its end. Returns whether a session
+    started."""
+    async def go():
+        p._hand_names(now)
+        started = bool(p._bg)
+        await asyncio.gather(*p._bg)
+        return started
+    return asyncio.run(go())
+
+
+def restarted(p):
+    """The processor the next start makes on the same run store, with the
+    same stand-ins and slots of its own."""
+    q = Processor(p.cfg, p.store, asyncio.Queue(), p.slack, p.runner)
+    q.runner.agent_sem = asyncio.Semaphore(2)
+    q._mem_call = p._mem_call
+    return q
+
+
+def tried(p, uid="U1"):
+    return p.household.rows[uid]["tried"]
+
+
+def names_alerts(p):
+    return [a for a in p.slack.alerts if "name in Slack" in a]
+
+
+def ran(store, sid, status="ok"):
+    """A run recorded under session `sid`."""
+    store.record_run(kind="agent", task_id=None, session_id=sid, started_at=utcnow(), exit_code=0, cost_usd=0.0,
+                     status=status)
+
+
+def test_a_due_change_starts_one_session_when_nothing_runs(tmp_path, monkeypatch):
+    memory = Memory("fan", "mei")
+    p, store, _ = names_processor(tmp_path, monkeypatch, memory, renames(), renames("mei", "Mei Chen"))
+    now = changed(p)
+    changed(p, "U2", "Mei Chen", now)
+    other = []
+
+    async def busy():
+        await asyncio.sleep(0)
+
+    async def go():
+        # nothing while a session or a wake runs, or a run is reserved
+        p._bg.add(asyncio.create_task(busy()))
+        p._hand_names(now)
+        await asyncio.gather(*p._bg)
+        p._bg.clear()
+        p._inflight_runs = 1
+        p._hand_names(now)
+        p._inflight_runs = 0
+        assert not p._bg
+
+        async def clock_session(w, at):
+            other.append(w.key)
+        p._clock_session = clock_session
+        p._wake([main.clock.Wake("clock:morning:U2", "U2", "x")], now)
+        p._hand_names(now)
+        assert len(p._bg) == 1
+        await asyncio.gather(*p._bg)
+        # then one id at a time, in the allowlist's order
+        p._hand_names(now)
+        p._hand_names(now)
+        assert len(p._bg) == 1
+        await asyncio.gather(*p._bg)
+        p._hand_names(now)
+        await asyncio.gather(*p._bg)
+    asyncio.run(go())
+    assert other == ["clock:morning:U2"] and len(p.runner.calls) == 2
+    assert p.household.told_names() == {"U1": "Fan Zhu", "U2": "Mei Chen"}
+
+
+def test_the_clock_hands_a_change_in_quiet_hours(tmp_path, monkeypatch):
+    p, store, _ = names_processor(tmp_path, monkeypatch, Memory("fan"), renames())
+    monkeypatch.setattr(p.cfg, "quiet_hours", "00:01-00:00")
+    monkeypatch.setattr("wanda.main.CLOCK_TICK_S", 0.01)
+    changed(p)
+
+    async def go():
+        ticking = asyncio.create_task(p.clock_loop())
+        while not p.runner.calls or p._bg:
+            await asyncio.sleep(0.01)
+        ticking.cancel()
+    asyncio.run(go())
+    assert len(p.runner.calls) == 1 and p.household.told("U1") == "Fan Zhu"
+
+
+def test_a_session_whose_change_is_no_longer_due_does_not_run(tmp_path, monkeypatch):
+    p, store, _ = names_processor(tmp_path, monkeypatch, Memory("fan"))
+    now = changed(p)
+    shows(p, "U1", "fan", now + timedelta(seconds=1))
+    asyncio.run(p._names_session("U1", "fan", "Fan Zhu", now))
+    assert p.runner.calls == [] and tried(p) is None and "U1" not in p._naming
+
+
+def test_an_advance_outlasts_a_read_in_flight(tmp_path, monkeypatch):
+    p, store, _ = names_processor(tmp_path, monkeypatch, Memory("fan"), renames())
+    now = changed(p)
+    reading = asyncio.Event()
+
+    async def user_now(uid):
+        reading.set()
+        await asyncio.sleep(0.1)
+        return {"profile": {"display_name": "Fan Zhu" if uid == "U1" else "mei"}}
+    p.slack.user_now = user_now
+
+    async def go():
+        refresh = asyncio.create_task(p.read_names(now + ROUND))
+        await reading.wait()
+        await p._names_session("U1", "fan", "Fan Zhu", now)
+        await refresh
+    asyncio.run(go())
+    assert p.household.told("U1") == "Fan Zhu"
+    assert Household.load(store, ["U1"]).told("U1") == "Fan Zhu"
+
+
+def test_a_names_session_reaches_no_one(tmp_path, monkeypatch, caplog):
+    """Its try is written before it runs; it is handed the frame whole, posts
+    nothing, owes nothing, and its snapshot follows."""
+    import logging
+    memory = Memory("fan")
+    seen = {}
+
+    def act(m, sid):
+        seen["tried"] = json.loads(store.get_meta("names:U1"))["tried"]
+        seen["sid"] = sid
+        m.rename("fan", "Fan Zhu")
+    p, store, snaps = names_processor(tmp_path, monkeypatch, memory, act)
+    # the tick's time, in the household's zone, dates the session
+    now = changed(p).astimezone(p.cfg.zone)
+    with caplog.at_level(logging.INFO, logger="wanda"):
+        assert hand(p, now)
+    sid = seen["sid"]
+    assert seen["tried"]["session"] == sid and seen["tried"]["name"] == "Fan Zhu"
+    assert seen["tried"]["error"] == "did not end" and seen["tried"]["count"] == 1
+    [(prompt, kw)] = p.runner.calls
+    assert prompt == vault.prompt(now.date().isoformat(), vault.renamed_text("fan", "Fan Zhu"))
+    assert kw["append_system_prompt"].endswith(vault.date_paragraph(now))
+    assert kw["session_id"] == sid and kw["feed"] is None
+    assert p.slack.replies == []
+    [run] = store._query("SELECT r.*, t.kind AS task_kind, t.thread_ts FROM runs r JOIN tasks t ON t.id = r.task_id")
+    assert (run["task_kind"], run["thread_ts"], run["session_id"], run["status"], run["notified"]) == (
+        "names", "names", sid, "ok", 1)
+    assert run["result_text"] == "I renamed fan's node to Fan Zhu."
+    asyncio.run(p.deliver_pending())
+    assert p.slack.replies == [] and snaps == [f"after {sid}"]
+    said = [r.getMessage() for r in caplog.records]
+    assert any(m.startswith(f"memory session {sid} in no conversation: ") and m.endswith(" characters, posted nowhere")
+               for m in said)
+    assert f"names: U1 is Fan Zhu to sessions from now on (session {sid})" in said
+    assert p.household.told("U1") == "Fan Zhu" and tried(p) is None and memory.reads == ["fan", "Fan Zhu"]
+
+
+def test_a_names_session_whose_last_turn_says_nothing_posts_nothing(tmp_path, monkeypatch):
+    """Its answer, kept by its transcript from an earlier turn, is recorded
+    and posted nowhere, and there is no failure note."""
+    p, store, snaps, slack = standin_processor(tmp_path, monkeypatch, steps=[0.2], notify="after")
+    p._mem_call = Memory("fan").call
+    now = changed(p)
+    asyncio.run(p._names_session("U1", "fan", "Fan Zhu", now))
+    runs = [dict(r) for r in store._query("SELECT status, notified, result_text FROM runs")]
+    assert len(runs) == 1 and runs[0]["status"] == "ok" and runs[0]["notified"] == 1
+    assert runs[0]["result_text"].startswith("one answer to 1: The person I have known in this Slack as fan")
+    asyncio.run(p.deliver_pending())
+    assert slack.replies == [] and len(snaps) == 1
+
+
+def frame_name(p):
+    """The name the next frame of fan's DM gives him."""
+    before = len(p.runner.calls)
+    asyncio.run(p.handle_slack(dm(f"{AT + len(p.runner.calls):.1f}", "the March one")))
+    [(prompt, _)] = p.runner.calls[before:]
+    return prompt.split(" now says:")[0].rsplit("\n", 1)[1]
+
+
+@pytest.mark.parametrize("act,name,kept", [
+    (renames(), "Fan Zhu", None),
+    (None, "fan", True),
+    (makes(), "fan", False),
+])
+def test_each_outcome_sets_the_name_later_frames_use(tmp_path, monkeypatch, act, name, kept):
+    p, store, _ = names_processor(tmp_path, monkeypatch, Memory("fan"), act or (lambda m, sid: None))
+    now = changed(p)
+    hand(p, now)
+    assert frame_name(p) == name
+    k = p.household.rows["U1"]["kept"]
+    assert (k["plain"] if k else None) == kept
+    if kept is False:
+        # alerted once, naming no one, and not handed again while Slack shows it
+        asyncio.run(p._flush_names())
+        asyncio.run(p._flush_names())
+        assert p.slack.alerts == ["1 change(s) of a household member's name in Slack were handed to memory, which "
+                                  "did not take the new name as theirs alone; sessions use the earlier name; doctor "
+                                  "says whose"]
+        shows(p, "U1", "Fan Zhu", now + 2 * ROUND)
+        assert not hand(p, now + 2 * ROUND)
+
+
+def test_an_advance_to_a_name_another_member_was_told_meanwhile_is_held(tmp_path, monkeypatch, caplog):
+    import logging
+
+    def act(m, sid):
+        m.rename("fan", "Fan Zhu")
+        p.household.rows["U2"]["told"].append({"name": "fan zhu", "since": utcnow(), "session": "s-mei"})
+    p, store, _ = names_processor(tmp_path, monkeypatch, Memory("fan"), act)
+    with caplog.at_level(logging.INFO, logger="wanda"):
+        hand(p, changed(p))
+    assert p.household.told("U1") == "fan" and tried(p) is None
+    assert "names: U1 stays fan to sessions: Fan Zhu is U2's" in [r.getMessage() for r in caplog.records]
+
+
+def test_a_name_another_member_takes_during_a_session_is_held_for_them(tmp_path, monkeypatch):
+    """fan's change to Fan Zhu is being handed when Slack moves him to Fan Z
+    and mei to Fan Zhu: her read finds Fan Zhu held by his try, so her full
+    name awaits instead, and no session is told mei goes by Fan Zhu."""
+    def act(m, sid):
+        later = datetime.now(timezone.utc) + ROUND
+        shows(p, "U1", "Fan Z", later)
+        shows(p, "U2", "Fan Zhu", later, full="Mei Chen")
+        m.rename("fan", "Fan Zhu")
+    p, store, _ = names_processor(tmp_path, monkeypatch, Memory("fan", "mei"), act, renames("mei", "Mei Chen"))
+    now = changed(p)
+    hand(p, now)
+    assert p.household.told_names() == {"U1": "Fan Zhu", "U2": "mei"}
+    assert p.household.awaiting("U2") == "Mei Chen"
+    later = now + 3 * ROUND
+    shows(p, "U2", "Fan Zhu", later, full="Mei Chen")
+    shows(p, "U1", "Fan Z", later)
+    assert p.household.due(store, later) == ("U1", "Fan Zhu", "Fan Z")
+    assert p.household.awaiting("U2") == "Mei Chen"
+
+
+def test_a_change_back_is_handed_by_a_second_session(tmp_path, monkeypatch):
+    p, store, _ = names_processor(tmp_path, monkeypatch, Memory("fan"), renames(), renames("Fan Zhu", "fan"),
+                                  renames("fan", "Fan Z"), renames("Fan Z", "Fan Zhu"))
+    now = changed(p)
+    hand(p, now)
+    now = changed(p, name="fan", at=now + 2 * ROUND)
+    hand(p, now)
+    assert "The person I have known in this Slack as Fan Zhu is named fan there now." in p.runner.calls[1][0]
+    assert p.household.told("U1") == "fan"
+    # and to a name the person had two changes ago
+    hand(p, changed(p, name="Fan Z", at=now + 2 * ROUND))
+    hand(p, changed(p, name="Fan Zhu", at=now + 4 * ROUND))
+    assert "known in this Slack as Fan Z is named Fan Zhu there now" in p.runner.calls[3][0]
+    assert [t["name"] for t in p.household.rows["U1"]["told"]] == ["fan", "Fan Zhu", "fan", "Fan Z", "Fan Zhu"]
+
+
+def test_a_rename_that_timed_out_with_a_change_back_seen_meanwhile_advances(tmp_path, monkeypatch):
+    def act(m, sid):
+        shows(p, "U1", "fan", now + timedelta(seconds=30))
+        return ends("timeout", renames())(m, sid)
+    p, store, _ = names_processor(tmp_path, monkeypatch, Memory("fan"), act, renames("Fan Zhu", "fan"))
+    now = changed(p)
+    hand(p, now)
+    assert p.household.told("U1") == "Fan Zhu" and tried(p) is None
+    shows(p, "U1", "fan", now + ROUND)
+    assert p.household.due(store, now + ROUND) == ("U1", "Fan Zhu", "fan")
+
+
+def stop_during(p, coro):
+    """Runs `coro` until its session's runner is under way, then stops it as
+    a shutdown does."""
+    async def go():
+        t = asyncio.create_task(coro)
+        while not p.runner.calls:
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.01)
+        t.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await t
+    asyncio.run(go())
+
+
+def test_a_rename_stopped_mid_run_and_then_set_back_is_handed_back(tmp_path, monkeypatch):
+    """The session renames fan and the daemon stops; at the next start Slack
+    shows fan again: the start's read advances, and the change back is
+    handed by a session of its own."""
+    p, store, _ = names_processor(tmp_path, monkeypatch, Memory("fan"), waits(renames()),
+                                  renames("Fan Zhu", "fan"))
+    now = changed(p)
+    stop_during(p, p._names_session("U1", "fan", "Fan Zhu", now))
+    assert tried(p)["error"] == "stopped mid-run" and tried(p)["count"] == 0
+    assert store._query("SELECT status FROM runs")[0]["status"] == "cancelled"
+    q = restarted(p)
+    start = now + ROUND
+    shows(q, "U1", "fan", start)
+    asyncio.run(q.relook_names(start, start=True))
+    assert q.household.told("U1") == "Fan Zhu" and q.household.awaiting("U1") == "fan"
+    shows(q, "U1", "fan", start + ROUND)
+    hand(q, start + ROUND)
+    assert q.household.told("U1") == "fan"
+
+
+def test_a_rename_whose_run_failed_and_whose_read_failed_is_handed_back_after_a_change_back(tmp_path, monkeypatch):
+    def act(m, sid):
+        m.rename("fan", "Fan Zhu")
+        m.fail = RuntimeError("mem show took longer than 60 s")
+        return ends("error")(m, sid)
+    memory = Memory("fan")
+    p, store, _ = names_processor(tmp_path, monkeypatch, memory, act, renames("Fan Zhu", "fan"))
+    now = changed(p)
+    hand(p, now)
+    assert tried(p)["error"] == "memory could not be read after the session: mem show took longer than 60 s"
+    assert tried(p)["count"] == 1 and len(names_alerts(p)) == 1
+    # set back within the hour
+    shows(p, "U1", "fan", now + timedelta(minutes=10))
+    shows(p, "U1", "fan", now + timedelta(minutes=20))
+    memory.fail = None
+    asyncio.run(p.relook_names(now + timedelta(minutes=20)))
+    assert p.household.told("U1") == "Fan Zhu" and tried(p) is None
+    hand(p, now + timedelta(minutes=20))
+    assert p.household.told("U1") == "fan" and len(p.runner.calls) == 2
+
+
+def test_a_crash_mid_run_waits_out_its_backoff_and_is_alerted_once(tmp_path, monkeypatch):
+    p, store, _ = names_processor(tmp_path, monkeypatch, Memory("fan"), renames())
+    now = changed(p)
+    # what a crash mid-run leaves: the try as written, with no run
+    p.household.trying("U1", "Fan Zhu", "s-crashed", now)
+    p.household.save(store, "U1")
+    q = restarted(p)
+    asyncio.run(q.relook_names(now + ROUND, start=True))
+    assert tried(q)["error"] == "cut short" and tried(q)["count"] == 1
+    assert names_alerts(q) == ["a change of a household member's name in Slack could not be handed to memory (1 "
+                               "try); sessions go on using the earlier name; doctor says whose"]
+    assert not hand(q, now + ROUND) and not hand(q, now + timedelta(minutes=59))
+    # a start on a later day says nothing more
+    store.set_meta("names_alert_date", "2026-01-01")
+    asyncio.run(restarted(q).relook_names(now + 2 * ROUND, start=True))
+    assert len(names_alerts(q)) == 1
+    assert hand(q, now + timedelta(hours=1)) and q.household.told("U1") == "Fan Zhu"
+
+
+def test_an_answer_that_cannot_be_read_after_a_run_ok_is_read_again(tmp_path, monkeypatch):
+    """A run ok that renamed fan, whose answer cannot be read: the id is held,
+    whatever Slack shows meanwhile, the alert goes once a day after the run,
+    another member first seen with the name falls to their full name, and
+    the next good read advances."""
+    memory = Memory("fan")
+
+    def act(m, sid):
+        m.rename("fan", "Fan Zhu")
+        m.fail = RuntimeError("mem show took longer than 60 s")
+    p, store, _ = names_processor(tmp_path, monkeypatch, memory, act)
+    store._exec("DELETE FROM meta WHERE key='names:U2'")
+    p.household = Household.load(store, p.cfg.slack_owner_user_ids)
+    now = changed(p)
+    hand(p, now)
+    assert tried(p)["error"] == "mem show took longer than 60 s" and tried(p)["count"] == 0
+    assert names_alerts(p) == [] and p.household.told("U1") == "fan"
+    ok, line = p.household.state(store, "U1", now, p.cfg.zone)
+    assert not ok and ": memory's answer could not be read (session " in line
+    # Slack moves on, and a new member shows the name being handed
+    changed(p, name="Fan Z", at=now + 2 * ROUND)
+    shows(p, "U2", "Fan Zhu", now + 2 * ROUND, full="Mei Chen")
+    assert p.household.told("U2") == "Mei Chen"
+    assert not hand(p, now + 2 * ROUND)
+    asyncio.run(p.relook_names(now + 2 * ROUND))
+    assert names_alerts(p) == []
+    day = datetime.now(timezone.utc) + timedelta(days=1, minutes=1)
+    asyncio.run(p.relook_names(day))
+    asyncio.run(p.relook_names(day))
+    assert names_alerts(p) == ["memory's answer to a change of a household member's name in Slack has not been read "
+                               "for a day after its session; sessions go on using the earlier name; doctor says "
+                               "whose"]
+    memory.fail = None
+    asyncio.run(p.relook_names(day))
+    assert p.household.told("U1") == "Fan Zhu" and tried(p) is None and len(p.runner.calls) == 1
+    assert p.household.awaiting("U1") == "Fan Z"
+
+
+@pytest.mark.parametrize("ending", ["cancelled", "raised"])
+def test_an_ok_run_that_left_fan_alone_is_kept_whatever_ends_its_snapshot(tmp_path, monkeypatch, ending):
+    """A stop during the snapshot leaves the try for the next start, which
+    records the keep; a raise there records it at once. Neither is a failed
+    try."""
+    def snapshot(cfg, message):
+        raise asyncio.CancelledError() if ending == "cancelled" else OSError("snapshots.git: no space left")
+    p, store, _ = names_processor(tmp_path, monkeypatch, Memory("fan"), lambda m, sid: None)
+    monkeypatch.setattr("wanda.vault.snapshot", snapshot)
+    now = changed(p)
+    if ending == "cancelled":
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(p._names_session("U1", "fan", "Fan Zhu", now))
+        assert tried(p)["error"] == "did not end"
+        p = restarted(p)
+        asyncio.run(p.relook_names(now + ROUND, start=True))
+    else:
+        asyncio.run(p._names_session("U1", "fan", "Fan Zhu", now))
+    assert tried(p) is None and p.household.rows["U1"]["kept"]["plain"] is True
+    assert names_alerts(p) == [] and p.household.told("U1") == "fan"
+
+
+@pytest.mark.parametrize("renamed,read,told,failed", [
+    (True, True, "Fan Zhu", False),
+    (False, True, "fan", True),
+    (True, False, "fan", True),
+])
+def test_a_stop_after_a_run_that_timed_out_is_settled_at_the_start(tmp_path, monkeypatch, renamed, read, told,
+                                                                   failed):
+    def snapshot(cfg, message):
+        raise asyncio.CancelledError()
+    memory = Memory("fan")
+    p, store, _ = names_processor(tmp_path, monkeypatch, memory, ends("timeout", renames() if renamed else None))
+    monkeypatch.setattr("wanda.vault.snapshot", snapshot)
+    now = changed(p)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(p._names_session("U1", "fan", "Fan Zhu", now))
+    memory.fail = None if read else RuntimeError("mem show took longer than 60 s")
+    q = restarted(p)
+    asyncio.run(q.relook_names(now + ROUND, start=True))
+    assert q.household.told("U1") == told
+    assert (tried(q) is not None and tried(q)["count"] == 1) is failed and bool(names_alerts(q)) is failed
+
+
+@pytest.mark.parametrize("made", [True, False])
+def test_a_session_stopped_mid_run_holds_its_change_until_memory_is_read(tmp_path, monkeypatch, made):
+    """Memory never knew him. With Fan Zhu made by the session, the first
+    good read advances; with nothing made, it is a stop, due at once."""
+    memory = Memory()
+    p, store, _ = names_processor(tmp_path, monkeypatch, memory, waits(makes() if made else None))
+    now = changed(p)
+    stop_during(p, p._names_session("U1", "fan", "Fan Zhu", now))
+    assert tried(p)["error"] == "stopped mid-run"
+    memory.fail = RuntimeError("mem show took longer than 60 s")
+    q = restarted(p)
+    asyncio.run(q.relook_names(now + ROUND, start=True))
+    assert tried(q)["error"] == "stopped mid-run" and not hand(q, now + ROUND)
+    ok, line = q.household.state(store, "U1", now + ROUND, q.cfg.zone)
+    assert not ok and ": stopped mid-run (session " in line and "memory is read again at each refresh" in line
+    day = datetime.now(timezone.utc) + timedelta(days=1, minutes=1)
+    asyncio.run(q.relook_names(day))
+    asyncio.run(q.relook_names(day))
+    assert len(names_alerts(q)) == 1
+    memory.fail = None
+    asyncio.run(q.relook_names(day))
+    if made:
+        assert q.household.told("U1") == "Fan Zhu" and tried(q) is None
+    else:
+        assert q.household.told("U1") == "fan" and tried(q)["error"] == "stopped" and tried(q)["count"] == 0
+        assert q.household.due(store, day) == ("U1", "fan", "Fan Zhu")
+
+
+def test_a_refresh_during_a_names_session_leaves_its_try_to_it(tmp_path, monkeypatch, caplog):
+    """During the run and during the session's own reads after it: the round
+    reads nothing for that id, logs nothing, and the session's own settle
+    advances once."""
+    import logging
+    memory = Memory("fan")
+    running = asyncio.Event()
+
+    async def act(m, sid):
+        m.rename("fan", "Fan Zhu")
+        running.set()
+        await asyncio.sleep(0.05)
+    p, store, _ = names_processor(tmp_path, monkeypatch, memory, act)
+    now = changed(p)
+
+    async def go():
+        session = asyncio.create_task(p._names_session("U1", "fan", "Fan Zhu", now))
+        await running.wait()
+        await p.relook_names(now)
+        memory.hold = asyncio.Event()
+        while not memory.reads:
+            await asyncio.sleep(0.01)
+        await p.relook_names(now)
+        memory.hold.set()
+        await session
+    with caplog.at_level(logging.INFO, logger="wanda"):
+        asyncio.run(go())
+    assert memory.reads == ["fan", "Fan Zhu"]
+    assert not [r for r in caplog.records if "names:" in r.getMessage() and "U1 is Fan Zhu" not in r.getMessage()
+                and "telling memory" not in r.getMessage()]
+    assert [t["name"] for t in p.household.rows["U1"]["told"]] == ["fan", "Fan Zhu"]
+
+
+def test_a_try_refused_while_a_relook_reads_keeps_what_it_wrote(tmp_path, monkeypatch):
+    memory = Memory("fan")
+    p, store, _ = names_processor(tmp_path, monkeypatch, memory)
+    now = changed(p)
+    p.household.trying("U1", "Fan Zhu", "s-0", now)
+    p.household.stopped("U1", now)
+
+    async def refused(reserve_usd=0.0):
+        return "busy"
+
+    async def go():
+        memory.hold = asyncio.Event()
+        relook = asyncio.create_task(p.relook_names(now))
+        while not memory.reads:
+            await asyncio.sleep(0.01)
+        p.check_budget = refused
+        await p._names_session("U1", "fan", "Fan Zhu", now)
+        # Slack moves on, so the read the re-look began, applied, would end
+        # the try it was not read for
+        shows(p, "U1", "Fan Z", now + ROUND)
+        memory.hold.set()
+        await relook
+    asyncio.run(go())
+    assert tried(p) is not None and tried(p)["error"] == "busy" and tried(p)["session"] != "s-0"
+
+
+def test_a_keep_ended_while_a_relook_reads_is_not_settled_by_that_read(tmp_path, monkeypatch):
+    memory = Memory("fan")
+    p, store, _ = names_processor(tmp_path, monkeypatch, memory)
+    now = changed(p)
+    p.household.keep("U1", "Fan Zhu", "s-1", "kept", True, now)
+    p.household.save(store, "U1")
+    memory.rename("fan", "Fan Zhu")
+
+    async def go():
+        memory.hold = asyncio.Event()
+        relook = asyncio.create_task(p.relook_names(now))
+        while not memory.reads:
+            await asyncio.sleep(0.01)
+        # Slack shows fan again in two reads a round apart, which ends the
+        # keep, so the read the re-look began, applied, would advance a
+        # change the member has taken back
+        shows(p, "U1", "fan", now + ROUND)
+        shows(p, "U1", "fan", now + 2 * ROUND)
+        assert p.household.rows["U1"]["kept"] is None
+        memory.hold.set()
+        await relook
+    asyncio.run(go())
+    assert p.household.told("U1") == "fan"
+
+
+def test_a_try_slack_moved_on_from_ends_at_a_relook(tmp_path, monkeypatch):
+    """Memory did not take it, and there is nothing left to hand."""
+    p, store, _ = names_processor(tmp_path, monkeypatch, Memory("fan"))
+    now = changed(p)
+    p.household.trying("U1", "Fan Zhu", "s-0", now)
+    p.household.stopped("U1", now)
+    shows(p, "U1", "Fan Z", now + ROUND)
+    asyncio.run(p.relook_names(now + ROUND))
+    assert tried(p) is None and p.household.told("U1") == "fan"
+
+
+def test_each_round_looks_again_at_a_try(tmp_path, monkeypatch):
+    """An ok run whose answer could not be read is settled by the refresh's
+    next round."""
+    monkeypatch.setattr("wanda.main.NAMES_EVERY_S", 0.01)
+    memory = Memory("fan")
+    memory.rename("fan", "Fan Zhu")
+    p, store, _ = names_processor(tmp_path, monkeypatch, memory)
+    now = changed(p)
+    p.household.trying("U1", "Fan Zhu", "s-ok", now)
+    p.household.unanswered("U1", "mem show took longer than 60 s")
+    ran(store, "s-ok")
+
+    async def user_now(uid):
+        return {"profile": {"display_name": "Fan Zhu" if uid == "U1" else "mei"}}
+    p.slack.user_now = user_now
+
+    async def go():
+        names = asyncio.create_task(p.names_loop())
+        try:
+            while p.household.told("U1") != "Fan Zhu":
+                await asyncio.sleep(0.01)
+        finally:
+            names.cancel()
+    asyncio.run(asyncio.wait_for(go(), 3))
+
+
+def test_a_relook_that_raises_holds_back_no_other(tmp_path, monkeypatch, caplog):
+    import logging
+    memory = Memory("fan", "mei")
+    p, store, _ = names_processor(tmp_path, monkeypatch, memory)
+    now = changed(p)
+    changed(p, "U2", "Mei Chen", now)
+    for uid, name in (("U1", "Fan Zhu"), ("U2", "Mei Chen")):
+        p.household.keep(uid, name, f"s-{uid}", "kept", True, now)
+    memory.rename("mei", "Mei Chen")
+    real = p._read_both
+
+    async def read_both(old, new, at):
+        if old == "fan":
+            raise ValueError("a row with no shape")
+        return await real(old, new, at)
+    p._read_both = read_both
+    with caplog.at_level(logging.WARNING, logger="wanda"):
+        asyncio.run(p.relook_names(now))
+    assert "names: looking again at U1's change failed" in [r.getMessage() for r in caplog.records]
+    assert p.household.told("U2") == "Mei Chen"
+
+
+@pytest.mark.parametrize("first", ["refused", "stopped"])
+def test_one_ids_try_is_never_settled_by_anothers_run(tmp_path, monkeypatch, first):
+    """U1's try refused by the run cap, or stopped before its run; then U2's
+    change, listed first and due by then, is handed and recorded ok on the
+    same task, before the next round or at the next start. Nothing settles
+    U1's try from that run, and U1 gets a session of its own when it is
+    due."""
+    memory = Memory("fan", "mei")
+    p, store, _ = names_processor(tmp_path, monkeypatch, memory, renames("mei", "Mei Chen"), renames())
+    monkeypatch.setattr(p.cfg, "slack_owner_user_ids", ["U2", "U1"])
+    p.household.allowed = ["U2", "U1"]
+    now = changed(p)
+    shows(p, "U2", "Mei Chen", now)
+    if first == "refused":
+        real = p.check_budget
+
+        async def refused(reserve_usd=0.0):
+            return "busy"
+        p.check_budget = refused
+        asyncio.run(p._names_session("U1", "fan", "Fan Zhu", now))
+        p.check_budget = real
+    else:
+        async def held():
+            # both slots taken, so the session waits for one and is stopped there
+            await p.runner.agent_sem.acquire()
+            await p.runner.agent_sem.acquire()
+            t = asyncio.create_task(p._names_session("U1", "fan", "Fan Zhu", now))
+            await asyncio.sleep(0.05)
+            t.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await t
+        asyncio.run(held())
+        p = restarted(p)
+    assert store._query("SELECT * FROM runs") == []
+    later = now + ROUND
+    shows(p, "U2", "Mei Chen", later)
+    asyncio.run(p.relook_names(later, start=first == "stopped"))
+    assert hand(p, later) and p.household.told("U2") == "Mei Chen"
+    asyncio.run(p.relook_names(later))
+    assert tried(p)["error"] == ("busy" if first == "refused" else "stopped") and p.household.told("U1") == "fan"
+    assert names_alerts(p) == [] and memory.people["person:000001"]["name"] == "fan"
+    due = now + timedelta(hours=1) if first == "refused" else later
+    assert first == "stopped" or not hand(p, due - timedelta(seconds=1))
+    assert hand(p, due) and p.household.told("U1") == "Fan Zhu"
+
+
+def test_an_outcome_is_stamped_with_when_it_is_applied(tmp_path, monkeypatch):
+    """Not with the tick's time, which is a session old by then."""
+    real, ahead = time.monotonic, [0.0]
+    monkeypatch.setattr(time, "monotonic", lambda: real() + ahead[0])
+
+    def act(m, sid):
+        m.rename("fan", "Fan Zhu")
+        ahead[0] = 300.0
+    p, store, _ = names_processor(tmp_path, monkeypatch, Memory("fan"), act)
+    now = changed(p)
+    hand(p, now)
+    since = datetime.fromisoformat(p.household.rows["U1"]["told"][-1]["since"])
+    assert timedelta(seconds=300) <= since - now < timedelta(seconds=310)
+
+
+def test_memory_is_read_on_the_households_date_whatever_time_it_is_given(tmp_path, monkeypatch):
+    p, store = make(tmp_path, tz="America/Los_Angeles")
+    env = {}
+
+    async def spawn(*args, **kw):
+        env.update(kw["env"])
+        raise RuntimeError("no mem here")
+    monkeypatch.setattr("asyncio.create_subprocess_exec", spawn)
+    # 20:00 on the 3rd in Los Angeles
+    with pytest.raises(RuntimeError):
+        asyncio.run(p._mem_call(datetime(2026, 10, 4, 3, 0, tzinfo=timezone.utc), "show", "person:fan"))
+    assert (env["MEM_DATE"], env["MEM_UTC_OFFSET"]) == ("2026-10-03", str(-7 * 3600))
+
+
+def test_a_refused_names_session_takes_no_other_sessions_run(tmp_path, monkeypatch):
+    """It finds its run by its own session id, not as the newest in the
+    store."""
+    p, store, _ = names_processor(tmp_path, monkeypatch, Memory("fan"))
+    ran(store, "s-message")
+
+    async def refused(reserve_usd=0.0):
+        return "busy"
+    p.check_budget = refused
+    now = changed(p)
+    asyncio.run(p._names_session("U1", "fan", "Fan Zhu", now))
+    assert tried(p)["error"] == "busy" and p.household.rows["U1"]["kept"] is None
+
+
+def test_a_failed_try_backs_off_and_is_alerted_once_a_day(tmp_path, monkeypatch):
+    p, store, _ = names_processor(tmp_path, monkeypatch, Memory("fan"), ends("error"), ends("error"))
+    now = changed(p)
+    hand(p, now)
+    assert (tried(p)["count"], tried(p)["error"]) == (1, "claude reported an error")
+    assert not hand(p, now + timedelta(minutes=59))
+    hand(p, now + timedelta(hours=1))
+    assert tried(p)["count"] == 2
+    assert datetime.fromisoformat(tried(p)["next"]) == now + timedelta(hours=3)
+    assert names_alerts(p) == ["a change of a household member's name in Slack could not be handed to memory (1 "
+                               "try); sessions go on using the earlier name; doctor says whose"]
+    ok, line = p.household.state(store, "U1", now + timedelta(hours=1), p.cfg.zone)
+    assert not ok and ": 2 tries, the last at " in line
+
+
+def test_a_names_alert_slack_refused_is_posted_by_a_later_pass(tmp_path, monkeypatch):
+    p, store, _ = names_processor(tmp_path, monkeypatch, Memory("fan"), ends("error"))
+    now = changed(p)
+    real = p.slack.alert
+
+    async def refused(text):
+        raise RuntimeError("no network")
+    p.slack.alert = refused
+    hand(p, now)
+    assert names_alerts(p) == []
+    p.slack.alert = real
+
+    async def nothing():
+        return None
+    p._housekeep = nothing
+    asyncio.run(p.drain_mail())
+    assert len(names_alerts(p)) == 1
+
+
+def test_a_refusal_waits_an_hour_and_is_no_failure(tmp_path, monkeypatch):
+    p, store, _ = names_processor(tmp_path, monkeypatch, Memory(), renames())
+
+    async def refused(reserve_usd=0.0):
+        return "busy"
+    p.check_budget = refused
+    now = changed(p)
+    hand(p, now)
+    assert (tried(p)["error"], tried(p)["count"]) == ("busy", 0)
+    assert datetime.fromisoformat(tried(p)["next"]) == now + timedelta(hours=1)
+    q = restarted(p)
+    asyncio.run(q.relook_names(now + ROUND, start=True))
+    assert names_alerts(q) == [] and tried(q)["error"] == "busy"
+    # memory holding neither name: not taken for an advance, which needs a run
+    assert q.household.told("U1") == "fan"
+    assert not hand(q, now + timedelta(minutes=59))
+    assert hand(q, now + timedelta(hours=1)) and len(q.runner.calls) == 1
+
+
+def test_a_stop_before_the_model_ran_is_due_again_at_once(tmp_path, monkeypatch):
+    p, store, _ = names_processor(tmp_path, monkeypatch, Memory())
+    now = changed(p)
+
+    async def stopped():
+        await p.runner.agent_sem.acquire()
+        await p.runner.agent_sem.acquire()
+        t = asyncio.create_task(p._names_session("U1", "fan", "Fan Zhu", now))
+        await asyncio.sleep(0.05)
+        t.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await t
+    asyncio.run(stopped())
+    assert (tried(p)["error"], tried(p)["count"], tried(p)["next"]) == ("stopped", 0, now.isoformat())
+    q = restarted(p)
+    asyncio.run(q.relook_names(now + ROUND, start=True))
+    assert q.household.told("U1") == "fan" and names_alerts(q) == []
+    assert hand(q, now + ROUND)
+
+
+def test_a_kept_change_is_looked_at_again_each_round(tmp_path, monkeypatch):
+    """Renamed later by a message session, it advances. An alerted keep whose
+    second person is forgotten ends, and the change is handed again; a
+    plain keep beside a second person a message session then makes is
+    alerted, once."""
+    memory = Memory("fan")
+    p, store, _ = names_processor(tmp_path, monkeypatch, memory, lambda m, sid: None, makes("Fan Z"),
+                                  lambda m, sid: None)
+    now = changed(p)
+    hand(p, now)
+    assert p.household.rows["U1"]["kept"]["plain"] is True
+    memory.rename("fan", "Fan Zhu")
+    asyncio.run(p.relook_names(now + ROUND))
+    assert p.household.told("U1") == "Fan Zhu"
+    # an alerted keep, its stray forgotten
+    now = changed(p, name="Fan Z", at=now + 3 * ROUND)
+    hand(p, now)
+    kept = p.household.rows["U1"]["kept"]
+    assert kept["plain"] is False
+    asyncio.run(p._flush_names())
+    stray = next(pid for pid, x in memory.people.items() if x["name"] == "Fan Z")
+    memory.forget(stray)
+    asyncio.run(p.relook_names(now + ROUND))
+    assert p.household.rows["U1"]["kept"] is None and p.household.awaiting("U1") == "Fan Z"
+    hand(p, now + ROUND)
+    assert len(p.runner.calls) == 3 and p.household.rows["U1"]["kept"]["plain"] is True
+    memory.make("Fan Z", "s-message")
+    asyncio.run(p.relook_names(now + 2 * ROUND))
+    asyncio.run(p.relook_names(now + 3 * ROUND))
+    assert p.household.rows["U1"]["kept"]["plain"] is False
+    asyncio.run(p._flush_names())
+    asyncio.run(p._flush_names())
+    assert len(p.slack.alerts) == 2
+
+
+def test_a_message_session_outlasting_a_names_session_keeps_its_opening_names(tmp_path, monkeypatch):
+    """On two slots, a names session that a message session's first step
+    outlasts: what is added to the message session is framed with the name
+    its opening frame used, whatever memory has since taken."""
+    p, store, _, slack = standin_processor(tmp_path, monkeypatch, steps=[3.0, 0.2])
+    p.runner.agent_sem = asyncio.Semaphore(2)
+    memory = Memory("fan")
+    memory.rename("fan", "Fan Zhu")
+    p._mem_call = memory.call
+    now = changed(p)
+
+    async def go():
+        first = asyncio.create_task(p.handle_slack(dm(f"{AT:.1f}", "can you remind me at 5")))
+        await moment(("tool_use", 1, 0.1), p.cfg.vault_dir)
+        # the names session, started now, takes one quick step
+        monkeypatch.setenv("STANDIN", json.dumps({"steps": [0.1]}))
+        await p._names_session("U1", "fan", "Fan Zhu", now)
+        added = asyncio.create_task(p.handle_slack(dm(f"{AT + 30:.1f}", "to call the plumber")))
+        await asyncio.gather(first, added)
+    asyncio.run(go())
+    assert p.household.told("U1") == "Fan Zhu"
+    assert [h for h in handed_texts(tmp_path) if h] == [[vault.added_text("dm", "fan", "to call the plumber",
+                                                                           "16:40")]]
+
+
+def test_the_start_settles_a_try_before_any_session(tmp_path, monkeypatch):
+    """A run recorded ok whose outcome was never read, left by a stop: the
+    daemon's start reads memory and advances before Slack connects."""
+    store = Store(tmp_path / "wanda.db")
+    told(store)
+    store.set_meta("vault_since", "2026-09-01")
+    h = Household.load(store, ["U1", "U2"])
+    now = datetime.now(timezone.utc)
+    h.trying("U1", "Fan Zhu", "s-stopped", now - ROUND)
+    h.save(store, "U1")
+    store.record_run(kind="agent", task_id=None, session_id="s-stopped", started_at=utcnow(), exit_code=0,
+                     cost_usd=0.0, status="ok")
+    store.close()
+    memory = Memory("fan")
+    memory.rename("fan", "Fan Zhu")
+    monkeypatch.setattr("wanda.main.Processor._mem_call", lambda self, now, *args: memory.call(now, *args))
+    c, _, _ = daemon(tmp_path, monkeypatch, {"U1": {"profile": {"display_name": "Fan Zhu"}}, "U2": MEI})
+    h = names_in(c)
+    assert h.told("U1") == "Fan Zhu" and h.rows["U1"]["tried"] is None
+
+
+@pytest.mark.skipif(not os.environ.get("TEST_MEM_BIN"), reason="TEST_MEM_BIN names a mem build")
+@pytest.mark.parametrize("does,told,kept", [
+    (("rename", "person:fan", "Fan Zhu"), "Fan Zhu", None),
+    (("entity", "--kind", "person", "--name", "Fan Zhu", "--new"), "fan", False),
+    (("entity", "--kind", "person", "--name", "Fan Zhu", "--summary", "his cousin", "--new"), "fan", False),
+    (("show", "person:fan"), "fan", True),
+])
+def test_memorys_own_answers_settle_a_change(tmp_path, monkeypatch, does, told, kept):
+    """Through the build: the session's `mem` call, and the daemon's reads of
+    memory after it, give the name sessions are told. fan was made by an
+    earlier session; a second person Fan Zhu beside him is alerted."""
+    root = Path(__file__).resolve().parent.parent
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "mem").symlink_to(os.environ["TEST_MEM_BIN"])
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
+    monkeypatch.setenv("MEM_TEMPLATES", str(root / "memory" / "templates"))
+
+    def mem(sid, *args):
+        return subprocess.run(["mem", *args], env=vault.session_env(p.cfg, sid, now), capture_output=True,
+                              text=True, check=True).stdout
+    p, store, _ = memory_processor(tmp_path, ConversationSlack(), Naming(None, lambda m, sid: mem(sid, *does)),
+                                   monkeypatch)
+    now = changed(p)
+    mem("s-earlier", "entity", "--kind", "person", "--name", "fan", "--summary", "the member")
+    asyncio.run(p._names_session("U1", "fan", "Fan Zhu", now))
+    k = p.household.rows["U1"]["kept"]
+    assert p.household.told("U1") == told and (k["plain"] if k else None) == kept and tried(p) is None
+    if kept is False:
+        assert re.fullmatch(r"person:Fan Zhu finds person:[0-9a-f]{6} \(Fan Zhu\); person:fan finds person:"
+                            r"[0-9a-f]{6} \(fan\)", k["memory"]), k["memory"]
