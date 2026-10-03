@@ -311,8 +311,8 @@ fn today_local() -> String {
 }
 
 fn local_offset_seconds(_now: i64) -> i64 {
-    // TZ handling is the host's; the lab always runs in UTC and a replay pins
-    // the date outright, so this is the one place the two can part.
+    // TZ handling is the host's: the lab always runs in UTC and a replay pins
+    // the date outright. transcript::clock reads the same offset.
     std::env::var("MEM_UTC_OFFSET").ok().and_then(|s| s.parse().ok()).unwrap_or(0)
 }
 
@@ -1687,7 +1687,7 @@ fn cmd_session(v: &Vault, r: &str, day: &str, with_: &str, last: i64, full: bool
     let on_that_day = exchanges.len();
     if !with_.is_empty() {
         let w = with_.to_lowercase();
-        exchanges.retain(|e| e.speaker.to_lowercase().contains(&w));
+        exchanges.retain(|e| transcript::was_with(e, &w));
     }
     if last > 0 {
         let keep = exchanges.len().saturating_sub(last as usize);

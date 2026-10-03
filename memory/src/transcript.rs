@@ -51,6 +51,10 @@ static THREAD_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(concat!(
     r"\.[^\n]*\n\n",
     r"(?:The (?:thread|conversation) so far:\n\n.*?\n\n)?",
     r"(?P<speaker>[^\n]+?) (?:now )?says(?:, after (?P<also>[^\n]+?))?:\n\n(?P<text>.*)$")).unwrap());
+// a session no message started: nobody is speaking, so the name is who she
+// speaks to, and the indented lines are what woke her
+static UNPROMPTED_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
+    r"(?s)^No message started this session\. What I say now reaches (.+?) alone, in a direct message\.\n\n(.*)$").unwrap());
 
 /// (stated date, channel, speaker, text). A prompt not in this shape comes back
 /// whole, undated, from nobody in particular.
@@ -60,7 +64,8 @@ pub fn parse_prompt(prompt: &str) -> (String, String, String, String) {
     };
     let when = m[1].to_string();
     let arrival = m[2].to_string();
-    for (chan, rx) in [("dm", &*DM_RE), ("email", &*EMAIL_RE), ("thread", &*THREAD_RE)] {
+    for (chan, rx) in [("dm", &*DM_RE), ("email", &*EMAIL_RE), ("thread", &*THREAD_RE),
+                       ("clock", &*UNPROMPTED_RE)] {
         if let Some(a) = rx.captures(&arrival) {
             let said = a.name("text").unwrap_or_else(|| a.get(2).unwrap());
             let text: Vec<&str> = crate::text::split_lines(said.as_str())
@@ -125,18 +130,44 @@ impl Exchange {
     pub fn answered(&self) -> bool {
         !self.answer.is_empty() || self.turns.iter().any(|t| t.kind == "answered")
     }
+
+    /// The answer a listing shows. A message's exchange shows its final
+    /// answer, the one the daemon posts. A clock exchange shows the last of
+    /// its answers that says something, which the daemon posts unless it is
+    /// a placeholder the daemon drops: nobody is waiting on it, and a later
+    /// turn, begun when a command it left running ends, can rightly say
+    /// nothing after the reminder was given.
+    pub fn said(&self) -> &str {
+        if self.channel == "clock" {
+            if let Some(t) = self.turns.iter().rev()
+                .find(|t| t.kind == "answered" && !py_strip(&t.text).is_empty()) {
+                return &t.text;
+            }
+        }
+        &self.answer
+    }
 }
 
 static CLOCK_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
     r"^\d{4}-\d{2}-\d{2}(?:[T ](\d{2}):(\d{2}):(\d{2}))?").unwrap());
 
-/// The time of day the timestamp states, in the offset it states it in — the
-/// Python formats the parsed value without converting it, so neither does this.
+/// The time of day the timestamp states. Claude Code stamps in UTC, and with
+/// `MEM_UTC_OFFSET` set a UTC stamp is shown in the household's own time, the
+/// time its sessions are told it is; any other stamp keeps the offset it states.
 fn clock(ts: &str) -> String {
     match CLOCK_RE.captures(ts) {
         // a bare date parses, and formats as midnight
         Some(c) if c.get(1).is_none() => "00:00:00".into(),
-        Some(c) => format!("{}:{}:{}", &c[1], &c[2], &c[3]),
+        Some(c) => {
+            let part = |i: usize| c[i].parse::<i64>().unwrap_or(0);
+            let mut t = part(1) * 3600 + part(2) * 60 + part(3);
+            if ts.ends_with('Z') || ts.ends_with("+00:00") {
+                t += std::env::var("MEM_UTC_OFFSET").ok()
+                    .and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+            }
+            let t = t.rem_euclid(86_400);
+            format!("{:02}:{:02}:{:02}", t / 3600, t % 3600 / 60, t % 60)
+        }
         None => "--:--:--".into(),
     }
 }
@@ -329,6 +360,18 @@ fn result_text(c: Option<&Value>) -> String {
 /// person claiming to be her.
 const UNPARSED: &str = "the opening message";
 
+/// Who an exchange was with, as its opening line names them. In a clock
+/// exchange nobody spoke, and under "said" the person she spoke to would read
+/// as having started it.
+fn opened_by(ex: &Exchange) -> String {
+    match (ex.speaker.is_empty(), ex.date.is_empty()) {
+        (false, _) if ex.channel == "clock" => format!("unprompted, to {}", ex.speaker),
+        (false, _) => format!("{} said", ex.speaker),
+        (true, true) => UNPARSED.to_string(),
+        (true, false) => "someone said".to_string(),
+    }
+}
+
 /// What a session sees: the exchange's own date, and times of day only — a
 /// timestamp's date is never rendered, whatever day the reader is on.
 /// `in_progress` marks the caller's own exchange while it has not answered.
@@ -345,11 +388,7 @@ pub fn render(ex: &Exchange, full: bool, in_progress: bool) -> String {
         head += " \u{b7} this session, in progress";
     }
     let mut out = vec![head, String::new()];
-    let who = match (ex.speaker.is_empty(), ex.date.is_empty()) {
-        (false, _) => format!("{} said", ex.speaker),
-        (true, true) => UNPARSED.to_string(),
-        (true, false) => "someone said".to_string(),
-    };
+    let who = opened_by(ex);
     for t in &ex.turns {
         match t.kind.as_str() {
             "said" => out.push(format!("{}  {who}: {}", t.at, t.text)),
@@ -382,16 +421,27 @@ pub fn render(ex: &Exchange, full: bool, in_progress: bool) -> String {
 /// One line for a listing.
 pub fn line(ex: &Exchange) -> String {
     let said = take_chars(&one_line(&ex.text), 70);
-    let ans = take_chars(&one_line(&ex.answer), 70);
+    let ans = take_chars(&one_line(ex.said()), 70);
     let ans = if ans.is_empty() { "(silent)".to_string() } else { ans };
-    format!("{}  {}  {}: {said}\n          me: {ans}",
+    let who = match (ex.speaker.is_empty(), ex.date.is_empty()) {
+        (false, _) if ex.channel == "clock" => opened_by(ex),
+        (false, _) => ex.speaker.clone(),
+        (true, true) => UNPARSED.to_string(),
+        (true, false) => "?".to_string(),
+    };
+    format!("{}  {}  {who}: {said}\n          me: {ans}",
         take_chars(&ex.session, 8),
-        if ex.date.is_empty() { "----------" } else { &ex.date },
-        match (ex.speaker.is_empty(), ex.date.is_empty()) {
-            (false, _) => ex.speaker.as_str(),
-            (true, true) => UNPARSED,
-            (true, false) => "?",
-        })
+        if ex.date.is_empty() { "----------" } else { &ex.date })
+}
+
+/// Whether an exchange is one with this person, for a listing of them. A
+/// clock exchange in which she gave no answer that says something passed
+/// nothing between them, and a look every morning would otherwise push what
+/// the person said out of the most recent few; `--day` and the id still show
+/// it.
+pub fn was_with(ex: &Exchange, name: &str) -> bool {
+    ex.speaker.to_lowercase().contains(&name.to_lowercase())
+        && !(ex.channel == "clock" && py_strip(ex.said()).is_empty())
 }
 
 /// A session id, or an unambiguous prefix of one.
@@ -515,5 +565,81 @@ mod tests {
         assert_eq!(parse_prompt(&prompt(arrival)),
                    ("2026-01-01".into(), "group dm".into(), "probe (after other)".into(),
                     "one line".into()));
+    }
+
+    fn exchange(prompt: &str, answer: &str) -> Exchange {
+        let (date, channel, speaker, text) = parse_prompt(prompt);
+        Exchange { date, channel, speaker, text, answer: answer.into(), ..Default::default() }
+    }
+
+    const LOOK: &str = "I am wanda.\n\nToday is 2031-01-13.\n\nNo message started this session. \
+What I say now reaches mei alone, in a direct message.\n\n    It is Monday, 08:00, and this is \
+my look at the day ahead for mei.\n\n    Come due for mei after 2031-01-12:\n    \
+`trajectory:aaaaaa`  2031-01-13, today  I undertook to remind mei at 5\n        involves: me; mei\n\n\
+Do three things, in this order.\n";
+
+    #[test]
+    fn a_clock_exchange_reads_back_as_hers_to_the_person_named() {
+        let ex = exchange(LOOK, "");
+        assert_eq!((ex.date.as_str(), ex.channel.as_str(), ex.speaker.as_str()),
+                   ("2031-01-13", "clock", "mei"));
+        assert_eq!(ex.text, "It is Monday, 08:00, and this is my look at the day ahead for mei.\n\n\
+Come due for mei after 2031-01-12:\n`trajectory:aaaaaa`  2031-01-13, today  I undertook to \
+remind mei at 5\n    involves: me; mei");
+        assert!(line(&ex).contains("unprompted, to mei: It is Monday, 08:00"));
+    }
+
+    #[test]
+    fn a_silent_clock_exchange_is_left_out_of_a_listing_with_that_person() {
+        assert!(!was_with(&exchange(LOOK, ""), "mei"));
+        assert!(!was_with(&exchange(LOOK, "  "), "Mei"));
+        assert!(was_with(&exchange(LOOK, "Morning, it is at 5 today."), "mei"));
+        let dm = "I am wanda.\n\nToday is 2031-01-13.\n\nmei says to me, in a direct message:\
+\n\n    morning\n\nDo three things, in this order.\n";
+        assert!(was_with(&exchange(dm, ""), "mei"), "a silent reply to a message still lists");
+        assert!(!was_with(&exchange(dm, "hi"), "fan"));
+    }
+
+    /// A transcript as Claude Code writes one: the prompt, then each turn's
+    /// structured output as an attachment.
+    fn transcript(tag: &str, prompt: &str, answers: &[&str]) -> Exchange {
+        let dir = std::env::temp_dir().join(format!("mem-transcript-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut lines = vec![serde_json::json!({"type": "user", "timestamp": "2031-01-13T16:00:00.000Z",
+            "message": {"role": "user", "content": prompt}}).to_string()];
+        for (i, a) in answers.iter().enumerate() {
+            lines.push(serde_json::json!({"type": "attachment",
+                "timestamp": format!("2031-01-13T16:0{}:00.000Z", i + 1),
+                "attachment": {"type": "structured_output",
+                               "data": {"recalled": [], "answer": a, "recorded": []}}}).to_string());
+        }
+        let path = dir.join("s1.jsonl");
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+        let ex = load(&path);
+        std::fs::remove_dir_all(&dir).ok();
+        ex
+    }
+
+    // a clock exchange that answered in one turn and said nothing in a later
+    // one, begun when a command it left running ended
+    #[test]
+    fn a_clock_exchange_reads_as_its_last_answer_that_says_something() {
+        let ex = transcript("clock", LOOK, &["Morning, it is at 5 today.", ""]);
+        assert_eq!(ex.said(), "Morning, it is at 5 today.");
+        assert!(was_with(&ex, "mei"), "listed with the person it reached");
+        assert!(line(&ex).ends_with("me: Morning, it is at 5 today."), "{}", line(&ex));
+        // the whole exchange still shows every turn as it was
+        let full = render(&ex, true, false);
+        assert!(full.contains("I said: Morning, it is at 5 today.") && full.contains("I said: (nothing)"),
+                "{full}");
+        // nothing said in any turn is silent
+        let ex = transcript("clock-silent", LOOK, &["", " "]);
+        assert!(!was_with(&ex, "mei") && line(&ex).ends_with("me: (silent)"));
+        // a message's exchange reads as its final answer, the one posted
+        let dm = "I am wanda.\n\nToday is 2031-01-13.\n\nmei says to me, in a direct message:\
+\n\n    morning\n\nDo three things, in this order.\n";
+        let ex = transcript("dm", dm, &["Morning.", ""]);
+        assert_eq!(ex.said(), "");
+        assert!(line(&ex).ends_with("me: (silent)"));
     }
 }
