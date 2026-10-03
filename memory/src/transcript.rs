@@ -38,10 +38,19 @@ static DM_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
 static EMAIL_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
     r"(?s)^An email has arrived[^\n]*\n\n\s*From: (.+?)\n(.*)$").unwrap());
 // the thread so far is rendered above the new message; only that new message is
-// this exchange's input
+// this exchange's input. The product gives a direct message with messages
+// before it, a group direct message and a channel the same shape, naming the
+// place, since who could read an exchange is part of what it was; a public
+// channel, and a thread in one, say that anyone in the Slack can read them.
+// A product turn that took messages from several people names the others
+// after the speaker.
 static THREAD_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(concat!(
-    r"(?s)^In a Slack thread that .+? (?:read, wanda included|and I read)\.[^\n]*\n\n",
-    r"(?:The thread so far:\n\n.*?\n\n)?([^\n]+?) (?:now )?says:\n\n(.*)$")).unwrap());
+    r"(?s)^In (?P<place>a Slack thread in a public channel|a public Slack channel|a Slack thread",
+    r"|a Slack channel|a direct message|a group direct message) ",
+    r"that (?:anyone in this Slack can read; .+? and I are in it|.+? (?:read, wanda included|and I read))",
+    r"\.[^\n]*\n\n",
+    r"(?:The (?:thread|conversation) so far:\n\n.*?\n\n)?",
+    r"(?P<speaker>[^\n]+?) (?:now )?says(?:, after (?P<also>[^\n]+?))?:\n\n(?P<text>.*)$")).unwrap());
 
 /// (stated date, channel, speaker, text). A prompt not in this shape comes back
 /// whole, undated, from nobody in particular.
@@ -53,12 +62,27 @@ pub fn parse_prompt(prompt: &str) -> (String, String, String, String) {
     let arrival = m[2].to_string();
     for (chan, rx) in [("dm", &*DM_RE), ("email", &*EMAIL_RE), ("thread", &*THREAD_RE)] {
         if let Some(a) = rx.captures(&arrival) {
-            let text: Vec<&str> = crate::text::split_lines(a.get(2).unwrap().as_str())
+            let said = a.name("text").unwrap_or_else(|| a.get(2).unwrap());
+            let text: Vec<&str> = crate::text::split_lines(said.as_str())
                 .into_iter()
                 .map(|l| if let Some(rest) = l.strip_prefix("    ") { rest } else { l })
                 .collect();
-            return (when, chan.to_string(), py_strip(&a[1]).to_string(),
-                    py_strip(&text.join("\n")).to_string());
+            let chan = match a.name("place").map(|p| p.as_str()) {
+                Some("a direct message") => "dm",
+                Some("a group direct message") => "group dm",
+                Some("a Slack channel") => "channel",
+                Some("a public Slack channel") => "public channel",
+                Some("a Slack thread in a public channel") => "public thread",
+                _ => chan,
+            };
+            let speaker = py_strip(a.name("speaker").unwrap_or_else(|| a.get(1).unwrap()).as_str());
+            // whoever else's message the turn took is named with the speaker,
+            // so the exchange is one person's only when its turn was
+            let speaker = match a.name("also") {
+                Some(also) => format!("{speaker} (after {})", py_strip(also.as_str())),
+                None => speaker.to_string(),
+            };
+            return (when, chan.to_string(), speaker, py_strip(&text.join("\n")).to_string());
         }
     }
     (when, String::new(), String::new(), py_strip(&arrival).to_string())
@@ -444,4 +468,52 @@ pub fn tool_calls(path: &Path) -> Vec<serde_json::Map<String, Value>> {
         m.insert("result".into(), take_chars(&one_line(&text), 300).into());
         Some(m)
     }).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn prompt(arrival: &str) -> String {
+        format!("I am wanda.\n\nToday is 2026-01-01.\n\n{arrival}\n\nDo three things, in this order.\n\nRun mem as: mem\n")
+    }
+
+    // the product's frames, written out whole as a session is handed them, so
+    // a change to either the product or this parser shows here
+    #[test]
+    fn the_product_frames_read_back() {
+        for (arrival, chan) in [
+            ("In a direct message that probe and I read.\n\nThe conversation so far:\n\n    \
+              Mon 2025-12-29 23:58 probe: earlier\n    23:59 me: reply\n\nprobe now says:\n\n    \
+              one line\n    and a second", "dm"),
+            ("In a group direct message that other, probe and I read. Everyone in it sees what \
+              I say there.\n\nprobe says:\n\n    one line\n    and a second", "group dm"),
+            ("In a Slack channel that other, probe and I read. Everyone in it sees what I say \
+              there.\n\nThe conversation so far:\n\n    09:10 other: earlier\n        over two lines\n\n\
+              probe now says:\n\n    one line\n    and a second", "channel"),
+            ("In a public Slack channel that anyone in this Slack can read; other, probe and I are \
+              in it.\n\nThe conversation so far:\n\n    09:10 other: earlier\n\n\
+              probe now says:\n\n    one line\n    and a second", "public channel"),
+            ("In a Slack thread that other (a guest in this Slack), probe and I read. Everyone \
+              in it sees what I say there.\n\nThe thread so far:\n\n    09:10 other: earlier\n\n\
+              probe now says:\n\n    one line\n    and a second", "thread"),
+            ("In a Slack thread in a public channel that anyone in this Slack can read; probe and \
+              I are in it.\n\nprobe says:\n\n    one line\n    and a second", "public thread"),
+        ] {
+            assert_eq!(parse_prompt(&prompt(arrival)),
+                       ("2026-01-01".into(), chan.into(), "probe".into(),
+                        "one line\nand a second".into()), "{arrival}");
+        }
+    }
+
+    // a turn that took messages from more than one person is no one person's
+    #[test]
+    fn a_turn_of_several_speakers_is_no_one_persons() {
+        let arrival = "In a group direct message that other, probe and I read. Everyone in it sees \
+                       what I say there.\n\nThe conversation so far:\n\n    16:58 other: remind me at 5\n\n\
+                       probe now says, after other:\n\n    one line";
+        assert_eq!(parse_prompt(&prompt(arrival)),
+                   ("2026-01-01".into(), "group dm".into(), "probe (after other)".into(),
+                    "one line".into()));
+    }
 }
