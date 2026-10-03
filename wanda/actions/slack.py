@@ -62,6 +62,11 @@ class SlackActions:
             ssl=ssl_context(),
             retry_handlers=default_retry_handlers() + [RateLimitErrorRetryHandler(max_retry_count=3)],
         )
+        # The household's names are read on a client of their own, outside
+        # the pacing lock: a Slack that hangs on one holds up no post. Ten
+        # seconds and no retry, where the SDK waits thirty and retries a
+        # connection error: the next round reads again.
+        self.names_web = WebClient(token=cfg.slack_bot_token, ssl=ssl_context(), timeout=10, retry_handlers=[])
         self._pace = asyncio.Lock()
         self._last_call = 0.0
         self._users: dict[str, dict] = {}
@@ -184,6 +189,13 @@ class SlackActions:
             except Exception:
                 log.warning("could not look up Slack user %s", uid)
         return {uid: self._users[uid] for uid in user_ids if uid in self._users}
+
+    async def user_now(self, user_id: str) -> dict:
+        """users.info for one id, read now, whatever is kept, and kept in its
+        place. Raises when the read fails, leaving what was kept."""
+        user = (await asyncio.to_thread(self.names_web.users_info, user=user_id)).get("user") or {}
+        self._users[user_id] = user
+        return user
 
     async def user_names(self, user_ids: set[str]) -> dict[str, str]:
         """Resolve ids to display names, cached for the process lifetime."""

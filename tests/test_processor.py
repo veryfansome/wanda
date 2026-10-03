@@ -16,6 +16,7 @@ import pytest
 from wanda.config import Config
 from wanda.events import Event
 from wanda import main, vault
+from wanda.household import Household
 from wanda.main import ANCHOR, BUDGET_REPLIES, MAX_APPLY_ATTEMPTS, RETRY_BASE_S, Additions, Processor
 from wanda.runner import RunResult, RunnerService
 from wanda.store import Store, utcnow
@@ -624,6 +625,24 @@ def test_the_look_at_the_snapshots_holds_up_nothing(tmp_path, monkeypatch):
     assert len(looks) == 2 and store.get_meta("snapshots_housekept") == datetime.now(p.cfg.zone).date().isoformat()
 
 
+def slack_names(monkeypatch, answers=None) -> list[str]:
+    """A start's reads of the household's names: fan and mei unless
+    `answers` says what Slack gives each id, a record or an error to raise.
+    Each start, with `vault.prepare` faked, finds no snapshot either."""
+    read = []
+    answers = answers or {"U1": {"profile": {"display_name": "fan"}}, "U2": {"profile": {"display_name": "mei"}}}
+
+    async def user_now(self, uid):
+        read.append(uid)
+        got = answers[uid]
+        if isinstance(got, Exception):
+            raise got
+        return got
+    monkeypatch.setattr("wanda.actions.slack.SlackActions.user_now", user_now)
+    monkeypatch.setattr("wanda.vault.last_snapshot", lambda cfg: "none")
+    return read
+
+
 def test_a_good_start_clears_a_failed_starts_alert(tmp_path, monkeypatch):
     """A start that fails while Slack is unreachable keeps its alert for a
     retry; a later start that passes must not post it while running."""
@@ -653,8 +672,9 @@ def test_a_good_start_clears_a_failed_starts_alert(tmp_path, monkeypatch):
     monkeypatch.setattr("wanda.main.RunnerService", Runner)
     monkeypatch.setattr("wanda.vault.snapshot", lambda cfg, message: None)
     monkeypatch.setattr("wanda.main.acquire_lock", lambda path: None)  # one process, two starts
+    slack_names(monkeypatch)
     c = Config(_env_file=None, data_dir=tmp_path, slack_bot_token="x", slack_app_token="y",
-               alert_channel="C9", slack_owner_user_ids="U1,U2", slack_names="U1:fan,U2:mei",
+               alert_channel="C9", slack_owner_user_ids="U1,U2",
                tz="America/Los_Angeles", email_triage=False, claude_bin="/bin/true", memory_sessions=1)
     monkeypatch.setattr("wanda.vault.prepare", lambda c, now, since=None: "mem recall me: timed out")
     with pytest.raises(SystemExit):
@@ -699,8 +719,9 @@ def test_a_start_that_cannot_open_the_run_store_says_so_and_waits(tmp_path, monk
     monkeypatch.setattr("wanda.vault.prepare", lambda c, now, since=None: None)
     monkeypatch.setattr("wanda.vault.snapshot", lambda cfg, message: None)
     monkeypatch.setattr("wanda.main.acquire_lock", lambda path: None)
+    slack_names(monkeypatch)
     c = Config(_env_file=None, data_dir=tmp_path, slack_bot_token="x", slack_app_token="y",
-               alert_channel="C9", slack_owner_user_ids="U1,U2", slack_names="U1:fan,U2:mei",
+               alert_channel="C9", slack_owner_user_ids="U1,U2",
                tz="America/Los_Angeles", email_triage=False, claude_bin="/bin/true")
     asyncio.run(main.run_daemon(c))
     assert opened["n"] == 4 and tries["alert"] == 2
@@ -741,8 +762,9 @@ def test_a_start_whose_run_store_opens_and_takes_no_write_says_so_and_waits(tmp_
     monkeypatch.setattr("wanda.vault.prepare", lambda c, now, since=None: None)
     monkeypatch.setattr("wanda.vault.snapshot", lambda cfg, message: None)
     monkeypatch.setattr("wanda.main.acquire_lock", lambda path: None)
+    slack_names(monkeypatch)
     c = Config(_env_file=None, data_dir=tmp_path, slack_bot_token="x", slack_app_token="y",
-               alert_channel="C9", slack_owner_user_ids="U1,U2", slack_names="U1:fan,U2:mei",
+               alert_channel="C9", slack_owner_user_ids="U1,U2",
                tz="America/Los_Angeles", email_triage=False, claude_bin="/bin/true")
     asyncio.run(main.run_daemon(c))
     assert full["writes"] == 3 and tries["alert"] == 2
@@ -946,9 +968,19 @@ def dm(ts, text, channel_type="im", thread=None, channel="D1", user="U1"):
         "in_thread": bool(thread), "user": user, "text": text, "files": [], "ts": ts})
 
 
+def told(store, names=None, at=None) -> None:
+    """The run store as a start leaves it once Slack has named each id, here
+    fan and mei by default, the names sessions are then told."""
+    h = Household.load(store, [])
+    for uid, name in (names or {"U1": "fan", "U2": "mei"}).items():
+        h.observe(uid, {"profile": {"display_name": name}}, at or datetime(2026, 9, 1, tzinfo=timezone.utc))
+        h.save(store, uid)
+
+
 def memory_processor(tmp_path, slack, runner, monkeypatch, snapshot=None):
-    p, store = make(tmp_path, slack, data_dir=tmp_path, slack_owner_user_ids="U1,U2",
-                    slack_names="U1:fan,U2:mei", tz="America/Los_Angeles")
+    p, store = make(tmp_path, slack, data_dir=tmp_path, slack_owner_user_ids="U1,U2", tz="America/Los_Angeles")
+    told(store)
+    p.household = Household.load(store, p.cfg.slack_owner_user_ids)
     p.runner = runner
     snaps = []
     monkeypatch.setattr("wanda.vault.snapshot", snapshot or (lambda cfg, message: snaps.append(message)))
@@ -1931,3 +1963,447 @@ def test_a_follow_up_in_a_thread_a_mention_began_is_framed_where_the_mention_was
     conversation(p, (0, mention), (("tool_use", 1, 0.1), dm(f"{AT + 30:.1f}", "and sunday", channel_type="group",
                                                             channel="C1", thread=f"{AT:.1f}")))
     assert handed_texts(tmp_path) == [[vault.added_text("channel", "fan", "and sunday", "16:40")]]
+
+
+# --- the household's names, from Slack ---
+
+def not_found(error="user_not_found"):
+    from slack_sdk.errors import SlackApiError
+    return SlackApiError("The request to the Slack API failed.", {"ok": False, "error": error})
+
+
+def daemon(tmp_path, monkeypatch, answers=None, *, snapshot="none", then=None, alert_ok=True):
+    """A daemon start against fakes, stopped after the mail loop's first
+    pass, which runs `then` first if given, with the processor and the ids
+    whose names have been read so far. Returns its settings, the alerts
+    Slack took and the ids whose names were read, in order. `snapshot` is
+    what snapshots.git holds, or an error reading it raises."""
+    posted = []
+
+    async def alert(self, text):
+        if not alert_ok:
+            raise RuntimeError("no network")
+        posted.append(text)
+
+    async def one_pass(self):
+        if then is not None:
+            await then(self, read)
+        await self.drain_mail()
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    def last_snapshot(cfg):
+        if isinstance(snapshot, Exception):
+            raise snapshot
+        return snapshot
+
+    monkeypatch.setattr("wanda.actions.slack.SlackActions.alert", alert)
+    monkeypatch.setattr("wanda.main.SlackWatcher.start", lambda self: None)
+    monkeypatch.setattr("wanda.main.SlackWatcher.stop", lambda self: None)
+    monkeypatch.setattr("wanda.main.Processor.loop", one_pass)
+    monkeypatch.setattr("wanda.vault.prepare", lambda c, now, since=None: None)
+    monkeypatch.setattr("wanda.vault.snapshot", lambda cfg, message: None)
+    monkeypatch.setattr("wanda.main.acquire_lock", lambda path: None)
+    read = slack_names(monkeypatch, answers)
+    monkeypatch.setattr("wanda.vault.last_snapshot", last_snapshot)
+    c = Config(_env_file=None, data_dir=tmp_path, slack_bot_token="x", slack_app_token="y", alert_channel="C9",
+               slack_owner_user_ids="U1,U2", tz="America/Los_Angeles", email_triage=False, claude_bin="/bin/true")
+    asyncio.run(main.run_daemon(c))
+    return c, posted, read
+
+
+def names_in(c) -> Household:
+    store = Store(c.db_path)
+    try:
+        return Household.load(store, c.slack_owner_user_ids)
+    finally:
+        store.close()
+
+
+FAN = {"profile": {"display_name": "fan", "real_name": "Fan Zhu"}}
+MEI = {"profile": {"display_name": "mei"}}
+
+
+def test_the_start_reads_every_name_and_logs_them(tmp_path, monkeypatch, caplog):
+    import logging
+    with caplog.at_level(logging.INFO, logger="wanda"):
+        c, posted, read = daemon(tmp_path, monkeypatch)
+    assert read == ["U1", "U2"] and posted == []
+    assert "names: U1 as fan (display name), U2 as mei (display name)" in [r.getMessage() for r in caplog.records]
+    assert names_in(c).told_names() == {"U1": "fan", "U2": "mei"}
+
+
+SHOWS_NO_ONE = [not_found(), not_found("user_not_visible"), {"is_bot": True, "profile": {"display_name": "mei"}},
+                {"deleted": True, "profile": {"display_name": "mei"}}]
+
+
+@pytest.mark.parametrize("slack_says", SHOWS_NO_ONE + [{"profile": {"display_name": "wanda", "real_name": ""}}])
+def test_an_id_slack_gives_no_usable_name_is_not_let_in_until_it_does(tmp_path, monkeypatch, caplog, slack_says):
+    import logging
+    with caplog.at_level(logging.INFO, logger="wanda"):
+        c, posted, _ = daemon(tmp_path, monkeypatch, {"U1": FAN, "U2": slack_says})
+    assert names_in(c).told_names() == {"U1": "fan"}
+    assert posted == ["1 id(s) in WANDA_SLACK_OWNER_USER_IDS are not let in: Slack has no member for them, does "
+                      "not show them, or gives no usable name; doctor says whose"]
+    assert "names: U1 as fan (display name), U2 not let in" in [r.getMessage() for r in caplog.records]
+    # its DM runs nothing and posts nothing, and is said once
+    caplog.clear()
+    runner = RecordingRunner(answer("Hi."))
+    store = Store(c.db_path)
+    p = Processor(c, store, asyncio.Queue(), ConversationSlack(), runner)
+    with caplog.at_level(logging.WARNING, logger="wanda"):
+        for i in range(2):
+            asyncio.run(p.handle_slack(dm(f"{AT + i:.1f}", "hello?", channel="D2", user="U2")))
+    assert runner.calls == [] and p.slack.replies == [] and store._query("SELECT * FROM runs") == []
+    assert [r.getMessage() for r in caplog.records] == [
+        "not taking part in D2: U2 is not let in until Slack gives a name for them (doctor)"]
+    # alerted once: the next start, with the same answer, says nothing new
+    store.close()
+    c, posted, _ = daemon(tmp_path, monkeypatch, {"U1": FAN, "U2": slack_says})
+    assert posted == []
+    # a usable read lets it in
+    store = Store(c.db_path)
+    p = Processor(c, store, asyncio.Queue(), ConversationSlack(), runner)
+
+    async def user_now(uid):
+        return {"U1": FAN, "U2": MEI}[uid]
+    p.slack.user_now = user_now
+    asyncio.run(p.read_names(datetime.now(timezone.utc)))
+    asyncio.run(p.handle_slack(dm(f"{AT + 9:.1f}", "hello?", channel="D2", user="U2")))
+    assert p.household.told_names() == {"U1": "fan", "U2": "mei"} and len(runner.calls) == 1
+
+
+@pytest.mark.parametrize("slack_says", SHOWS_NO_ONE)
+def test_a_member_slack_stops_showing_stays_let_in_by_the_name_sessions_know(tmp_path, monkeypatch, slack_says):
+    store = Store(tmp_path / "wanda.db")
+    told(store)
+    store.set_meta("vault_since", "2026-09-01")
+    store.close()
+    c, posted, _ = daemon(tmp_path, monkeypatch, {"U1": FAN, "U2": slack_says})
+    h = names_in(c)
+    assert h.told_names() == {"U1": "fan", "U2": "mei"}
+    assert h.rows["U2"]["slack"]["read"] == "2026-09-01T00:00:00+00:00", "the answer does not stand as a read"
+    assert posted == ["1 household member(s) are no longer shown by Slack, and are let in under the name sessions "
+                      "know; doctor says whose"]
+    c, posted, _ = daemon(tmp_path, monkeypatch, {"U1": FAN, "U2": slack_says})
+    assert posted == [], "alerted once"
+
+
+@pytest.mark.parametrize("answers,named,exits", [
+    # every read failed, and no id has a name: nothing to start on
+    ({"U1": RuntimeError("timed out"), "U2": RuntimeError("timed out")}, None, "timed out"),
+    ({"U1": not_found("invalid_auth"), "U2": not_found("invalid_auth")}, None, "invalid_auth"),
+    # one failed read goes on, its id left out
+    ({"U1": RuntimeError("timed out"), "U2": MEI}, {"U2": "mei"}, None),
+    # Slack's answer about every id is an answer, and so is one about one id
+    ({"U1": not_found(), "U2": not_found()}, {}, None),
+    ({"U1": RuntimeError("timed out"), "U2": not_found()}, {}, None),
+])
+def test_a_start_with_no_names_stops_only_when_slack_said_nothing_about_anyone(tmp_path, monkeypatch, answers,
+                                                                              named, exits):
+    if exits:
+        with pytest.raises(SystemExit, match=f"^could not read any name from Slack: {exits}; a session is told who "
+                                             "is speaking by it$"):
+            daemon(tmp_path, monkeypatch, answers)
+        return
+    c, _, _ = daemon(tmp_path, monkeypatch, answers)
+    assert names_in(c).told_names() == named
+
+
+def test_a_start_with_names_goes_on_whatever_slack_answers(tmp_path, monkeypatch):
+    store = Store(tmp_path / "wanda.db")
+    told(store)
+    store.close()
+    down = not_found("service_unavailable")
+    c, _, read = daemon(tmp_path, monkeypatch, {"U1": down, "U2": down})
+    assert read == ["U1", "U2"] and names_in(c).told_names() == {"U1": "fan", "U2": "mei"}
+
+
+@pytest.mark.parametrize("snapshot,lost", [
+    ("none", False),
+    ("1a2b3c4 after 6f0d", True),
+    (OSError("git log: exit 128: fatal: not a git repository"), True),
+])
+def test_a_run_store_started_afresh_beside_a_vault_with_history_is_said(tmp_path, monkeypatch, snapshot, lost):
+    """Every name sessions were told before is gone with the old store: the
+    first start says so in the log and the alerts, until Slack takes it,
+    even when no id gives a name. A first start says nothing."""
+    answers = {"U1": not_found(), "U2": not_found()}
+    c, posted, _ = daemon(tmp_path, monkeypatch, answers, snapshot=snapshot, alert_ok=False)
+    store = Store(c.db_path)
+    row = json.loads(store.get_meta("store_lost") or "null")
+    assert (row is not None) == lost
+    store.close()
+    if not lost:
+        return
+    assert row["alerted"] is False and row["snapshot"] != "none"
+    # the next start finds the store knows the vault, and flushes what waits
+    c, posted, _ = daemon(tmp_path, monkeypatch, answers, snapshot="1a2b3c4 after 6f0d")
+    assert posted == ["the run store was started afresh beside a vault with history: the names household "
+                      "members had before are not known (README, State)\n2 id(s) in WANDA_SLACK_OWNER_USER_IDS "
+                      "are not let in: Slack has no member for them, does not show them, or gives no usable name; "
+                      "doctor says whose"]
+    store = Store(c.db_path)
+    assert json.loads(store.get_meta("store_lost"))["alerted"] is True
+    store.close()
+    c, posted, _ = daemon(tmp_path, monkeypatch, answers, snapshot="1a2b3c4 after 6f0d")
+    assert posted == []
+
+
+def test_the_names_alert_waits_for_slack_and_says_each_event_once(tmp_path):
+    p, store = make(tmp_path, slack_owner_user_ids="U1,U2,U3", tz="America/Los_Angeles")
+    told(store, {"U1": "fan", "U3": "jo"})
+    store.set_meta("store_lost", json.dumps({"at": "2026-10-03T08:00:00+00:00", "snapshot": "1a2b3c4 x",
+                                             "alerted": False}))
+    p.household = Household.load(store, p.cfg.slack_owner_user_ids)
+    now = datetime.now(timezone.utc)
+    p.household.unread("U2", "user_not_found", now)
+    p.household.unread("U3", "deleted", now)
+
+    async def refused(text):
+        raise RuntimeError("no network")
+    p.slack.alert = refused
+    asyncio.run(p._flush_names())
+    assert json.loads(store.get_meta("store_lost"))["alerted"] is False
+    p.slack = FakeSlack()
+    asyncio.run(p._flush_names())
+    asyncio.run(p._flush_names())
+    [said] = p.slack.alerts
+    assert said.split("\n") == [
+        "the run store was started afresh beside a vault with history: the names household members had before are "
+        "not known (README, State)",
+        "1 id(s) in WANDA_SLACK_OWNER_USER_IDS are not let in: Slack has no member for them, does not show them, or "
+        "gives no usable name; doctor says whose",
+        "1 household member(s) are no longer shown by Slack, and are let in under the name sessions know; doctor "
+        "says whose"]
+    assert not any(w in said for w in ("U1", "U2", "U3", "fan", "jo"))
+    # one that flaps is said once a UTC day
+    p.household.observe("U3", {"profile": {"display_name": "jo"}}, now)
+    p.household.unread("U3", "deleted", now)
+    asyncio.run(p._flush_names())
+    assert len(p.slack.alerts) == 1
+    p.household.rows["U3"]["out_day"] = "2026-01-01"
+    asyncio.run(p._flush_names())
+    assert p.slack.alerts[1] == ("1 household member(s) are no longer shown by Slack, and are let in under the name "
+                                 "sessions know; doctor says whose")
+    # what was marked is in the store
+    assert Household.load(store, ["U3"]).rows["U3"]["out"]["alerted"] is True
+
+
+def test_the_names_alert_marks_what_it_said_whatever_a_read_does_meanwhile(tmp_path):
+    """A read while Slack takes the message can end or replace the event it
+    was about, and the flush marks the event it said: an answer showing no
+    one that began meanwhile waits for the next UTC day's."""
+    p, store = make(tmp_path, slack_owner_user_ids="U1,U2,U4", tz="America/Los_Angeles")
+    told(store, {"U1": "fan", "U2": "mei", "U4": "ann"})
+    p.household = Household.load(store, p.cfg.slack_owner_user_ids)
+    now = datetime.now(timezone.utc)
+    p.household.unread("U2", "user_not_visible", now)
+    p.household.unread("U4", "user_not_visible", now)
+    sent = []
+
+    async def alert(text):
+        sent.append(text)
+        await asyncio.sleep(0)
+        if len(sent) == 1:
+            # the refresh reads mei, and Slack now answers that ann's account
+            # is deleted, while the message is in flight
+            p.household.observe("U2", {"profile": {"display_name": "mei"}}, now)
+            p.household.unread("U4", "deleted", now)
+    p.slack.alert = alert
+    asyncio.run(p._flush_names())
+    assert len(sent) == 1 and p.household.rows["U2"]["out"] is None
+    assert p.household.rows["U4"]["out"]["alerted"] is False
+    p.household.unread("U2", "user_not_visible", now)
+    asyncio.run(p._flush_names())
+    assert len(sent) == 1, "said once a UTC day"
+    p.household.rows["U4"]["out_day"] = "2026-01-01"
+    asyncio.run(p._flush_names())
+    assert sent[1:] == ["1 household member(s) are no longer shown by Slack, and are let in under the name sessions "
+                        "know; doctor says whose"]
+
+
+def test_a_change_seen_at_the_start_waits_and_frames_keep_the_name_sessions_know(tmp_path, monkeypatch, caplog):
+    import logging
+    store = Store(tmp_path / "wanda.db")
+    told(store)
+    store.close()
+    with caplog.at_level(logging.INFO, logger="wanda"):
+        c, _, _ = daemon(tmp_path, monkeypatch, {"U1": {"profile": {"display_name": "Fan Zhu"}}, "U2": MEI})
+    said = [r.getMessage() for r in caplog.records]
+    assert "names: U1 is Fan Zhu in Slack now; sessions say fan until memory has been told" in said
+    assert "names: U1 as fan (Slack shows Fan Zhu), U2 as mei (display name)" in said
+    h = names_in(c)
+    assert h.awaiting("U1") == "Fan Zhu" and h.told("U1") == "fan"
+    runner = RecordingRunner()
+    store = Store(c.db_path)
+    p = Processor(c, store, asyncio.Queue(), ConversationSlack(), runner)
+    monkeypatch.setattr("wanda.vault.snapshot", lambda cfg, message: None)
+    asyncio.run(p.handle_slack(dm(f"{AT:.1f}", "the March one")))
+    assert "fan now says:\n\n    the March one" in runner.calls[0][0]
+
+
+def test_the_names_are_read_again_each_round_until_the_stop(tmp_path, monkeypatch):
+    """By a task of the daemon's own, which a stop cancels; each round reads
+    every allowed id once, in the allowlist's order."""
+    monkeypatch.setattr("wanda.main.NAMES_EVERY_S", 0.05)
+    ended = []
+    real = main.Processor.names_loop
+
+    async def names_loop(self):
+        try:
+            await real(self)
+        finally:
+            ended.append(True)
+    monkeypatch.setattr("wanda.main.Processor.names_loop", names_loop)
+
+    async def three_rounds(p, read):
+        while len(read) < 6:
+            await asyncio.sleep(0.01)
+    c, _, read = daemon(tmp_path, monkeypatch, then=three_rounds)
+    assert read[:6] == ["U1", "U2"] * 3 and ended == [True]
+
+
+def test_a_name_read_that_hangs_holds_back_no_session(tmp_path, monkeypatch):
+    p, store, _ = memory_processor(tmp_path, ConversationSlack(), RecordingRunner(), monkeypatch)
+    monkeypatch.setattr("wanda.main.NAMES_EVERY_S", 0)
+    hung = asyncio.Event()
+
+    async def user_now(uid):
+        hung.set()
+        await asyncio.Event().wait()
+    p.slack.user_now = user_now
+    started = []
+
+    async def clock_session(w, now):
+        started.append(w.key)
+    p._clock_session = clock_session
+
+    async def go():
+        names = asyncio.create_task(p.names_loop())
+        await hung.wait()
+        p._wake([main.clock.Wake("clock:morning:U1", "U1", "x")], datetime.now(p.cfg.zone))
+        await asyncio.gather(*p._bg)
+        await p.handle_slack(dm(f"{AT:.1f}", "the March one"))
+        names.cancel()
+    asyncio.run(go())
+    assert started == ["clock:morning:U1"] and len(p.runner.calls) == 1
+
+
+def test_one_ids_read_that_raises_holds_back_none_after_it(tmp_path, monkeypatch, caplog):
+    import logging
+    p, store, _ = memory_processor(tmp_path, ConversationSlack(), RecordingRunner(), monkeypatch)
+    read = []
+
+    async def user_now(uid):
+        read.append(uid)
+        return {"U1": {"profile": {"display_name": "fan"}}, "U2": {"profile": {"display_name": "Mei Chen"}}}[uid]
+    p.slack.user_now = user_now
+    real = p.household.observe
+
+    def observe(uid, user, now):
+        if uid == "U1":
+            raise ValueError("a record with no shape")
+        return real(uid, user, now)
+    p.household.observe = observe
+    with caplog.at_level(logging.WARNING, logger="wanda"):
+        asyncio.run(p.read_names(datetime.now(timezone.utc)))
+    assert read == ["U1", "U2"] and p.household.awaiting("U2") == "Mei Chen"
+    assert "names: reading U1 failed" in [r.getMessage() for r in caplog.records]
+
+
+def test_a_round_of_reads_that_raises_is_followed_by_the_next(tmp_path, monkeypatch):
+    p, store, _ = memory_processor(tmp_path, ConversationSlack(), RecordingRunner(), monkeypatch)
+    monkeypatch.setattr("wanda.main.NAMES_EVERY_S", 0.01)
+    rounds = []
+
+    async def read_names(now, *, start=False):
+        rounds.append(now)
+        if len(rounds) == 1:
+            raise RuntimeError("a round that raises")
+        return []
+    p.read_names = read_names
+
+    async def go():
+        names = asyncio.create_task(p.names_loop())
+        try:
+            while len(rounds) < 2:
+                await asyncio.sleep(0.01)
+        finally:
+            names.cancel()
+    asyncio.run(asyncio.wait_for(go(), 3))
+
+
+def test_a_group_with_an_allowed_id_not_let_in_is_not_the_households(tmp_path, monkeypatch):
+    """Who is let in, not the allowlist, decides, in a group as in a DM."""
+    p, store, _ = memory_processor(tmp_path, ConversationSlack(members=["U1", "U2", "UBOT"]),
+                                   RecordingRunner(), monkeypatch)
+    store._exec("DELETE FROM meta WHERE key='names:U2'")
+    p.household = Household.load(store, p.cfg.slack_owner_user_ids)
+    assert asyncio.run(p._household_members({"channel": "G1", "channel_type": "mpim", "user": "U1"})) is None
+
+
+def test_a_queued_message_from_an_id_not_let_in_gets_no_restart_notice(tmp_path, monkeypatch):
+    p, store, _ = memory_processor(tmp_path, ConversationSlack(), RecordingRunner(), monkeypatch)
+    store._exec("DELETE FROM meta WHERE key='names:U2'")
+    p.household = Household.load(store, p.cfg.slack_owner_user_ids)
+    for ev in (dm(f"{AT:.1f}", "hello?", channel="D2", user="U2"), dm(f"{AT:.1f}", "hello?")):
+        p.slack_queue.put_nowait(ev)
+    asyncio.run(p.shutdown(grace_s=1))
+    owed = store._query("SELECT t.slack_channel FROM runs r JOIN tasks t ON t.id = r.task_id WHERE r.notified=0")
+    assert [r["slack_channel"] for r in owed] == ["D1"]
+
+
+def test_a_member_keeps_one_spelling_through_a_session(tmp_path, monkeypatch):
+    """A change of capitals while a session works: a message added to it is
+    framed with the name its opening frame used, and the next turn's frame
+    with the new one."""
+    p, store, _, slack = standin_processor(tmp_path, monkeypatch, steps=[1.0, 0.2])
+
+    async def go():
+        first = asyncio.create_task(p.handle_slack(dm(f"{AT:.1f}", "can you remind me at 5")))
+        await moment(("tool_use", 1, 0.1), p.cfg.vault_dir)
+        p.household.observe("U1", {"profile": {"display_name": "FAN"}}, datetime.now(timezone.utc))
+        added = asyncio.create_task(p.handle_slack(dm(f"{AT + 30:.1f}", "to call the plumber")))
+        await asyncio.gather(first, added)
+    asyncio.run(go())
+    assert handed_texts(tmp_path) == [[vault.added_text("dm", "fan", "to call the plumber", "16:40")]]
+    assert p.household.told("U1") == "FAN"
+
+
+def test_doctor_shows_each_members_name_from_the_store_alone(tmp_path, capsys):
+    from wanda.main import run_doctor
+
+    c = Config(_env_file=None, data_dir=tmp_path, claude_bin="/bin/true", email_triage=False,
+               slack_owner_user_ids="U1,U2,U3", tz="America/Los_Angeles")
+    asyncio.run(run_doctor(c, smoke=False))
+    out = capsys.readouterr().out
+    assert "✓ memory settings — U1, U2, U3 allowed, each let in once Slack gives a name (slack: below); time zone " \
+           "America/Los_Angeles; 1 session(s) at once" in out
+    assert "✓ U1 — no name yet; the first start reads Slack" in out
+    store = Store(c.db_path)
+    told(store, {"U1": "fan"}, at=datetime.now(timezone.utc))
+    h = Household.load(store, c.slack_owner_user_ids)
+    h.unread("U2", "user_not_found", datetime.now(timezone.utc))
+    h.save(store, "U2")
+    store.set_meta("store_lost", json.dumps({"at": "2026-10-03T08:00:00+00:00", "snapshot": "1a2b3c4 x",
+                                             "alerted": False}))
+    store.close()
+    asyncio.run(run_doctor(c, smoke=False))
+    out = capsys.readouterr().out
+    assert "  ✗ run store — started afresh on 2026-10-03 beside a vault with history\n" in out
+    assert "  ✓ U1 — sessions say fan, since " in out and "Slack shows fan (display name fan, full name empty)" in out
+    assert "  ✗ U2 — not let in: WANDA_SLACK_OWNER_USER_IDS lists U2, which Slack has no member for\n" in out
+    assert "  ✓ U3 — no name yet; the first start reads Slack\n" in out
+    store = Store(c.db_path)
+    assert store._query("SELECT COUNT(*) AS n FROM tasks")[0]["n"] == 0, "doctor writes no task"
+    assert sorted(store.meta_starting("names:")) == ["names:U1", "names:U2"]
+
+
+def test_names_come_from_slack_alone(monkeypatch):
+    """compose no longer asks for a name map, nor does .env.example; an .env
+    that still has one starts as before."""
+    root = Path(__file__).resolve().parent.parent
+    for f in ("compose.wanda.yaml", ".env.example", "README.md"):
+        assert "WANDA_SLACK_NAMES" not in (root / f).read_text(), f
+    monkeypatch.setenv("WANDA_SLACK_NAMES", "U1:fan,U2:mei")
+    assert Config(_env_file=None, slack_owner_user_ids="U1,U2").slack_owner_user_ids == ["U1", "U2"]

@@ -9,7 +9,6 @@ from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 CsvList = Annotated[list[str], NoDecode]
-CsvMap = Annotated[dict[str, str], NoDecode]
 
 
 class Config(BaseSettings):
@@ -44,12 +43,9 @@ class Config(BaseSettings):
     # channel.
     alert_channel: str = ""
     # Who may start a session. The daemon refuses to start with it empty: a
-    # session reads the household's whole memory.
+    # session reads the household's whole memory. Each is called by the name
+    # Slack gives them (wanda/household.py).
     slack_owner_user_ids: CsvList = Field(default_factory=list)
-    # Slack user id to the name the vault knows that person by, "U0123:fan".
-    # A display name can change, and a second spelling of a person in a
-    # session's prompt becomes a second person in the vault.
-    slack_names: CsvMap = Field(default_factory=dict)
     # User token (xoxp-), only needed for `wanda slack search`.
     slack_user_token: str = ""
     slack_context_limit: int = 50
@@ -120,16 +116,6 @@ class Config(BaseSettings):
     def _split_csv(cls, v: object) -> object:
         if isinstance(v, str):
             return [s.strip() for s in v.split(",") if s.strip()]
-        return v
-
-    @field_validator("slack_names", mode="before")
-    @classmethod
-    def _split_pairs(cls, v: object) -> object:
-        if isinstance(v, str):
-            pairs = [s.split(":", 1) for s in v.split(",") if s.strip()]
-            if any(len(p) != 2 or not p[0].strip() or not p[1].strip() for p in pairs):
-                raise ValueError("expected id:name pairs, comma-separated")
-            return {i.strip(): n.strip() for i, n in pairs}
         return v
 
     @field_validator("memory_sessions", mode="before")

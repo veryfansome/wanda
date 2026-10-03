@@ -415,6 +415,12 @@ class Store:
                            (task_id, run_id))
         return rows[0] if rows else None
 
+    def session_run(self, session_id: str) -> sqlite3.Row | None:
+        """The first run recorded under this session, whatever its task: a
+        session the harness names itself records under that name alone."""
+        rows = self._query("SELECT * FROM runs WHERE session_id=? ORDER BY id LIMIT 1", (session_id,))
+        return rows[0] if rows else None
+
     def run(self, run_id: int) -> sqlite3.Row | None:
         """The run recorded under this id."""
         rows = self._query("SELECT * FROM runs WHERE id=?", (run_id,))

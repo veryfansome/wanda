@@ -297,6 +297,64 @@ def test_a_failed_user_lookup_is_not_kept(monkeypatch):
     assert sa.web.calls == 2, "a failure is retried and a success is kept"
 
 
+def test_a_members_name_is_read_now_on_a_client_of_its_own(monkeypatch):
+    """users.info for one id, read past what is kept and kept in its place,
+    with the daemon's trust store, ten seconds and no retry; a failure
+    raises and leaves what was kept. Outside the pacing lock posts wait on:
+    a read that hangs holds up no post."""
+    import threading
+
+    import wanda.actions.slack as actions
+    from wanda.tls import ssl_context
+
+    monkeypatch.setattr(actions, "MIN_INTERVAL_S", 0)
+    sa = actions.SlackActions(cfg(slack_bot_token="xoxb-x"), store=None)
+    assert sa.names_web is not sa.web
+    assert (sa.names_web.ssl, sa.names_web.timeout, sa.names_web.retry_handlers) == (ssl_context(), 10, [])
+
+    class Names:
+        fail = hang = False
+        gate = threading.Event()
+
+        def users_info(self, user):
+            if self.hang:
+                self.gate.wait(5)
+            if self.fail:
+                raise RuntimeError("timed out")
+            return {"user": {"id": user, "profile": {"display_name": "fan"}}}
+
+    class Posts:
+        posted = []
+
+        def chat_postMessage(self, **kw):
+            self.posted.append(kw["text"])
+            return {"ok": True}
+
+        def users_info(self, user):
+            raise AssertionError("a name read now is not read on the posts' client")
+
+    sa.names_web, sa.web = Names(), Posts()
+    sa._users["U1"] = {"id": "U1", "profile": {"display_name": "fzhu"}}
+
+    async def go():
+        assert (await sa.user_now("U1"))["profile"]["display_name"] == "fan"
+        assert (await sa.users({"U1"}))["U1"]["profile"]["display_name"] == "fan"
+        sa.names_web.fail = True
+        with pytest.raises(RuntimeError, match="timed out"):
+            await sa.user_now("U1")
+        assert sa._users["U1"]["profile"]["display_name"] == "fan"
+        sa.names_web.fail, sa.names_web.hang = False, True
+        reading = asyncio.create_task(sa.user_now("U1"))
+        await asyncio.sleep(0.05)
+        await asyncio.wait_for(sa.reply(None, "Will do.", channel="D1"), 2)
+        assert not reading.done()
+        sa.names_web.gate.set()
+        await reading
+
+    asyncio.run(go())
+    assert sa.web.posted == ["Will do."]
+
+
 def test_the_workspace_is_read_each_time_and_a_conversation_has_its_type(monkeypatch):
     """Someone who joined the Slack a minute ago can open a public channel
     now, so users.list is read each time it is asked; and conversations.info

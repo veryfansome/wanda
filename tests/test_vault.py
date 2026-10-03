@@ -21,8 +21,9 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from wanda import vault
+from wanda import clock, vault
 from wanda.config import Config
+from wanda.household import Household, flaw
 from wanda.transcript import plain
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -103,7 +104,8 @@ def parser():
         body = re.search(rf"static {name}: .*?Regex::new\((.*?)\)\.unwrap\(\)", src, re.DOTALL).group(1)
         return re.compile("".join(re.findall(r'r"(.*?)"', body, re.DOTALL)))
 
-    prompt_re, dm_re, email_re, thread_re = (regex(n) for n in ("PROMPT_RE", "DM_RE", "EMAIL_RE", "THREAD_RE"))
+    prompt_re, dm_re, email_re, thread_re, unprompted_re = (
+        regex(n) for n in ("PROMPT_RE", "DM_RE", "EMAIL_RE", "THREAD_RE", "UNPROMPTED_RE"))
     places = {"a direct message": "dm", "a group direct message": "group dm", "a Slack channel": "channel",
               "a public Slack channel": "public channel", "a Slack thread in a public channel": "public thread"}
 
@@ -112,7 +114,7 @@ def parser():
         if not m:
             return ("", "", "", text.strip())
         when, arrival = m.group(1), m.group(2)
-        for chan, rx in (("dm", dm_re), ("email", email_re), ("thread", thread_re)):
+        for chan, rx in (("dm", dm_re), ("email", email_re), ("thread", thread_re), ("clock", unprompted_re)):
             if a := rx.match(arrival):
                 named = a.groupdict()
                 lines = [line.removeprefix("    ") for line in
@@ -251,23 +253,136 @@ def test_plain_turns_slack_markup_into_what_was_written():
 def test_readers():
     users = {"U1": {}, "U2": {"is_restricted": True}, "U3": {"is_restricted": True}, "B1": {"is_bot": True},
              "U4": {"deleted": True}}
-    name_map = {"U1": "fan", "U2": "mei"}
-    named = name_map | {"U3": "jane", "U4": "old"}
+    told = {"U1": "fan", "U2": "mei"}
+    named = told | {"U3": "jane", "U4": "old"}
     # mei's account being a guest one does not make her a guest in her own conversations
-    got = vault.readers(["U3", "U2", "U1", "B1", "U4", "UBOT"], users, named, frozenset({"UBOT"}), name_map)
+    got = vault.readers(["U3", "U2", "U1", "B1", "U4", "UBOT"], users, named, frozenset({"UBOT"}), told)
     assert got == ["fan", "jane (a guest in this Slack)", "mei"]
     crowd = {f"X{i}": f"p{i:02d}" for i in range(20)}
-    got = vault.readers(list(crowd) + ["U1"], {u: {} for u in crowd}, crowd | named, frozenset(), name_map)
+    got = vault.readers(list(crowd) + ["U1"], {u: {} for u in crowd}, crowd | named, frozenset(), told)
     assert got == ["fan", "20 others"]
     with pytest.raises(LookupError, match="U9"):
-        vault.readers(["U1", "U9"], users, named, frozenset(), name_map)
+        vault.readers(["U1", "U9"], users, named, frozenset(), told)
+    # a member is named by the name sessions are told, with no Slack record
+    # needed, and is never a guest
+    assert vault.readers(["U2"], {}, told, frozenset(), told) == ["mei"]
 
 
-def test_names_prefer_the_vaults_and_mark_a_namesake():
-    users = {"U1": {"profile": {"display_name": "fzhu"}}, "U9": {"profile": {"real_name": "Jane D"}},
-             "U7": {"profile": {"display_name": "Mei"}}}
-    assert vault.names(users, {"U1": "fan", "U2": "mei"}) == {
-        "U1": "fan", "U2": "mei", "U9": "Jane D", "U7": "Mei (another person in this Slack)"}
+AT = datetime(2026, 10, 1, 16, 40, tzinfo=timezone.utc)
+
+
+def household() -> Household:
+    """fan (U1), who was fzhu before; mei (U2), whose change to Mei Chen
+    memory kept the earlier name for, and whose Slack still shows it; and U3,
+    allowed, whom Slack has given no name sessions can use."""
+    h = Household({}, ["U1", "U2", "U3"])
+    h.observe("U1", {"profile": {"display_name": "fzhu"}}, AT)
+    h.advance("U1", "fan", "s-1", AT)
+    h.observe("U1", {"profile": {"display_name": "fan"}}, AT)
+    h.observe("U2", {"profile": {"display_name": "mei"}}, AT)
+    h.observe("U2", {"profile": {"display_name": "Mei Chen"}}, AT)
+    h.keep("U2", "Mei Chen", "s-2", "mei stays mei", True, AT)
+    h.observe("U3", {"profile": {}}, AT)
+    return h
+
+
+def test_a_member_is_called_by_the_name_sessions_are_told():
+    h = household()
+    users = {"U1": {"profile": {"display_name": "fzhu"}}, "U2": {"profile": {"display_name": "Mei Chen"}}}
+    named = vault.names(users, h.told_names(), h.namesakes())
+    assert named == {"U1": "fan", "U2": "mei"}, "whatever Slack shows for them now"
+
+
+def test_anyone_else_called_by_a_members_name_is_marked():
+    """Earlier names included, and a change memory kept the earlier name for
+    while the member's Slack shows it; an allowed id not let in is anyone
+    else. Her own bot user is never marked: no member is told her name."""
+    h = household()
+    users = {"U7": {"profile": {"display_name": "FZHU"}}, "U8": {"profile": {"display_name": "Mei Chen"}},
+             "U3": {"profile": {"real_name": "fan"}}, "U9": {"profile": {"display_name": "jane"}},
+             "UBOT": {"is_bot": True, "profile": {"display_name": "wanda"}}}
+    named = vault.names(users, h.told_names(), h.namesakes())
+    assert named == {"U7": "FZHU" + vault.NAMESAKE, "U8": "Mei Chen" + vault.NAMESAKE,
+                     "U3": "fan" + vault.NAMESAKE, "U9": "jane", "UBOT": "wanda", "U1": "fan", "U2": "mei"}
+    # once mei's Slack no longer shows the kept name, it marks no one
+    h.observe("U2", {"profile": {"display_name": "mei"}}, AT)
+    assert "Mei Chen" not in h.namesakes() and "mei chen" not in h.namesakes()
+    assert vault.names({"U8": users["U8"]}, h.told_names(), h.namesakes()) == {
+        "U8": "Mei Chen", "U1": "fan", "U2": "mei"}
+    # with spaces `mem` would collapse
+    assert vault.names({"U7": {"profile": {"display_name": " fan  "}}}, h.told_names(), h.namesakes())["U7"] == (
+        " fan  " + vault.NAMESAKE)
+
+
+def test_a_removed_member_is_not_marked_for_its_own_name():
+    """Its names hold for no one else, and are its own."""
+    h = Household({}, ["U1", "U9"])
+    h.observe("U1", {"profile": {"display_name": "fan"}}, AT)
+    h.observe("U9", {"profile": {"display_name": "jane"}}, AT)
+    removed = Household(h.rows, ["U1"])
+    named = vault.names({"U9": {"profile": {"display_name": "jane"}}}, removed.told_names(), removed.namesakes())
+    assert named["U9"] == "jane"
+
+
+def test_her_mention_reads_as_her_name_in_every_frame():
+    h = household()
+    users = {"U1": {}, "UBOT": {"is_bot": True, "profile": {"display_name": "wanda"}}}
+    named = vault.names(users, h.told_names(), h.namesakes())
+    said = vault.message_text("<@UBOT> the plumber is Tuesday", None, named)
+    assert said == "@wanda the plumber is Tuesday"
+    assert "fan says to me, in a direct message:\n\n    @wanda the plumber" in vault.arrival_text(
+        "dm", named["U1"], said, ["fan"], [])
+    assert vault.added_text("dm", named["U1"], said, "16:41").startswith(
+        "fan adds this in the same direct message at 16:41, before anything I say back has been sent:\n\n"
+        "    @wanda the plumber is Tuesday")
+
+
+# Names a person may give themselves in Slack, each rendered into every frame
+# a session is handed and read back by the copies of mem's own parser.
+AWKWARD = ["Fan Zhu", "-fan", "李梅", "fan says", "Now Mei", "Mei now", "fan_zhu", "fan/zhu",
+           "fan (after mei", "fan (then mei"]
+
+
+def frames(name: str) -> dict[str, str]:
+    """Every shape a frame names its speaker in, by where it is."""
+    out = {}
+    for place in vault.PLACES:
+        for earlier in ([], [("16:38", "mei", "earlier")]):
+            if place == "dm" and not earlier:
+                continue
+            out[f"{place}, {len(earlier)} earlier"] = vault.arrival_text(place, name, SAID, [name, "mei"], earlier)
+    out["dm alone"] = vault.arrival_text("dm", name, SAID, [], [])
+    out["clock"] = clock.Wake("clock:morning:U1", "U1", "It is Thursday, 08:00.").arrival(name)
+    return out
+
+
+def test_a_usable_name_reads_back_whole_from_every_frame():
+    parse = parser()
+    for name in AWKWARD:
+        if flaw(name):
+            continue
+        for shape, arrival in frames(name).items():
+            got = parse(vault.prompt("2026-10-01", arrival))
+            assert got[2] == name, (name, shape, got)
+        assert added_parser()(vault.added_text("group", name, SAID, "16:41")) == (name, SAID), name
+
+
+def test_a_name_the_parser_misreads_is_not_used():
+    """A final " now" is cut off where a frame has no earlier lines, and
+    " (after " or " (then " reads as more than one speaker."""
+    parse = parser()
+    assert [n for n in AWKWARD if flaw(n)] == ["Mei now", "fan (after mei", "fan (then mei"]
+    shapes = frames("Mei now")
+    misread = sorted(shape for shape, arrival in shapes.items()
+                     if parse(vault.prompt("2026-10-01", arrival))[2] != "Mei now")
+    assert "group, 0 earlier" in misread and "thread, 0 earlier" in misread
+    assert all(shape.endswith("0 earlier") for shape in misread), misread
+    src = (ROOT / "memory" / "src" / "transcript.rs").read_text()
+    body = re.search(r"pub fn one_speaker\(.*?\{(.*?)\n\}", src, re.DOTALL).group(1)
+    several = re.findall(r'contains\("(.*?)"\)', body)
+    assert sorted(several) == [" (after ", " (then "]
+    for name in ("fan (after mei", "fan (then mei"):
+        assert any(s in name for s in several)
 
 
 def test_who_may_be_in_a_conversation():
@@ -517,36 +632,23 @@ def test_report_reads_structured_output_or_the_result_text():
 
 def test_settings_problem():
     assert "anyone" in vault.settings_problem(Config(_env_file=None))
-    c = Config(_env_file=None, slack_owner_user_ids="U1,U2", slack_names="U1:fan")
-    assert "U2" in vault.settings_problem(c)
-    c = Config(_env_file=None, slack_owner_user_ids="U1,U2", slack_names="U1:fan, U2:mei")
+    c = Config(_env_file=None, slack_owner_user_ids="U1,U2")
     assert "WANDA_TZ is not set" in vault.settings_problem(c)
-    c = Config(_env_file=None, slack_owner_user_ids="U1,U2", slack_names="U1:fan, U2:mei", tz="Mars/Olympus")
+    c = Config(_env_file=None, slack_owner_user_ids="U1,U2", tz="Mars/Olympus")
     assert "not a time zone" in vault.settings_problem(c)
-    c = Config(_env_file=None, slack_owner_user_ids="U1,U2", slack_names="U1:fan, U2:mei",
-               tz="America/Los_Angeles")
-    assert vault.settings_problem(c) is None and c.slack_names == {"U1": "fan", "U2": "mei"}
-    with pytest.raises(ValueError, match="id:name pairs"):
-        Config(_env_file=None, slack_names="U1:fan,mei")
+    c = Config(_env_file=None, slack_owner_user_ids="U1,U2", tz="America/Los_Angeles")
+    assert vault.settings_problem(c) is None
     for n, ok in ((1, True), (2, True), (0, False), (3, False)):
-        c = Config(_env_file=None, slack_owner_user_ids="U1,U2", slack_names="U1:fan, U2:mei",
-                   tz="America/Los_Angeles", memory_sessions=n)
+        c = Config(_env_file=None, slack_owner_user_ids="U1,U2", tz="America/Los_Angeles", memory_sessions=n)
         assert (vault.settings_problem(c) is None) == ok
 
 
-@pytest.mark.parametrize("names,said", [
-    ({"U1": "fan", "U2": "mei", "U9": "fan"}, "WANDA_SLACK_NAMES gives fan to more than one id"),
-    ({"U1": "fan", "U2": "Fan"}, "WANDA_SLACK_NAMES gives fan to more than one id"),
-    ({"U1": "fan", "U2": "mei", "U9": "jane"}, "WANDA_SLACK_NAMES names U9, which is not in "
-                                               "WANDA_SLACK_OWNER_USER_IDS"),
-])
-def test_a_name_that_leads_to_no_one_allowed_id_is_refused(names, said):
-    """The clock opens the DM of whoever asked for a reminder by the name the
-    reminder gives: a name on a second id, off the allowlist or not, could
-    open someone else's, with the household's memory in the session."""
-    c = Config(_env_file=None, slack_owner_user_ids="U1,U2", slack_names=names, tz="America/Los_Angeles")
-    got = vault.settings_problem(c)
-    assert got is not None and got.startswith(said), got
+def test_an_env_that_still_names_people_starts(monkeypatch):
+    """Names come from Slack: an .env from before, which still gives
+    WANDA_SLACK_NAMES, is read as it always was apart from that line."""
+    monkeypatch.setenv("WANDA_SLACK_NAMES", "U1:fan,U2:mei")
+    c = Config(_env_file=None, slack_owner_user_ids="U1,U2", tz="America/Los_Angeles")
+    assert vault.settings_problem(c) is None and not hasattr(c, "slack_names")
 
 
 def test_sessions_at_once_are_one_unless_set(monkeypatch):

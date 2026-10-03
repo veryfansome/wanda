@@ -19,11 +19,14 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import IO
 
+from slack_sdk.errors import SlackApiError
+
 from wanda import clock, slack_cli, vault
 from wanda.actions.mailbox import MOVED, move_to_trash
 from wanda.actions.slack import SlackActions
 from wanda.config import Config, load_config
 from wanda.events import Event
+from wanda.household import NAMES_EVERY_S, SHUT, Household
 from wanda.runner import RunnerService, RunResult
 from wanda.store import Store, utcnow
 from wanda.tls import ssl_context
@@ -190,6 +193,11 @@ class Additions:
         self.readers: frozenset[str] | None = None
         self.place: str | None = None
         self.now: datetime | None = None
+        # the names that frame gave the household's members, and the names it
+        # marked anyone else by: a member called two ways in one session reads
+        # as two people in its transcript
+        self.told: dict[str, str] = {}
+        self.namesakes: set[str] = set()
         # (channel, ts) of messages deleted after they were taken
         self.withdrawn: set[tuple[str, str]] = set()
         self.results: list[dict] = []
@@ -281,7 +289,8 @@ class Processor:
         self._additions: dict[int, Additions] = {}
         # conversations already given a restart notice in this shutdown
         self._noticed: set[int] = set()
-        # conversations already logged as having someone else in them
+        # conversations already logged as having someone else in them, and
+        # allowed ids already logged as not let in
         self._outside: set[str] = set()
         # the look at snapshots.git the housekeeping waits on (_housekeep)
         self._snapshots_look: asyncio.Future | None = None
@@ -289,6 +298,9 @@ class Processor:
         # clock has already said once in the log
         self._clock_failed: dict[str, float] = {}
         self._clock_said: set = set()
+        # every member's names, read from the run store once; whatever
+        # changes them saves the change at once (wanda/household.py)
+        self.household = Household.load(store, cfg.slack_owner_user_ids)
 
     async def loop(self) -> None:
         """Mail pipeline only. Owner commands are consumed by slack_loop on a
@@ -338,9 +350,10 @@ class Processor:
             if task is None:
                 continue
             # a memory conversation gets one notice, and only where it is known to
-            # be the household's: a 1:1 DM, read by the one who wrote
+            # be the household's: a 1:1 DM, read by the one who wrote, who is let in
             if task["kind"] != "email" and (
-                    pl.get("channel_type") != "im" or not self._owes_notice(task["id"])):
+                    pl.get("channel_type") != "im" or pl.get("user") not in self.household.told_names()
+                    or not self._owes_notice(task["id"])):
                 log.info("dropped a message in %s at shutdown", pl["channel"])
                 continue
             log.info("recording dropped trigger in %s", pl["channel"])
@@ -364,8 +377,9 @@ class Processor:
             try:
                 now = datetime.now(self.cfg.zone)
                 claimed = lambda p: self.store.get_meta(f"clock:morning:{p}")  # noqa: E731
-                wakes = clock.morning_wakes(now, looks, quiet, claimed, self._called)
-                for person in clock.missed(now, looks, claimed):
+                let_in = self._looks_let_in(looks, now)
+                wakes = clock.morning_wakes(now, let_in, quiet, claimed, self.household.told)
+                for person in clock.missed(now, let_in, claimed):
                     self._skip_look(person, now)
                 if time.monotonic() - last_due >= DUE_EVERY_S:
                     last_due = time.monotonic()
@@ -377,16 +391,15 @@ class Processor:
                 log.exception("clock tick failed")
             await asyncio.sleep(CLOCK_TICK_S)
 
-    def _askers(self) -> dict[str, str]:
-        """Each name a reminder's asker can go by, lower case, to the allowed
-        id whose direct message the clock opens for it."""
-        return {self.cfg.slack_names[u].strip().lower(): u
-                for u in self.cfg.slack_owner_user_ids if u in self.cfg.slack_names}
-
-    def _called(self, uid: str) -> str:
-        """The name a session knows the person with this member id by, which
-        the clock's frames say."""
-        return self.cfg.slack_names[uid]
+    def _looks_let_in(self, looks: dict, now: datetime) -> dict:
+        """The looks of ids that are let in, which have a name sessions know
+        them by; one that is not is said in the log once a day."""
+        let_in = self.household.told_names()
+        for uid in looks.keys() - let_in.keys():
+            if (uid, now.date()) not in self._clock_said:
+                self._clock_said.add((uid, now.date()))
+                log.warning("clock: no look for %s: not let in until Slack gives a name for them (doctor)", uid)
+        return {uid: at for uid, at in looks.items() if uid in let_in}
 
     def _skip_look(self, person: str, now: datetime) -> None:
         # a day with no look looks, in Slack, like a look with nothing to say
@@ -408,7 +421,8 @@ class Processor:
         except Exception as e:
             log.warning("clock: the due check was skipped: %s", e)
             return []
-        wakes = clock.due_wakes(now, clock.items(due), self._askers(), lambda k: bool(self.store.get_meta(k)),
+        wakes = clock.due_wakes(now, clock.items(due), self.household.askers(),
+                                lambda k: bool(self.store.get_meta(k)),
                                 self._clock_said, lambda item, why: self._lost(item.id, item.by,
                                                                                  item.asked_by, why))
         self.store.set_meta("clock:checked", now.date().isoformat())
@@ -425,7 +439,8 @@ class Processor:
         # what the store holds of the session cut short can read as given,
         # a note that the reminder was given among it, though nothing reached
         # the person, so the session woken again is told
-        wakes = [dataclasses.replace(w, text=w.text + "\n    " + clock.AGAIN.format(speaker=self._called(w.person)))
+        wakes = [dataclasses.replace(w, text=w.text + "\n    " + clock.AGAIN.format(
+                     speaker=self.household.told(w.person)))
                  if waking.get(w.key, {}).get("again") else w for w in wakes]
         self._check_marked(now, due)
         return wakes
@@ -514,7 +529,7 @@ class Processor:
         morning = w.key.startswith("clock:morning:")
         before = self.store.get_meta(w.key) or ""
         try:
-            called = self._called(w.person)
+            called = self.household.told(w.person)
             channel = await self.slack.dm_channel(w.person)
             # the person's own DM task, so a reply to them and this never run
             # at once, and an answer Slack refused is retried like any other
@@ -525,11 +540,14 @@ class Processor:
                 # what came due for them since their last look that ran and
                 # reported; a first look is handed only what is due today
                 after = self._listed(w.person, task) or (now.date() - timedelta(days=1)).isoformat()
-                listed = (await self._mem(now, "due", "--for", called, "--after", after,
+                # joined to its flag, since clap reads a value that begins
+                # with "-" as a flag of its own
+                listed = (await self._mem(now, "due", f"--for={called}", "--after", after,
                                           "--at", f"{now:%H:%M}")).splitlines()
                 # due.rs marks what is later than the look; one whose time has
                 # come while its wake waits is the clock's to give as well
-                listed = clock.still_to_come(listed, now, self._askers(), lambda k: bool(self.store.get_meta(k)))
+                listed = clock.still_to_come(listed, now, self.household.askers(),
+                                             lambda k: bool(self.store.get_meta(k)))
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -784,6 +802,95 @@ class Processor:
             r["named"] = r["named"] or (r["id"], r["by"]) in named
         self.store.set_meta("clock:lost", json.dumps(lost))
 
+    async def _flush_names(self) -> None:
+        """The alerts about the household's names that go once per event,
+        held in the run store until Slack takes them, all that wait in one
+        message: a run store started afresh beside a vault with history, an
+        allowed id not let in, and a member Slack has stopped showing, each
+        id at most once a UTC day. Each line counts and names no one, since
+        the alerts may be read by anyone in the household; doctor says
+        whose."""
+        now = datetime.now(timezone.utc)
+        lost = json.loads(self.store.get_meta("store_lost") or "null")
+        # each event as it stands now: a read can end or replace one while
+        # Slack takes the message, and what is marked is what was said
+        shut = [(uid, self.household.rows[uid]["out"]) for uid in self.household.unalerted(now)]
+        out = [u for u, _ in shut if not self.household.told(u)]
+        gone = [u for u, _ in shut if self.household.told(u)]
+        lines = []
+        if lost and not lost["alerted"]:
+            lines.append("the run store was started afresh beside a vault with history: the names household "
+                         "members had before are not known (README, State)")
+        if out:
+            lines.append(f"{len(out)} id(s) in WANDA_SLACK_OWNER_USER_IDS are not let in: Slack has no member "
+                         "for them, does not show them, or gives no usable name; doctor says whose")
+        if gone:
+            lines.append(f"{len(gone)} household member(s) are no longer shown by Slack, and are let in under "
+                         "the name sessions know; doctor says whose")
+        if not lines:
+            return
+        try:
+            await self.slack.alert("\n".join(lines))
+        except Exception:
+            log.warning("names alert undeliverable; will retry")
+            return
+        if lost and not lost["alerted"]:
+            self.store.set_meta("store_lost", json.dumps(lost | {"alerted": True}))
+        for uid, shown in shut:
+            self.household.alerted(uid, shown, now)
+            self.household.save(self.store, uid)
+
+    # --- the household's names ---
+
+    async def names_loop(self) -> None:
+        """Every allowed id's name, read again each NAMES_EVERY_S, the start
+        having read them just before. Its own task, outside the sessions'
+        (`_bg`), on a Slack client of its own: a Slack that hangs on a read
+        holds back no post, no tick and no session."""
+        while True:
+            await asyncio.sleep(NAMES_EVERY_S)
+            try:
+                await self.read_names(datetime.now(timezone.utc))
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("names: a round of reads failed")
+
+    async def read_names(self, now: datetime, *, start: bool = False) -> list[str]:
+        """One round: each allowed id read from Slack in the allowlist's
+        order, so of two first seen with one name the first listed keeps it,
+        and each row saved as soon as it changes. An id's read that raises
+        holds back none after it. Returns what failed for each read Slack gave
+        no answer about the id, which at a start with no names leaves nothing
+        to start on."""
+        failed = []
+        for uid in self.cfg.slack_owner_user_ids:
+            try:
+                try:
+                    user = await self.slack.user_now(uid)
+                except Exception as e:
+                    # Slack's own word for what it would not give
+                    error = (str(e.response.get("error") or e) if isinstance(e, SlackApiError)
+                             else str(e) or type(e).__name__)
+                    said = self.household.unread(uid, error, now)
+                    self.household.save(self.store, uid)
+                    if error not in SHUT:
+                        failed.append(error)
+                        # a round says it once a UTC day, the start every time
+                        if start:
+                            said = said or f"names: could not read {uid} from Slack: {error}"
+                    if said:
+                        log.warning("%s", said)
+                    continue
+                said = self.household.observe(uid, user, now)
+                self.household.save(self.store, uid)
+                if said:
+                    log.info("%s", said)
+            except Exception as e:
+                failed.append(str(e) or type(e).__name__)
+                log.exception("names: reading %s failed", uid)
+        return failed
+
     async def _mem(self, now: datetime, *args: str) -> str:
         """A `mem` call the daemon makes itself, dated by the tick and bounded,
         since nothing else would end one held up on the vault's lock. What it
@@ -815,6 +922,7 @@ class Processor:
         await self._flush_abandoned_alert()
         await self._flush_given_up()
         await self._flush_lost()
+        await self._flush_names()
         for kind in ("breaker", "cap", "snapshot", "startup", "clock"):
             await self._flush_alert(kind)
         await self._housekeep()
@@ -1668,7 +1776,7 @@ class Processor:
             more.withdrawn.add((channel, ts))
 
     async def _read_by_others(self, channel: str) -> bool:
-        """Whether anyone but fan, mei and her can read a conversation now,
+        """Whether anyone but the household and her can read a conversation now,
         asked before what is owed there is posted later than its session
         ran: someone may have been added meanwhile. A 1:1 DM takes no one
         else."""
@@ -1676,18 +1784,28 @@ class Processor:
         return kind != "im" and await self._household_members({"channel": channel, "channel_type": kind}) is None
 
     async def _household_members(self, p: dict) -> list[str] | None:
-        """Who reads this conversation, or None when anyone but fan, mei and
-        she can. A public channel is open to everyone in this Slack, so there
-        it is the whole workspace that has to be the household."""
+        """Who reads this conversation, or None when anyone but the household's
+        members and she can. A member is an allowed id with a name sessions
+        are told, which Slack gave; one without is not let in yet. A public
+        channel is open to everyone in this Slack, so there it is the whole
+        workspace that has to be the household."""
+        members = self.household.told_names()
         if p.get("channel_type") == "im":
-            return [p["user"]]  # read by the one who sent it, whom the watcher let in
+            # read by the one who sent it, whom the watcher found on the allowlist
+            if p["user"] in members:
+                return [p["user"]]
+            if p["user"] not in self._outside:
+                self._outside.add(p["user"])
+                log.warning("not taking part in %s: %s is not let in until Slack gives a name for them (doctor)",
+                            p["channel"], p["user"])
+            return None
         own = await self.slack.own_ids()
         if not own:
             raise RuntimeError("could not look up my own Slack ids")
         ids = await self.slack.members(p["channel"])
         can_read = ids + (vault.full_members(await self.slack.workspace())
                           if p.get("channel_type") == "channel" else [])
-        if others := vault.outsiders(can_read, own, self.cfg.slack_owner_user_ids):
+        if others := vault.outsiders(can_read, own, list(members)):
             if p["channel"] not in self._outside:
                 self._outside.add(p["channel"])
                 log.warning("not taking part in %s: %s can read it besides the household",
@@ -1706,8 +1824,10 @@ class Processor:
         if ids is None:
             return None
         place = vault.where(p)
+        told, namesakes = self.household.told_names(), self.household.namesakes()
         if more is not None:
             more.readers, more.place, more.now = frozenset(ids), place, now
+            more.told, more.namesakes = told, namesakes
         own = await self.slack.own_ids()
         try:
             msgs = await self.slack.fetch_context(
@@ -1720,10 +1840,10 @@ class Processor:
         seen = {m.get("ts") for m in msgs}
         msgs = sorted(msgs + [m for m in batch if m["ts"] not in seen], key=lambda m: float(m.get("ts") or 0))
         users = await self.slack.users(set(ids) | user_ids_in(msgs) | user_ids_in([p]))
-        named = vault.names(users, self.cfg.slack_names)
+        named = vault.names(users, told, namesakes)
         return vault.arrival_text(
             place, named[p["user"]], vault.message_text(p.get("text"), p.get("files"), named),
-            vault.readers(ids, users, named, own, self.cfg.slack_names),
+            vault.readers(ids, users, named, own, told),
             vault.earlier(msgs, p["ts"], place, named, own, now),
             also=sorted({named[m["user"]] for m in batch} - {named[p["user"]]}),
         )
@@ -1740,7 +1860,8 @@ class Processor:
                      p["ts"], p["channel"])
             return None
         users = await self.slack.users({p["user"]} | user_ids_in([p]))
-        named = vault.names(users, self.cfg.slack_names)
+        # as its opening frame named everyone, whatever has changed since
+        named = vault.names(users, more.told, more.namesakes)
         return vault.added_text(more.place, named[p["user"]],
                                 vault.message_text(p.get("text"), p.get("files"), named),
                                 vault.stamp(float(p["ts"]), more.now))
@@ -1878,10 +1999,30 @@ async def run_daemon(cfg: Config) -> None:
     # a failed start's alert still waiting for Slack would now be untrue
     store.set_meta("startup_alert_pending", "")
     if not store.get_meta("vault_since"):
+        # A run store that does not know the vault beside a vault that has
+        # history was started afresh: every name sessions were told before
+        # is gone with it, and a reminder asked under one is not given.
+        try:
+            last = await asyncio.to_thread(vault.last_snapshot, cfg)
+        except OSError as e:
+            last = f"unknown ({e})"
+        if last != "none":
+            log.warning("the run store was started afresh beside a vault with history (snapshot %s): the names "
+                        "household members had before are not known", last)
+            store.set_meta("store_lost", json.dumps({"at": utcnow(), "snapshot": last, "alerted": False}))
         store.set_meta("vault_since", now.date().isoformat())
     if said := await asyncio.to_thread(vault.snapshot, cfg, "startup"):
         log.warning("%s", said)
         await processor._alert_once("snapshot", f"vault snapshots: {said}")
+    # Who is let in, and by what name. An id sessions already know is let in
+    # on its name whatever Slack answers; the start gives up only when no id
+    # has a name and Slack said nothing about any of them, as with a bad
+    # token or no network, and Docker starts it again.
+    failed = await processor.read_names(datetime.now(timezone.utc), start=True)
+    named = processor.household.told_names()
+    if not named and len(failed) == len(cfg.slack_owner_user_ids):
+        sys.exit(f"could not read any name from Slack: {failed[0]}; a session is told who is speaking by it")
+    log.info("names: %s", ", ".join(processor.household.summary(uid) for uid in cfg.slack_owner_user_ids))
     # before Slack connects, so that no session has run in a DM since the
     # timed wake a stop or a crash cut short there, or the look a crash did
     processor.settle_wakes(datetime.now(cfg.zone))
@@ -1909,6 +2050,7 @@ async def run_daemon(cfg: Config) -> None:
     # retries undelivered answers and flushes alerts
     tasks.append(asyncio.create_task(processor.loop()))
     tasks.append(asyncio.create_task(processor.clock_loop()))
+    tasks.append(asyncio.create_task(processor.names_loop()))
     await stop.wait()
     log.info("shutting down")
     if imap_watcher:
@@ -1943,9 +2085,11 @@ async def run_doctor(cfg: Config, smoke: bool) -> int:
     report("email triage", True, "on" if cfg.email_triage else "off")
     report("enforcement", True, cfg.enforcement)
     problem = vault.settings_problem(cfg)
-    report("memory settings", problem is None, problem or ", ".join(
-        f"{u} as {cfg.slack_names[u]}" for u in cfg.slack_owner_user_ids)
-        + f"; time zone {cfg.tz}; {cfg.memory_sessions} session(s) at once")
+    report("memory settings", problem is None, problem or (
+        f"{', '.join(cfg.slack_owner_user_ids)} allowed, each let in once Slack gives a name (slack: below); "
+        f"time zone {cfg.tz}; {cfg.memory_sessions} session(s) at once"))
+    # the times doctor gives, once the zone is known to be good
+    zone = cfg.zone if problem is None else timezone.utc
     report("agent tools", True, f"{vault.TOOLS} (memory sessions), {cfg.agent_allowed_tools} (email tasks)")
     looks = clock.settings_problem(cfg.mornings, cfg.quiet_hours, cfg.slack_owner_user_ids)
     # the zone is read only once the memory settings have found it good
@@ -1960,9 +2104,16 @@ async def run_doctor(cfg: Config, smoke: bool) -> int:
         report("vault", problem is None, problem or str(cfg.vault_dir))
 
     print("store:")
+    household = None
     try:
         store = Store(cfg.db_path)
         report("sqlite", True, str(cfg.db_path))
+        household = Household.load(store, cfg.slack_owner_user_ids)
+        # until the alert has gone: a reminder asked under a name from before
+        # is not given, and doctor's own names start from that day
+        afresh = json.loads(store.get_meta("store_lost") or "null")
+        if afresh and not afresh["alerted"]:
+            report("run store", False, f"started afresh on {afresh['at'][:10]} beside a vault with history")
         # as a start proves it: on a full disk the store opens and takes no write
         try:
             store.set_meta("doctor_ran", utcnow())
@@ -1999,7 +2150,7 @@ async def run_doctor(cfg: Config, smoke: bool) -> int:
         quiet = clock.quiet_hours(cfg.quiet_hours) if clock_ok else None
         for uid, at in (clock.mornings(cfg.mornings) if clock_ok else {}).items():
             last = store.get_meta(f"clock:outcome:{uid}")
-            report(f"last look for {uid} ({cfg.slack_names[uid]})", clock.look_healthy(
+            report(f"last look for {uid} ({household.told(uid) or 'not let in'})", clock.look_healthy(
                 last, datetime.now(cfg.zone), running, clock.first_start(at, quiet)), last or "none yet")
         # the timed reminders not given, with who asked and why, which their
         # alert leaves out. Its session may have closed the item, and the
@@ -2008,7 +2159,8 @@ async def run_doctor(cfg: Config, smoke: bool) -> int:
         lost = [r for r in json.loads(store.get_meta("clock:lost") or "[]") if r["at"] >= since]
         report("timed reminders not given, last 30 days", True, str(len(lost)) if lost else "none")
         for r in lost:
-            print(f"      trajectory:{r['id']} due {r['by']}, asked by {r['asked']}: {r['why']} (seen {r['at']})")
+            print(f"      trajectory:{r['id']} due {r['by']}, asked by {household.asker(r['asked'])}: {r['why']} "
+                  f"(seen {r['at']})")
             if r.get("moved"):
                 continue  # the clock gives it at the time the person moved it to
             # how to see the item as it stands before the command: the person
@@ -2109,6 +2261,11 @@ async def run_doctor(cfg: Config, smoke: bool) -> int:
                 report("channel", False, str(e))
     else:
         report("bot token", False, "not set")
+    # each allowed id's name, from the run store alone: what the daemon last
+    # read, and any change of name waiting for memory
+    if household is not None and store is not None:
+        for uid in cfg.slack_owner_user_ids:
+            report(uid, *household.state(store, uid, datetime.now(timezone.utc), zone))
 
     print(f"\n{'all checks passed' if failures == 0 else f'{failures} check(s) failed'}")
     return 0 if failures == 0 else 1

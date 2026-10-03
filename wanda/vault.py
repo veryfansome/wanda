@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import NamedTuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from wanda import household
 from wanda.config import Config
 from wanda.transcript import is_mine, plain
 
@@ -56,8 +57,8 @@ PLACES = {
 }
 EVERYONE = " Everyone in it sees what I say there."
 GUEST = " (a guest in this Slack)"
-# after someone outside the household whose Slack name is a household name,
-# so their words are not read as that person's
+# after someone outside the household whose Slack name is one a member goes
+# or went by, so their words are not read as that person's
 NAMESAKE = " (another person in this Slack)"
 ME = "me"
 # Past this many, a frame names the household's readers and counts the rest.
@@ -124,23 +125,6 @@ def settings_problem(cfg: Config) -> str | None:
     if not cfg.slack_owner_user_ids:
         return ("WANDA_SLACK_OWNER_USER_IDS is empty: anyone in the workspace could start "
                 "a session that reads the household's memory")
-    unnamed = [u for u in cfg.slack_owner_user_ids if u not in cfg.slack_names]
-    if unnamed:
-        return (f"no name in WANDA_SLACK_NAMES for {', '.join(unnamed)}: a session is told "
-                "who is speaking by the name the vault knows them by")
-    # the clock opens the direct message of whoever asked for a reminder by
-    # the name the reminder gives, so a name has to lead to one id, and that
-    # one allowed
-    ids: dict[str, list[str]] = {}
-    for uid, name in cfg.slack_names.items():
-        ids.setdefault(name.strip().lower(), []).append(uid)
-    if shared := sorted(name for name, us in ids.items() if len(us) > 1):
-        return (f"WANDA_SLACK_NAMES gives {', '.join(shared)} to more than one id: the clock would not "
-                "know whose direct message to open")
-    if outside := sorted(u for u in cfg.slack_names if u not in cfg.slack_owner_user_ids):
-        return (f"WANDA_SLACK_NAMES names {', '.join(outside)}, which is not in "
-                "WANDA_SLACK_OWNER_USER_IDS: the clock opens a direct message by name, and a name is "
-                "for an allowed id alone")
     if not cfg.tz:
         return "WANDA_TZ is not set: every session is told the household's date and time in it"
     try:
@@ -154,11 +138,12 @@ def settings_problem(cfg: Config) -> str | None:
 
 # --- who is in a conversation ---
 
-def outsiders(ids: list[str], own: frozenset[str], allowed: list[str]) -> list[str]:
-    """Who in a conversation is neither fan nor mei nor her. A memory session
-    runs only where this is no one: another person's words would reach a
-    session that holds the household's whole memory and has a shell."""
-    return sorted(set(ids) - own - set(allowed))
+def outsiders(ids: list[str], own: frozenset[str], members: list[str]) -> list[str]:
+    """Who in a conversation is neither one of the household's let-in
+    members nor her. A memory session runs only where this is no one:
+    another person's words would reach a session that holds the household's
+    whole memory and has a shell."""
+    return sorted(set(ids) - own - set(members))
 
 
 def full_members(people: list[dict]) -> list[str]:
@@ -177,38 +162,39 @@ def where(p: dict) -> str:
     return {"im": "dm", "mpim": "group", "channel": "public"}.get(p.get("channel_type") or "", "channel")
 
 
-def names(users: dict[str, dict], name_map: dict[str, str]) -> dict[str, str]:
-    """Slack id to name: the vault's name for a member of the household,
-    the one Slack shows for anyone else."""
-    household = {n.lower() for n in name_map.values()}
+def names(users: dict[str, dict], told: dict[str, str], namesakes: set[str]) -> dict[str, str]:
+    """Slack id to name: the name sessions are told for a member of the
+    household (`told`), the one Slack shows for anyone else, marked when
+    `mem` would read it as one of `namesakes`, lower case, which a member
+    goes or went by."""
     out = {}
     for uid, u in users.items():
         prof = u.get("profile") or {}
         name = prof.get("display_name") or prof.get("real_name") or u.get("name") or uid
-        out[uid] = name + (NAMESAKE if name.lower() in household else "")
-    return out | name_map
+        out[uid] = name + (NAMESAKE if household.spelled(name).lower() in namesakes else "")
+    return out | told
 
 
 def readers(ids: list[str], users: dict[str, dict], named: dict[str, str],
-            own: frozenset[str], name_map: dict[str, str]) -> list[str]:
+            own: frozenset[str], told: dict[str, str]) -> list[str]:
     """Who can read what is said in a conversation. A guest is marked as one,
-    unless the household names them; bots, deactivated accounts and her own
-    ids read nothing. A reader Slack would not describe fails the frame, as
-    an unreadable member list does."""
+    unless the household names them (`told`); bots, deactivated accounts and
+    her own ids read nothing. A reader Slack would not describe fails the
+    frame, as an unreadable member list does."""
     out = []
     for uid in ids:
         if uid in own:
             continue
-        if uid not in name_map and uid not in users:
+        if uid not in told and uid not in users:
             raise LookupError(f"no Slack record for {uid}")
         u = users.get(uid) or {}
         if u.get("is_bot") or u.get("deleted"):
             continue
-        guest = uid not in name_map and (u.get("is_restricted") or u.get("is_ultra_restricted"))
+        guest = uid not in told and (u.get("is_restricted") or u.get("is_ultra_restricted"))
         out.append(named.get(uid, uid) + (GUEST if guest else ""))
     out.sort()
     if len(out) > NAMED_READERS:
-        known = [n for n in out if n in name_map.values()]
+        known = [n for n in out if n in told.values()]
         out = known + [f"{len(out) - len(known)} others"]
     return out
 
