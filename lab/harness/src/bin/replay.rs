@@ -10,7 +10,7 @@
 //! arrival N times to one snapshot varies only the session; putting it once to
 //! each of several snapshots varies only the store.
 
-use harness::arrival::{Input, ME};
+use harness::arrival::{last_look, Input, ME};
 use harness::session::{
     install_mem, materialise, placeholder_fields, read_trace, resolve, run_session,
     summarise_trace, write_trace,
@@ -185,6 +185,10 @@ fn run() -> Result<i32, String> {
                 .filter_map(|i| i.get("id").and_then(|v| v.as_i64()).map(|n| (n, i)))
                 .collect()
         };
+        // a clock arrival is handed what came due since that person's last
+        // look, which the arrivals before it say
+        let earlier: Vec<Input> = by_id.values()
+            .filter_map(|i| serde_json::from_value(i.clone()).ok()).collect();
         for line in memory::text::split_lines(&text) {
             let Ok(rec) = serde_json::from_str::<Value>(line) else { continue };
             // the arrivals have to be the ones this run was made from: a date
@@ -249,7 +253,8 @@ fn run() -> Result<i32, String> {
                     .map_err(|e| e.to_string())?;
                 let key = format!("{rp_stem}|{ident}|{k}");
                 let (body, meta) = match run_session(&dest, &inp, &mem_cmd, args.timeout,
-                                                     &key, &memlog, members, history) {
+                                                     &key, &memlog, members, history,
+                                                     &last_look(&earlier, &inp)) {
                     Ok((body, meta, sid)) => {
                         write_trace(&toollog, &key, &sid, &dest);
                         (body, meta)

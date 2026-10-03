@@ -318,6 +318,16 @@ def snaps_for(rec: dict, results: Path, flag: str) -> Path | None:
     return None
 
 
+def said(rec: dict) -> tuple[str, str]:
+    """Who an arrival came from and what it was, as the judge reads them. On
+    the clock nobody wrote: the speaker is who the assistant was looking out
+    for, and the text is the time it looked."""
+    if rec.get("channel") == "clock":
+        return ("nobody wrote", f"at {rec['text']} the assistant looked, unprompted, at the day "
+                f"ahead for {rec['speaker']}, and what it said went to {rec['speaker']} alone")
+    return f"from {rec['speaker']}", rec["text"]
+
+
 def judge_one(rec: dict, vault: S.Vault, timeout_s: int = 120) -> tuple[dict, int]:
     lines, unresolved = [], 0
     # an opaque id says nothing to the judge; every id it sees is rendered
@@ -378,10 +388,12 @@ def judge_one(rec: dict, vault: S.Vault, timeout_s: int = 120) -> tuple[dict, in
     # and the store may hold nothing of it — that is what such a scene tests
     earlier = ""
     for pr in rec.get("prior") or []:
-        earlier += (f"    {pr['date']}, from {pr['speaker']}: {pr['text']}\n"
+        who, what = said(pr)
+        earlier += (f"    {pr['date']}, {who}: {what}\n"
                     f"    the assistant answered: {pr['answer'] or '(nothing)'}\n")
+    who, what = said(rec)
     prompt = (
-        f"Situation ({rec['date']}, from {rec['speaker']}):\n    {rec['text']}\n\n"
+        f"Situation ({rec['date']}, {who}):\n    {what}\n\n"
         + (f"Earlier in this scene, in order:\n{earlier}\n" if earlier else "")
         + f"What the assistant recalled, in its own order:\n" + ("\n".join(lines) or "  (nothing)") +
         f"\n\nWhat it answered:\n    " + (rec.get("answer") or

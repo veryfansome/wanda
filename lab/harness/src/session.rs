@@ -1,6 +1,6 @@
 //! What a session is set up with, how it is run, and what is read back out.
 
-use crate::arrival::{arrival_text, prompt_for, Input};
+use crate::arrival::{arrival_text, clock_text, prompt_for, weekday, Input};
 use memory::text::py_repr;
 use memory::vault::Vault;
 use memory::{index, transcript};
@@ -269,22 +269,34 @@ const ANCHOR: &str = r#"I am wanda, and I am the one reading this. In the messag
 
 /// One exchange. Returns what the session reported, a one-line summary, and
 /// the session id — which this process chooses, so the id is known before the
-/// session runs and every node it writes is stamped with it.
+/// session runs and every node it writes is stamped with it. `last_look` is,
+/// for a `clock` arrival, the date of that person's last look: the list it is
+/// handed is what came due since, read from the store as the session meets it.
 #[allow(clippy::too_many_arguments)]
 pub fn run_session(vault: &Path, inp: &Input, mem_cmd: &str, timeout_s: u64, key: &str,
-               memlog: &Path, members: &[String], history: &[(String, String)])
+               memlog: &Path, members: &[String], history: &[(String, String)],
+               last_look: &str)
     -> Result<(Value, String, String), String>
 {
-    let arrival = arrival_text(inp, members, history);
+    let arrival = if inp.channel == "clock" {
+        // a clock line's text is the time the look runs at
+        let listed = memory::due::for_look(&Vault::new(vault), &inp.date, last_look, &inp.speaker,
+                                           &inp.text)
+            .unwrap_or_default();
+        clock_text(inp, &listed)
+    } else {
+        arrival_text(inp, members, history)
+    };
     let prompt = prompt_for(&inp.date, &arrival, mem_cmd);
     let sid = uuid::Uuid::new_v4().to_string();
     let date = &inp.date;
+    let day = weekday(date);
     // the date this process was given only takes hold from the system prompt.
     // Set in the user prompt it loses to the environment date Claude Code
     // injects, and elapsed-time judgements come out months off.
     let system = format!(
         "{ANCHOR}\n\n\
-         Today is {date}. Any other date I am shown is the machine's, \
+         Today is {day}, {date}. Any other date I am shown is the machine's, \
          not mine — the date in my system prompt, the date the shell reports, \
          the timestamps on files. Every judgement about the date, about how long \
          ago something happened, and about what is overdue uses {date} as now. \

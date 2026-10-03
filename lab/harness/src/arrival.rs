@@ -48,6 +48,51 @@ there.\n\n{history}{speaker} {now}says:\n\n    {text}";
 /// How the thread so far labels her own replies.
 pub const ME: &str = "me";
 
+// a session no message started. Nobody is speaking, so the frame names who
+// hears what she says rather than who said something; the indented lines are
+// what woke her, and a `clock` arrival's text is the time of day it ran at.
+pub const CLOCK: &str = "No message started this session. What I say now reaches {speaker} alone, in a \
+direct message.\n\n    {text}";
+pub const MORNING: &str = "It is {weekday}, {time}, and this is my look at the day ahead for {speaker}.";
+
+/// A morning look, and below it the list `memory::due::for_look` gives for
+/// that person, when it gives one.
+pub fn clock_text(inp: &Input, listed: &[String]) -> String {
+    let mut woke = MORNING.replace("{weekday}", weekday(&inp.date))
+        .replace("{time}", &inp.text).replace("{speaker}", &inp.speaker);
+    if !listed.is_empty() {
+        woke += &format!("\n\n    {}", listed.join("\n    "));
+    }
+    CLOCK.replace("{speaker}", &inp.speaker).replace("{text}", &woke)
+}
+
+/// The date of this person's last look before `at`: their latest earlier
+/// `clock` arrival, or the day before when they have had none, so a first look
+/// is handed only what is due that day.
+pub fn last_look(inputs: &[Input], at: &Input) -> String {
+    inputs.iter()
+        .filter(|i| i.id < at.id && i.channel == "clock" && i.speaker == at.speaker)
+        .map(|i| i.date.clone())
+        .max()
+        .unwrap_or_else(|| memory::due::days_from_civil(&at.date)
+            .map(|d| memory::due::civil_from_days(d - 1)).unwrap_or_default())
+}
+
+/// The day of the week a date falls on.
+pub fn weekday(date: &str) -> &'static str {
+    const DAYS: [&str; 7] = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
+                             "Saturday"];
+    // the month's offset in Sakamoto's method, January first
+    const OFFSET: [i64; 12] = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4];
+    let num = |r: std::ops::Range<usize>| date.get(r).and_then(|x| x.parse::<i64>().ok());
+    let (Some(y), Some(m), Some(d)) = (num(0..4), num(5..7), num(8..10)) else { return "" };
+    if !(1..=12).contains(&m) {
+        return "";
+    }
+    let y = if m < 3 { y - 1 } else { y };
+    DAYS[(y + y / 4 - y / 100 + y / 400 + OFFSET[(m - 1) as usize] + d).rem_euclid(7) as usize]
+}
+
 /// The arrival as the session sees it. For a thread, `members` is who is in it
 /// and `history` is (speaker, text) for every message so far, her own replies
 /// under `ME`.
@@ -56,6 +101,7 @@ pub fn arrival_text(inp: &Input, members: &[String], history: &[(String, String)
         let t = match inp.channel.as_str() {
             "email" => EMAIL,
             "thread" => THREAD,
+            "clock" => return clock_text(inp, &[]),
             _ => DM,
         };
         return t.replace("{speaker}", &inp.speaker).replace("{text}", &inp.text);
@@ -178,6 +224,22 @@ pub fn check_prompt_shape() -> Result<(), String> {
             }
         }
     }
+    let morning = Input { channel: "clock".into(), text: "08:00".into(), ..Input::default() };
+    let morning = Input { speaker: "probe".into(), date: "2026-01-01".into(), ..morning };
+    let look = "It is Thursday, 08:00, and this is my look at the day ahead for probe.";
+    let listed = ["Come due for probe after 2025-12-31:".to_string(),
+                  "`trajectory:aaaaaa`  2026-01-01, today  one line".to_string(),
+                  "    involves: probe".to_string()];
+    for (arrival, text) in [
+        (arrival_text(&morning, &[], &[]), look.to_string()),
+        (clock_text(&morning, &listed), format!("{look}\n\n{}", listed.join("\n"))),
+    ] {
+        let got = read(PROMPT, &arrival);
+        let woke = ("2026-01-01".to_string(), "clock".to_string(), "probe".to_string(), text);
+        if got != woke {
+            return Err(format!("the prompt and the parser disagree for clock: {got:?}"));
+        }
+    }
     for (i, (prompt, arrivals)) in EARLIER.iter().enumerate() {
         for &(chan, arrival) in arrivals.iter() {
             let got = read(prompt, arrival);
@@ -188,4 +250,42 @@ pub fn check_prompt_shape() -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_parser_reads_back_every_prompt() {
+        check_prompt_shape().unwrap();
+    }
+
+    #[test]
+    fn weekdays_fall_where_the_calendar_puts_them() {
+        assert_eq!(weekday("2026-01-01"), "Thursday");
+        assert_eq!(weekday("2026-10-01"), "Thursday");
+        assert_eq!(weekday("2024-02-29"), "Thursday");
+        assert_eq!(weekday("2026-03-01"), "Sunday");
+        assert_eq!(weekday("2000-01-01"), "Saturday");
+        assert_eq!(weekday("2026-13-01"), "");
+    }
+
+    #[test]
+    fn a_look_is_handed_what_came_due_since_that_persons_last_one() {
+        let at = |id: i64, date: &str, channel: &str, speaker: &str| Input {
+            id, date: date.into(), channel: channel.into(), speaker: speaker.into(),
+            text: "08:00".into(), ..Input::default()
+        };
+        let inputs = [at(1, "2026-07-18", "clock", "mei"), at(2, "2026-07-20", "clock", "fan"),
+                      at(3, "2026-07-21", "dm", "mei"), at(4, "2026-07-23", "clock", "mei")];
+        assert_eq!(last_look(&inputs, &inputs[3]), "2026-07-18");
+        assert_eq!(last_look(&inputs, &inputs[0]), "2026-07-17");
+        assert_eq!(last_look(&inputs, &inputs[1]), "2026-07-19");
+        let text = clock_text(&inputs[3], &["Come due for mei after 2026-07-18:".into(),
+                                            "`trajectory:aaaaaa`  2026-07-23, today  x".into()]);
+        assert_eq!(text, "No message started this session. What I say now reaches mei alone, in \
+a direct message.\n\n    It is Thursday, 08:00, and this is my look at the day ahead for mei.\n\n    \
+Come due for mei after 2026-07-18:\n    `trajectory:aaaaaa`  2026-07-23, today  x");
+    }
 }

@@ -6,7 +6,7 @@
 //! nothing else. Every session is a Claude Code session with the vault as its
 //! working directory and `mem` as its only way into the store.
 
-use harness::arrival::{check_prompt_shape, Input, ME};
+use harness::arrival::{check_prompt_shape, last_look, Input, ME};
 use harness::session::{
     install_mem, placeholder_fields, read_trace, resolve, run_session, summarise_trace,
     write_session_config, write_trace,
@@ -253,6 +253,7 @@ fn run() -> Result<i32, String> {
             &vault_path, inp, &mem_cmd, args.timeout, &trace_key, &memlog,
             members.get(inp.thread()).map(|v| v.as_slice()).unwrap_or(&[]),
             threads.get(inp.thread()).map(|v| v.as_slice()).unwrap_or(&[]),
+            &last_look(&inputs, inp),
         ) {
             Ok((out, meta, sid)) => {
                 write_trace(&toollog, &trace_key, &sid, &vault_path);

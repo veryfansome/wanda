@@ -79,11 +79,11 @@ def test_tools_schema_placeholders_and_date_paragraph_are_the_labs():
     lab_words = re.search(r"const PLACEHOLDER: \[&str; \d+\] = \[(.*?)\];", src, re.DOTALL).group(1)
     assert tuple(re.findall(r'"(.*?)"', lab_words)) == vault.PLACEHOLDER
     system = rust_str(re.search(r'let system = format!\(\s*"(.*?)"\);', src, re.DOTALL).group(1))
-    assert system.startswith("{ANCHOR}\n\nToday is {date}. ")
+    assert system.startswith("{ANCHOR}\n\nToday is {day}, {date}. ")
     paragraph = vault.date_paragraph(NOW)
     first = "Today is Thursday, 2026-10-01, and it is 16:40 here (PDT) as this session begins. "
     assert paragraph.startswith(first)
-    assert paragraph.removeprefix(first) == system.split("Today is {date}. ", 1)[1].replace(
+    assert paragraph.removeprefix(first) == system.split("Today is {day}, {date}. ", 1)[1].replace(
         "{date}", "2026-10-01")
 
 

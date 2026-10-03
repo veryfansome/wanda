@@ -80,8 +80,11 @@ her; they are not talking to each other in these lines. Lines on the `email`
 channel are mail that arrived in someone's mailbox, and the mailbox is named
 at the end of the line. Lines on a `thread:<name>` channel are messages in one
 Slack thread that everyone in it reads, wanda included: there fan and mei
-*are* talking to each other, and to her. Your job is to find where the story
-contradicts itself, not to judge whether it is a good test of anything.
+*are* talking to each other, and to her. Lines on the `clock` channel are not
+messages: nobody wrote, and at the time the line gives, wanda looks at the day
+ahead for the person named and whatever she says goes to that person alone.
+Your job is to find where the story contradicts itself, not to judge whether
+it is a good test of anything.
 
 Report only what a careful reader would call a genuine problem:
 
@@ -185,7 +188,10 @@ Lines on the `dm` channel are one person speaking to the assistant alone;
 `email` lines are mail in someone's mailbox; lines on a `thread:<name>`
 channel are messages in one Slack thread that everyone in it reads, the
 assistant included, so there the people are talking to each other as well as
-to her, and whatever she says is heard by all of them.
+to her, and whatever she says is heard by all of them. Lines on the `clock`
+channel are not messages: nobody wrote, and at the time the line gives, the
+assistant looks at the day ahead for the person named and whatever she says
+goes to that person alone.
 
 Judge against the history you are given and the moment you are given. Recency
 matters: something last mentioned six months ago and settled is a fair
@@ -311,7 +317,8 @@ def check_one(cp: C.Input, history: list[C.Input], timeout_s: int = 180,
     prompt = (
         "The history, in order, as the store was built from it:\n" +
         "\n".join(f"  {l}" for l in lines) +
-        f"\n\nThe moment being tested ({cp.date}, {cp.channel}, from {cp.speaker}):\n"
+        f"\n\nThe moment being tested ({cp.date}, {cp.channel}, "
+        f"{'for' if cp.channel == 'clock' else 'from'} {cp.speaker}):\n"
         f"  {cp.text}\n\n"
         "should:\n" + "\n".join(f"- {s}" for s in cp.should) +
         ("\n\nshould not:\n" + "\n".join(
