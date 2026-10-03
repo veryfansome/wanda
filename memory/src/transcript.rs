@@ -558,14 +558,30 @@ pub fn line(ex: &Exchange) -> String {
         if ex.date.is_empty() { "----------" } else { &ex.date })
 }
 
-/// Whether an exchange is one with this person, for a listing of them. A
-/// clock exchange in which she gave no answer that says something passed
-/// nothing between them, and a look every morning would otherwise push what
-/// the person said out of the most recent few; `--day` and the id still show
-/// it.
-pub fn was_with(ex: &Exchange, name: &str) -> bool {
+/// Whether an exchange is one with this person, for a listing of them: `name`
+/// anywhere in its speaker, or one of `others`, the other names the person
+/// goes by, as the whole name of someone it names, so that one of those names
+/// inside a longer one lists nobody else. A clock exchange in which she gave
+/// no answer that says something passed nothing between them, and a look
+/// every morning would otherwise push what the person said out of the most
+/// recent few; `--day` and the id still show it.
+pub fn was_with(ex: &Exchange, name: &str, others: &[String]) -> bool {
+    if ex.channel == "clock" && py_strip(&ex.answer).is_empty() {
+        return false;
+    }
     ex.speaker.to_lowercase().contains(&name.to_lowercase())
-        && !(ex.channel == "clock" && py_strip(&ex.answer).is_empty())
+        || names_in(ex).iter().any(|s| others.iter().any(|o| o.to_lowercase() == s.to_lowercase()))
+}
+
+/// Everyone an exchange names: its speaker, or whom the clock had her speak
+/// to; anyone whose message the opening turn took with the speaker's; and
+/// whoever added one while it worked.
+fn names_in(ex: &Exchange) -> Vec<String> {
+    let opened = ex.speaker.split(" (then ").next().unwrap_or("");
+    let mut out = speakers(opened);
+    out.extend(ex.turns.iter().filter(|t| t.kind == "added" && !t.who.is_empty())
+        .map(|t| t.who.clone()));
+    out
 }
 
 /// A session id, or an unambiguous prefix of one.
@@ -895,13 +911,13 @@ remind mei at 5\n    involves: me; mei");
 
     #[test]
     fn a_silent_clock_exchange_is_left_out_of_a_listing_with_that_person() {
-        assert!(!was_with(&exchange(LOOK, ""), "mei"));
-        assert!(!was_with(&exchange(LOOK, "  "), "Mei"));
-        assert!(was_with(&exchange(LOOK, "Morning, it is at 5 today."), "mei"));
+        assert!(!was_with(&exchange(LOOK, ""), "mei", &[]));
+        assert!(!was_with(&exchange(LOOK, "  "), "Mei", &[]));
+        assert!(was_with(&exchange(LOOK, "Morning, it is at 5 today."), "mei", &[]));
         let dm = "I am wanda.\n\nToday is 2031-01-13.\n\nmei says to me, in a direct message:\
 \n\n    morning\n\nDo three things, in this order.\n";
-        assert!(was_with(&exchange(dm, ""), "mei"), "a silent reply to a message still lists");
-        assert!(!was_with(&exchange(dm, "hi"), "fan"));
+        assert!(was_with(&exchange(dm, ""), "mei", &[]), "a silent reply to a message still lists");
+        assert!(!was_with(&exchange(dm, "hi"), "fan", &[]));
     }
 
     /// A transcript as Claude Code writes one: the prompt, then each turn's
@@ -930,7 +946,7 @@ remind mei at 5\n    involves: me; mei");
     fn a_clock_exchange_reads_as_its_last_answer_that_says_something() {
         let ex = transcript("clock", LOOK, &["Morning, it is at 5 today.", ""]);
         assert_eq!(ex.answer, "Morning, it is at 5 today.");
-        assert!(was_with(&ex, "mei"), "listed with the person it reached");
+        assert!(was_with(&ex, "mei", &[]), "listed with the person it reached");
         assert!(line(&ex).ends_with("me: Morning, it is at 5 today."), "{}", line(&ex));
         // shown whole, the empty answer after it changes nothing
         let full = render(&ex, true, false);
@@ -938,7 +954,7 @@ remind mei at 5\n    involves: me; mei");
                 "{full}");
         // nothing said in any turn is silent
         let ex = transcript("clock-silent", LOOK, &["", " "]);
-        assert!(!was_with(&ex, "mei") && line(&ex).ends_with("me: (silent)"));
+        assert!(!was_with(&ex, "mei", &[]) && line(&ex).ends_with("me: (silent)"));
         // a message's exchange reads the same way
         let dm = "I am wanda.\n\nToday is 2031-01-13.\n\nmei says to me, in a direct message:\
 \n\n    morning\n\nDo three things, in this order.\n";

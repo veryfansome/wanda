@@ -269,8 +269,9 @@ impl Cmd {
     /// other, so a verb added later is held as a write until it is listed here.
     fn hold(&self) -> Hold {
         match self {
-            // they read only Claude Code's transcripts, which Claude Code
-            // writes without the lock, or nothing
+            // they read Claude Code's transcripts, which Claude Code writes
+            // without the lock, or nothing; `session --with` holds the vault
+            // itself, only while it looks up a person's names (`other_names`)
             Cmd::Session { .. } | Cmd::Help => Hold::Nothing,
             Cmd::Recall { .. } | Cmd::Search { .. } | Cmd::Show { .. } | Cmd::Due { .. } =>
                 Hold::Shared,
@@ -1658,6 +1659,34 @@ fn says_again(with: &str, said: &str) -> bool {
     starts.iter().any(|&s| ends.iter().any(|&e| e > s && norm(&with[s..e]) == said))
 }
 
+/// The names `--with` matches whole besides the one given: the other names of
+/// the person `person:<name>` finds, as `mem show` finds one, so their
+/// exchanges under a name they had before a rename are listed with the rest.
+/// A name counts only while it finds that person alone, since one another
+/// person also has or had would list that person's too. Her own node is not
+/// followed: every exchange is hers, and a speaker called by one of her names
+/// is someone else. The vault is held shared for these lookups and not while
+/// the transcripts are read, so a write waits only for them; not had within
+/// `within`, the name given is matched alone, so a busy vault still lists.
+fn other_names(v: &Vault, name: &str, within: std::time::Duration) -> Vec<String> {
+    let Ok(_held) = v.lock(false, within) else { return Vec::new() };
+    let Some(nid) = v.person(name) else { return Vec::new() };
+    if v.me().as_ref() == Some(&nid) {
+        return Vec::new();
+    }
+    let (meta, body) = stored(v, &nid);
+    let mut names = vec![memory::fm::label(&meta)];
+    names.extend(memory::fm::former_names(&body));
+    let mut seen = vec![one_line(name).to_lowercase()];
+    names.retain(|n| {
+        let low = n.to_lowercase();
+        let first = !seen.contains(&low);
+        seen.push(low);
+        first && v.person(n).as_ref() == Some(&nid)
+    });
+    names
+}
+
 /// An exchange, or a list of them, from the transcripts Claude Code keeps. This
 /// is the belt: what was said, both sides, and what wanda did about it, for as
 /// long as the transcripts last. Nothing in the vault duplicates it; a node's
@@ -1673,6 +1702,7 @@ fn cmd_session(v: &Vault, r: &str, day: &str, with_: &str, last: i64, full: bool
         out!("{}", transcript::render(&ex, full, in_progress));
         return 0;
     }
+    let others = if with_.is_empty() { Vec::new() } else { other_names(v, with_, WAIT) };
     let mut exchanges = transcript::load_all(&v.root);
     // unanswered, the caller's own exchange reads as an earlier one left silent
     exchanges.retain(|e| v.session.is_empty() || e.session != v.session);
@@ -1681,8 +1711,7 @@ fn cmd_session(v: &Vault, r: &str, day: &str, with_: &str, last: i64, full: bool
     }
     let on_that_day = exchanges.len();
     if !with_.is_empty() {
-        let w = with_.to_lowercase();
-        exchanges.retain(|e| transcript::was_with(e, &w));
+        exchanges.retain(|e| transcript::was_with(e, with_, &others));
     }
     if last > 0 {
         let keep = exchanges.len().saturating_sub(last as usize);
@@ -2007,5 +2036,51 @@ mod tests {
     fn forget_takes_no_reason() {
         let refused = Cli::try_parse_from(["mem", "forget", "x", "--because", "y"]).err();
         assert_eq!(refused.map(|e| e.kind()), Some(clap::error::ErrorKind::UnknownArgument));
+    }
+
+    // clap reads a value opening with `-` after a space as a flag, and after
+    // `=` as the value
+    #[test]
+    fn a_look_is_asked_for_under_a_name_opening_with_a_hyphen() {
+        let cli = Cli::try_parse_from(["mem", "due", "--for=-Alpha", "--after", "2031-01-09"]);
+        assert!(matches!(cli.map(|c| c.cmd), Ok(Cmd::Due { for_, .. }) if for_ == "-Alpha"));
+        assert!(Cli::try_parse_from(["mem", "due", "--for", "-Alpha", "--after", "2031-01-09"]).is_err());
+    }
+
+    #[test]
+    fn a_persons_other_names_are_read_with_the_vault_held_for_that_alone() {
+        let v = store("with");
+        let v = &v.0;
+        v.rename("person:1a2b3c", "Beta", "", "", "2031-01-11");
+        let within = std::time::Duration::from_secs(10);
+        assert_eq!(other_names(v, "Alpha", within), ["Beta"]);
+        assert_eq!(other_names(v, "beta", within), ["Alpha"]);
+        let held = std::fs::File::open(&v.root).unwrap();
+        assert!(held.try_lock().is_ok(), "let go once they are found");
+        // held elsewhere past the wait, the name given is matched alone
+        let short = std::time::Duration::from_millis(200);
+        assert!(other_names(v, "Alpha", short).is_empty());
+        drop(held);
+    }
+
+    // the lookups hold the vault shared, so another reader holding it keeps
+    // no name from them
+    #[test]
+    fn a_persons_other_names_are_read_beside_another_reader() {
+        let v = store("with-shared");
+        let v = &v.0;
+        v.rename("person:1a2b3c", "Beta", "", "", "2031-01-11");
+        let held = std::fs::File::open(&v.root).unwrap();
+        held.lock_shared().unwrap();
+        assert_eq!(other_names(v, "Alpha", std::time::Duration::from_millis(500)), ["Beta"]);
+        drop(held);
+    }
+
+    // `session` holds the vault only around other_names' lookups, never
+    // while the transcripts are read
+    #[test]
+    fn a_listing_of_exchanges_holds_nothing_itself() {
+        let cli = Cli::try_parse_from(["mem", "session", "--with", "Alpha"]).unwrap();
+        assert!(matches!(cli.cmd.hold(), Hold::Nothing));
     }
 }

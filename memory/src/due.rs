@@ -5,7 +5,7 @@
 use crate::fm::label;
 use crate::text::one_line;
 use crate::transcript;
-use crate::vault::Vault;
+use crate::vault::{named, Vault};
 use std::collections::HashMap;
 
 /// A day count for a date, so two dates can be subtracted. None for a date not
@@ -65,6 +65,8 @@ pub struct Item {
     pub days_ago: i64,
     pub summary: String,
     pub involves: Vec<String>,
+    /// the ids of what it involves, in the order of `involves`
+    pub involved: Vec<String>,
     pub constrained_by: Vec<String>,
     /// whose message the thread was made in; empty when the transcript is gone,
     /// when nobody wrote, as with an email or the clock, and when more than one
@@ -73,11 +75,6 @@ pub struct Item {
 }
 
 impl Item {
-    pub fn involves_name(&self, name: &str) -> bool {
-        let name = name.to_lowercase();
-        self.involves.iter().any(|l| l.to_lowercase() == name)
-    }
-
     /// Whether the clock wakes her for this at its time on its day: an
     /// undertaking of hers, at a time of day a clock shows, written in the one
     /// shape `mem` writes, which wanda/clock.py reads too, that one person
@@ -166,6 +163,7 @@ pub fn items(v: &Vault, today: &str, after: Option<&str>) -> Option<Vec<Item>> {
         days_ago: now - day,
         summary: one_line(n.meta.get("summary")),
         involves: to(n, "involves"),
+        involved: n.meta.edges.iter().filter(|e| e.rel == "involves").map(|e| e.to.clone()).collect(),
         constrained_by: to(n, "constrained_by"),
         asked_by: asked_by(v, n.meta.get("made")),
     }).collect())
@@ -179,12 +177,44 @@ pub fn items(v: &Vault, today: &str, after: Option<&str>) -> Option<Vec<Item>> {
 /// re-dated it would take that away. Nothing at all when nothing came due, so
 /// the look is framed as it would be without a list. None when either date
 /// is not one.
+///
+/// The person is anyone labelled `name`, case aside, and the one person
+/// `person:<name>` finds, so a name they had before a rename still finds
+/// them; a name another person also has or had finds no one that way, and
+/// leaves the look to the label. A node of another kind labelled `name` with
+/// no summary and no body, the stub a reminder `--about` someone no node had
+/// yet makes of them, stands for them whatever persons exist: it is almost
+/// always the member, made before memory recorded them, since a node a
+/// session records on purpose is given a summary. One with a summary or
+/// a body is not them while a person answers to `name`, by label or by a name
+/// a rename struck, and stands for them while none does.
+///
+/// A member with no node in memory, whose name another person had before a
+/// rename, is handed that person's items: from the vault alone they cannot be
+/// told from a member a session relabelled, whose look the struck name is
+/// there to keep.
 pub fn for_look(v: &Vault, today: &str, after: &str, name: &str, at: &str) -> Option<Vec<String>> {
     let items = items(v, today, Some(after))?;
+    let want = name.to_lowercase();
+    let nodes = v.nodes();
+    let mut whose: Vec<String> = nodes.iter()
+        .filter(|n| n.kind() == "person" && label(&n.meta).to_lowercase() == want)
+        .map(|n| n.id.clone()).collect();
+    whose.extend(v.person(name));
+    let anyone = !whose.is_empty() || nodes.iter().any(|n| n.kind() == "person" && named(n, &want));
+    whose.extend(nodes.iter()
+        .filter(|n| n.kind() != "person" && label(&n.meta).to_lowercase() == want
+                && n.meta.get("summary").is_empty() && n.body.trim().is_empty())
+        .map(|n| n.id.clone()));
+    let theirs = |i: &Item| if anyone {
+        i.involved.iter().any(|p| whose.contains(p))
+    } else {
+        i.involves.iter().any(|l| l.to_lowercase() == want)
+    };
     let ahead = |i: &Item| !at.is_empty() && i.days_ago == 0 && i.woken_at_its_time()
         && i.by.get(11..).is_some_and(|t| t >= at);
     let mut out = Vec::new();
-    for item in items.iter().filter(|i| i.involves_name(name)) {
+    for item in items.iter().filter(|i| theirs(i)) {
         if out.is_empty() {
             out.push(LOOK_HEAD.replace("{name}", name).replace("{after}", after));
         }
@@ -203,12 +233,17 @@ mod tests {
     use crate::fm::Edge;
 
     /// A vault in a fresh directory with its transcripts beside it, removed
-    /// when the test ends.
-    struct Store(Vault, std::path::PathBuf);
+    /// when the test ends. The transcripts are named by an environment
+    /// variable every test in the process shares, so a test holds `ONE` until
+    /// it ends.
+    struct Store(Vault, std::path::PathBuf, #[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+    static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     impl Drop for Store {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.1);
+            std::env::remove_var("MEM_TRANSCRIPTS");
         }
     }
 
@@ -226,6 +261,8 @@ mod tests {
     }
 
     fn store(tag: &str) -> Store {
+        // poisoned by a test that failed holding it, it guards nothing the next one needs
+        let one = ONE.lock().unwrap_or_else(|e| e.into_inner());
         let base = std::env::temp_dir().join(format!("mem-due-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let root = base.join("vault");
@@ -271,7 +308,20 @@ mod tests {
                &[edge("involves", "person:1a2b3c")]);
         v.session = String::new();
         std::env::set_var("MEM_TRANSCRIPTS", &tx);
-        Store(v, base)
+        Store(v, base, one)
+    }
+
+    /// An open trajectory involving one node, come due on the 12th.
+    fn open(v: &Vault, id: &str, summary: &str, about: &str) {
+        v.upsert(id, "trajectory", summary, summary, "",
+                 &[("expect".into(), "it happens".into()), ("expect_by".into(), "2031-01-12".into()),
+                   ("status".into(), "open".into())],
+                 &[edge("involves", about)], "2031-01-10");
+    }
+
+    /// The ids a look lists, in its order.
+    fn listed(look: &[String]) -> Vec<&str> {
+        look.iter().filter_map(|l| l.strip_prefix('`')?.split('`').next()).collect()
     }
 
     #[test]
@@ -388,6 +438,118 @@ mod tests {
         assert_eq!((item("trajectory:kkkkkk").asked_by.as_str(), item("trajectory:llllll").asked_by.as_str()),
                    ("", "fan"));
         assert!(!item("trajectory:kkkkkk").woken_at_its_time() && item("trajectory:llllll").woken_at_its_time());
-        std::env::remove_var("MEM_TRANSCRIPTS");
+    }
+
+    // a look under the name a person had before a rename lists what one
+    // under the name they have now lists; while a person `fan` exists, a
+    // thing with that name and a summary, or one that once had the name, is
+    // not in fan's look
+    #[test]
+    fn a_look_follows_a_person_by_a_name_they_had() {
+        let s = store("renamed");
+        let v = &s.0;
+        v.upsert("thing:5e6f7a", "thing", "fan", "the ceiling fan in the hall", "", &[], &[], "2031-01-10");
+        v.upsert("thing:6f7a8b", "thing", "fan", "the fan on the desk", "", &[], &[], "2031-01-10");
+        v.rename("thing:6f7a8b", "desk fan", "", "", "2031-01-11");
+        open(v, "trajectory:mmmmmm", "service the ceiling fan", "thing:5e6f7a");
+        open(v, "trajectory:nnnnnn", "return the desk fan", "thing:6f7a8b");
+        let before = for_look(v, "2031-01-12", "2031-01-08", "fan", "08:00").unwrap();
+        assert_eq!(listed(&before), ["trajectory:aaaaaa", "trajectory:gggggg", "trajectory:cccccc"]);
+        v.rename("person:1a2b3c", "Fan Zhu", "", "", "2031-01-11");
+        let after = |name: &str| for_look(v, "2031-01-12", "2031-01-08", name, "08:00").unwrap();
+        for name in ["fan", "Fan Zhu"] {
+            assert_eq!(after(name), vec![
+                format!("Come due for {name} after 2031-01-08:"),
+                "`trajectory:aaaaaa`  2031-01-12T17:00, today  remind fan at 5".into(),
+                "    involves: me; Fan Zhu; mei".into(),
+                "    constrained_by: keep it from mei".into(),
+                "    asked by: fan".into(),
+                "    still to come: the clock gives it to fan at 17:00, but only while it is open and timed so".into(),
+                "`trajectory:gggggg`  2031-01-12T09:00, today  remind fan at 9".into(),
+                "    involves: me; Fan Zhu".into(),
+                "`trajectory:cccccc`  2031-01-09, 3 days ago  gone by".into(),
+                "    involves: Fan Zhu".into(),
+            ]);
+        }
+        assert_eq!(listed(&after("FAN")), listed(&before), "in any capitals");
+    }
+
+    // a cousin renamed from the member's name keeps it struck, so that name
+    // finds two people and no one alone: the member's look goes by the label,
+    // and the cousin's by the name the cousin has now
+    #[test]
+    fn a_name_two_people_answer_to_finds_only_whoever_is_labelled_with_it() {
+        let s = store("cousin");
+        let v = &s.0;
+        v.upsert("person:4e5f6a", "person", "fan", "", "", &[], &[], "2031-01-10");
+        v.rename("person:4e5f6a", "Fan Li", "", "", "2031-01-11");
+        open(v, "trajectory:pppppp", "lend the ladder back", "person:4e5f6a");
+        assert_eq!(listed(&for_look(v, "2031-01-12", "2031-01-08", "fan", "").unwrap()),
+                   ["trajectory:aaaaaa", "trajectory:gggggg", "trajectory:cccccc"]);
+        assert_eq!(listed(&for_look(v, "2031-01-12", "2031-01-08", "Fan Li", "").unwrap()),
+                   ["trajectory:pppppp"]);
+    }
+
+    // while no person answers to a name, any node of another kind labelled
+    // with it is the member, whether a bare stub, as `--about` makes of a name
+    // no node had, or one with a summary; one that only had the name is not
+    #[test]
+    fn a_member_known_only_as_a_thing_has_a_look() {
+        let s = store("stub");
+        let v = &s.0;
+        v.upsert("thing:5e6f7a", "thing", "Alpha", "", "", &[], &[], "2031-01-10");
+        v.upsert("thing:6f7a8b", "thing", "Alpha", "the lamp in the hall", "", &[], &[], "2031-01-10");
+        v.rename("thing:6f7a8b", "the lamp", "", "", "2031-01-11");
+        v.upsert("thing:8b9c0d", "thing", "Alpha", "the router in the hall", "", &[], &[], "2031-01-10");
+        open(v, "trajectory:pppppp", "ring Alpha back", "thing:5e6f7a");
+        open(v, "trajectory:qqqqqq", "mend the lamp", "thing:6f7a8b");
+        open(v, "trajectory:rrrrrr", "restart Alpha", "thing:8b9c0d");
+        assert_eq!(for_look(v, "2031-01-12", "2031-01-08", "alpha", "").unwrap(), vec![
+            "Come due for alpha after 2031-01-08:".to_string(),
+            "`trajectory:pppppp`  2031-01-12, today  ring Alpha back".into(),
+            "    involves: Alpha".into(),
+            "`trajectory:rrrrrr`  2031-01-12, today  restart Alpha".into(),
+            "    involves: Alpha".into(),
+        ]);
+    }
+
+    // the bare stub `--about` made of a member before memory recorded them
+    // stays theirs once a person has their name, beside that person's own
+    // items; a thing with a summary or a body then leaves their look
+    #[test]
+    fn a_members_stub_stays_in_their_look_once_memory_records_them() {
+        let s = store("recorded");
+        let v = &s.0;
+        v.upsert("thing:5e6f7a", "thing", "Alpha", "", "", &[], &[], "2031-01-10");
+        v.upsert("thing:8b9c0d", "thing", "Alpha", "the router in the hall", "", &[], &[], "2031-01-10");
+        v.upsert("thing:9c0d1e", "thing", "Alpha", "", "kept in the shed", &[], &[], "2031-01-10");
+        open(v, "trajectory:pppppp", "ring Alpha back", "thing:5e6f7a");
+        open(v, "trajectory:rrrrrr", "restart Alpha", "thing:8b9c0d");
+        open(v, "trajectory:tttttt", "oil Alpha", "thing:9c0d1e");
+        v.upsert("person:7a8b9c", "person", "Alpha", "a member of the household", "", &[], &[], "2031-01-11");
+        open(v, "trajectory:ssssss", "call the shop", "person:7a8b9c");
+        assert_eq!(listed(&for_look(v, "2031-01-12", "2031-01-08", "ALPHA", "").unwrap()),
+                   ["trajectory:pppppp", "trajectory:ssssss"]);
+    }
+
+    // a member with no node in memory, whose name another person had before
+    // a rename, is handed that person's items; a thing with the name and a
+    // summary is not theirs while anyone answers to it, two people by a struck
+    // name included
+    #[test]
+    fn a_name_only_someone_else_had_finds_them_while_no_one_has_it() {
+        let s = store("struck");
+        let v = &s.0;
+        v.upsert("person:4e5f6a", "person", "Alpha", "", "", &[], &[], "2031-01-10");
+        v.rename("person:4e5f6a", "Alpha Li", "", "", "2031-01-11");
+        v.upsert("thing:5e6f7a", "thing", "Alpha", "the router in the hall", "", &[], &[], "2031-01-11");
+        open(v, "trajectory:pppppp", "lend the ladder back", "person:4e5f6a");
+        open(v, "trajectory:qqqqqq", "restart Alpha", "thing:5e6f7a");
+        let look = || listed(&for_look(v, "2031-01-12", "2031-01-08", "alpha", "").unwrap())
+            .into_iter().map(str::to_string).collect::<Vec<_>>();
+        assert_eq!(look(), ["trajectory:pppppp"]);
+        v.upsert("person:6a7b8c", "person", "Alpha", "", "", &[], &[], "2031-01-11");
+        v.rename("person:6a7b8c", "Alpha Chen", "", "", "2031-01-11");
+        assert_eq!(look(), Vec::<String>::new());
     }
 }

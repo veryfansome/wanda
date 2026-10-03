@@ -286,6 +286,16 @@ impl Vault {
         me_in(&nodes).map(|i| nodes[i].id.clone())
     }
 
+    /// The one person `mem show "person:<name>"` shows: by id; by label, or by
+    /// a name it had before a rename, where no other person answers to it;
+    /// her own node by either of her names. None where it finds no one, more
+    /// than one person, or a node of another kind, which that lookup shows
+    /// when no person is so named.
+    pub fn person(&self, name: &str) -> Option<String> {
+        self.find(&format!("person:{name}"), "", Slot::Reading).ok()
+            .filter(|n| n.starts_with("person:"))
+    }
+
     /// The id this vault gave a node of this kind and name in this session, by
     /// its name now or a name it had; of several, the lowest ranked not
     /// excluded.
@@ -834,7 +844,7 @@ pub fn ends_sentence(s: &str) -> bool {
 }
 
 /// The node's label, or a name it had, is this one, lower case.
-fn named(n: &Node, want: &str) -> bool {
+pub(crate) fn named(n: &Node, want: &str) -> bool {
     fm::label(&n.meta).to_lowercase() == want
         || fm::former_names(&n.body).iter().any(|a| a.to_lowercase() == want)
 }
