@@ -281,8 +281,8 @@ def prompt(date: str, arrival: str) -> str:
 
 
 def date_paragraph(now: datetime) -> str:
-    """The system prompt's date paragraph for every memory session. `now` is
-    in the household's zone."""
+    """The system prompt's date paragraph for every memory session, the
+    clock's included. `now` is in the household's zone."""
     date = now.date().isoformat()
     return (TODAY.format(weekday=f"{now:%A}", date=date, time=f"{now:%H:%M}", zone=now.tzname())
             + AFTER_DATE.replace("{date}", date))
@@ -437,6 +437,31 @@ def answer(out: dict) -> str:
         log.warning("dropping a placeholder answer: %r", text)
         return ""
     return text
+
+
+def transcript_answers(vault: Path, sid: str) -> list[str]:
+    """The answers a session gave, in order, as its transcript keeps each
+    turn's structured output; none when it cannot be read."""
+    try:
+        lines = (transcripts_dir(vault) / f"{sid}.jsonl").read_text(errors="replace").splitlines()
+    except OSError:
+        return []
+    out = []
+    for line in lines:
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        a = e.get("attachment") if isinstance(e, dict) and isinstance(e.get("attachment"), dict) else {}
+        if a.get("type") == "structured_output" and (o := report(a.get("data"), None)) is not None:
+            out.append(answer(o))
+    return out
+
+
+def last_said(given: list[str]) -> str:
+    """The last of a session's answers that says something, or "": the
+    product posts that one, since a turn after it may rightly say nothing."""
+    return next((a for a in reversed(given) if a), "")
 
 
 # --- the vault ---

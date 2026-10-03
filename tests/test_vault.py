@@ -400,6 +400,30 @@ def test_a_line_whose_time_cannot_be_paired_still_has_its_calls_counted(tmp_path
     assert vault.looks_back(c, "s1") == (4, 2.0)
 
 
+def test_the_answers_a_session_gave_are_read_from_its_transcript(tmp_path, monkeypatch):
+    """Each turn's structured output, in order, as Claude Code keeps it; the
+    one the product posts is the last that says something. A line that will
+    not read is passed over, and a session with no transcript gave none."""
+    monkeypatch.setenv("HOME", str(tmp_path / "h"))
+    c = cfg(tmp_path)
+    d = vault.transcripts_dir(c.vault_dir)
+    d.mkdir(parents=True)
+
+    def given(answer):
+        return json.dumps({"type": "attachment", "attachment": {"type": "structured_output", "data": {
+            "recalled": [], "answer": answer, "recorded": []}}})
+    (d / "s1.jsonl").write_text("\n".join([
+        given("It is 7: the gift."),
+        "not a line Claude Code writes",
+        json.dumps({"type": "user", "message": {"role": "user", "content": "<task-notification>"}}),
+        given(""),
+    ]) + "\n")
+    answers = vault.transcript_answers(c.vault_dir, "s1")
+    assert answers == ["It is 7: the gift.", ""]
+    assert vault.last_said(answers) == "It is 7: the gift."
+    assert vault.transcript_answers(c.vault_dir, "no-such-session") == [] and vault.last_said([]) == ""
+
+
 def test_the_busy_vault_refusal_is_mems():
     """The sentence `mem` prints when it gave up waiting for the vault, which
     doctor counts the refusals by."""

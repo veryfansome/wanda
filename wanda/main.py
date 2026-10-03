@@ -18,7 +18,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import IO
 
-from wanda import slack_cli, vault
+from wanda import clock, slack_cli, vault
 from wanda.actions.mailbox import MOVED, move_to_trash
 from wanda.actions.slack import SlackActions
 from wanda.config import Config, load_config
@@ -43,7 +43,7 @@ from wanda.watchers.imap_watcher import (
     fetch_parsed,
     resolve_trash_folder,
 )
-from wanda.watchers.slack_watcher import SlackWatcher
+from wanda.watchers.slack_watcher import DM_TASK_KEY, SlackWatcher
 
 log = logging.getLogger("wanda")
 
@@ -56,7 +56,8 @@ RETRY_MAX_S = 1800
 DEFER_S = 900  # how long a rate-capped trash waits before the cap is re-tested
 # The local hour from which the snapshots' housekeeping may run. Past git's
 # threshold it packs every loose object over the Mac's mount, for a minute or
-# two in which every snapshot waits, and with it a turn: at this hour the
+# two in which every snapshot waits, and with it a message's turn and a
+# clock session, which returns only after its snapshot: at this hour the
 # household is asleep.
 HOUSEKEEPING_HOUR = 3
 # How long the look at snapshots.git before the housekeeping may take: it
@@ -65,6 +66,14 @@ SNAPSHOTS_LOOK_S = 10
 # How long a start that cannot open or write the run store waits before it
 # tries again.
 STORE_RETRY_S = 60
+CLOCK_TICK_S = 60
+DUE_EVERY_S = 300  # how late a timed undertaking can be noticed
+MEM_TIMEOUT_S = 60  # a `mem` call the daemon makes itself
+LOST_KEPT = timedelta(days=30)  # how long doctor lists a timed reminder not given
+# The note doctor's command adds to the item it reopens: the notes before it
+# can say the reminder was given, as one from a session cut short or a look
+# does, and the session woken at the new time reads them.
+REOPENED = "Not given at its time; reopened for a later time."
 # Kinds that own their conversation and open a task on first contact.
 CONVERSATION_KINDS = ("mention", "mention_guest", "dm")
 BUDGET_REPLIES = {
@@ -178,6 +187,10 @@ class Processor:
         self._outside: set[str] = set()
         # the look at snapshots.git the housekeeping waits on (_housekeep)
         self._snapshots_look: asyncio.Future | None = None
+        # when each clock wake last failed before its claim, and what the
+        # clock has already said once in the log
+        self._clock_failed: dict[str, float] = {}
+        self._clock_said: set = set()
 
     async def loop(self) -> None:
         """Mail pipeline only. Owner commands are consumed by slack_loop on a
@@ -240,6 +253,451 @@ class Processor:
                 notified=0,
             )
 
+    # --- the clock ---
+
+    async def clock_loop(self) -> None:
+        """Sessions nobody's message starts. Its own task, so neither the mail
+        drain nor a reply holds a morning back, and a failed tick costs only
+        that minute."""
+        looks = clock.mornings(self.cfg.mornings)
+        quiet = clock.quiet_hours(self.cfg.quiet_hours)
+        people = clock.people(self.cfg.slack_names, self.cfg.slack_owner_user_ids)
+        last_due = float("-inf")
+        while True:
+            try:
+                now = datetime.now(self.cfg.zone)
+                claimed = lambda p: self.store.get_meta(f"clock:morning:{p}")  # noqa: E731
+                wakes = clock.morning_wakes(now, looks, quiet, claimed)
+                for person in clock.missed(now, looks, claimed):
+                    self._skip_look(person, now)
+                if time.monotonic() - last_due >= DUE_EVERY_S:
+                    last_due = time.monotonic()
+                    wakes += await self._due_wakes(now, people)
+                self._wake(wakes, now)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("clock tick failed")
+            await asyncio.sleep(CLOCK_TICK_S)
+
+    def _skip_look(self, person: str, now: datetime) -> None:
+        # a day with no look looks, in Slack, like a look with nothing to say
+        today = now.date().isoformat()
+        if not (self.store.get_meta(f"clock:outcome:{person}") or "").startswith(today):
+            log.warning("clock: no look for %s ran before noon; none today", person)
+            self.store.set_meta(f"clock:outcome:{person}", f"{now:%Y-%m-%d %H:%M} skipped")
+
+    async def _due_wakes(self, now: datetime, people: set[str]) -> list[clock.Wake]:
+        # back to the day before the last check that ran, so what came due
+        # while the daemon was down is seen, and kept as a reminder not given
+        # if it is too late to wake for; and two days back at least, so an
+        # undertaking due just before midnight is still seen within LATE of it
+        since = now.date() - timedelta(days=2)
+        if checked := self.store.get_meta("clock:checked"):
+            since = min(since, datetime.fromisoformat(checked).date() - timedelta(days=1))
+        try:
+            due = await self._mem(now, "due", "--after", since.isoformat())
+        except Exception as e:
+            log.warning("clock: the due check was skipped: %s", e)
+            return []
+        wakes = clock.due_wakes(now, clock.items(due), people, lambda k: bool(self.store.get_meta(k)),
+                                self._clock_said, lambda item, why: self._lost(item.id, item.by,
+                                                                                 item.asked_by, why))
+        self.store.set_meta("clock:checked", now.date().isoformat())
+        # a wake cut short and released at the start to be woken again: one
+        # this check does not wake, since the session cut short closed or
+        # re-dated it, or its time is now too far gone, was not given
+        waking = json.loads(self.store.get_meta("clock:waking") or "{}")
+        if missing := [k for k, m in waking.items() if m.get("again") and k not in {w.key for w in wakes}]:
+            for k in missing:
+                m = waking.pop(k)
+                self._lost(m["id"], m["by"], m["asked"], "its session was cut short, and it was not open "
+                           "at that time when the clock looked again")
+            self.store.set_meta("clock:waking", json.dumps(waking))
+        # what the store holds of the session cut short can read as given,
+        # a note that the reminder was given among it, though nothing reached
+        # the person, so the session woken again is told
+        wakes = [clock.Wake(w.key, w.person, w.text + "\n    " + clock.AGAIN.format(speaker=w.person),
+                            w.about, w.by) if waking.get(w.key, {}).get("again") else w for w in wakes]
+        self._check_marked(now, due)
+        return wakes
+
+    def _mark(self, listed: list[str], at: str) -> None:
+        # what a look's list marked as still to come, and when it was marked:
+        # _check_marked holds each to its time until the clock wakes for it,
+        # and only a wake that started after the mark gives what it marks
+        marked = json.loads(self.store.get_meta("clock:marked") or "[]")
+        held = {(m["id"], m["by"], m["asked"]) for m in marked}
+        for item in clock.items("\n".join(listed)):
+            if item.field(clock.STILL_TO_COME) and (item.id, item.by, item.asked_by) not in held:
+                held.add((item.id, item.by, item.asked_by))
+                marked.append({"id": item.id, "by": item.by, "asked": item.asked_by, "at": at})
+        self.store.set_meta("clock:marked", json.dumps(marked))
+
+    def _unmark(self, at: str) -> None:
+        # a look refused before it ran reached no one: the marks it made go
+        marked = json.loads(self.store.get_meta("clock:marked") or "[]")
+        self.store.set_meta("clock:marked", json.dumps([m for m in marked if m.get("at") != at]))
+
+    def _check_marked(self, now: datetime, due: str) -> None:
+        """Each reminder a look's list marked as still to come, from the first
+        due check after its time until the clock wakes for it, at that time
+        or at another the person moved it to: one no longer open at that
+        time, and not woken, was taken away before the clock gave it, by the
+        look or anything after it, and is a reminder not given. Its reason
+        tells one moved to another time that day, which the clock gives then,
+        from one closed or moved off the day's times. One still open at its
+        time is held while its wake waits, since a look that starts after
+        that time runs while the wake waits behind it. So is one moved to an
+        earlier time that day and not yet woken there, while that time is
+        under LATE gone: the due check that finds its wake runs before the
+        wake starts and claims it."""
+        marked = json.loads(self.store.get_meta("clock:marked") or "[]")
+        if not marked:
+            return
+        wall = now.replace(tzinfo=None)
+        listed = {i.id: i.by for i in clock.items(due)}
+        left = []
+        for m in marked:
+            at = datetime.fromisoformat(m["by"])
+            moved = listed.get(m["id"], "")
+            if at > wall:
+                left.append(m)
+            elif any(started and started >= m.get("at", "")
+                     for started in self.store.meta_starting(f"clock:due:{m['id']}:").values()):
+                # given by the clock since the look, at this time or at one it
+                # was moved to: a wake's claim holds the UTC time it started,
+                # a released one what it held before, empty for one never run
+                continue
+            elif moved == m["by"]:
+                # past LATE the due check keeps it as noticed too late
+                if at > wall - clock.LATE:
+                    left.append(m)
+            elif (clock.TIMED.match(moved) and moved[:10] == m["by"][:10] and moved < m["by"]
+                  and not self.store.get_meta(f"clock:due:{m['id']}:{moved}:{m['asked']}")):
+                # held for the claim of the wake this check finds; past LATE
+                # the due check keeps it, at that time, as noticed too late
+                if datetime.fromisoformat(moved) > wall - clock.LATE:
+                    left.append(m)
+            elif clock.TIMED.match(moved) and moved[:10] == m["by"][:10]:
+                self._lost(m["id"], m["by"], m["asked"], f"it was re-dated to {moved[11:]} the same day, after "
+                           "a morning look listed it as still to come; the clock gives it at that time instead",
+                           moved=moved)
+            else:
+                self._lost(m["id"], m["by"], m["asked"], "it was closed, or re-dated to another day or to no "
+                           "time of day, before the clock gave it, after a morning look listed it as still "
+                           "to come")
+        self.store.set_meta("clock:marked", json.dumps(left))
+
+    def _wake(self, wakes: list[clock.Wake], now: datetime) -> None:
+        # people first: a wake starts only in a minute when no session is
+        # running, the person's own conversation included, and one at a time.
+        # Of those waiting, the one that has gone longest without failing to
+        # start: one that keeps failing would otherwise stand first every time
+        # and hold back every other.
+        if not wakes or self._bg or self._inflight_runs:
+            return
+        w = min(wakes, key=lambda w: self._clock_failed.get(w.key, float("-inf")))
+        t = asyncio.create_task(self._clock_session(w, now))
+        self._bg.add(t)
+        t.add_done_callback(self._bg.discard)
+
+    async def _clock_session(self, w: clock.Wake, now: datetime) -> None:
+        morning = w.key.startswith("clock:morning:")
+        before = self.store.get_meta(w.key) or ""
+        try:
+            user = {name.lower(): uid for uid, name in self.cfg.slack_names.items()}[w.person]
+            channel = await self.slack.dm_channel(user)
+            # the person's own DM task, so a reply to them and this never run
+            # at once, and an answer Slack refused is retried like any other
+            self.store.create_task(None, channel, DM_TASK_KEY, kind="dm", reply_thread=None)
+            task = self.store.get_task_by_thread(channel, DM_TASK_KEY)
+            listed: list[str] = []
+            if morning:
+                # what came due for them since their last look that ran and
+                # reported; a first look is handed only what is due today
+                after = self._listed(w.person, task) or (now.date() - timedelta(days=1)).isoformat()
+                listed = (await self._mem(now, "due", "--for", w.person, "--after", after,
+                                          "--at", f"{now:%H:%M}")).splitlines()
+                # due.rs marks what is later than the look; one whose time has
+                # come while its wake waits is the clock's to give as well
+                listed = clock.still_to_come(
+                    listed, now, clock.people(self.cfg.slack_names, self.cfg.slack_owner_user_ids),
+                    lambda k: bool(self.store.get_meta(k)))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # nothing was claimed, so a later tick tries again, behind the rest.
+            # The alert says what could not start, never whose: the alerts can
+            # be read by the person a reminder is kept from
+            self._clock_failed[w.key] = time.monotonic()
+            log.exception("clock: %s could not start", w.key)
+            if morning:
+                # so doctor shows whose look it is, from this minute on
+                self.store.set_meta(f"clock:outcome:{w.person}", f"{now:%Y-%m-%d %H:%M} could not start")
+                await self._alert_once("clock", f"a morning look could not start on {now.date()}; "
+                                                "doctor says whose")
+            else:
+                await self._alert_once("clock", f"the reminder trajectory:{w.about} due {w.by} could "
+                                                "not start; it is tried again until two hours after "
+                                                "that time")
+            return
+        # claimed only once nothing is left to fail before the model runs. A
+        # look a restart cuts short from here is not run again that day; a
+        # timed wake is marked as in flight first, so that one a stop or a
+        # crash cuts short is settled at the next start (settle_wakes)
+        waking = prior = None
+        if not morning:
+            # one released at a start to be woken again keeps its entry for
+            # a refusal to put back, so the next wake is still told
+            prior = json.loads(self.store.get_meta("clock:waking") or "{}").get(w.key)
+            waking = {"id": w.about, "by": w.by, "asked": w.person, "task": task["id"],
+                      "last": None, "before": before}
+            self._mark_waking(w.key, waking)
+        claimed = utcnow()
+        self.store.set_meta(w.key, now.date().isoformat() if morning else claimed)
+        if morning:
+            # what doctor shows if a restart cuts the look short
+            self.store.set_meta(f"clock:outcome:{w.person}", f"{now:%Y-%m-%d %H:%M} started")
+            self._mark(listed, claimed)
+        log.info("clock: %s for %s", w.key, w.person)
+        run = None
+        try:
+            # the person's conversation lock, which their DM replies take too
+            async with self._task_locks.setdefault(task["id"], asyncio.Lock()):
+                # held, so the first run recorded in this DM after the newest
+                # one now is this session's
+                last = self.store.newest_run(task["id"])
+                if waking is not None:
+                    waking["last"] = last
+                    self._mark_waking(w.key, waking)
+                if morning:
+                    # this look's day starts the next look's list once its run
+                    # is recorded ok, and once its answer, if it has one, is
+                    # delivered; `_listed` settles which run is the look's,
+                    # here or, after a crash, at the next start, which finds
+                    # the look's DM by the task kept here, with no Slack
+                    self.store.set_meta(f"clock:trying:{w.person}",
+                                        f"{now.date().isoformat()} {task['id']} {last} {after}")
+                try:
+                    error = await self.memory_turn(task, w.arrival(listed), now, channel=channel,
+                                                   reply_thread=None, owed=False)
+                finally:
+                    # however the runner ends, a raise included, and while the
+                    # lock still keeps a later reply's run out of this DM
+                    run = self.store.run_after(task["id"], last)
+                    if morning:
+                        self._listed(w.person, task)
+        except Exception as e:
+            log.exception("clock session %s failed", w.key)
+            error = str(e) or type(e).__name__
+        # read from the run it recorded: a post Slack refused leaves it owed
+        # and spoken, and delivery tries it again until it gives up
+        if run is not None:
+            outcome = ("spoke" if run["result_text"] else "silent") if run["status"] == "ok" else "failed"
+        else:
+            outcome = "not run" if error in BUDGET_REPLIES else "failed"
+        # one that gave its answer and then failed in a later turn spoke: a
+        # reminder is not kept as not given, and the failure is alerted
+        then_failed = run is not None and run["status"] == "ok" and bool(run["error"])
+        if then_failed:
+            log.warning("clock: %s gave its answer, then failed: %s", w.key, run["error"])
+        if outcome == "not run":
+            # refused before the model ran, as by the budget: nothing was
+            # sent, so the wake is released for a later tick, and a look's
+            # marks go with it
+            self.store.set_meta(w.key, before)
+            if morning:
+                self._unmark(claimed)
+        if morning:
+            if outcome in ("failed", "not run"):
+                what = "failed" if outcome == "failed" else "was refused before it ran"
+                await self._alert_once("clock", f"a morning look on {now.date()} {what}; doctor says whose")
+            elif then_failed:
+                await self._alert_once("clock", f"a morning look on {now.date()} failed after it spoke; "
+                                                "doctor says whose")
+            self.store.set_meta(f"clock:outcome:{w.person}",
+                                f"{now:%Y-%m-%d %H:%M} {outcome}" + (", then failed" if then_failed else ""))
+        elif outcome == "not run":
+            await self._alert_once("clock", f"the reminder trajectory:{w.about} due {w.by} was refused "
+                                            "before it ran; it is tried again until two hours after "
+                                            "that time")
+        elif outcome == "failed":
+            # a timed wake is not tried again: its claim stands
+            log.warning("clock: %s failed, and the reminder is not tried again", w.key)
+            self._lost(w.about, w.by, w.person, "its session failed")
+        else:
+            if run["result_text"] and not run["notified"]:
+                self._owe(run["id"], w.about, w.by, w.person)
+            if then_failed:
+                # an answer Slack has not taken yet is still owed, and is kept
+                # as not given if delivery gives up on it
+                what = ("was given, and its session then failed" if run["notified"] else
+                        "was answered and its post is being tried again; its session then failed")
+                await self._alert_once("clock", f"the reminder trajectory:{w.about} due {w.by} {what}")
+        if waking is not None:
+            # settled here, so the next start leaves it alone; a stop, which
+            # cancels the session, never reaches this line. A refusal puts
+            # back what was there before the claim
+            self._mark_waking(w.key, prior if outcome == "not run" else None)
+
+    def _mark_waking(self, key: str, entry: dict | None) -> None:
+        waking = json.loads(self.store.get_meta("clock:waking") or "{}")
+        if entry is None:
+            waking.pop(key, None)
+        else:
+            waking[key] = entry
+        self.store.set_meta("clock:waking", json.dumps(waking))
+
+    def settle_wakes(self, now: datetime) -> None:
+        """Each timed wake a stop or a crash cut short after its claim, and
+        each look a crash cut short after it took its lock, settled at the
+        next start, before Slack connects. A run recorded in its DM after
+        the wake took the conversation's lock is the wake's own: it held the
+        lock until the process ended, nothing has run there since, and a stop
+        records a message it dropped as a run that is never recorded ok. One
+        recorded ok, with a report or an answer an earlier turn gave, was
+        given, its answer, if not yet posted, followed as one Slack refused.
+        One that posted nothing is released to be woken again while its time
+        is no more than LATE gone, and is otherwise a reminder not given.
+        Every upgrade's stop cancels a wake in flight. A look's run is found
+        the same way, so its day is handed on unless it was recorded ok; a
+        look is not run again that day."""
+        waking = json.loads(self.store.get_meta("clock:waking") or "{}")
+        kept = {(r["id"], r["by"]) for r in json.loads(self.store.get_meta("clock:lost") or "[]")}
+        wall = now.replace(tzinfo=None)
+        for key, m in list(waking.items()):
+            if m.get("again"):
+                continue  # released at an earlier start; the next due check settles it
+            run = None if m["last"] is None else self.store.run_after(m["task"], m["last"])
+            if (m["id"], m["by"]) in kept:
+                pass  # kept as not given before the process ended
+            elif run is not None and run["status"] == "ok":
+                if run["result_text"] and not run["notified"]:
+                    self._owe(run["id"], m["id"], m["by"], m["asked"])
+            elif datetime.fromisoformat(m["by"]) > wall - clock.LATE:
+                log.warning("clock: %s was cut short before it was given, and is woken again", key)
+                self.store.set_meta(key, m["before"])
+                m["again"] = True
+                continue
+            else:
+                self._lost(m["id"], m["by"], m["asked"], "its session was cut short, and the daemon was "
+                           f"back more than {clock.LATE.seconds // 3600} h after its time")
+            del waking[key]
+        self.store.set_meta("clock:waking", json.dumps(waking))
+        for person in clock.people(self.cfg.slack_names, self.cfg.slack_owner_user_ids):
+            if trying := self.store.get_meta(f"clock:trying:{person}"):
+                self._listed(person, {"id": int(trying.split(" ")[1])})
+
+    def _owe(self, run_id: int, about: str, by: str, asked: str) -> None:
+        # a timed wake's answer not posted yet stays owed: if delivery gives up
+        # on it, the reminder was not given
+        owed = json.loads(self.store.get_meta("clock:owed") or "[]")
+        if all(o["run"] != run_id for o in owed):
+            owed.append({"run": run_id, "id": about, "by": by, "asked": asked})
+            self.store.set_meta("clock:owed", json.dumps(owed))
+
+    def _listed(self, person: str, task) -> str | None:
+        """Where this person's next look's list starts: the day of their last
+        look whose run was recorded ok (a report came back, or an earlier turn
+        answered before a later one failed) and that stayed silent or whose
+        answer was delivered. A look that failed with nothing said, was
+        refused before it ran, or whose answer is not delivered, delivery
+        having given up on it or not yet got it through, said nothing to
+        them, so the list it was handed is handed on."""
+        trying = self.store.get_meta(f"clock:trying:{person}")
+        if trying:
+            day, _, last, after = trying.split(" ")
+            run = self.store.run_after(task["id"], int(last))
+            if run is not None and run["status"] == "ok":
+                self.store.set_meta(f"clock:listed:{person}", f"{day} {run['id']} {after}")
+            self.store.set_meta(f"clock:trying:{person}", "")
+        day, _, rest = (self.store.get_meta(f"clock:listed:{person}") or "").partition(" ")
+        if rest:
+            run_id, after = rest.split(" ")
+            run = self.store.run(int(run_id))
+            if run is not None and run["result_text"] and (
+                    not run["notified"] or run["deliver_attempts"] >= MAX_DELIVERY_ATTEMPTS):
+                return after
+        return day or None
+
+    def _lost(self, about: str, by: str, asked: str, why: str, moved: str = "") -> None:
+        """A timed reminder the clock was to give and did not, kept in the run
+        store, which outlives the container and its log: doctor lists it with
+        who asked and why, and the next alert of its kind names it. Kept once,
+        however often a due check sees it again. `moved` is the time the
+        person moved it to that day, when the clock gives it instead, so
+        doctor offers no command to give it later."""
+        lost = json.loads(self.store.get_meta("clock:lost") or "[]")
+        if any(r["id"] == about and r["by"] == by for r in lost):
+            return
+        now = datetime.now(timezone.utc)
+        # doctor lists a month of them; one not yet named in an alert stays
+        lost = [r for r in lost if not r["named"]
+                or r["at"] >= (now - LOST_KEPT).isoformat(timespec="seconds")]
+        lost.append({"id": about, "by": by, "asked": asked, "why": why,
+                     "at": now.isoformat(timespec="seconds"), "named": False, "moved": moved})
+        self.store.set_meta("clock:lost", json.dumps(lost))
+
+    async def _flush_lost(self) -> None:
+        """Timed reminders not given, alerted at most once a UTC day as answers
+        given up on are, and a kind of their own, so another alert that day
+        does not hold them back: every one not yet named, by its id and time
+        only, and none dropped at a day's end. Who asked, and why, are
+        doctor's, since the alerts can be read by the person a reminder is
+        kept from."""
+        # a timed wake's answer Slack refused stays owed; once delivery gives
+        # up on it, the reminder was not given
+        owed = json.loads(self.store.get_meta("clock:owed") or "[]")
+        left = []
+        for o in owed:
+            run = self.store.run(o["run"])
+            if run is not None and not run["notified"]:
+                left.append(o)
+            elif run is not None and run["deliver_attempts"] >= MAX_DELIVERY_ATTEMPTS:
+                self._lost(o["id"], o["by"], o["asked"], "its answer could not be posted")
+        if left != owed:
+            self.store.set_meta("clock:owed", json.dumps(left))
+        unnamed = [r for r in json.loads(self.store.get_meta("clock:lost") or "[]") if not r["named"]]
+        today = datetime.now(timezone.utc).date().isoformat()
+        if not unnamed or self.store.get_meta("reminder_alert_date") == today:
+            return
+        which = "; ".join(f"trajectory:{r['id']} due {r['by']}" for r in unnamed)
+        try:
+            await self.slack.alert(f"{len(unnamed)} timed reminder(s) not given at their time: {which}. "
+                                   "Who asked, why, and how to give one later are in doctor.")
+        except Exception:
+            log.warning("reminder alert undeliverable; will retry")
+            return
+        self.store.set_meta("reminder_alert_date", today)
+        named = {(r["id"], r["by"]) for r in unnamed}
+        lost = json.loads(self.store.get_meta("clock:lost") or "[]")
+        for r in lost:
+            r["named"] = r["named"] or (r["id"], r["by"]) in named
+        self.store.set_meta("clock:lost", json.dumps(lost))
+
+    async def _mem(self, now: datetime, *args: str) -> str:
+        """A `mem` call the daemon makes itself, dated by the tick and bounded,
+        since nothing else would end one held up on the vault's lock. What it
+        says on stderr, such as an item it cannot date, is logged once."""
+        proc = await asyncio.create_subprocess_exec(
+            "mem", *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            env=vault.session_env(self.cfg, "", now))
+        try:
+            out, err = await asyncio.wait_for(proc.communicate(), MEM_TIMEOUT_S)
+        except TimeoutError:
+            proc.kill()
+            await proc.wait()
+            raise RuntimeError(f"mem {args[0]} took longer than {MEM_TIMEOUT_S} s") from None
+        if proc.returncode:
+            raise RuntimeError(f"mem {args[0]} failed ({proc.returncode}): "
+                               f"{(err or out).decode()[:300]}")
+        for line in err.decode().splitlines():
+            if line.strip() and line not in self._clock_said:
+                self._clock_said.add(line)
+                log.warning("%s", line)
+        return out.decode()
+
     # --- mail pipeline ---
 
     async def drain_mail(self) -> None:
@@ -248,7 +706,8 @@ class Processor:
         await self.deliver_pending()
         await self._flush_abandoned_alert()
         await self._flush_given_up()
-        for kind in ("breaker", "cap", "snapshot", "startup"):
+        await self._flush_lost()
+        for kind in ("breaker", "cap", "snapshot", "startup", "clock"):
             await self._flush_alert(kind)
         await self._housekeep()
         if not self.cfg.email_triage:
@@ -854,15 +1313,19 @@ class Processor:
                           ) -> str | None:
         """One memory session for an arrival, at `now` in the household's zone:
         a fresh `claude -p` with the lab's prompt, tools, schema and
-        environment, and its answer, if it has one, posted once. The caller
-        holds the conversation's lock. A message's turn passes `frame` in
-        place of the two: called once the session holds its slot, it returns
-        them, or None to run nothing, so that what the session is shown and
-        who it is told reads its answer are as they are when it starts.
-        `owed` is whether someone is waiting: if not, a refusal, a failure or
-        a restart posts nothing. Returns what went wrong, or None. A post
-        Slack refuses is not something that went wrong: the run stays owed
-        and is posted later."""
+        environment, and its answer, if it has one, posted once. Messages and
+        the clock both start sessions here, the caller holding the
+        conversation's lock. A message's turn passes `frame` in place of the
+        two: called once the session holds its slot, it returns them, or None
+        to run nothing, so that what the session is shown and who it is told
+        reads its answer are as they are when it starts. `owed` is whether
+        someone is waiting: if not, as for the clock, a refusal, a failure or
+        a restart posts nothing, except that an answer an earlier turn gave is
+        still posted when a later turn fails or runs out of time; a session a
+        stop cancels before its answer is recorded posts nothing, and the clock
+        settles it at the next start (settle_wakes).
+        Returns what went wrong, or None. A post Slack refuses is not
+        something that went wrong: the run stays owed and is posted later."""
         state = {} if state is None else state
         reserve = self.cfg.agent_expected_usd
         if (verdict := await self.check_budget(reserve_usd=reserve)) != "ok":
@@ -932,17 +1395,29 @@ class Processor:
             left = int(self.store.get_meta("sessions_left_running") or 0) + 1
             self.store.set_meta("sessions_left_running", str(left))
         out = vault.report(rr.structured, rr.result_text) if rr.ok else None
+        given = vault.answer(out) if out is not None else ""
+        if not owed and not given:
+            # With its input closed after the prompt, Claude Code prints the
+            # last turn's result alone, and a turn begun by a background
+            # command's end after the session gave its answer may say nothing,
+            # or fail. The transcript keeps every turn's answer, and the last
+            # that says something is posted when a later turn says nothing,
+            # fails or runs out of time; a session a stop cancels before then
+            # posts nothing, and the next start settles it (settle_wakes).
+            given = vault.last_said(await asyncio.to_thread(vault.transcript_answers, self.cfg.vault_dir, sid))
         if out is not None:
-            text, error = vault.answer(out), None
+            text, error = given, None
         else:
             error = rr.error or "the session ended without its report"
-            text = f"⚠️ my run failed: {truncate(error, 1000)}" if owed else ""
+            text = given or (f"⚠️ my run failed: {truncate(error, 1000)}" if owed else "")
         # recorded before it is posted and before the snapshot: a restart
         # while either runs still finds the answer here and delivers it
         run_id = self.store.record_run(
             kind="agent", task_id=task["id"], session_id=sid, started_at=started,
             exit_code=rr.exit_code, cost_usd=rr.cost_usd,
-            status="ok" if out is not None else ("timeout" if rr.timed_out else "error"),
+            # answered, though a later turn failed: the run is the answer's,
+            # which a later delivery posts as an answer, its error kept beside it
+            status="ok" if out is not None or given else ("timeout" if rr.timed_out else "error"),
             error=truncate(error, 1000) if error else None,
             result_text=text,
             notified=0 if text else 1,
@@ -951,7 +1426,7 @@ class Processor:
         # posted before the snapshot, which can wait its turn behind another;
         # _post_run keeps deliver_pending off the run from its first line
         if text:
-            await self._post_run(run_id, text, channel, reply_thread, note=error is not None)
+            await self._post_run(run_id, text, channel, reply_thread, note=error is not None and not given)
         # after the post, which reading the transcript would otherwise hold up
         looks = await asyncio.to_thread(vault.looks_back, self.cfg, sid)
         log.info("memory session %s in %s: waited %.1f s for a slot, ran %.1f s, %d mem session call(s) "
@@ -959,7 +1434,8 @@ class Processor:
                  "%d recalled, %d recorded, %s",
                  sid, channel, waited, ran, looks.calls, looks.seconds, len((out or {}).get("recalled") or []),
                  len((out or {}).get("recorded") or []),
-                 f"{len(text)} characters to post" if text else (f"failed: {error}" if error else "silent"))
+                 (f"{len(text)} characters to post" + (f", then failed: {error}" if given and error else ""))
+                 if text else (f"failed: {error}" if error else "silent"))
         if said := await asyncio.to_thread(vault.snapshot, self.cfg, f"after {sid}"):
             log.warning("%s", said)
             await self._alert_once("snapshot", f"vault snapshots: {said}")
@@ -1166,6 +1642,11 @@ async def run_daemon(cfg: Config) -> None:
         sys.exit("missing required settings: WANDA_ALERT_CHANNEL (see .env.example)")
     if problem := vault.settings_problem(cfg):
         sys.exit(problem)
+    # a name the clock wakes for has to be one a DM can be opened to, under
+    # one allowed id, at a time a look can run
+    if problem := clock.settings_problem(cfg.mornings, cfg.quiet_hours, cfg.slack_names,
+                                         cfg.slack_owner_user_ids):
+        sys.exit(problem)
     claude_bin = cfg.resolve_claude_bin()
     if not claude_bin:
         sys.exit("claude CLI not found; set WANDA_CLAUDE_BIN")
@@ -1193,6 +1674,9 @@ async def run_daemon(cfg: Config) -> None:
     if said := await asyncio.to_thread(vault.snapshot, cfg, "startup"):
         log.warning("%s", said)
         await processor._alert_once("snapshot", f"vault snapshots: {said}")
+    # before Slack connects, so that no session has run in a DM since the
+    # timed wake a stop or a crash cut short there, or the look a crash did
+    processor.settle_wakes(datetime.now(cfg.zone))
 
     slack_watcher = SlackWatcher(cfg, store, loop, slack_queue)
     slack_watcher.start()
@@ -1216,6 +1700,7 @@ async def run_daemon(cfg: Config) -> None:
     # with triage off nothing reaches the mail queue, and the loop still
     # retries undelivered answers and flushes alerts
     tasks.append(asyncio.create_task(processor.loop()))
+    tasks.append(asyncio.create_task(processor.clock_loop()))
     await stop.wait()
     log.info("shutting down")
     if imap_watcher:
@@ -1254,6 +1739,12 @@ async def run_doctor(cfg: Config, smoke: bool) -> int:
         f"{u} as {cfg.slack_names[u]}" for u in cfg.slack_owner_user_ids)
         + f"; time zone {cfg.tz}; {cfg.memory_sessions} session(s) at once")
     report("agent tools", True, f"{vault.TOOLS} (memory sessions), {cfg.agent_allowed_tools} (email tasks)")
+    looks = clock.settings_problem(cfg.mornings, cfg.quiet_hours, cfg.slack_names, cfg.slack_owner_user_ids)
+    # the zone is read only once the memory settings have found it good
+    report("clock", not (problem or looks), looks or problem or (
+        f"{datetime.now(cfg.zone):%Y-%m-%d %H:%M %Z}; mornings "
+        f"{', '.join(cfg.mornings) or 'none'}; quiet {cfg.quiet_hours or 'never'}"))
+    clock_ok = not (problem or looks)
 
     print("memory:")
     if problem is None:
@@ -1287,6 +1778,40 @@ async def run_doctor(cfg: Config, smoke: bool) -> int:
         for r in given_up:
             print(f"      run {r['id']}, from {r['started_at']}: {r['slack_channel']}"
                   + (f", thread {r['reply_thread']}" if r["reply_thread"] else ""))
+        # a look that failed, one a restart cut short and a day with none all
+        # look, in Slack, like a look with nothing to say. A look runs its
+        # session and posts, then takes its snapshot in its turn, behind
+        # another snapshot or the snapshots' housekeeping, each stopped whole
+        # past its time; one session can be ahead of it: a message in that DM
+        # that came while the look fetched its list, or, with memory sessions
+        # one at a time, any other.
+        stopping = 3 * vault.STOP_GRACE_S
+        running = timedelta(seconds=2 * cfg.agent_timeout_s + vault.HOUSEKEEPING_TIMEOUT_S + stopping
+                            + 2 * (vault.SNAPSHOT_TIMEOUT_S + stopping) + 60)
+        quiet = clock.quiet_hours(cfg.quiet_hours) if clock_ok else None
+        for person, at in (clock.mornings(cfg.mornings) if clock_ok else {}).items():
+            last = store.get_meta(f"clock:outcome:{person}")
+            report(f"last look for {person}", clock.look_healthy(
+                last, datetime.now(cfg.zone), running, clock.first_start(at, quiet)), last or "none yet")
+        # the timed reminders not given, with who asked and why, which their
+        # alert leaves out. Its session may have closed the item, and the
+        # clock wakes only for an open one, so the command reopens it too
+        since = (datetime.now(timezone.utc) - LOST_KEPT).isoformat(timespec="seconds")
+        lost = [r for r in json.loads(store.get_meta("clock:lost") or "[]") if r["at"] >= since]
+        report("timed reminders not given, last 30 days", True, str(len(lost)) if lost else "none")
+        for r in lost:
+            print(f"      trajectory:{r['id']} due {r['by']}, asked by {r['asked']}: {r['why']} (seen {r['at']})")
+            if r.get("moved"):
+                continue  # the clock gives it at the time the person moved it to
+            # how to see the item as it stands before the command: the person
+            # may since have cancelled it or moved it to another day, or it may
+            # have been given another way, and the command would then revive
+            # it or give it again. The command to see it rather than the item,
+            # since whoever runs doctor may be the person it is kept from
+            print(f"        to see it as it stands: docker compose -f compose.wanda.yaml exec wanda mem show "
+                  f"trajectory:{r['id']}")
+            print(f"        to give it later: docker compose -f compose.wanda.yaml exec wanda mem advance "
+                  f"trajectory:{r['id']} --status open --by <date>T<HH:MM> --note \"{REOPENED}\"")
         # Neither is alerted: what a session left running was ended with it,
         # and a `mem` refused for a busy vault wrote nothing and told its
         # session so. Each means something held on longer than it should.

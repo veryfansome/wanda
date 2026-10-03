@@ -83,6 +83,13 @@ class Config(BaseSettings):
     daily_run_cap: int = 200
     daily_cost_cap_usd: float = 5.0
 
+    # the clock. Whose morning gets a look, and when, as name@HH:MM in the
+    # household's own time (WANDA_TZ), before noon; empty for none.
+    mornings: CsvList = Field(default_factory=list)
+    # No morning look starts in these hours; a reminder asked for at a time in
+    # them still comes then, and a message still gets its answer.
+    quiet_hours: str = "21:30-07:00"
+
     # daemon
     data_dir: Path = Path("~/.wanda")
     # The vault, when it is not the data directory's vault/. In Docker it is a
@@ -107,7 +114,7 @@ class Config(BaseSettings):
     snippet_bytes: int = 4096
     log_level: str = "INFO"
 
-    @field_validator("slack_owner_user_ids", "never_trash", mode="before")
+    @field_validator("slack_owner_user_ids", "never_trash", "mornings", mode="before")
     @classmethod
     def _split_csv(cls, v: object) -> object:
         if isinstance(v, str):

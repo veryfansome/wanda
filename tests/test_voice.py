@@ -17,10 +17,11 @@ import pytest
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from wanda import slack_cli, vault
+from wanda import clock, slack_cli, vault
 from wanda.main import (
     ANCHOR,
     HOW_TO_REPLY,
+    REOPENED,
     addressed_to_me,
     agent_seed_prompt,
     triage_system_prompt,
@@ -63,6 +64,13 @@ def slack_help() -> str:
     return re.sub(r"\$?WANDA_\w+", " ", text)
 
 
+def rust_str(path: str, name: str) -> str:
+    """A `pub const NAME: &str = "...";` as the program holds it."""
+    lit = re.search(rf'pub const {name}: &str =\s*"(.*?)";', (ROOT / path).read_text(), re.DOTALL)
+    assert lit, f"{name} is gone from {path}"
+    return lit.group(1)
+
+
 def texts() -> list[tuple[str, str]]:
     found = [
         ("email seed", agent_seed_prompt(EMAIL, "summarize it")),
@@ -83,6 +91,27 @@ def texts() -> list[tuple[str, str]]:
         ("triage system prompt", triage_system_prompt()),
         ("triage batch", build_batch_prompt([EMAIL])[0]),
         ("wanda slack help", slack_help()),
+        ("clock, morning look", clock.Wake("k", "mei", clock.MORNING.format(
+            weekday="Thursday", time="08:00", speaker="mei")).arrival(
+            # the heading and the mark as `mem due --for` prints them
+            # (memory/src/due.rs, LOOK_HEAD and STILL_TO_COME)
+            ["Come due for mei after 2026-09-30:",
+             "`trajectory:aaaaaa`  2026-10-01, today  the letter", "    asked by: mei",
+             "`trajectory:bbbbbb`  2026-10-01T17:00, today  I undertook to remind mei at 5",
+             "    asked by: mei", "    " + rust_str("memory/src/due.rs", "STILL_TO_COME").replace(
+                 "{asker}", "mei").replace("{time}", "17:00")])),
+        ("clock, timed undertaking", clock.Wake("k", "fan", "\n    ".join((
+            clock.COME_DUE.format(weekday="Thursday", time="17:00"),
+            "`trajectory:aaaaaa`  2026-10-01T17:00, today  I undertook to remind fan at 5",
+            "    involves: me; fan", "    asked by: fan"))).arrival()),
+        # woken again after a session for it was cut short
+        ("clock, timed undertaking woken again", clock.Wake("k", "fan", "\n    ".join((
+            clock.COME_DUE.format(weekday="Thursday", time="17:10"),
+            "`trajectory:aaaaaa`  2026-10-01T17:00, today  I undertook to remind fan at 5",
+            "    involves: me; fan", "    asked by: fan", clock.AGAIN.format(speaker="fan")))).arrival()),
+        # the note doctor's command leaves on a reminder it reopens, which the
+        # session woken for it reads among the item's notes
+        ("doctor's note on a reminder reopened", REOPENED),
     ]
     for path in sorted(ROOT.glob("skills/*/SKILL.md")) + sorted(ROOT.glob("memory/templates/*.md")):
         found.append((str(path.relative_to(ROOT)), path.read_text()))

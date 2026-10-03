@@ -66,6 +66,7 @@ class SlackActions:
         self._last_call = 0.0
         self._users: dict[str, dict] = {}
         self._own_ids: frozenset[str] = frozenset()
+        self._dms: dict[str, str] = {}
 
     async def _call(self, method: str, /, **kwargs):
         async with self._pace:
@@ -235,6 +236,14 @@ class SlackActions:
             if not cursor:
                 break
         return people
+
+    async def dm_channel(self, user_id: str) -> str:
+        """The direct message with this person, opened if it never has been: a
+        session the clock started has no message to reply under."""
+        if user_id not in self._dms:
+            resp = await self._call("conversations_open", users=user_id)
+            self._dms[user_id] = resp["channel"]["id"]
+        return self._dms[user_id]
 
     async def alert(self, text: str) -> None:
         await self._call(

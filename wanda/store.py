@@ -404,6 +404,22 @@ class Store:
         )
         return cur.lastrowid
 
+    def newest_run(self, task_id: int) -> int:
+        """The id of the newest run recorded for this task, 0 for none."""
+        rows = self._query("SELECT COALESCE(MAX(id), 0) AS id FROM runs WHERE task_id=?", (task_id,))
+        return rows[0]["id"]
+
+    def run_after(self, task_id: int, run_id: int) -> sqlite3.Row | None:
+        """The first run recorded for this task after the run `run_id`."""
+        rows = self._query("SELECT * FROM runs WHERE task_id=? AND id > ? ORDER BY id LIMIT 1",
+                           (task_id, run_id))
+        return rows[0] if rows else None
+
+    def run(self, run_id: int) -> sqlite3.Row | None:
+        """The run recorded under this id."""
+        rows = self._query("SELECT * FROM runs WHERE id=?", (run_id,))
+        return rows[0] if rows else None
+
     def runs_since(self, since: datetime) -> tuple[int, float]:
         rows = self._query(
             "SELECT COUNT(*) AS n, COALESCE(SUM(cost_usd), 0) AS cost FROM runs WHERE started_at >= ?",
@@ -484,6 +500,11 @@ class Store:
         )
 
     # --- meta ---
+
+    def meta_starting(self, prefix: str) -> dict[str, str]:
+        """Every meta row whose key starts with `prefix`, by key."""
+        rows = self._query("SELECT key, value FROM meta WHERE substr(key, 1, ?) = ?", (len(prefix), prefix))
+        return {r["key"]: r["value"] for r in rows}
 
     def get_meta(self, key: str) -> str | None:
         rows = self._query("SELECT value FROM meta WHERE key=?", (key,))
