@@ -12,6 +12,7 @@
 //! everywhere.
 
 use clap::{Parser, Subcommand};
+use memory::due::{self, civil_from_days, days_from_civil};
 use memory::index;
 use memory::recall::{self, HOPS, LIMIT};
 use memory::transcript;
@@ -204,6 +205,21 @@ enum Cmd {
         #[arg(long, default_value = "", hide_default_value = true)]
         because: String,
     },
+    /// open trajectories whose date has come: today's, then the ones gone by
+    #[command(hide = true)]
+    Due {
+        /// only what involves this person, under the line a morning look is handed
+        #[arg(long = "for", default_value = "", hide_default_value = true, value_name = "NAME",
+              requires = "after")]
+        for_: String,
+        /// only what came due after this date
+        #[arg(long, default_value = "", hide_default_value = true, value_name = "YYYY-MM-DD")]
+        after: String,
+        /// the time of day the look runs at: my own undertakings timed later today, for someone who asked, are marked as still to come, since the clock wakes me for each at its time
+        #[arg(long, default_value = "", hide_default_value = true, value_name = "HH:MM",
+              requires = "for_")]
+        at: String,
+    },
     /// an exchange from the transcripts: what was said both ways, and what I did
     Session {
         /// a session id, or a prefix of one
@@ -242,6 +258,7 @@ impl Cmd {
             Cmd::Amend { .. } => "amend",
             Cmd::Forget { .. } => "forget",
             Cmd::Retract { .. } => "retract",
+            Cmd::Due { .. } => "due",
             Cmd::Session { .. } => "session",
             Cmd::Help => "help",
         }
@@ -255,7 +272,8 @@ impl Cmd {
             // they read only Claude Code's transcripts, which Claude Code
             // writes without the lock, or nothing
             Cmd::Session { .. } | Cmd::Help => Hold::Nothing,
-            Cmd::Recall { .. } | Cmd::Search { .. } | Cmd::Show { .. } => Hold::Shared,
+            Cmd::Recall { .. } | Cmd::Search { .. } | Cmd::Show { .. } | Cmd::Due { .. } =>
+                Hold::Shared,
             _ => Hold::Exclusive,
         }
     }
@@ -314,34 +332,6 @@ fn local_offset_seconds(_now: i64) -> i64 {
     // TZ handling is the host's: the lab always runs in UTC and a replay pins
     // the date outright. transcript::clock reads the same offset.
     std::env::var("MEM_UTC_OFFSET").ok().and_then(|s| s.parse().ok()).unwrap_or(0)
-}
-
-fn civil_from_days(z: i64) -> String {
-    let z = z + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    format!("{y:04}-{m:02}-{d:02}")
-}
-
-/// None for a date not on the calendar, which `date_or_die` lets through.
-fn days_from_civil(s: &str) -> Option<i64> {
-    let y: i64 = s.get(0..4)?.parse().ok()?;
-    let m: i64 = s.get(5..7)?.parse().ok()?;
-    let d: i64 = s.get(8..10)?.parse().ok()?;
-    let y2 = if m <= 2 { y - 1 } else { y };
-    let era = y2.div_euclid(400);
-    let yoe = y2 - era * 400;
-    let doy = (153 * ((m + 9) % 12) + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let z = era * 146_097 + doe - 719_468;
-    (civil_from_days(z) == s.get(..10)?).then_some(z)
 }
 
 /// A deadline counted from the wrong today looks like any other date; its
@@ -631,8 +621,13 @@ fn date_or_die(s: &str, flag: &str) -> Result<String, i32> {
         return Ok(String::new());
     }
     static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(||
-        regex::Regex::new(r"^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2})?$").unwrap());
-    if !RE.is_match(s) {
+        regex::Regex::new(r"^\d{4}-\d{2}-\d{2}(?:T(\d{2}):(\d{2}))?$").unwrap());
+    // the daemon wakes her at the time of day given, and a time no clock shows
+    // ("T24:00" for midnight, a minute of 60) is one it cannot read
+    let no_clock_shows = RE.captures(s).and_then(|c| Some((c.get(1)?, c.get(2)?)))
+        .is_some_and(|(h, m)| h.as_str() > "23" || m.as_str() > "59");
+    // and a day no calendar has ("2026-09-31") would be stored and never come due
+    if !RE.is_match(s) || no_clock_shows || days_from_civil(s).is_none() {
         out!("({flag} must be a date, YYYY-MM-DD; got {}. It says when, not who.)",
                  py_repr(s));
         return Err(1);
@@ -1709,6 +1704,43 @@ fn cmd_session(v: &Vault, r: &str, day: &str, with_: &str, last: i64, full: bool
     0
 }
 
+/// For the daemon and the lab, not for a session: the list a morning look is
+/// handed with `--for`, and everything open that has come due without it.
+fn cmd_due(v: &Vault, today: &str, who: &str, after: &str, at: &str) -> i32 {
+    if today.is_empty() {
+        out!("(MEM_DATE is not set, so there is no today to count from)");
+        return 1;
+    }
+    if !who.is_empty() {
+        if !at.is_empty() && !due::is_clock_time(at) {
+            out!("(--at must be a time of day, HH:MM; got {})", py_repr(at));
+            return 1;
+        }
+        let Some(lines) = due::for_look(v, today, after, who, at) else {
+            out!("(--after must be a date, YYYY-MM-DD; got {})", py_repr(after));
+            return 1;
+        };
+        // nothing at all when nothing came due: what is printed is what the
+        // look is handed
+        for line in lines {
+            out!("{line}");
+        }
+        return 0;
+    }
+    let after = (!after.is_empty()).then_some(after);
+    let Some(items) = due::items(v, today, after) else {
+        out!("(--after must be a date, YYYY-MM-DD; got {})", py_repr(after.unwrap_or("")));
+        return 1;
+    };
+    if items.is_empty() {
+        out!("(nothing open has come due by {today})");
+    }
+    for line in items.iter().flat_map(|i| i.lines()) {
+        out!("{line}");
+    }
+    0
+}
+
 /// The indexes made to follow the store, then the call's writes checked: one
 /// the store could not take ends the call with exit 1 and says so, where
 /// printing `ok` would tell the session its words were kept.
@@ -1831,6 +1863,7 @@ fn main() {
             cmd_retract(&v, subject, rel, object, inverse, line, because),
         Cmd::Session { r#ref, day, with_, last, full } =>
             cmd_session(&v, r#ref, day, with_, *last, *full),
+        Cmd::Due { for_, after, at } => cmd_due(&v, &today(), for_, after, at),
         // what the root instructions tell a session to run
         Cmd::Help => { let _ = <Cli as clap::CommandFactory>::command().print_help(); out!(""); 0 }
     };
@@ -1956,6 +1989,18 @@ mod tests {
         assert_eq!(cmd_relate(&v.0, "Ari Cole", "knows", "Alpha", ""), 0);
         assert!(v.0.path_for(forgot).exists() && read(&v.0, forgot).contains("Ari Cole"),
                 "not {again}, the name made again later");
+    }
+
+    #[test]
+    fn a_time_of_day_no_clock_shows_is_refused() {
+        assert!(date_or_die("2026-10-01T24:00", "--by").is_err());
+        assert!(date_or_die("2026-10-01T12:60", "--by").is_err());
+        // a day no calendar has, with a time or without
+        assert!(date_or_die("2026-09-31", "--by").is_err());
+        assert!(date_or_die("2027-02-29T09:00", "--by").is_err());
+        assert_eq!(date_or_die("2028-02-29", "--by"), Ok("2028-02-29".into()));
+        assert_eq!(date_or_die("2026-10-01T23:59", "--by"), Ok("2026-10-01T23:59".into()));
+        assert_eq!(date_or_die("2026-10-01", "--by"), Ok("2026-10-01".into()));
     }
 
     #[test]

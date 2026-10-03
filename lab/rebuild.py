@@ -427,7 +427,7 @@ def main() -> int:
     # transcript: that is a transcript shape this no longer reads, or the
     # wrong run's transcripts, and the log is what tells the cases apart.
     carrying = sum(1 for ids in order.values() if ids)
-    reads = {"recall", "search", "show", "help", "session"}
+    reads = {"recall", "search", "show", "due", "help", "session"}
     wrote = sum(1 for c in calls if c.get("cmd") not in reads and c.get("rc") == 0)
     if order and not carrying and wrote:
         print(f"{len(order)} transcripts read from {tdir} and none held a mint "

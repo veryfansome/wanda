@@ -4,6 +4,7 @@
 //! index, the search table, the generated CLAUDE.md surfaces. What lives here
 //! is what decides a node's bytes; `mem` is the CLI that drives it.
 
+pub mod due;
 pub mod fm;
 pub mod index;
 // the store as a Python module, for the tools that read a finished run
