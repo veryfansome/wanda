@@ -87,6 +87,9 @@ def texts() -> list[tuple[str, str]]:
             [("Wed 2026-09-30 21:40", "bob", "earlier"), ("09:05", vault.ME, "reply")])))
     found.append(("memory frame, a turn of two speakers", vault.arrival_text(
         "group", "alice", "hi", ["alice", "bob"], [("09:05", "bob", "earlier")], also=["bob"])))
+    for place in vault.PLACES:
+        found.append((f"a message added while the session works, {place}",
+                      vault.added_text(place, "alice", "hi", "09:06")))
     found += [
         ("triage system prompt", triage_system_prompt()),
         ("triage batch", build_batch_prompt([EMAIL])[0]),

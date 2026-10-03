@@ -6,14 +6,17 @@ import json
 import os
 import signal
 import sqlite3
+import sys
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
 from wanda.config import Config
 from wanda.events import Event
-from wanda.main import ANCHOR, BUDGET_REPLIES, MAX_APPLY_ATTEMPTS, RETRY_BASE_S, Processor
+from wanda import main, vault
+from wanda.main import ANCHOR, BUDGET_REPLIES, MAX_APPLY_ATTEMPTS, RETRY_BASE_S, Additions, Processor
 from wanda.runner import RunResult, RunnerService
 from wanda.store import Store, utcnow
 from wanda.triage import Verdict
@@ -1489,3 +1492,442 @@ def test_triage_off_leaves_mail_rows_alone(tmp_path):
     asyncio.run(p.drain_mail())
     assert slack.tasks == [] and slack.digests == []
     assert [store.get_message_by_key(k)["status"] for k in ("k1", "k2", "k3")] == ["triaged", "acting", "new"]
+
+
+# --- a message added while its conversation's session works (tests/claude_standin.py
+# replays the shapes the pinned CLI wrote for sessions with their input open) ---
+
+STANDIN = Path(__file__).with_name("claude_standin.py")
+
+
+def standin_processor(tmp_path, monkeypatch, slack=None, **behaviour):
+    """A processor whose sessions run the stand-in for claude in a vault of
+    the test's own, with the transcripts under the test's own home."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("STANDIN", json.dumps(behaviour))
+    fake = tmp_path / "claude"
+    fake.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{STANDIN}" "$@"\n')
+    fake.chmod(0o755)
+    slack = slack or ConversationSlack(history=[])
+    p, store, snaps = memory_processor(tmp_path, slack, RunnerService(str(fake), agent_sem=asyncio.Semaphore(1)),
+                                       monkeypatch)
+    (tmp_path / "vault").mkdir(exist_ok=True)
+    return p, store, snaps, slack
+
+
+async def moment(at, vault_dir):
+    """Waits for `at`: seconds, or (what, n, then): until the session's
+    transcript holds n lines recording `what` (a tool's call or result, or
+    the answer), and `then` seconds more."""
+    if not isinstance(at, tuple):
+        await asyncio.sleep(at)
+        return
+    what, n, then = at
+    d = vault.transcripts_dir(vault_dir)
+    for _ in range(800):
+        lines = [x for f in d.glob("*.jsonl") for x in f.read_text().splitlines()] if d.exists() else []
+        if sum(f'"{what}"' in x for x in lines) >= n:
+            break
+        await asyncio.sleep(0.025)
+    await asyncio.sleep(then)
+
+
+def conversation(p, *messages):
+    """Each (moment, event) handled as the watcher would, the first at once."""
+    async def go():
+        tasks = []
+        for at, ev in messages:
+            await moment(at, p.cfg.vault_dir)
+            tasks.append(asyncio.create_task(p.handle_slack(ev)))
+        await asyncio.gather(*tasks)
+    asyncio.run(go())
+
+
+def handed_texts(tmp_path):
+    out = []
+    for f in vault.transcripts_dir(tmp_path / "vault").glob("*.jsonl"):
+        out.append(vault.handed(tmp_path / "vault", f.stem))
+    return out
+
+
+def test_a_message_added_while_its_session_works_gets_the_one_answer(tmp_path, monkeypatch):
+    p, store, snaps, slack = standin_processor(tmp_path, monkeypatch, steps=[1.0, 0.2])
+    conversation(p, (0, dm(f"{AT:.1f}", "can you remind me at 5")),
+                 (("tool_use", 1, 0.1), dm(f"{AT + 30:.1f}", "to call the plumber")))
+    assert slack.replies == ["one answer to 2: can you remind me at 5 | to call the plumber"]
+    assert len(snaps) == 1 and len(store._query("SELECT * FROM runs")) == 1
+    # framed with who added it, where, when, and that only the last answer is sent
+    assert handed_texts(tmp_path) == [[vault.added_text("dm", "fan", "to call the plumber", "16:40")]]
+
+
+def test_one_added_after_the_answer_was_written_still_gets_one_post(tmp_path, monkeypatch):
+    p, store, _, slack = standin_processor(tmp_path, monkeypatch, steps=[0.2], reply_s=1.5)
+    conversation(p, (0, dm(f"{AT:.1f}", "can you remind me at 5")),
+                 (("tool_result", 1, 0.2), dm(f"{AT + 30:.1f}", "to call the plumber")))
+    assert slack.replies == ["one answer to 2: can you remind me at 5 | to call the plumber"]
+    assert store._query("SELECT cost_usd FROM runs")[0]["cost_usd"] == 0.02
+
+
+def test_one_its_session_was_not_handed_is_answered_by_the_next_turn(tmp_path, monkeypatch):
+    p, store, _, slack = standin_processor(tmp_path, monkeypatch, steps=[0.2], reply_s=1.5, on_eof="drop")
+    conversation(p, (0, dm(f"{AT:.1f}", "can you remind me at 5")),
+                 (("tool_result", 1, 0.2), dm(f"{AT + 30:.1f}", "to call the plumber")))
+    assert slack.replies == ["one answer to 1: can you remind me at 5", "one answer to 1: to call the plumber"]
+
+
+def test_past_the_limit_a_message_waits_for_the_next_turn(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "FOLD_LIMIT", 1)
+    p, _, _, slack = standin_processor(tmp_path, monkeypatch, steps=[1.2, 0.2])
+    conversation(p, (0, dm(f"{AT:.1f}", "one")), (("tool_use", 1, 0.1), dm(f"{AT + 10:.1f}", "two")),
+                 (0.1, dm(f"{AT + 20:.1f}", "three")))
+    assert slack.replies == ["one answer to 2: one | two", "one answer to 1: three"]
+
+
+def test_a_failed_session_that_was_handed_an_addition_posts_one_note(tmp_path, monkeypatch):
+    p, store, _, slack = standin_processor(tmp_path, monkeypatch, steps=[1.0, 0.2], fail="first")
+    conversation(p, (0, dm(f"{AT:.1f}", "one")), (("tool_use", 1, 0.1), dm(f"{AT + 10:.1f}", "two")))
+    assert slack.replies == ["⚠️ my run failed: error_during_execution"] and slack.notes == [True]
+    assert store.pending_deliveries() == []
+
+
+def test_mei_added_to_fans_question_is_framed_as_hers(tmp_path, monkeypatch):
+    slack = ConversationSlack(members=["U1", "U2", "UBOT"], history=[])
+    p, _, _, slack = standin_processor(tmp_path, monkeypatch, slack=slack, steps=[1.0, 0.2])
+    conversation(p, (0, dm(f"{AT:.1f}", "dinner at 7?", channel_type="mpim")),
+                 (("tool_use", 1, 0.1), dm(f"{AT + 60:.1f}", "I'm out till 8", channel_type="mpim", user="U2")))
+    assert slack.replies == ["one answer to 2: dinner at 7? | I'm out till 8"]
+    assert handed_texts(tmp_path) == [[vault.added_text("group", "mei", "I'm out till 8", "16:41")]]
+
+
+def test_a_session_no_one_messaged_takes_in_nothing(tmp_path, monkeypatch):
+    """A clock session's frame says no message started it, and it owes
+    nobody: a message in that DM waits for the session that follows."""
+    runner = Held(answer("Morning."))
+    p, store, _ = memory_processor(tmp_path, ConversationSlack(history=[]), runner, monkeypatch)
+    tid = store.create_task(None, "D1", "conversation", kind="dm")
+    task = store.get_task_by_thread("D1", "conversation")
+
+    async def go():
+        async def clock():
+            async with p._task_locks.setdefault(tid, asyncio.Lock()):
+                await p.memory_turn(task, "(a look)", datetime.fromtimestamp(AT, p.cfg.zone),
+                                    channel="D1", reply_thread=None, owed=False)
+        looking = asyncio.create_task(clock())
+        await asyncio.sleep(0.05)
+        message = asyncio.create_task(p.handle_slack(dm(f"{AT + 5:.1f}", "morning!")))
+        await asyncio.sleep(0.05)
+        runner.release.set()
+        await asyncio.gather(looking, message)
+    asyncio.run(go())
+    (_, look), (_, reply) = runner.calls
+    assert look["feed"] is None and isinstance(reply["feed"], Additions)
+
+
+def test_a_restart_while_a_session_holds_an_addition_leaves_one_notice(tmp_path, monkeypatch):
+    p, store, _, slack = standin_processor(tmp_path, monkeypatch, steps=[30])
+
+    async def go():
+        for at, ev in ((0, dm(f"{AT:.1f}", "one")), (("tool_use", 1, 0.3), dm(f"{AT + 10:.1f}", "two"))):
+            await moment(at, p.cfg.vault_dir)
+            t = asyncio.create_task(p.handle_slack(ev))
+            p._bg.add(t)
+        await asyncio.sleep(0.5)
+        taken.extend(len(more.taken) for more in p._additions.values())
+        await p.shutdown(grace_s=5)
+    taken = []
+    asyncio.run(go())
+    assert taken == [1]  # written to the session's input when the restart came
+    rows = store._query("SELECT status, notified FROM runs")
+    assert [r["notified"] for r in rows].count(0) == 1, [dict(r) for r in rows]
+    asyncio.run(p.deliver_pending())
+    assert slack.replies == ["⏸ I restarted while working on this — reply again to retry."]
+
+
+def test_a_restart_during_a_further_turn_delivers_the_answer_already_given(tmp_path, monkeypatch):
+    """The first turn has answered, and a follow-up written after its last
+    step runs a further turn, when the daemon stops: the answer is the run's,
+    delivered at the next start, and the conversation's one restart notice
+    is left for the follow-up."""
+    p, store, _, slack = standin_processor(tmp_path, monkeypatch, steps=[0.2], reply_s=1.0, steps_later=[30])
+
+    async def go():
+        for at, ev in ((0, dm(f"{AT:.1f}", "can you remind me at 5")),
+                       (("tool_result", 1, 0.2), dm(f"{AT + 30:.1f}", "to call the plumber"))):
+            await moment(at, p.cfg.vault_dir)
+            t = asyncio.create_task(p.handle_slack(ev))
+            p._bg.add(t)
+        # the further turn's tool call has begun
+        await moment(("tool_use", 2, 0.2), p.cfg.vault_dir)
+        await p.shutdown(grace_s=5)
+    asyncio.run(go())
+    rows = [dict(r) for r in store._query("SELECT status, notified, result_text FROM runs")]
+    assert {"status": "ok", "notified": 0, "result_text": "one answer to 1: can you remind me at 5"} in rows, rows
+    asyncio.run(p.deliver_pending())
+    assert sorted(zip(slack.replies, slack.notes)) == [
+        ("one answer to 1: can you remind me at 5", False),
+        ("⏸ I restarted while working on this — reply again to retry.", False)]
+
+
+def opening_blocks(tmp_path):
+    """How many text blocks each session's opening message holds."""
+    out = []
+    for f in sorted(vault.transcripts_dir(tmp_path / "vault").glob("*.jsonl")):
+        entries = [json.loads(x) for x in f.read_text().splitlines()]
+        out.append(len(next(e["message"]["content"] for e in entries if e.get("type") == "user")))
+    return out
+
+
+def test_a_message_waiting_when_its_session_starts_is_answered_once(tmp_path, monkeypatch):
+    """At one session at a time fan's second line arrives while his turn waits
+    behind mei's session: his turn's frame, built once it holds the slot,
+    takes it, and his session is not handed it again."""
+    p, store, _, slack = standin_processor(tmp_path, monkeypatch, startup_s=1.0, steps=[1.0, 0.2])
+    conversation(p, (0, dm(f"{AT:.1f}", "what time is dinner?", channel="D2", user="U2")),
+                 (0.3, dm(f"{AT + 10:.1f}", "can you remind me at 5")),
+                 (0.3, dm(f"{AT + 20:.1f}", "to call the plumber")))
+    assert slack.replies == ["one answer to 1: what time is dinner?", "one answer to 1: to call the plumber"]
+    assert len(store._query("SELECT * FROM runs")) == 2
+    assert opening_blocks(tmp_path) == [1, 1]
+    assert [h for h in handed_texts(tmp_path) if h] == []
+    # the earlier line is in his frame, among the conversation so far
+    firsts = [next(e["message"]["content"][0]["text"] for e in map(json.loads, f.read_text().splitlines())
+                   if e.get("type") == "user")
+              for f in vault.transcripts_dir(tmp_path / "vault").glob("*.jsonl")]
+    assert sum("can you remind me at 5" in t for t in firsts) == 1
+
+
+def test_a_burst_during_its_sessions_startup_is_one_session(tmp_path, monkeypatch):
+    p, store, _, slack = standin_processor(tmp_path, monkeypatch, startup_s=1.0, steps=[1.0, 0.2])
+    conversation(p, (0, dm(f"{AT:.1f}", "can you remind me")), (0.1, dm(f"{AT + 1:.1f}", "to call the plumber")),
+                 (0.1, dm(f"{AT + 2:.1f}", "at 5")))
+    assert slack.replies == ["one answer to 3: can you remind me | to call the plumber | at 5"]
+    assert len(store._query("SELECT * FROM runs")) == 1
+    assert opening_blocks(tmp_path) == [1]
+
+
+def test_two_messages_after_the_last_step_are_one_further_turn(tmp_path, monkeypatch):
+    p, store, _, slack = standin_processor(tmp_path, monkeypatch, steps=[0.2], reply_s=1.5)
+    conversation(p, (0, dm(f"{AT:.1f}", "can you remind me at 5")),
+                 (("tool_result", 1, 0.2), dm(f"{AT + 30:.1f}", "to call the plumber")),
+                 (0.05, dm(f"{AT + 31:.1f}", "and the electrician")))
+    assert slack.replies == ["one answer to 3: can you remind me at 5 | to call the plumber | and the electrician"]
+    assert handed_texts(tmp_path) == [[vault.added_text("dm", "fan", "to call the plumber", "16:40"),
+                                       vault.added_text("dm", "fan", "and the electrician", "16:40")]]
+
+
+def test_a_follow_up_that_needs_no_answer_leaves_the_first_answer(tmp_path, monkeypatch):
+    """A further turn that says nothing does not take back the answer before it."""
+    p, store, _, slack = standin_processor(tmp_path, monkeypatch, steps=[0.2], reply_s=1.5, silent_later=True)
+    conversation(p, (0, dm(f"{AT:.1f}", "can you remind me at 5 to call the plumber?")),
+                 (("tool_result", 1, 0.2), dm(f"{AT + 30:.1f}", "thanks!")))
+    assert slack.replies == ["one answer to 1: can you remind me at 5 to call the plumber?"]
+    assert slack.notes == [False] and store._query("SELECT status FROM runs")[0]["status"] == "ok"
+
+
+def test_a_failed_last_turn_after_an_answer_posts_the_answer_then_the_note(tmp_path, monkeypatch):
+    p, store, _, slack = standin_processor(tmp_path, monkeypatch, steps=[0.2], reply_s=1.5, fail="later")
+    conversation(p, (0, dm(f"{AT:.1f}", "can you remind me at 5")),
+                 (("tool_result", 1, 0.2), dm(f"{AT + 30:.1f}", "to call the plumber")))
+    assert slack.replies == ["one answer to 1: can you remind me at 5", "⚠️ my run failed: error_during_execution"]
+    assert slack.notes == [False, True] and store.pending_deliveries() == []
+
+
+class RefusingAt(ConversationSlack):
+    """A Slack that refuses the posts at these places in the order they are
+    made, as a rate limit or a blip would, and takes the rest."""
+
+    def __init__(self, refused, **kw):
+        super().__init__(**kw)
+        self.refused, self.made = set(refused), 0
+
+    async def reply(self, thread_ts, text, channel=None, note=False):
+        self.made += 1
+        if self.made - 1 in self.refused:
+            raise RuntimeError("ratelimited")
+        return await super().reply(thread_ts, text, channel=channel, note=note)
+
+
+@pytest.mark.parametrize("refused", ["the answer", "the answer twice", "the note"])
+def test_a_failed_last_turns_note_follows_its_answer_when_slack_refuses_a_post(tmp_path, monkeypatch, refused):
+    """The note is all the follow-up handed to the turn that failed is told:
+    when Slack refuses the answer's first post or the note's, the note is
+    kept, and delivery posts it after the answer, never before it."""
+    slack = RefusingAt({"the answer": {0}, "the answer twice": {0, 1}, "the note": {1}}[refused], history=[])
+    p, store, _, slack = standin_processor(tmp_path, monkeypatch, slack=slack, steps=[0.2], reply_s=1.5,
+                                           fail="later")
+    conversation(p, (0, dm(f"{AT:.1f}", "can you remind me at 5")),
+                 (("tool_result", 1, 0.2), dm(f"{AT + 30:.1f}", "to call the plumber")))
+    assert handed_texts(tmp_path) == [[vault.added_text("dm", "fan", "to call the plumber", "16:40")]]
+    answered, note = "one answer to 1: can you remind me at 5", "⚠️ my run failed: error_during_execution"
+    assert slack.replies == ([answered] if refused == "the note" else [])
+    if refused == "the answer twice":
+        asyncio.run(p.deliver_pending())
+        assert slack.replies == [] and len(store.pending_deliveries()) == 2
+    asyncio.run(p.deliver_pending())
+    assert slack.replies == [answered, note] and slack.notes == [False, True]
+    assert [dict(r) for r in store._query("SELECT status, error, result_text, notified FROM runs")] == [
+        {"status": "ok", "error": "error_during_execution", "result_text": answered, "notified": 1},
+        {"status": "error", "error": "error_during_execution", "result_text": note, "notified": 1}]
+
+
+def test_a_turn_begun_by_a_background_notice_that_says_nothing_leaves_the_answer(tmp_path, monkeypatch):
+    p, store, _, slack = standin_processor(tmp_path, monkeypatch, steps=[0.2], notify="after")
+    conversation(p, (0, dm(f"{AT:.1f}", "can you remind me at 5")))
+    assert slack.replies == ["one answer to 1: can you remind me at 5"] and handed_texts(tmp_path) == [[]]
+
+
+@pytest.mark.parametrize("first", ["failed", "ended without its report"])
+@pytest.mark.parametrize("later", ["says nothing", "answers the follow-up alone"])
+def test_a_failed_first_turn_and_a_further_one(tmp_path, monkeypatch, first, later):
+    """A first turn that failed or ended without its report, then a further
+    turn for a follow-up written after its last step: with nothing said, the
+    failure is told, never the model's text; an answer the further turn
+    gives is posted instead."""
+    p, store, _, slack = standin_processor(tmp_path, monkeypatch, steps=[0.2], reply_s=1.5,
+                                           **({"fail": "first"} if first == "failed" else {"no_report": "first"}),
+                                           **({"silent_later": True} if later == "says nothing" else
+                                              {"answer_new": True}))
+    conversation(p, (0, dm(f"{AT:.1f}", "can you remind me at 5 to call the plumber?")),
+                 (("tool_result", 1, 0.2), dm(f"{AT + 30:.1f}", "thanks!" if later == "says nothing" else
+                                              "and the electrician")))
+    runs = [dict(r) for r in store._query("SELECT status, error FROM runs")]
+    if later == "says nothing":
+        error = "error_during_execution" if first == "failed" else "the session ended without its report"
+        assert slack.replies == [f"⚠️ my run failed: {error}"] and slack.notes == [True]
+        assert runs == [{"status": "error", "error": error}]
+    else:
+        assert slack.replies == ["one answer to 1: and the electrician"] and slack.notes == [False]
+        assert runs == [{"status": "ok", "error": None}]
+    assert store.pending_deliveries() == []
+
+
+def test_an_exit_after_the_answer_posts_the_answer_then_the_note(tmp_path, monkeypatch):
+    """Claude Code ended from outside, or by a crash, in a further turn after
+    its answer: the answer is posted, then the failure note, which names the
+    exit and never carries the report."""
+    p, store, _, slack = standin_processor(tmp_path, monkeypatch, steps=[0.2], reply_s=1.5, crash="later")
+    conversation(p, (0, dm(f"{AT:.1f}", "can you remind me at 5")),
+                 (("tool_result", 1, 0.2), dm(f"{AT + 30:.1f}", "to call the plumber")))
+    assert slack.replies == ["one answer to 1: can you remind me at 5",
+                             "⚠️ my run failed: claude exited 1 after its last result"]
+    assert slack.notes == [False, True] and store.pending_deliveries() == []
+    assert [dict(r) for r in store._query("SELECT status, error FROM runs")] == [
+        {"status": "ok", "error": "claude exited 1 after its last result"}]
+
+
+def test_a_clock_sessions_answer_stands_when_a_turn_after_it_says_nothing(tmp_path, monkeypatch):
+    """A session the clock starts has its input closed after the prompt, and
+    Claude Code prints its last turn's result alone: a turn a background
+    command's end began after the reminder, saying nothing, leaves the
+    reminder to be posted."""
+    p, store, _, slack = standin_processor(tmp_path, monkeypatch, steps=[0.2], notify="after")
+    store.create_task(None, "D1", "conversation", kind="dm")
+    task = store.get_task_by_thread("D1", "conversation")
+    got = asyncio.run(p.memory_turn(task, "It is 17:00, as asked:\n\n    call the plumber",
+                                    datetime.fromtimestamp(AT, p.cfg.zone), channel="D1", reply_thread=None,
+                                    owed=False))
+    assert got is None and slack.replies == ["one answer to 1: call the plumber"]
+    assert [dict(r) for r in store._query("SELECT status, notified FROM runs")] == [{"status": "ok", "notified": 1}]
+
+
+@pytest.mark.parametrize("later", ["fails", "runs out of time"])
+def test_a_clock_session_that_fails_after_its_reminder_posts_it(tmp_path, monkeypatch, later):
+    """A session the clock starts owes nobody, but a reminder it already gave
+    is posted when a turn after it fails or runs out of time; the run reads
+    as spoken, and the failure is what it returns, for the clock to alert."""
+    p, store, _, slack = standin_processor(tmp_path, monkeypatch, steps=[0.2], notify="after",
+                                           **({"fail": "later"} if later == "fails" else {"hang": "later"}))
+    monkeypatch.setattr(p.cfg, "agent_timeout_s", 4)
+    store.create_task(None, "D1", "conversation", kind="dm")
+    task = store.get_task_by_thread("D1", "conversation")
+    got = asyncio.run(p.memory_turn(task, "It is 17:00, as asked:\n\n    call the plumber",
+                                    datetime.fromtimestamp(AT, p.cfg.zone), channel="D1", reply_thread=None,
+                                    owed=False))
+    error = "error_during_execution" if later == "fails" else "timed out after 4s"
+    assert got == error and slack.replies == ["one answer to 1: call the plumber"] and slack.notes == [False]
+    assert [dict(r) for r in store._query("SELECT status, error, notified FROM runs")] == [
+        {"status": "ok", "error": error, "notified": 1}]
+    assert store.pending_deliveries() == []
+
+
+def test_a_message_deleted_after_its_session_took_it_is_not_put_back(tmp_path, monkeypatch):
+    p, store, _, slack = standin_processor(tmp_path, monkeypatch, hang=True)
+    monkeypatch.setattr(p.cfg, "agent_timeout_s", 4)
+    deleted = Event(source="slack", dedupe_key="D1:del", payload={"kind": "deleted", "channel": "D1",
+                                                                   "ts": f"{AT + 30:.1f}"})
+    conversation(p, (0, dm(f"{AT:.1f}", "can you remind me at 5")),
+                 (1.5, dm(f"{AT + 30:.1f}", "that was meant for mei")), (0.5, deleted))
+    assert slack.replies == ["⚠️ my run failed: timed out after 4s"]
+    assert len(store._query("SELECT * FROM runs")) == 1
+
+
+@pytest.mark.parametrize("ending", ["the session answered", "its readers changed", "the session still working"])
+def test_a_message_deleted_while_it_is_framed_is_not_answered(tmp_path, monkeypatch, ending):
+    """Deleted while the session framed it: whether the frame is then given
+    up or built while the session still works, it is neither handed to the
+    session nor put back for a turn of its own."""
+    real = Processor._added_text
+
+    async def slow_frame(self, p, more):
+        await asyncio.sleep(2.0)
+        return None if ending == "its readers changed" else await real(self, p, more)
+    monkeypatch.setattr(Processor, "_added_text", slow_frame)
+    p, store, _, slack = standin_processor(tmp_path, monkeypatch,
+                                           steps=[1.0, 0.2] if ending == "the session answered" else [4.0, 0.2])
+    deleted = Event(source="slack", dedupe_key="D1:del", payload={"kind": "deleted", "channel": "D1",
+                                                                   "ts": f"{AT + 30:.1f}"})
+    conversation(p, (0, dm(f"{AT:.1f}", "can you remind me at 5")),
+                 (("tool_use", 1, 0.1), dm(f"{AT + 30:.1f}", "that was meant for mei")), (0.3, deleted))
+    assert slack.replies == ["one answer to 1: can you remind me at 5"]
+    assert len(store._query("SELECT * FROM runs")) == 1 and handed_texts(tmp_path) == [[]]
+
+
+class ChangingSlack(ConversationSlack):
+    """A private channel whose member list changes once the session's opening
+    frame has been built: each message is checked when it arrives, and the
+    first again for its frame."""
+
+    def __init__(self, first, later):
+        super().__init__(members=first, history=[])
+        self.later = later
+        self.calls = 0
+
+    async def members(self, channel):
+        self.calls += 1
+        if self.calls > 2:
+            if self.later is None:
+                raise RuntimeError("ratelimited")
+            return self.later
+        return self.member_ids
+
+
+def test_a_message_whose_readers_changed_gets_a_turn_of_its_own(tmp_path, monkeypatch):
+    slack = ChangingSlack(["U1", "UBOT"], ["U1", "U2", "UBOT"])
+    p, _, _, slack = standin_processor(tmp_path, monkeypatch, slack=slack, steps=[1.0, 0.2])
+    conversation(p, (0, dm(f"{AT:.1f}", "what should I get mei for her birthday?", channel_type="group",
+                          channel="C1")),
+                 (("tool_use", 1, 0.1), dm(f"{AT + 30:.1f}", "keep it quiet", channel_type="group",
+                                            channel="C1")))
+    assert slack.replies == ["one answer to 1: what should I get mei for her birthday?",
+                             "one answer to 1: keep it quiet"]
+    assert handed_texts(tmp_path) == [[], []]
+
+
+def test_a_message_whose_household_check_failed_is_not_taken_in(tmp_path, monkeypatch):
+    p, _, _, slack = standin_processor(tmp_path, monkeypatch, slack=ChangingSlack(["U1", "U2", "UBOT"], None),
+                                       steps=[1.0, 0.2])
+    conversation(p, (0, dm(f"{AT:.1f}", "dinner at 7?", channel_type="group", channel="C1")),
+                 (("tool_use", 1, 0.1), dm(f"{AT + 30:.1f}", "and the gift", channel_type="group",
+                                            channel="C1")))
+    assert slack.replies == ["one answer to 1: dinner at 7?",
+                             "⚠️ my run failed: could not see who reads this conversation: ratelimited"]
+
+
+def test_a_follow_up_in_a_thread_a_mention_began_is_framed_where_the_mention_was(tmp_path, monkeypatch):
+    slack = ConversationSlack(members=["U1", "U2", "UBOT"], history=[])
+    p, _, _, slack = standin_processor(tmp_path, monkeypatch, slack=slack, steps=[1.0, 0.2])
+    mention = dm(f"{AT:.1f}", "what's on saturday?", channel_type="group", channel="C1", thread=f"{AT:.1f}")
+    mention.payload["in_thread"] = False
+    conversation(p, (0, mention), (("tool_use", 1, 0.1), dm(f"{AT + 30:.1f}", "and sunday", channel_type="group",
+                                                            channel="C1", thread=f"{AT:.1f}")))
+    assert handed_texts(tmp_path) == [[vault.added_text("channel", "fan", "and sunday", "16:40")]]

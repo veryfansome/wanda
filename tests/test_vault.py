@@ -150,7 +150,76 @@ def test_a_turn_of_several_speakers_is_read_back_as_no_one_persons():
         assert parser()(text) == ("2026-10-01", chan, "mei (after fan)", SAID)
 
 
+def added_parser():
+    """memory/src/transcript.rs's parse_added, run on its own regex."""
+    src = (ROOT / "memory" / "src" / "transcript.rs").read_text()
+    body = re.search(r"static ADDED_RE: .*?Regex::new\((.*?)\)\.unwrap\(\)", src, re.DOTALL).group(1)
+    added_re = re.compile("".join(re.findall(r'r"(.*?)"', body, re.DOTALL)))
+
+    def parse(text):
+        if not (a := added_re.match(text)):
+            return None
+        return (a.group("speaker").strip(),
+                "\n".join(line.removeprefix("    ") for line in a.group("text").split("\n")).strip())
+    return parse
+
+
+@pytest.mark.parametrize("place", list(vault.PLACES))
+def test_the_parser_reads_an_added_message_back(place):
+    # a line of the message like the closing sentence, indented, does not end it
+    said = SAID + "\n\nNothing I have said back in this session has been sent yet, it says"
+    text = vault.added_text(place, "mei", said, "Fri 2026-10-02 00:05")
+    assert added_parser()(text) == ("mei", said)
+
+
 # --- what the frames say ---
+
+def test_an_added_message_says_who_where_when_and_what_is_sent():
+    assert vault.added_text("group", "mei", "and tell me too", "16:42") == (
+        "mei adds this in the same group direct message at 16:42, before anything I say back "
+        "has been sent:\n\n    and tell me too\n\n"
+        "Nothing I have said back in this session has been sent yet. The last answer I give in this session "
+        "that says something is the one sent, so that is where anything said here gets its answer.")
+    assert "in the same Slack thread in a public channel at" in vault.added_text(
+        "public thread", "fan", "x", "09:00")
+
+
+def test_what_a_session_was_handed_is_read_from_its_transcript(tmp_path, monkeypatch):
+    """The prompt is not counted; a message taken in at a turn's next step, one
+    that began a later turn and one taken into a turn with another are;
+    Claude Code's own notes, a background command's notice of its end and a
+    tool's result are not. Shapes as the pinned CLI wrote them for sessions
+    with their input open, or as its code reads (the merged message, the
+    notices)."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    v = tmp_path / "vault"
+    v.mkdir()
+    d = vault.transcripts_dir(v)
+    d.mkdir(parents=True)
+    notice = "<task-notification>\n<task-id>b1</task-id>\n</task-notification>"
+    rows = [
+        {"type": "queue-operation", "operation": "enqueue"},
+        {"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "the prompt"},
+                                                                 {"type": "text", "text": "taken with it"}]}},
+        {"type": "user", "message": {"role": "user", "content": [
+            {"tool_use_id": "t1", "type": "tool_result", "content": "ok"}]}},
+        {"type": "attachment", "attachment": {"type": "queued_command", "commandMode": "prompt",
+                                              "prompt": [{"type": "text", "text": "added mid-turn"}]}},
+        {"type": "attachment", "attachment": {"type": "queued_command", "commandMode": "task-notification",
+                                              "prompt": notice}},
+        {"type": "attachment", "attachment": {"type": "queued_command", "commandMode": "prompt",
+                                              "isMeta": True, "prompt": "a note"}},
+        {"type": "queue-operation", "operation": "remove", "reason": "absorbed_mid_turn"},
+        {"type": "user", "isMeta": True, "message": {"role": "user", "content": "[structured-output-enforce] x"}},
+        {"type": "attachment", "attachment": {"type": "structured_output", "data": {"answer": "a"}}},
+        {"type": "user", "origin": {"kind": "task-notification"}, "message": {"role": "user", "content": notice}},
+        {"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "a later turn"},
+                                                                 {"type": "text", "text": "and another"}]}},
+    ]
+    (d / "s1.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows) + "not json\n")
+    assert vault.handed(v, "s1") == ["taken with it", "added mid-turn", "a later turn", "and another"]
+    assert vault.handed(v, "s2") is None
+
 
 def test_frames_name_who_reads_and_what_came_before():
     assert vault.arrival_text("group", "fan", "hi", ["fan", "mei"], []) == (
@@ -403,7 +472,8 @@ def test_a_line_whose_time_cannot_be_paired_still_has_its_calls_counted(tmp_path
 def test_the_answers_a_session_gave_are_read_from_its_transcript(tmp_path, monkeypatch):
     """Each turn's structured output, in order, as Claude Code keeps it; the
     one the product posts is the last that says something. A line that will
-    not read is passed over, and a session with no transcript gave none."""
+    not read, the prompt and an output that is no report are passed over,
+    and a session with no transcript gave none."""
     monkeypatch.setenv("HOME", str(tmp_path / "h"))
     c = cfg(tmp_path)
     d = vault.transcripts_dir(c.vault_dir)
@@ -413,8 +483,10 @@ def test_the_answers_a_session_gave_are_read_from_its_transcript(tmp_path, monke
         return json.dumps({"type": "attachment", "attachment": {"type": "structured_output", "data": {
             "recalled": [], "answer": answer, "recorded": []}}})
     (d / "s1.jsonl").write_text("\n".join([
+        json.dumps({"type": "user", "message": {"role": "user", "content": "the prompt"}}),
         given("It is 7: the gift."),
         "not a line Claude Code writes",
+        json.dumps({"type": "attachment", "attachment": {"type": "structured_output", "data": {"no": "answer"}}}),
         json.dumps({"type": "user", "message": {"role": "user", "content": "<task-notification>"}}),
         given(""),
     ]) + "\n")

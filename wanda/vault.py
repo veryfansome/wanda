@@ -280,6 +280,76 @@ def prompt(date: str, arrival: str) -> str:
     return PROMPT.replace("{date}", date).replace("{arrival}", arrival)
 
 
+# A message added to the conversation while its session works, as that session
+# is handed it: at its next step, or as a further turn once it has given an
+# answer that has not been sent. The last of the session's answers that says
+# something is posted, so the frame says so; `mem session` reads the frame back
+# (ADDED_RE in memory/src/transcript.rs), the closing sentences ending the
+# message.
+ADDED = ("{speaker} adds this in the same {room} at {when}, before anything I say back has been sent:"
+         "\n\n    {text}\n\n"
+         "Nothing I have said back in this session has been sent yet. The last answer I give in this session "
+         "that says something is the one sent, so that is where anything said here gets its answer.")
+
+
+def added_text(place: str, speaker: str, text: str, when: str) -> str:
+    room = PLACES[place][0].removeprefix("a ")
+    return (ADDED.replace("{speaker}", speaker).replace("{room}", room).replace("{when}", when)
+            .replace("{text}", _indent(text, 4)))
+
+
+def _texts(content) -> list[str]:
+    """The words of a message a session was handed: a string, or text blocks
+    alone, as a turn's input is; a tool's result is not one."""
+    if isinstance(content, str):
+        return [content]
+    if isinstance(content, list) and content and all(
+            isinstance(b, dict) and b.get("type") == "text" for b in content):
+        return [b.get("text") or "" for b in content]
+    return []
+
+
+def _notice(entry: dict) -> bool:
+    """A turn Claude Code began with a background command's notice of its
+    end, not with a message."""
+    texts = _texts((entry.get("message") or {}).get("content"))
+    origin = entry.get("origin") if isinstance(entry.get("origin"), dict) else {}
+    return origin.get("kind") == "task-notification" or bool(texts) and texts[0].lstrip().startswith(
+        "<task-notification>")
+
+
+def handed(vault: Path, sid: str) -> list[str] | None:
+    """Every message a session was handed after its first, as its transcript
+    records them: one taken in at a turn's next step (an attachment of type
+    queued_command, in the mode of a message), one that began a further turn,
+    and one Claude Code took into a turn with another (a later text block of
+    the same message, the opening one included). Not a background command's
+    notice of its end, which Claude Code hands over the same ways in a mode
+    of its own, nor its own meta notes. None when the transcript cannot be
+    read."""
+    try:
+        lines = (transcripts_dir(vault) / f"{sid}.jsonl").read_text(errors="replace").splitlines()
+    except OSError:
+        return None
+    out, opened = [], False
+    for line in lines:
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(e, dict):
+            continue
+        a = e.get("attachment") if isinstance(e.get("attachment"), dict) else {}
+        if e.get("type") == "attachment" and a.get("type") == "queued_command":
+            if a.get("commandMode") == "prompt" and not a.get("isMeta"):
+                out += _texts(a.get("prompt"))
+        elif e.get("type") == "user" and not e.get("isMeta") and not _notice(e):
+            texts = _texts((e.get("message") or {}).get("content"))
+            out += texts if opened else texts[1:]
+            opened = opened or bool(texts)
+    return out
+
+
 def date_paragraph(now: datetime) -> str:
     """The system prompt's date paragraph for every memory session, the
     clock's included. `now` is in the household's zone."""
@@ -437,6 +507,12 @@ def answer(out: dict) -> str:
         log.warning("dropping a placeholder answer: %r", text)
         return ""
     return text
+
+
+def answers(results: list[dict]) -> list[str]:
+    """The answers a session's results carry, in order."""
+    return [answer(o) for ev in results
+            if (o := report(ev.get("structured_output"), ev.get("result"))) is not None]
 
 
 def transcript_answers(vault: Path, sid: str) -> list[str]:
