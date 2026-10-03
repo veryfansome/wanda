@@ -55,6 +55,11 @@ static THREAD_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(concat!(
 // speaks to, and the indented lines are what woke her
 static UNPROMPTED_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
     r"(?s)^No message started this session\. What I say now reaches (.+?) alone, in a direct message\.\n\n(.*)$").unwrap());
+// a session no message started whose answer reaches no one: the product's own
+// news for her memory. Nobody speaks and nobody hears, so the speaker group is
+// empty; without it, the first group, the text, would be taken for the speaker
+static NOBODY_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
+    r"(?s)^No message started this session\. What I say now reaches no one\.(?P<speaker>)\n\n(?P<text>.*)$").unwrap());
 
 // a message added to the conversation while its session worked, as the product
 // hands it to that session (wanda/vault.py, ADDED). Every line of the message
@@ -81,8 +86,8 @@ pub fn parse_prompt(prompt: &str) -> (String, String, String, String) {
     };
     let when = m[1].to_string();
     let arrival = m[2].to_string();
-    for (chan, rx) in [("dm", &*DM_RE), ("email", &*EMAIL_RE), ("thread", &*THREAD_RE),
-                       ("clock", &*UNPROMPTED_RE)] {
+    for (chan, rx) in [("nobody", &*NOBODY_RE), ("dm", &*DM_RE), ("email", &*EMAIL_RE),
+                       ("thread", &*THREAD_RE), ("clock", &*UNPROMPTED_RE)] {
         if let Some(a) = rx.captures(&arrival) {
             let said = a.name("text").unwrap_or_else(|| a.get(2).unwrap());
             let text: Vec<&str> = crate::text::split_lines(said.as_str())
@@ -475,15 +480,24 @@ const UNPARSED: &str = "the opening message";
 
 /// Who an exchange was with, as its opening line names them. In a clock
 /// exchange nobody spoke, and under "said" the person she spoke to would read
-/// as having started it. Whoever added a message later is shown by it, not as
-/// having opened the exchange.
+/// as having started it; in one that reached no one, nobody spoke or heard.
+/// Whoever added a message later is shown by it, not as having opened the
+/// exchange.
 fn opened_by(ex: &Exchange) -> String {
     match (ex.speaker.is_empty(), ex.date.is_empty()) {
+        _ if ex.channel == "nobody" => "unprompted, to no one".to_string(),
         (false, _) if ex.channel == "clock" => format!("unprompted, to {}", ex.speaker),
         (false, _) => format!("{} said", ex.speaker.split(" (then ").next().unwrap_or(&ex.speaker)),
         (true, true) => UNPARSED.to_string(),
         (true, false) => "someone said".to_string(),
     }
+}
+
+/// What follows "I said" and "me". What she said in a session that reached no
+/// one was posted nowhere, and a later session should not read it as said to
+/// anyone.
+fn to_whom(ex: &Exchange) -> &'static str {
+    if ex.channel == "nobody" { ", to no one" } else { "" }
 }
 
 /// What a session sees: the exchange's own date, and times of day only — a
@@ -507,6 +521,7 @@ pub fn render(ex: &Exchange, full: bool, in_progress: bool) -> String {
     let last_added = ex.turns.iter().rposition(|t| t.kind == "added");
     let pending = |i: usize| in_progress && last_added.is_some_and(|a| a > i);
     let who = opened_by(ex);
+    let to = to_whom(ex);
     for (i, t) in ex.turns.iter().enumerate() {
         match t.kind.as_str() {
             "said" => out.push(format!("{}  {who}: {}", t.at, t.text)),
@@ -524,14 +539,14 @@ pub fn render(ex: &Exchange, full: bool, in_progress: bool) -> String {
                 out.push(format!("{}  I (aside): {}", t.at,
                     if full { t.text.clone() } else { take_chars(&t.text, 200) }));
             },
-            "answered" => out.push(format!("{}  I said: {}", t.at,
+            "answered" => out.push(format!("{}  I said{to}: {}", t.at,
                 if t.text.is_empty() { "(nothing)" } else { &t.text })),
             _ => {}
         }
     }
     if !ex.turns.iter().enumerate().any(|(i, t)| t.kind == "answered" && !pending(i)) {
         let waiting = ex.turns.iter().enumerate().any(|(i, t)| t.kind == "answered" && pending(i));
-        out.push(format!("          I said: {}", if !ex.answer.is_empty() && !waiting {
+        out.push(format!("          I said{to}: {}", if !ex.answer.is_empty() && !waiting {
             &ex.answer
         } else if in_progress {
             "(nothing yet \u{2014} this session is in progress)"
@@ -548,14 +563,16 @@ pub fn line(ex: &Exchange) -> String {
     let ans = take_chars(&one_line(&ex.answer), 70);
     let ans = if ans.is_empty() { "(silent)".to_string() } else { ans };
     let who = match (ex.speaker.is_empty(), ex.date.is_empty()) {
+        _ if ex.channel == "nobody" => opened_by(ex),
         (false, _) if ex.channel == "clock" => opened_by(ex),
         (false, _) => ex.speaker.clone(),
         (true, true) => UNPARSED.to_string(),
         (true, false) => "?".to_string(),
     };
-    format!("{}  {}  {who}: {said}\n          me: {ans}",
+    format!("{}  {}  {who}: {said}\n          me{}: {ans}",
         take_chars(&ex.session, 8),
-        if ex.date.is_empty() { "----------" } else { &ex.date })
+        if ex.date.is_empty() { "----------" } else { &ex.date },
+        to_whom(ex))
 }
 
 /// Whether an exchange is one with this person, for a listing of them: `name`
@@ -564,9 +581,10 @@ pub fn line(ex: &Exchange) -> String {
 /// inside a longer one lists nobody else. A clock exchange in which she gave
 /// no answer that says something passed nothing between them, and a look
 /// every morning would otherwise push what the person said out of the most
-/// recent few; `--day` and the id still show it.
+/// recent few; `--day` and the id still show it. One that reached no one was
+/// with no one, whoever it was about.
 pub fn was_with(ex: &Exchange, name: &str, others: &[String]) -> bool {
-    if ex.channel == "clock" && py_strip(&ex.answer).is_empty() {
+    if ex.channel == "nobody" || (ex.channel == "clock" && py_strip(&ex.answer).is_empty()) {
         return false;
     }
     ex.speaker.to_lowercase().contains(&name.to_lowercase())
@@ -961,5 +979,56 @@ remind mei at 5\n    involves: me; mei");
         let ex = transcript("dm", dm, &["Morning.", ""]);
         assert_eq!(ex.answer, "Morning.");
         assert!(line(&ex).ends_with("me: Morning."));
+    }
+
+    // the product's frame for a session it starts itself and whose answer it
+    // posts nowhere, written out whole with the news it carries
+    const NOBODY: &str = "No message started this session. What I say now reaches no one.\n\n    \
+The person I have known in this Slack as fan is named Fan Zhu there now. It is the same person; only \
+the name I take for them from this Slack has changed. When my memory is read after this session ends, \
+their messages, and others' mentions of them, start to reach me under Fan Zhu if it finds exactly one \
+person by the name Fan Zhu, named Fan Zhu, in any capitals, who is also found by the name fan, or was \
+made in this session while the name fan finds no one; and, if this session ended without failing, also \
+if it finds no one by either name. Otherwise they go on reaching me under fan. What they said before \
+now, and what I hold about them, may name them fan. A note of mine that names them only in its words \
+has no link to them: `mem recall` reaches it by neither name, and `mem search` finds it only by a word \
+of three or more characters that it holds.";
+
+    #[test]
+    fn a_session_that_reaches_no_one_reads_back_with_no_speaker() {
+        let news = NOBODY.split_once("\n\n    ").unwrap().1;
+        assert_eq!(parse_prompt(&prompt(NOBODY)),
+                   ("2026-01-01".into(), "nobody".into(), String::new(), news.into()));
+        // a look for someone called "no one" is still the clock's
+        let look = "No message started this session. What I say now reaches no one alone, in a direct \
+                    message.\n\n    It is Monday, 08:00, and this is my look at the day ahead for no one.";
+        assert_eq!(parse_prompt(&prompt(look)),
+                   ("2026-01-01".into(), "clock".into(), "no one".into(),
+                    "It is Monday, 08:00, and this is my look at the day ahead for no one.".into()));
+    }
+
+    // what she said there was posted nowhere, and reads so; it was with no one
+    #[test]
+    fn a_session_that_reaches_no_one_is_shown_as_said_to_no_one() {
+        let opened = format!("I am wanda.\n\nToday is 2031-01-13.\n\n{NOBODY}\n\nDo three things, in this order.\n");
+        let ex = transcript("nobody", &opened, &["I renamed fan's node to Fan Zhu."]);
+        let shown = render(&ex, false, false);
+        assert!(shown.starts_with("session s1 \u{b7} 2031-01-13 \u{b7} nobody \u{b7} 0 actions\n\n\
+                                   16:00:00  unprompted, to no one: The person I have known in this Slack \
+                                   as fan is named Fan Zhu there now."), "{shown}");
+        assert!(shown.ends_with("\n16:01:00  I said, to no one: I renamed fan's node to Fan Zhu."), "{shown}");
+        let listed = line(&ex);
+        assert!(listed.starts_with("s1  2031-01-13  unprompted, to no one: The person I have known")
+                && listed.ends_with("\n          me, to no one: I renamed fan's node to Fan Zhu."), "{listed}");
+        for name in ["fan", "Fan Zhu", "no one", "nobody", ""] {
+            assert!(!was_with(&ex, name, &["fan".into(), "Fan Zhu".into()]), "{name}");
+        }
+        // with no answer, or an empty one
+        let silent = transcript("nobody-silent", &opened, &[]);
+        assert!(render(&silent, false, false)
+                .ends_with("\n          I said, to no one: (nothing \u{2014} I did not answer)"));
+        assert!(line(&silent).ends_with("\n          me, to no one: (silent)"));
+        assert!(render(&transcript("nobody-empty", &opened, &[""]), false, false)
+                .ends_with("\n16:01:00  I said, to no one: (nothing)"));
     }
 }

@@ -552,4 +552,25 @@ mod tests {
         v.rename("person:6a7b8c", "Alpha Chen", "", "", "2031-01-11");
         assert_eq!(look(), Vec::<String>::new());
     }
+
+    // a session that reached no one had no one in it to ask, so what it
+    // undertook is not given to anyone at its time
+    #[test]
+    fn what_a_session_that_reached_no_one_undertook_has_no_asker() {
+        let mut s = store("nobody");
+        transcript(&s.1.join("transcripts"), "s-nobody", "No message started this session. What I say \
+                   now reaches no one.\n\n    The person I have known in this Slack as fan is named Fan Zhu \
+                   there now.");
+        s.0.session = "s-nobody".into();
+        s.0.upsert("trajectory:qqqqqq", "trajectory", "remind fan at 6", "remind fan at 6", "",
+                   &[("expect".into(), "it happens".into()), ("expect_by".into(), "2031-01-12T18:00".into()),
+                     ("status".into(), "open".into())],
+                   &[edge("involves", "person:3c4d5e"), edge("involves", "person:1a2b3c")], "2031-01-10");
+        let found = items(&s.0, "2031-01-12", Some("2031-01-11")).unwrap();
+        let item = found.iter().find(|i| i.id == "trajectory:qqqqqq").unwrap();
+        assert!(item.asked_by.is_empty() && !item.woken_at_its_time());
+        let fan = for_look(&s.0, "2031-01-12", "2031-01-11", "fan", "08:00").unwrap();
+        assert!(fan.contains(&"`trajectory:qqqqqq`  2031-01-12T18:00, today  remind fan at 6".to_string())
+                && !fan.iter().any(|l| l.contains("at 18:00")), "{fan:?}");
+    }
 }
