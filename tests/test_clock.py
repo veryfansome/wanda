@@ -25,9 +25,11 @@ from wanda.store import Store, utcnow
 
 ROOT = Path(__file__).resolve().parent.parent
 LA = ZoneInfo("America/Los_Angeles")
-LOOKS = clock.mornings(["fan@08:00", "mei@07:30"])
+LOOKS = clock.mornings(["U1@08:00", "U2@07:30"])
 QUIET = clock.quiet_hours("21:30-07:00")
-PEOPLE = {"fan", "mei"}
+# the names sessions know fan and mei by, and the ids those names lead to
+NAMES = {"U1": "fan", "U2": "mei"}
+ASKERS = {"fan": "U1", "mei": "U2"}
 
 # what `mem due --after 2026-09-29` printed on 2026-10-01 for a small vault
 # built through `mem`: her undertakings at a time of day, one kept from mei,
@@ -82,7 +84,7 @@ def run_mornings(start, end, store_meta: dict, down=(), looks=LOOKS):
     for now in minutes(start, end):
         if any(a <= now < b for a, b in down):
             continue
-        for w in clock.morning_wakes(now, looks, QUIET, lambda p: store_meta.get(f"clock:morning:{p}")):
+        for w in clock.morning_wakes(now, looks, QUIET, lambda p: store_meta.get(f"clock:morning:{p}"), NAMES.get):
             store_meta[w.key] = now.date().isoformat()
             fired.append((now, w))
     return fired
@@ -92,9 +94,9 @@ def test_each_morning_wakes_once_per_person_per_day():
     meta: dict = {}
     fired = run_mornings(datetime(2026, 10, 1, 0, 0, tzinfo=LA), datetime(2026, 10, 4, 0, 0, tzinfo=LA), meta)
     assert [(n.strftime("%m-%d %H:%M"), w.person) for n, w in fired] == [
-        ("10-01 07:30", "mei"), ("10-01 08:00", "fan"),
-        ("10-02 07:30", "mei"), ("10-02 08:00", "fan"),
-        ("10-03 07:30", "mei"), ("10-03 08:00", "fan"),
+        ("10-01 07:30", "U2"), ("10-01 08:00", "U1"),
+        ("10-02 07:30", "U2"), ("10-02 08:00", "U1"),
+        ("10-03 07:30", "U2"), ("10-03 08:00", "U1"),
     ]
 
 
@@ -102,7 +104,7 @@ def test_a_morning_missed_while_down_runs_when_back_and_says_when():
     meta: dict = {}
     down = [(datetime(2026, 10, 1, 6, 0, tzinfo=LA), datetime(2026, 10, 1, 10, 17, tzinfo=LA))]
     fired = run_mornings(datetime(2026, 10, 1, 0, 0, tzinfo=LA), datetime(2026, 10, 2, 0, 0, tzinfo=LA), meta, down)
-    assert [(n.strftime("%H:%M"), w.person) for n, w in fired] == [("10:17", "fan"), ("10:17", "mei")]
+    assert [(n.strftime("%H:%M"), w.person) for n, w in fired] == [("10:17", "U1"), ("10:17", "U2")]
     assert fired[0][1].text == "It is Thursday, 10:17, and this is my look at the day ahead for fan."
 
 
@@ -111,28 +113,29 @@ def test_a_morning_missed_until_noon_is_skipped_for_the_day():
     down = [(datetime(2026, 10, 1, 6, 0, tzinfo=LA), datetime(2026, 10, 1, 12, 0, tzinfo=LA))]
     fired = run_mornings(datetime(2026, 10, 1, 0, 0, tzinfo=LA), datetime(2026, 10, 2, 9, 0, tzinfo=LA), meta, down)
     assert [(n.strftime("%m-%d %H:%M"), w.person) for n, w in fired] == [
-        ("10-02 07:30", "mei"), ("10-02 08:00", "fan")]
+        ("10-02 07:30", "U2"), ("10-02 08:00", "U1")]
 
 
 def test_a_restart_after_a_look_does_not_repeat_it(tmp_path):
     first = Store(tmp_path / "w.db")
     now = datetime(2026, 10, 1, 8, 5, tzinfo=LA)
-    w = clock.morning_wakes(now, {"fan": LOOKS["fan"]}, QUIET, lambda p: first.get_meta(f"clock:morning:{p}"))[0]
+    w = clock.morning_wakes(now, {"U1": LOOKS["U1"]}, QUIET, lambda p: first.get_meta(f"clock:morning:{p}"),
+                            NAMES.get)[0]
     first.set_meta(w.key, now.date().isoformat())
     first.close()
     again = Store(tmp_path / "w.db")
     later = now + timedelta(minutes=30)
-    assert clock.morning_wakes(later, {"fan": LOOKS["fan"]}, QUIET,
-                               lambda p: again.get_meta(f"clock:morning:{p}")) == []
+    assert clock.morning_wakes(later, {"U1": LOOKS["U1"]}, QUIET,
+                               lambda p: again.get_meta(f"clock:morning:{p}"), NAMES.get) == []
     tomorrow = now + timedelta(days=1)
-    assert len(clock.morning_wakes(tomorrow, {"fan": LOOKS["fan"]}, QUIET,
-                                   lambda p: again.get_meta(f"clock:morning:{p}"))) == 1
+    assert len(clock.morning_wakes(tomorrow, {"U1": LOOKS["U1"]}, QUIET,
+                                   lambda p: again.get_meta(f"clock:morning:{p}"), NAMES.get)) == 1
 
 
 def test_a_morning_inside_quiet_hours_waits_for_them_to_end():
     meta: dict = {}
     fired = run_mornings(datetime(2026, 10, 1, 0, 0, tzinfo=LA), datetime(2026, 10, 1, 12, 0, tzinfo=LA),
-                         meta, looks=clock.mornings(["fan@06:15"]))
+                         meta, looks=clock.mornings(["U1@06:15"]))
     assert [n.strftime("%H:%M") for n, _ in fired] == ["07:00"]
 
 
@@ -141,13 +144,13 @@ def test_a_morning_inside_quiet_hours_waits_for_them_to_end():
 def test_a_clock_change_neither_doubles_nor_drops_a_morning(start):
     meta: dict = {}
     fired = run_mornings(start.replace(tzinfo=LA), (start + timedelta(days=3)).replace(tzinfo=LA), meta)
-    days = [n.date().isoformat() for n, w in fired if w.person == "fan"]
+    days = [n.date().isoformat() for n, w in fired if w.person == "U1"]
     assert len(days) == 3 and len(set(days)) == 3
-    assert all(n.strftime("%H:%M") == "08:00" for n, w in fired if w.person == "fan")
+    assert all(n.strftime("%H:%M") == "08:00" for n, w in fired if w.person == "U1")
 
 
 def due_at(now, fired=frozenset(), said=None):
-    return clock.due_wakes(now, ITEMS, PEOPLE, lambda k: k in fired, set() if said is None else said)
+    return clock.due_wakes(now, ITEMS, ASKERS, lambda k: k in fired, set() if said is None else said)
 
 
 def test_a_timed_undertaking_wakes_only_the_person_who_asked_when_its_time_comes():
@@ -155,13 +158,13 @@ def test_a_timed_undertaking_wakes_only_the_person_who_asked_when_its_time_comes
     assert due_at(day.replace(hour=16, minute=55)) == []
     # fan's plumber call was asked for by mei: the wake is hers
     at5 = due_at(day.replace(hour=17, minute=0))
-    assert [(w.person, w.key) for w in at5] == [("mei", "clock:due:a24e0d:2026-10-01T17:00:mei")]
+    assert [(w.person, w.key) for w in at5] == [("U2", "clock:due:a24e0d:2026-10-01T17:00:mei")]
     # the 6pm meeting is not her undertaking, so nothing wakes for it
     assert [w.key for w in due_at(day.replace(hour=18, minute=5))] == [at5[0].key]
     # a gift kept from mei wakes fan, who asked, and never mei
     at7 = due_at(day.replace(hour=19, minute=3), {w.key for w in at5})
-    assert [w.person for w in at7] == ["fan"]
-    assert at7[0].arrival() == (
+    assert [w.person for w in at7] == ["U1"]
+    assert at7[0].arrival("fan") == (
         "No message started this session. What I say now reaches fan alone, in a direct message.\n\n"
         "    It is Thursday, 19:03, and this has come due:\n"
         "    `trajectory:b6647b`  2026-10-01T19:00, today  I undertook to remind fan at 7 to pick up "
@@ -184,13 +187,13 @@ def test_a_timed_wake_fires_once_and_not_when_long_past():
 
 def test_a_time_asked_for_inside_quiet_hours_still_wakes():
     at = due_at(datetime(2026, 10, 1, 21, 45, tzinfo=LA))
-    assert [(w.person, w.key) for w in at] == [("fan", "clock:due:07f41d:2026-10-01T21:45:fan")]
+    assert [(w.person, w.key) for w in at] == [("U1", "clock:due:07f41d:2026-10-01T21:45:fan")]
 
 
 def test_one_whose_asker_is_not_known_is_left_to_the_morning():
     unknown = clock.items(DUE.replace("    asked by: fan\n", ""))
     keys = {w.key for h in range(24) for m in (0, 30)
-            for w in clock.due_wakes(datetime(2026, 10, 1, h, m, tzinfo=LA), unknown, PEOPLE,
+            for w in clock.due_wakes(datetime(2026, 10, 1, h, m, tzinfo=LA), unknown, ASKERS,
                                      lambda k: False, set())}
     assert not any("b6647b" in k or "07f41d" in k for k in keys)
     assert any("a24e0d" in k for k in keys)
@@ -208,7 +211,7 @@ def test_a_time_no_clock_shows_is_skipped_and_said_once(caplog):
     said: set = set()
     with caplog.at_level(logging.WARNING, logger="wanda.clock"):
         for h in (17, 18, 19):
-            woke = clock.due_wakes(datetime(2026, 10, 1, h, 0, tzinfo=LA), items, PEOPLE,
+            woke = clock.due_wakes(datetime(2026, 10, 1, h, 0, tzinfo=LA), items, ASKERS,
                                    lambda k: False, said)
             assert woke, "the rest of the list is still woken for"
     got = [r.getMessage() for r in caplog.records]
@@ -225,7 +228,7 @@ def test_what_is_not_woken_is_said_once_with_its_id_and_why(caplog):
     with caplog.at_level(logging.WARNING, logger="wanda.clock"):
         for at in (datetime(2026, 10, 1, 16, 0, tzinfo=LA), datetime(2026, 10, 1, 21, 50, tzinfo=LA),
                    datetime(2026, 10, 1, 21, 55, tzinfo=LA)):
-            assert clock.due_wakes(at, unknown, PEOPLE, lambda k: False, said) == []
+            assert clock.due_wakes(at, unknown, ASKERS, lambda k: False, said) == []
     got = sorted(r.getMessage() for r in caplog.records)
     assert got == sorted([
         "clock: 27212d (2026-10-01T24:00) is not woken for: it has a time no clock shows",
@@ -237,7 +240,7 @@ def test_what_is_not_woken_is_said_once_with_its_id_and_why(caplog):
     ]), got
     # one already woken is not said to be late
     caplog.clear()
-    clock.due_wakes(datetime(2026, 10, 1, 21, 50, tzinfo=LA), ITEMS, PEOPLE,
+    clock.due_wakes(datetime(2026, 10, 1, 21, 50, tzinfo=LA), ITEMS, ASKERS,
                     lambda k: "a24e0d" in k, set())
     assert not any("a24e0d" in r.getMessage() for r in caplog.records)
 
@@ -274,9 +277,9 @@ def test_a_time_mem_would_refuse_is_said_and_its_lines_stay_its_own(caplog):
     woke = []
     with caplog.at_level(logging.WARNING, logger="wanda.clock"):
         for h in (9, 16, 17):
-            woke += clock.due_wakes(datetime(2026, 10, 1, h, 35, tzinfo=LA), got, PEOPLE, lambda k: False, said)
+            woke += clock.due_wakes(datetime(2026, 10, 1, h, 35, tzinfo=LA), got, ASKERS, lambda k: False, said)
     # the bank at 9:35, and nothing for the two by hand at 16:35 or after
-    assert [(w.person, w.about) for w in woke] == [("fan", "1ba5c2")]
+    assert [(w.person, w.about) for w in woke] == [("U1", "1ba5c2")]
     assert "keep the gift from fan" not in woke[0].text and "mei" not in woke[0].text
     msgs = [r.getMessage() for r in caplog.records]
     assert msgs.count("clock: cec212 (2026-09-30T9:00) is not woken for: it has a time no clock shows") == 1
@@ -297,13 +300,14 @@ def test_the_frame_is_the_one_the_lab_renders_and_mem_reads_back():
     assert rust_const("lab/harness/src/arrival.rs", "CLOCK") == clock.CLOCK
     assert rust_const("lab/harness/src/arrival.rs", "MORNING") == clock.MORNING
     # the composed look, as arrival.rs's own test pins it
-    w = clock.Wake("clock:morning:mei", "mei",
+    w = clock.Wake("clock:morning:U2", "U2",
                    clock.MORNING.format(weekday="Thursday", time="08:00", speaker="mei"))
-    assert w.arrival(["Come due for mei after 2026-07-18:", "`trajectory:aaaaaa`  2026-07-23, today  x"]) == (
+    assert w.arrival("mei", ["Come due for mei after 2026-07-18:",
+                             "`trajectory:aaaaaa`  2026-07-23, today  x"]) == (
         "No message started this session. What I say now reaches mei alone, in a direct message.\n\n"
         "    It is Thursday, 08:00, and this is my look at the day ahead for mei.\n\n"
         "    Come due for mei after 2026-07-18:\n    `trajectory:aaaaaa`  2026-07-23, today  x")
-    assert w.arrival([]) == w.arrival()
+    assert w.arrival("mei", []) == w.arrival("mei")
 
 
 class FakeSlack:
@@ -337,8 +341,9 @@ REFUSED, FAILED = ("busy", None), ("claude reported an error", None)
 
 
 def settings(tmp_path, **kw) -> Config:
-    return Config(_env_file=None, mornings=["fan@08:00", "mei@07:30"], slack_names="U1:fan,U2:mei",
-                  slack_owner_user_ids="U1,U2", tz="America/Los_Angeles", data_dir=tmp_path, **kw)
+    return Config(_env_file=None, **{"mornings": ["U1@08:00", "U2@07:30"], "slack_names": "U1:fan,U2:mei",
+                                     "slack_owner_user_ids": "U1,U2", "tz": "America/Los_Angeles",
+                                     "data_dir": tmp_path} | kw)
 
 
 def processor(tmp_path, slack, outcomes, mem_out=""):
@@ -348,7 +353,7 @@ def processor(tmp_path, slack, outcomes, mem_out=""):
 
     async def memory_turn(task, arrival, now, *, channel, reply_thread, owed, state=None):
         turns.append((channel, task["thread_ts"], arrival, owed,
-                      store.get_meta("clock:morning:fan"), store.get_meta("clock:morning:mei"),
+                      store.get_meta("clock:morning:U1"), store.get_meta("clock:morning:U2"),
                       reply_thread, p._task_locks[task["id"]].locked()))
         await asyncio.sleep(0)
         error, answer = outcomes.pop(0)
@@ -379,15 +384,15 @@ def test_the_loop_starts_one_wake_at_a_time_in_the_persons_own_dm(tmp_path):
     now = datetime(2026, 10, 1, 8, 1, tzinfo=LA)
 
     async def go():
-        wakes = clock.morning_wakes(now, LOOKS, QUIET, lambda q: store.get_meta(f"clock:morning:{q}"))
+        wakes = clock.morning_wakes(now, LOOKS, QUIET, lambda q: store.get_meta(f"clock:morning:{q}"), NAMES.get)
         assert len(wakes) == 2
         p._wake(wakes, now)
         p._wake(wakes, now)  # one is running: the other waits
         await asyncio.gather(*p._bg)
-        wakes = clock.morning_wakes(now, LOOKS, QUIET, lambda q: store.get_meta(f"clock:morning:{q}"))
+        wakes = clock.morning_wakes(now, LOOKS, QUIET, lambda q: store.get_meta(f"clock:morning:{q}"), NAMES.get)
         p._wake(wakes, now)
         await asyncio.gather(*p._bg)
-        return clock.morning_wakes(now, LOOKS, QUIET, lambda q: store.get_meta(f"clock:morning:{q}"))
+        return clock.morning_wakes(now, LOOKS, QUIET, lambda q: store.get_meta(f"clock:morning:{q}"), NAMES.get)
 
     assert asyncio.run(go()) == []
     assert [t[0] for t in turns] == ["D-U1", "D-U2"]
@@ -401,8 +406,8 @@ def test_the_loop_starts_one_wake_at_a_time_in_the_persons_own_dm(tmp_path):
         "    It is Thursday, 08:01, and this is my look at the day ahead for mei.\n\n"
         "    Come due for mei after 2026-09-30:\n    `trajectory:eca883`  2026-10-01, today  x\n"
         "        involves: me; mei")
-    assert store.get_meta("clock:outcome:fan") == "2026-10-01 08:01 silent"
-    assert store.get_meta("clock:outcome:mei") == "2026-10-01 08:01 spoke"
+    assert store.get_meta("clock:outcome:U1") == "2026-10-01 08:01 silent"
+    assert store.get_meta("clock:outcome:U2") == "2026-10-01 08:01 spoke"
     assert alerts == []
 
 
@@ -410,17 +415,17 @@ def test_the_next_look_is_handed_what_came_due_since_the_last_that_ran(tmp_path)
     """A look that failed said nothing, so the next one is handed its day too;
     a look that ran, spoken or silent, moves the start on."""
     p, store, turns, alerts, mems = processor(tmp_path, FakeSlack(), [FAILED, SILENT, SPOKE])
-    store.set_meta("clock:morning:fan", "2026-09-27")
-    store.set_meta("clock:listed:fan", "2026-09-27")
+    store.set_meta("clock:morning:U1", "2026-09-27")
+    store.set_meta("clock:listed:U1", "2026-09-27")
     for day in (1, 2, 3):
         now = datetime(2026, 10, day, 8, 0, tzinfo=LA)
-        w = clock.morning_wakes(now, {"fan": LOOKS["fan"]}, QUIET,
-                                lambda q: store.get_meta(f"clock:morning:{q}"))
+        w = clock.morning_wakes(now, {"U1": LOOKS["U1"]}, QUIET,
+                                lambda q: store.get_meta(f"clock:morning:{q}"), NAMES.get)
         asyncio.run(p._clock_session(w[0], now))
-        assert store.get_meta("clock:morning:fan") == now.date().isoformat(), "one look a day"
+        assert store.get_meta("clock:morning:U1") == now.date().isoformat(), "one look a day"
     assert [m[4] for m in mems] == ["2026-09-27", "2026-09-27", "2026-10-02"]
     task = store.get_task_by_thread("D-U1", "conversation")
-    assert p._listed("fan", task) == "2026-10-03"
+    assert p._listed("U1", task) == "2026-10-03"
 
 
 def test_a_restart_after_the_run_is_recorded_still_moves_the_list_on(tmp_path):
@@ -430,15 +435,15 @@ def test_a_restart_after_the_run_is_recorded_still_moves_the_list_on(tmp_path):
     p, store, turns, alerts, mems = processor(tmp_path, FakeSlack(), [SILENT, SILENT])
     store.create_task(None, "D-U1", "conversation", kind="dm", reply_thread=None)
     task = store.get_task_by_thread("D-U1", "conversation")
-    store.set_meta("clock:listed:fan", "2026-09-29")
-    store.set_meta("clock:trying:fan", f"2026-09-30 {task['id']} {store.newest_run(task['id'])} 2026-09-29")
+    store.set_meta("clock:listed:U1", "2026-09-29")
+    store.set_meta("clock:trying:U1", f"2026-09-30 {task['id']} {store.newest_run(task['id'])} 2026-09-29")
     store.record_run(kind="agent", task_id=task["id"], session_id="s", started_at=utcnow(), exit_code=0,
                      cost_usd=0.0, status="ok", result_text="Morning.", notified=1)
-    look = lambda now: clock.morning_wakes(now, {"fan": LOOKS["fan"]}, QUIET, lambda q: None)[0]  # noqa: E731
+    look = lambda now: clock.morning_wakes(now, {"U1": LOOKS["U1"]}, QUIET, lambda q: None, NAMES.get)[0]  # noqa: E731
     now = datetime(2026, 10, 1, 8, 0, tzinfo=LA)
     asyncio.run(p._clock_session(look(now), now))
     assert mems[0][4] == "2026-09-30"
-    store.set_meta("clock:trying:fan", f"2026-10-02 {task['id']} {store.newest_run(task['id'])} 2026-10-01")
+    store.set_meta("clock:trying:U1", f"2026-10-02 {task['id']} {store.newest_run(task['id'])} 2026-10-01")
     store.record_run(kind="agent", task_id=task["id"], session_id="s", started_at=utcnow(), exit_code=None,
                      cost_usd=0.0, status="cancelled", error="daemon shut down mid-run")
     now = datetime(2026, 10, 3, 8, 0, tzinfo=LA)
@@ -452,7 +457,7 @@ def test_a_runner_that_raises_is_read_from_the_run_it_recorded(tmp_path):
     later in that DM is not taken for it; with one recorded, that run says
     how the look went."""
     p, store, turns, alerts, mems = processor(tmp_path, FakeSlack(), [])
-    store.set_meta("clock:listed:fan", "2026-09-30")
+    store.set_meta("clock:listed:U1", "2026-09-30")
     raised = iter([FileNotFoundError("claude"), RuntimeError("after its record")])
 
     async def memory_turn(task, arrival, now, *, channel, reply_thread, owed, state=None):
@@ -462,11 +467,11 @@ def test_a_runner_that_raises_is_read_from_the_run_it_recorded(tmp_path):
                              exit_code=0, cost_usd=0.0, status="ok", result_text="Morning.", notified=1)
         raise e
     p.memory_turn = memory_turn
-    look = lambda now: clock.morning_wakes(now, {"fan": LOOKS["fan"]}, QUIET, lambda q: None)[0]  # noqa: E731
+    look = lambda now: clock.morning_wakes(now, {"U1": LOOKS["U1"]}, QUIET, lambda q: None, NAMES.get)[0]  # noqa: E731
     day1 = datetime(2026, 10, 1, 8, 0, tzinfo=LA)
     asyncio.run(p._clock_session(look(day1), day1))
-    assert store.get_meta("clock:outcome:fan") == "2026-10-01 08:00 failed"
-    assert not store.get_meta("clock:trying:fan")
+    assert store.get_meta("clock:outcome:U1") == "2026-10-01 08:00 failed"
+    assert not store.get_meta("clock:trying:U1")
     # fan writes in his DM later that day, and that reply's run is recorded there
     task = store.get_task_by_thread("D-U1", "conversation")
     store.record_run(kind="agent", task_id=task["id"], session_id="r", started_at=utcnow(), exit_code=0,
@@ -474,8 +479,8 @@ def test_a_runner_that_raises_is_read_from_the_run_it_recorded(tmp_path):
     day2 = datetime(2026, 10, 2, 8, 0, tzinfo=LA)
     asyncio.run(p._clock_session(look(day2), day2))
     assert [m[4] for m in mems] == ["2026-09-30", "2026-09-30"]
-    assert store.get_meta("clock:outcome:fan") == "2026-10-02 08:00 spoke"
-    assert p._listed("fan", task) == "2026-10-02"
+    assert store.get_meta("clock:outcome:U1") == "2026-10-02 08:00 spoke"
+    assert p._listed("U1", task) == "2026-10-02"
     assert [a[1] for a in alerts] == ["a morning look on 2026-10-01 failed; doctor says whose"]
 
 
@@ -483,32 +488,34 @@ def test_a_failure_before_the_model_runs_claims_nothing_and_alerts(tmp_path):
     """The alert names no one, and doctor shows whose look it is from that
     minute: the alerts can be read by the person something is kept from."""
     p, store, turns, alerts, mems = processor(tmp_path, FakeSlack(fail_first=True), [SPOKE])
-    store.set_meta("clock:outcome:fan", "2026-09-30 08:00 spoke")
+    store.set_meta("clock:outcome:U1", "2026-09-30 08:00 spoke")
     now = datetime(2026, 10, 1, 8, 0, tzinfo=LA)
-    w = clock.morning_wakes(now, {"fan": LOOKS["fan"]}, QUIET, lambda q: store.get_meta(f"clock:morning:{q}"))[0]
+    w = clock.morning_wakes(now, {"U1": LOOKS["U1"]}, QUIET, lambda q: store.get_meta(f"clock:morning:{q}"),
+                            NAMES.get)[0]
     asyncio.run(p._clock_session(w, now))
-    assert turns == [] and store.get_meta("clock:morning:fan") is None
+    assert turns == [] and store.get_meta("clock:morning:U1") is None
     assert alerts == [("clock", "a morning look could not start on 2026-10-01; doctor says whose")]
-    assert store.get_meta("clock:outcome:fan") == "2026-10-01 08:00 could not start"
+    assert store.get_meta("clock:outcome:U1") == "2026-10-01 08:00 could not start"
     running = timedelta(minutes=30)
-    assert not clock.look_healthy(store.get_meta("clock:outcome:fan"), now.replace(hour=9), running,
-                                  LOOKS["fan"])
+    assert not clock.look_healthy(store.get_meta("clock:outcome:U1"), now.replace(hour=9), running,
+                                  LOOKS["U1"])
     # the next tick tries again, and the claim is in place before the run starts
     asyncio.run(p._clock_session(w, now + timedelta(minutes=1)))
     assert [t[4] for t in turns] == ["2026-10-01"]
-    assert store.get_meta("clock:outcome:fan") == "2026-10-01 08:01 spoke"
+    assert store.get_meta("clock:outcome:U1") == "2026-10-01 08:01 spoke"
 
 
 def test_a_look_refused_before_it_ran_is_released_and_a_failed_one_is_kept(tmp_path):
     p, store, turns, alerts, mems = processor(tmp_path, FakeSlack(), [REFUSED, FAILED])
-    store.set_meta("clock:morning:fan", "2026-09-30")
+    store.set_meta("clock:morning:U1", "2026-09-30")
     now = datetime(2026, 10, 1, 8, 0, tzinfo=LA)
-    w = clock.morning_wakes(now, {"fan": LOOKS["fan"]}, QUIET, lambda q: store.get_meta(f"clock:morning:{q}"))[0]
+    w = clock.morning_wakes(now, {"U1": LOOKS["U1"]}, QUIET, lambda q: store.get_meta(f"clock:morning:{q}"),
+                            NAMES.get)[0]
     asyncio.run(p._clock_session(w, now))
-    assert store.get_meta("clock:morning:fan") == "2026-09-30"
+    assert store.get_meta("clock:morning:U1") == "2026-09-30"
     asyncio.run(p._clock_session(w, now))
-    assert store.get_meta("clock:morning:fan") == "2026-10-01"
-    assert store.get_meta("clock:outcome:fan") == "2026-10-01 08:00 failed"
+    assert store.get_meta("clock:morning:U1") == "2026-10-01"
+    assert store.get_meta("clock:outcome:U1") == "2026-10-01 08:00 failed"
     assert [a[1] for a in alerts] == ["a morning look on 2026-10-01 was refused before it ran; doctor says whose",
                                       "a morning look on 2026-10-01 failed; doctor says whose"]
 
@@ -517,14 +524,14 @@ def test_a_wake_that_keeps_failing_to_start_goes_behind_the_others(tmp_path):
     """fan's DM cannot be opened: his look fails before its claim every time,
     and mei's look and her reminder still run, at their times."""
     p, store, turns, alerts, mems = processor(tmp_path, FakeSlack(refuse={"U1"}), [SILENT, SPOKE])
-    looks = clock.mornings(["fan@07:00", "mei@08:00"])
+    looks = clock.mornings(["U1@07:00", "U2@08:00"])
     bins = clock.items("`trajectory:f4a207`  2026-10-01T08:05, today  I undertook to remind mei at "
                        "8:05 to put the bins out\n    involves: me; mei\n    asked by: mei\n")
 
     async def tick(hh, mm):
         now = datetime(2026, 10, 1, hh, mm, tzinfo=LA)
-        wakes = clock.morning_wakes(now, looks, QUIET, lambda q: store.get_meta(f"clock:morning:{q}"))
-        wakes += clock.due_wakes(now, bins, PEOPLE, lambda k: bool(store.get_meta(k)), set())
+        wakes = clock.morning_wakes(now, looks, QUIET, lambda q: store.get_meta(f"clock:morning:{q}"), NAMES.get)
+        wakes += clock.due_wakes(now, bins, ASKERS, lambda k: bool(store.get_meta(k)), set())
         p._wake(wakes, now)
         await asyncio.gather(*p._bg)
 
@@ -540,19 +547,142 @@ def test_a_wake_that_keeps_failing_to_start_goes_behind_the_others(tmp_path):
 
 
 def test_names_are_one_spelling_whatever_case_the_settings_use(tmp_path):
-    p, store, turns, alerts, mems = processor(tmp_path, FakeSlack(), [SPOKE])
+    """An asker leads to an id in any case, and the clock's frames say the
+    name as the settings spell it, as a message's frame does."""
+    p, store, turns, alerts, mems = processor(tmp_path, FakeSlack(), [SPOKE, SILENT])
     p.cfg.slack_names = {"U1": "Fan", "U2": "Mei"}
-    people = clock.people(p.cfg.slack_names, p.cfg.slack_owner_user_ids)
-    assert people == {"fan", "mei"}
+    assert p._askers() == {"fan": "U1", "mei": "U2"}
     capital = clock.items(DUE.replace("asked by: mei", "asked by: Mei").replace("asked by: fan", "asked by: Fan"))
     at5 = datetime(2026, 10, 1, 17, 0, tzinfo=LA)
-    wakes = clock.due_wakes(at5, capital, people, lambda k: False, set())
-    assert [w.key for w in wakes] == ["clock:due:a24e0d:2026-10-01T17:00:mei"]
+    wakes = clock.due_wakes(at5, capital, p._askers(), lambda k: False, set())
+    assert [(w.person, w.key, w.asked) for w in wakes] == [("U2", "clock:due:a24e0d:2026-10-01T17:00:mei", "mei")]
     asyncio.run(p._clock_session(wakes[0], at5))
-    assert [t[0] for t in turns] == ["D-U2"] and alerts == []
-    assert clock.mornings(["Fan@08:00"]) == {"fan": time(8, 0)}
-    assert clock.settings_problem(["Fan@08:00", "MEI@07:30"], "21:30-07:00", p.cfg.slack_names,
-                                  p.cfg.slack_owner_user_ids) is None
+    eight = datetime(2026, 10, 2, 8, 0, tzinfo=LA)
+    look = clock.morning_wakes(eight, clock.mornings(["U1@08:00"]), QUIET, lambda q: None, p._called)
+    asyncio.run(p._clock_session(look[0], eight))
+    assert [t[0] for t in turns] == ["D-U2", "D-U1"] and alerts == []
+    assert turns[0][2].startswith("No message started this session. What I say now reaches Mei alone")
+    assert turns[1][2] == ("No message started this session. What I say now reaches Fan alone, in a direct "
+                           "message.\n\n    It is Friday, 08:00, and this is my look at the day ahead for Fan.")
+    assert mems == [("due", "--for", "Fan", "--after", "2026-10-01", "--at", "08:00")]
+    assert clock.settings_problem(["U1@08:00", "U2@07:30"], "21:30-07:00", p.cfg.slack_owner_user_ids) is None
+
+
+def test_a_look_is_kept_under_the_member_id_and_says_the_name(tmp_path):
+    """WANDA_MORNINGS gives a member id: the look is opened in that id's DM,
+    says the name sessions know the person by, and every record of it is
+    kept under the id."""
+    p, store, turns, alerts, mems = processor(tmp_path, FakeSlack(), [SPOKE])
+    trying = []
+    inner = p.memory_turn
+
+    async def memory_turn(task, arrival, now, **kw):
+        trying.append(store.get_meta("clock:trying:U1"))
+        return await inner(task, arrival, now, **kw)
+    p.memory_turn = memory_turn
+    now = datetime(2026, 10, 1, 8, 0, tzinfo=LA)
+    assert clock.mornings(["U1@08:00"]) == {"U1": time(8, 0)}
+    [w] = clock.morning_wakes(now, clock.mornings(["U1@08:00"]), QUIET, lambda q: None, p._called)
+    assert (w.key, w.person) == ("clock:morning:U1", "U1")
+    asyncio.run(p._clock_session(w, now))
+    assert turns[0][0] == "D-U1"
+    assert turns[0][2] == ("No message started this session. What I say now reaches fan alone, in a direct "
+                           "message.\n\n    It is Thursday, 08:00, and this is my look at the day ahead for fan.")
+    assert mems == [("due", "--for", "fan", "--after", "2026-09-30", "--at", "08:00")]
+    assert trying == ["2026-10-01 1 0 2026-09-30"]
+    assert store.meta_starting("clock:") == {
+        "clock:morning:U1": "2026-10-01", "clock:outcome:U1": "2026-10-01 08:00 spoke",
+        "clock:trying:U1": "", "clock:listed:U1": "2026-10-01 1 2026-09-30", "clock:marked": "[]"}
+
+
+def test_the_start_settles_a_look_whose_id_has_left_the_mornings(tmp_path):
+    """A look a crash cut short is settled at the next start though its id
+    has since been taken out of WANDA_MORNINGS: its run reported, so the
+    next look's list starts after its day."""
+    store = Store(tmp_path / "p.db")
+    p = Processor(settings(tmp_path, mornings=["U2@07:30"]), store, asyncio.Queue(), FakeSlack(),
+                  RunnerService("/bin/true"))
+    store.create_task(None, "D-U1", "conversation", kind="dm", reply_thread=None)
+    store.set_meta("clock:trying:U1", "2026-10-01 1 0 2026-09-30")
+    store.record_run(kind="agent", task_id=1, session_id="s", started_at=utcnow(), exit_code=0,
+                     cost_usd=0.0, status="ok", result_text="", notified=1)
+    p.settle_wakes(datetime(2026, 10, 1, 8, 30, tzinfo=LA))
+    assert store.get_meta("clock:trying:U1") == ""
+    assert store.get_meta("clock:listed:U1") == "2026-10-01 1 2026-09-30"
+
+
+# fan's reminder at 7, asked under his name with a capital
+FAN_AT7 = """\
+`trajectory:b6647b`  2026-10-01T19:00, today  I undertook to remind fan at 7 to pick up the gift for mei
+    involves: me; fan; mei
+    constrained_by: keep the gift from mei
+    asked by: Fan
+"""
+
+
+def test_a_reminder_wakes_the_dm_its_asker_leads_to_and_keeps_their_name(tmp_path, monkeypatch):
+    """`asked by: Fan` wakes in the DM of the id `fan` leads to. The wake's
+    key and its records keep the name, lower case, as a look's list shows it,
+    a wake rebuilt after one was cut short included; the clock's own mark in
+    a look's list says it as `mem due` printed it."""
+    key = "clock:due:b6647b:2026-10-01T19:00:fan"
+    at7 = datetime(2026, 10, 1, 19, 3, tzinfo=LA)
+    (tmp_path / "failed").mkdir()
+    p, store, turns, alerts, mems = processor(tmp_path / "failed", FakeSlack(), [FAILED], FAN_AT7)
+    waking = []
+    inner = p.memory_turn
+
+    async def memory_turn(task, arrival, now, **kw):
+        waking.append(json.loads(store.get_meta("clock:waking"))[key]["asked"])
+        return await inner(task, arrival, now, **kw)
+    p.memory_turn = memory_turn
+    [w] = asyncio.run(p._due_wakes(at7))
+    assert (w.person, w.key, w.asked) == ("U1", key, "fan")
+    asyncio.run(p._clock_session(w, at7))
+    assert turns[0][0] == "D-U1" and "reaches fan alone" in turns[0][2] and "    asked by: Fan" in turns[0][2]
+    assert waking == ["fan"]
+    assert [(r["id"], r["asked"]) for r in json.loads(store.get_meta("clock:lost"))] == [("b6647b", "fan")]
+    # an answer Slack has not taken is owed under the same name
+    (tmp_path / "owed").mkdir()
+    p, slack, store = refused_post(tmp_path / "owed", monkeypatch, "It is 7: the gift for mei.")
+    p._mem = lambda now, *args: asyncio.sleep(0, FAN_AT7)
+    [w] = asyncio.run(p._due_wakes(at7))
+    asyncio.run(p._clock_session(w, at7))
+    assert [(o["id"], o["asked"]) for o in json.loads(store.get_meta("clock:owed"))] == [("b6647b", "fan")]
+    # cut short and released at the start: woken again, told so by name
+    (tmp_path / "again").mkdir()
+    p, store, turns, alerts, mems = processor(tmp_path / "again", FakeSlack(), [], FAN_AT7)
+    store.set_meta("clock:waking", json.dumps({key: {"id": "b6647b", "by": "2026-10-01T19:00", "asked": "fan",
+                                                      "task": 1, "last": 0, "before": "", "again": True}}))
+    [w] = asyncio.run(p._due_wakes(at7))
+    assert (w.person, w.key, w.asked, w.about, w.by) == ("U1", key, "fan", "b6647b", "2026-10-01T19:00")
+    assert w.text.endswith("\n    " + clock.AGAIN.format(speaker="fan"))
+    # a look at 19:03 marks it as `mem due` printed its asker, and its wake,
+    # claimed after the mark, gives what the mark held
+    listed = ["Come due for fan after 2026-09-30:"] + FAN_AT7.splitlines()
+    marked = clock.still_to_come(listed, at7, ASKERS, lambda k: False)
+    assert marked[-1] == "    still to come: the clock gives it to Fan at 19:00, but only while it is open and timed so"
+    p._mark(marked, "2026-10-02T02:03:00+00:00")
+    assert marks(store) == [("b6647b", "2026-10-01T19:00", "fan")]
+    store.set_meta(key, "2026-10-02T02:06:00+00:00")
+    p._check_marked(datetime(2026, 10, 1, 19, 10, tzinfo=LA), "")
+    assert marks(store) == [] and store.get_meta("clock:lost") is None
+
+
+def test_the_names_the_clock_wakes_for_are_read_at_each_due_check(tmp_path, caplog):
+    """A reminder asked under a name no allowed id has is not woken for, and
+    is said once; the names are read again at the next check, which wakes it
+    once one leads to an id."""
+    p, store, turns, alerts, mems = processor(tmp_path, FakeSlack(), [], AT7.replace("asked by: fan", "asked by: jane"))
+    at7 = datetime(2026, 10, 1, 19, 3, tzinfo=LA)
+    with caplog.at_level(logging.WARNING, logger="wanda.clock"):
+        assert asyncio.run(p._due_wakes(at7)) == []
+        assert asyncio.run(p._due_wakes(at7 + timedelta(minutes=1))) == []
+    assert [r.getMessage() for r in caplog.records] == [
+        "clock: b6647b (2026-10-01T19:00) is not woken for: who asked is not known (jane)"]
+    p.cfg.slack_names = {"U1": "jane", "U2": "mei"}
+    assert [(w.person, w.key) for w in asyncio.run(p._due_wakes(at7 + timedelta(minutes=2)))] == [
+        ("U1", "clock:due:b6647b:2026-10-01T19:00:jane")]
 
 
 class Refusing(FakeSlack):
@@ -604,19 +734,19 @@ def test_a_look_whose_post_slack_refused_spoke_and_is_delivered_later(tmp_path, 
     its day moves the next list on."""
     p, slack, store = refused_post(tmp_path, monkeypatch, "Morning. The plumber is at 5.")
     now = datetime(2026, 10, 1, 8, 0, tzinfo=LA)
-    w = clock.morning_wakes(now, {"fan": LOOKS["fan"]}, QUIET, lambda q: None)[0]
+    w = clock.morning_wakes(now, {"U1": LOOKS["U1"]}, QUIET, lambda q: None, NAMES.get)[0]
     asyncio.run(p._clock_session(w, now))
-    assert store.get_meta("clock:outcome:fan") == "2026-10-01 08:00 spoke"
+    assert store.get_meta("clock:outcome:U1") == "2026-10-01 08:00 spoke"
     assert [r["result_text"] for r in store.pending_deliveries()] == ["Morning. The plumber is at 5."]
     assert slack.alerts == []
     task = store.get_task_by_thread("D-U1", "conversation")
-    assert p._listed("fan", task) == "2026-09-30", "not delivered yet"
+    assert p._listed("U1", task) == "2026-09-30", "not delivered yet"
 
     async def takes(thread_ts, text, channel=None, note=False):
         pass
     slack.reply = takes
     asyncio.run(p.deliver_pending())
-    assert p._listed("fan", task) == "2026-10-01"
+    assert p._listed("U1", task) == "2026-10-01"
 
 
 def test_a_look_whose_answer_delivery_gave_up_on_hands_its_day_on(tmp_path, monkeypatch):
@@ -625,13 +755,13 @@ def test_a_look_whose_answer_delivery_gave_up_on_hands_its_day_on(tmp_path, monk
     from wanda.main import MAX_DELIVERY_ATTEMPTS
     p, slack, store = refused_post(tmp_path, monkeypatch, "Morning. The plumber is at 5.")
     now = datetime(2026, 10, 1, 8, 0, tzinfo=LA)
-    w = clock.morning_wakes(now, {"fan": LOOKS["fan"]}, QUIET, lambda q: None)[0]
+    w = clock.morning_wakes(now, {"U1": LOOKS["U1"]}, QUIET, lambda q: None, NAMES.get)[0]
     asyncio.run(p._clock_session(w, now))
     for _ in range(MAX_DELIVERY_ATTEMPTS):
         asyncio.run(p.drain_mail())
     assert store.pending_deliveries() == [] and len(slack.alerts) == 1, slack.alerts
     task = store.get_task_by_thread("D-U1", "conversation")
-    assert p._listed("fan", task) == "2026-09-30"
+    assert p._listed("U1", task) == "2026-09-30"
 
 
 def test_a_timed_wake_whose_answer_delivery_gave_up_on_is_a_reminder_not_given(tmp_path, monkeypatch):
@@ -712,17 +842,18 @@ def test_a_clock_session_posts_the_last_answer_it_gave_that_says_something(tmp_p
         return ""
     p._mem = mem
     now = datetime(2026, 10, 1, 8, 0, tzinfo=LA)
-    asyncio.run(p._clock_session(clock.morning_wakes(now, {"fan": LOOKS["fan"]}, QUIET, lambda q: None)[0], now))
+    asyncio.run(p._clock_session(clock.morning_wakes(now, {"U1": LOOKS["U1"]}, QUIET, lambda q: None,
+                                                     NAMES.get)[0], now))
     assert slack.posts == ([("D-U1", posted, False)] if posted else [])
     run = store.run(1)
     assert (run["status"], run["result_text"]) == (("ok", posted) if posted else ("timeout", ""))
-    assert store.get_meta("clock:outcome:fan") == f"2026-10-01 08:00 {outcome}"
-    assert clock.look_healthy(store.get_meta("clock:outcome:fan"), now, timedelta(minutes=30),
-                              LOOKS["fan"]) is bool(posted)
+    assert store.get_meta("clock:outcome:U1") == f"2026-10-01 08:00 {outcome}"
+    assert clock.look_healthy(store.get_meta("clock:outcome:U1"), now, timedelta(minutes=30),
+                              LOOKS["U1"]) is bool(posted)
     assert slack.alerts == ([alert] if alert else [])
     task = store.get_task_by_thread("D-U1", "conversation")
     # spoken, its day starts the next look's list; failed, none has yet
-    assert p._listed("fan", task) == ("2026-10-01" if posted else None)
+    assert p._listed("U1", task) == ("2026-10-01" if posted else None)
 
 
 @pytest.mark.parametrize("posted", [True, False], ids=["posted", "post refused"])
@@ -856,8 +987,8 @@ def cut_short(tmp_path, monkeypatch, step, ending, look=False) -> Path:
     task = store.get_task_by_thread("D-U1", "conversation")
     if look:
         at = datetime(2026, 10, 1, 8, 0, tzinfo=LA)
-        w = clock.morning_wakes(at, {"fan": LOOKS["fan"]}, QUIET, lambda q: None)[0]
-        store.set_meta("clock:listed:fan", "2026-09-30")
+        w = clock.morning_wakes(at, {"U1": LOOKS["U1"]}, QUIET, lambda q: None, NAMES.get)[0]
+        store.set_meta("clock:listed:U1", "2026-09-30")
 
         async def mem(now, *args):
             return ""
@@ -914,7 +1045,7 @@ def started_again(found: Path, tmp_path: Path, at: datetime, due: str = AT7):
         return due
     p._mem = mem
     p.settle_wakes(at)
-    wakes = asyncio.run(p._due_wakes(at, PEOPLE))
+    wakes = asyncio.run(p._due_wakes(at))
     asyncio.run(p._flush_lost())
     lost = [(r["id"], r["why"]) for r in json.loads(store.get_meta("clock:lost") or "[]")]
     owed = [o["id"] for o in json.loads(store.get_meta("clock:owed") or "[]")]
@@ -976,8 +1107,8 @@ def test_the_daemon_settles_a_wake_cut_short_before_slack_connects(tmp_path, mon
 
     monkeypatch.setattr("wanda.main.SlackWatcher.start",
                         lambda self: seen.append((self.store.get_meta("clock:lost"),
-                                                  self.store.get_meta("clock:trying:mei"),
-                                                  self.store.get_meta("clock:listed:mei"))))
+                                                  self.store.get_meta("clock:trying:U2"),
+                                                  self.store.get_meta("clock:listed:U2"))))
     monkeypatch.setattr("wanda.main.SlackWatcher.stop", lambda self: None)
     monkeypatch.setattr("wanda.main.Processor.loop", one_pass)
     monkeypatch.setattr("wanda.main.Processor.clock_loop", no_clock)
@@ -993,7 +1124,7 @@ def test_the_daemon_settles_a_wake_cut_short_before_slack_connects(tmp_path, mon
         "id": "b6647b", "by": "2026-01-01T19:00", "asked": "fan", "task": 1, "last": 0, "before": ""}}))
     # and mei's look, which a crash cut short after its run reported
     store.create_task(None, "D-U2", "conversation", kind="dm", reply_thread=None)
-    store.set_meta("clock:trying:mei", "2026-01-02 2 0 2026-01-01")
+    store.set_meta("clock:trying:U2", "2026-01-02 2 0 2026-01-01")
     store.record_run(kind="agent", task_id=2, session_id="s", started_at=utcnow(), exit_code=0,
                      cost_usd=0.0, status="ok", result_text="", notified=1)
     store.close()
@@ -1030,7 +1161,7 @@ def test_a_wake_woken_again_and_refused_before_it_ran_is_still_told_it_was_cut_s
     p.settle_wakes(datetime(2026, 10, 1, 19, 10, tzinfo=LA))
     for mm in (10, 15):
         now = datetime(2026, 10, 1, 19, mm, tzinfo=LA)
-        wakes = asyncio.run(p._due_wakes(now, PEOPLE))
+        wakes = asyncio.run(p._due_wakes(now))
         assert [w.key for w in wakes] == [key], mm
         asyncio.run(p._clock_session(wakes[0], now))
     assert [t[2].endswith(clock.AGAIN.format(speaker="fan")) for t in turns] == [True, True]
@@ -1049,7 +1180,7 @@ def test_a_look_a_crash_cut_short_is_settled_at_the_next_start(tmp_path, monkeyp
     Its day is handed on unless its run reported and its answer reached him."""
     found = cut_short(tmp_path, monkeypatch, step, "crash", look=True)
     with sqlite3.connect(found) as db:
-        trying = db.execute("SELECT value FROM meta WHERE key='clock:trying:fan'").fetchone()[0]
+        trying = db.execute("SELECT value FROM meta WHERE key='clock:trying:U1'").fetchone()[0]
     assert trying == "2026-10-01 1 0 2026-09-30", trying
     d = tmp_path / "again"
     d.mkdir()
@@ -1058,9 +1189,9 @@ def test_a_look_a_crash_cut_short_is_settled_at_the_next_start(tmp_path, monkeyp
         src.backup(store._db)
     p = Processor(settings(d, email_triage=False), store, asyncio.Queue(), FakeSlack(), RunnerService("/bin/true"))
     p.settle_wakes(datetime(2026, 10, 1, 8, 30, tzinfo=LA))
-    assert not store.get_meta("clock:trying:fan")
+    assert not store.get_meta("clock:trying:U1")
     reported = step in ("post", "snapshot")
-    assert store.get_meta("clock:listed:fan") == ("2026-10-01 1 2026-09-30" if reported else "2026-09-30")
+    assert store.get_meta("clock:listed:U1") == ("2026-10-01 1 2026-09-30" if reported else "2026-09-30")
     # fan writes in his DM later that morning, and that reply's run is recorded there
     store.record_run(kind="agent", task_id=1, session_id="r", started_at=utcnow(), exit_code=0,
                      cost_usd=0.0, status="ok", result_text="Sure.", notified=1)
@@ -1075,7 +1206,8 @@ def test_a_look_a_crash_cut_short_is_settled_at_the_next_start(tmp_path, monkeyp
                          cost_usd=0.0, status="ok", result_text="", notified=1)
     p._mem, p.memory_turn = mem, memory_turn
     nxt = datetime(2026, 10, 2, 8, 0, tzinfo=LA)
-    asyncio.run(p._clock_session(clock.morning_wakes(nxt, {"fan": LOOKS["fan"]}, QUIET, lambda q: None)[0], nxt))
+    asyncio.run(p._clock_session(clock.morning_wakes(nxt, {"U1": LOOKS["U1"]}, QUIET, lambda q: None,
+                                                     NAMES.get)[0], nxt))
     # only a look whose answer was posted moves the start on; one recorded
     # and not yet posted hands its day on until delivery gets it through
     assert mems[0][4] == ("2026-10-01" if step == "snapshot" else "2026-09-30"), mems
@@ -1113,8 +1245,8 @@ def test_a_reminder_marked_still_to_come_and_taken_away_before_its_time_is_not_g
         slack = FakeSlack()
         p, store, turns, alerts, mems = processor(d, slack, [SILENT], listed)
         eight = datetime(2026, 10, 1, 8, 0, tzinfo=LA)
-        asyncio.run(p._clock_session(clock.morning_wakes(eight, {"fan": LOOKS["fan"]}, QUIET,
-                                                         lambda q: None)[0], eight))
+        asyncio.run(p._clock_session(clock.morning_wakes(eight, {"U1": LOOKS["U1"]}, QUIET,
+                                                         lambda q: None, NAMES.get)[0], eight))
         assert marks(store) == [("a24e0d", "2026-10-01T17:00", "mei")], case
         if case == "given":
             # woken and claimed, then closed by the session that gave it
@@ -1124,9 +1256,9 @@ def test_a_reminder_marked_still_to_come_and_taken_away_before_its_time_is_not_g
             return due
         p._mem = mem
         # before its time it is left alone, whatever the store says of it
-        assert asyncio.run(p._due_wakes(datetime(2026, 10, 1, 16, 55, tzinfo=LA), PEOPLE)) == []
+        assert asyncio.run(p._due_wakes(datetime(2026, 10, 1, 16, 55, tzinfo=LA))) == []
         assert store.get_meta("clock:lost") is None and len(json.loads(store.get_meta("clock:marked"))) == 1
-        wakes = asyncio.run(p._due_wakes(datetime(2026, 10, 1, 17, 2, tzinfo=LA), PEOPLE))
+        wakes = asyncio.run(p._due_wakes(datetime(2026, 10, 1, 17, 2, tzinfo=LA)))
         lost = [(r["id"], r["by"], r["asked"], r["why"], r["moved"])
                 for r in json.loads(store.get_meta("clock:lost") or "[]")]
         if case == "open":
@@ -1134,7 +1266,7 @@ def test_a_reminder_marked_still_to_come_and_taken_away_before_its_time_is_not_g
             assert lost == [] and [w.key for w in wakes] == [claim], case
             assert len(json.loads(store.get_meta("clock:marked"))) == 1, case
             store.set_meta(claim, utcnow())
-            asyncio.run(p._due_wakes(datetime(2026, 10, 1, 17, 7, tzinfo=LA), PEOPLE))
+            asyncio.run(p._due_wakes(datetime(2026, 10, 1, 17, 7, tzinfo=LA)))
         assert marks(store) == [], case
         if case in ("open", "given"):
             assert lost == [] and store.get_meta("clock:lost") is None, case
@@ -1159,7 +1291,7 @@ def marked_at_eight(d):
     d.mkdir()
     p, store, turns, alerts, mems = processor(d, FakeSlack(), [SILENT], PLUMBER)
     eight = datetime(2026, 10, 1, 8, 0, tzinfo=LA)
-    asyncio.run(p._clock_session(clock.morning_wakes(eight, {"fan": LOOKS["fan"]}, QUIET, lambda q: None)[0],
+    asyncio.run(p._clock_session(clock.morning_wakes(eight, {"U1": LOOKS["U1"]}, QUIET, lambda q: None, NAMES.get)[0],
                                  eight))
     assert marks(store) == [("a24e0d", "2026-10-01T17:00", "mei")]
     return p, store
@@ -1183,7 +1315,7 @@ def test_a_marked_reminder_the_clock_gave_at_another_time_that_day_was_given(tmp
         else:
             store.set_meta("clock:due:a24e0d:2026-10-01T07:00:mei", "2026-10-01T14:00:00+00:00")
         p._mem = lambda now, *args: asyncio.sleep(0, "")  # closed
-        asyncio.run(p._due_wakes(datetime(2026, 10, 1, 17, 2, tzinfo=LA), PEOPLE))
+        asyncio.run(p._due_wakes(datetime(2026, 10, 1, 17, 2, tzinfo=LA)))
         assert marks(store) == [], case
         assert lost_in(store) == ([] if case == "moved earlier and given" else
                                   [("a24e0d", "2026-10-01T17:00", "mei", OFF, "")]), case
@@ -1198,9 +1330,9 @@ def test_a_mark_held_for_its_wake_is_let_go_once_its_time_is_two_hours_gone(tmp_
     open_at5 = "\n".join(PLUMBER.splitlines()[1:4]) + "\n"
     p._mem = lambda now, *args: asyncio.sleep(0, open_at5)
     for hh, mm in ((17, 2), (18, 59)):
-        asyncio.run(p._due_wakes(datetime(2026, 10, 1, hh, mm, tzinfo=LA), PEOPLE))
+        asyncio.run(p._due_wakes(datetime(2026, 10, 1, hh, mm, tzinfo=LA)))
         assert marks(store) == [("a24e0d", "2026-10-01T17:00", "mei")] and lost_in(store) == [], (hh, mm)
-    asyncio.run(p._due_wakes(datetime(2026, 10, 1, 19, 1, tzinfo=LA), PEOPLE))
+    asyncio.run(p._due_wakes(datetime(2026, 10, 1, 19, 1, tzinfo=LA)))
     assert marks(store) == []
     assert lost_in(store) == [("a24e0d", "2026-10-01T17:00", "mei",
                                "its time was more than 2 h gone when the clock saw it", "")]
@@ -1220,18 +1352,18 @@ def test_a_marked_reminder_moved_a_little_earlier_is_held_for_the_wake_that_chec
     for case in ("woken", "never woken"):
         p, store = marked_at_eight(tmp_path / case.replace(" ", "-"))
         p._mem = lambda now, *args: asyncio.sleep(0, at458)
-        wakes = asyncio.run(p._due_wakes(datetime(2026, 10, 1, 17, 2, tzinfo=LA), PEOPLE))
+        wakes = asyncio.run(p._due_wakes(datetime(2026, 10, 1, 17, 2, tzinfo=LA)))
         assert [w.key for w in wakes] == [key], case
         assert marks(store) == [("a24e0d", "2026-10-01T17:00", "mei")] and lost_in(store) == [], case
         if case == "woken":
             store.set_meta(key, utcnow())
             p._mem = lambda now, *args: asyncio.sleep(0, "")  # closed by the session that gave it
-            asyncio.run(p._due_wakes(datetime(2026, 10, 1, 17, 7, tzinfo=LA), PEOPLE))
+            asyncio.run(p._due_wakes(datetime(2026, 10, 1, 17, 7, tzinfo=LA)))
             assert marks(store) == [] and lost_in(store) == [], case
             continue
-        asyncio.run(p._due_wakes(datetime(2026, 10, 1, 18, 57, tzinfo=LA), PEOPLE))
+        asyncio.run(p._due_wakes(datetime(2026, 10, 1, 18, 57, tzinfo=LA)))
         assert marks(store) == [("a24e0d", "2026-10-01T17:00", "mei")] and lost_in(store) == [], case
-        asyncio.run(p._due_wakes(datetime(2026, 10, 1, 18, 59, tzinfo=LA), PEOPLE))
+        asyncio.run(p._due_wakes(datetime(2026, 10, 1, 18, 59, tzinfo=LA)))
         assert marks(store) == [] and lost_in(store) == [(
             "a24e0d", "2026-10-01T16:58", "mei", "its time was more than 2 h gone when the clock saw it", "")]
 
@@ -1245,9 +1377,9 @@ def test_a_look_refused_before_it_ran_leaves_no_marks(tmp_path):
     earlier = {"id": "596f2d", "by": "2026-10-01T09:30", "asked": "fan", "at": "2026-10-01T14:00:00+00:00"}
     store.set_meta("clock:marked", json.dumps([earlier]))
     eight = datetime(2026, 10, 1, 8, 0, tzinfo=LA)
-    w = clock.morning_wakes(eight, {"fan": LOOKS["fan"]}, QUIET, lambda q: None)[0]
+    w = clock.morning_wakes(eight, {"U1": LOOKS["U1"]}, QUIET, lambda q: None, NAMES.get)[0]
     asyncio.run(p._clock_session(w, eight))
-    assert not store.get_meta("clock:morning:fan"), "released"
+    assert not store.get_meta("clock:morning:U1"), "released"
     assert marks(store) == [("596f2d", "2026-10-01T09:30", "fan")]
     asyncio.run(p._clock_session(w, eight + timedelta(minutes=1)))
     assert marks(store) == [("596f2d", "2026-10-01T09:30", "fan"), ("a24e0d", "2026-10-01T17:00", "mei")]
@@ -1281,17 +1413,17 @@ def test_a_look_after_a_reminders_time_marks_it_while_its_wake_waits(tmp_path):
     # what due.rs gave, and the same with the clock's own mark
     six = datetime(2026, 10, 1, 8, 6, tzinfo=LA)
     fired = {"clock:due:41ab07:2026-10-01T07:45:fan"}
-    got = clock.still_to_come(listed.splitlines(), six, PEOPLE, lambda k: k in fired)
+    got = clock.still_to_come(listed.splitlines(), six, ASKERS, lambda k: k in fired)
     assert got == listed.replace(tablet, tablet + mark + "\n").splitlines(), got
-    assert clock.still_to_come(got, six, PEOPLE, lambda k: k in fired) == got, "marked once"
+    assert clock.still_to_come(got, six, ASKERS, lambda k: k in fired) == got, "marked once"
     for case in ("closed", "given"):
         d = tmp_path / case
         d.mkdir()
         slack = FakeSlack()
         p, store, turns, alerts, mems = processor(d, slack, [SILENT], listed)
         store.set_meta("clock:due:41ab07:2026-10-01T07:45:fan", "2026-10-01T14:45:00+00:00")
-        asyncio.run(p._clock_session(clock.morning_wakes(six, {"fan": LOOKS["fan"]}, QUIET,
-                                                         lambda q: None)[0], six))
+        asyncio.run(p._clock_session(clock.morning_wakes(six, {"U1": LOOKS["U1"]}, QUIET,
+                                                         lambda q: None, NAMES.get)[0], six))
         assert mems[0][-1] == "08:06" and mark in turns[0][2], turns[0][2]
         assert marks(store) == [("596f2d", "2026-10-01T09:30", "fan"),
                                 ("6ec742", "2026-10-01T08:00", "mei")], case
@@ -1300,7 +1432,7 @@ def test_a_look_after_a_reminders_time_marks_it_while_its_wake_waits(tmp_path):
             return due
         p._mem = mem
         # a due check while the look runs: still open, its wake waiting
-        wakes = asyncio.run(p._due_wakes(datetime(2026, 10, 1, 8, 8, tzinfo=LA), PEOPLE))
+        wakes = asyncio.run(p._due_wakes(datetime(2026, 10, 1, 8, 8, tzinfo=LA)))
         assert [w.key for w in wakes] == ["clock:due:6ec742:2026-10-01T08:00:mei"], case
         assert len(json.loads(store.get_meta("clock:marked"))) == 2 and store.get_meta("clock:lost") is None
         if case == "closed":
@@ -1308,7 +1440,7 @@ def test_a_look_after_a_reminders_time_marks_it_while_its_wake_waits(tmp_path):
             p._mem = lambda now, *args: asyncio.sleep(0, "")
         else:
             store.set_meta("clock:due:6ec742:2026-10-01T08:00:mei", utcnow())
-        asyncio.run(p._due_wakes(datetime(2026, 10, 1, 8, 13, tzinfo=LA), PEOPLE))
+        asyncio.run(p._due_wakes(datetime(2026, 10, 1, 8, 13, tzinfo=LA)))
         lost = [(r["id"], r["by"], r["asked"]) for r in json.loads(store.get_meta("clock:lost") or "[]")]
         assert marks(store) == [("596f2d", "2026-10-01T09:30", "fan")], case
         assert lost == ([("6ec742", "2026-10-01T08:00", "mei")] if case == "closed" else []), case
@@ -1326,7 +1458,7 @@ def test_a_look_marks_only_her_own_reminder_one_of_the_household_asked_for():
               + item("cccccc", "me; fan") + item("dddddd", "fan", "fan"))
     mark = "    still to come: the clock gives it to fan at 08:00, but only while it is open and timed so\n"
     six = datetime(2026, 10, 1, 8, 6, tzinfo=LA)
-    assert clock.still_to_come(listed.splitlines(), six, PEOPLE, lambda k: False) == listed.replace(
+    assert clock.still_to_come(listed.splitlines(), six, ASKERS, lambda k: False) == listed.replace(
         hers, hers + mark).splitlines()
 
 
@@ -1368,14 +1500,14 @@ def test_a_reminder_too_late_to_wake_for_is_kept_whenever_it_came_due(tmp_path):
     p, store, turns, alerts, mems = processor(tmp_path, FakeSlack(), [], DUE)
     store.set_meta("clock:checked", "2026-09-27")
     later = datetime(2026, 10, 3, 9, 0, tzinfo=LA)
-    asyncio.run(p._due_wakes(later, PEOPLE))
+    asyncio.run(p._due_wakes(later))
     assert mems == [("due", "--after", "2026-09-26")]
     assert store.get_meta("clock:checked") == "2026-10-03"
     lost = json.loads(store.get_meta("clock:lost"))
     assert sorted((r["id"], r["asked"]) for r in lost) == [("07f41d", "fan"), ("a24e0d", "mei"),
                                                            ("b6647b", "fan")]
     assert {r["why"] for r in lost} == {"its time was more than 2 h gone when the clock saw it"}
-    asyncio.run(p._due_wakes(later + timedelta(minutes=5), PEOPLE))
+    asyncio.run(p._due_wakes(later + timedelta(minutes=5)))
     assert mems[1] == ("due", "--after", "2026-10-01"), "two days back at least"
     assert len(json.loads(store.get_meta("clock:lost"))) == 3
 
@@ -1407,58 +1539,64 @@ def test_doctor_lists_the_reminders_not_given(tmp_path, capsys):
 
 
 @pytest.mark.parametrize("spec,quiet,said", [
-    (["fan08:00"], "21:30-07:00", "WANDA_MORNINGS=fan08:00 is not a list of name@HH:MM"),
-    (["fan@8am"], "21:30-07:00", "WANDA_MORNINGS=fan@8am is not a list of name@HH:MM"),
-    (["fan@25:00"], "21:30-07:00", "WANDA_MORNINGS=fan@25:00 is not a list of name@HH:MM"),
-    (["jane@08:00"], "21:30-07:00", "WANDA_MORNINGS names jane, who is not an allowed id's name"),
-    (["@08:00"], "21:30-07:00", "WANDA_MORNINGS=@08:00 is not a list of name@HH:MM"),
-    (["fan@08:00", " @07:30"], "21:30-07:00", "WANDA_MORNINGS=fan@08:00, @07:30 is not a list of name@HH:MM"),
-    (["fan@08:00", "Fan@11:00"], "21:30-07:00",
-     "WANDA_MORNINGS gives fan more than one time, and a person has one look a day"),
-    (["fan@12:30"], "21:30-07:00", "WANDA_MORNINGS puts fan at or after 12:00"),
-    (["fan@08:00"], "22-07", "WANDA_QUIET_HOURS=22-07 is not HH:MM-HH:MM"),
-    (["fan@08:00", "mei@07:30"], "21:30-12:00",
-     "WANDA_QUIET_HOURS=21:30-12:00 keeps fan and mei from having a look before 12:00"),
-    (["fan@08:00", "mei@07:30"], "07:45-13:00", "WANDA_QUIET_HOURS=07:45-13:00 keeps fan from having"),
-    (["fan@08:00", "mei@07:30"], "", None),
-    (["fan@08:00", "mei@07:30"], "21:30-11:59", None),
-    (["fan@08:00", "mei@07:30"], "00:00-00:00", None),
+    (["U108:00"], "21:30-07:00", "WANDA_MORNINGS=U108:00 is not a list of <member id>@HH:MM, as U0123456789@08:00"),
+    (["U1@8am"], "21:30-07:00", "WANDA_MORNINGS=U1@8am is not a list of <member id>@HH:MM"),
+    (["U1@25:00"], "21:30-07:00", "WANDA_MORNINGS=U1@25:00 is not a list of <member id>@HH:MM"),
+    # a name, which an older .env may give
+    (["fan@08:00"], "21:30-07:00", "WANDA_MORNINGS names fan, which is not in WANDA_SLACK_OWNER_USER_IDS: "
+                                   "it takes member ids, as U0123456789@08:00"),
+    (["U9@08:00"], "21:30-07:00", "WANDA_MORNINGS names U9, which is not in WANDA_SLACK_OWNER_USER_IDS"),
+    (["u1@08:00"], "21:30-07:00", "WANDA_MORNINGS names u1, which is not in WANDA_SLACK_OWNER_USER_IDS"),
+    (["@08:00"], "21:30-07:00", "WANDA_MORNINGS=@08:00 is not a list of <member id>@HH:MM"),
+    (["U1@08:00", " @07:30"], "21:30-07:00", "WANDA_MORNINGS=U1@08:00, @07:30 is not a list of <member id>@HH:MM"),
+    (["U1@08:00", " U1 @11:00"], "21:30-07:00",
+     "WANDA_MORNINGS gives U1 more than one time, and a person has one look a day"),
+    (["U1@12:30"], "21:30-07:00", "WANDA_MORNINGS puts U1 at or after 12:00"),
+    (["U1@08:00"], "22-07", "WANDA_QUIET_HOURS=22-07 is not HH:MM-HH:MM"),
+    (["U1@08:00", "U2@07:30"], "21:30-12:00",
+     "WANDA_QUIET_HOURS=21:30-12:00 keeps U1 and U2 from having a look before 12:00"),
+    (["U1@08:00", "U2@07:30"], "07:45-13:00", "WANDA_QUIET_HOURS=07:45-13:00 keeps U1 from having"),
+    (["U1@08:00", "U2@07:30"], "", None),
+    (["U1@08:00", "U2@07:30"], "21:30-11:59", None),
+    (["U1@08:00", "U2@07:30"], "00:00-00:00", None),
 ])
 def test_a_setting_the_clock_cannot_read_is_one_sentence(spec, quiet, said):
-    got = clock.settings_problem(spec, quiet, {"U1": "fan", "U2": "mei"}, ["U1", "U2"])
+    got = clock.settings_problem(spec, quiet, ["U1", "U2"])
     assert (got is None) if said is None else got.startswith(said), got
 
 
-@pytest.mark.parametrize("names,said", [
-    ({"U1": "fan", "U2": "mei", "U9": "fan"}, "WANDA_SLACK_NAMES gives fan to more than one id"),
-    ({"U1": "fan", "U2": "Fan"}, "WANDA_SLACK_NAMES gives fan to more than one id"),
-    ({"U1": "fan", "U2": "mei", "U9": "jane"}, "WANDA_SLACK_NAMES names U9, which is not in "
-                                               "WANDA_SLACK_OWNER_USER_IDS"),
+@pytest.mark.parametrize("change,said", [
+    (dict(mornings=["U1@8am"]), r"^WANDA_MORNINGS=U1@8am is not a list of <member id>@HH:MM"),
+    (dict(mornings=["fan@08:00"]), r"^WANDA_MORNINGS names fan, which is not in WANDA_SLACK_OWNER_USER_IDS"),
+    (dict(mornings=["U1@08:00", "U1@09:00"]), r"^WANDA_MORNINGS gives U1 more than one time"),
+    (dict(mornings=["U9@08:00"]), r"^WANDA_MORNINGS names U9, which is not in WANDA_SLACK_OWNER_USER_IDS"),
+    (dict(slack_names={"U1": "fan", "U2": "Fan"}), r"^WANDA_SLACK_NAMES gives fan to more than one id"),
 ])
-def test_a_name_that_leads_to_no_one_allowed_id_is_refused(names, said):
-    """The clock opens a person's DM by their name: a name on a second id,
-    off the allowlist or not, could open someone else's, with the household's
-    memory in the session."""
-    for spec in ([], ["fan@08:00"]):
-        got = clock.settings_problem(spec, "21:30-07:00", names, ["U1", "U2"])
-        assert got is not None and got.startswith(said), got
-
-
-def test_the_daemon_refuses_a_clock_setting_with_its_sentence(tmp_path, monkeypatch):
+def test_the_daemon_refuses_a_clock_setting_with_its_sentence(tmp_path, monkeypatch, change, said):
     def past_the_check(*args, **kw):
         raise AssertionError("the daemon went past its settings check, towards Slack")
     # the tokens are dummies, and a daemon that took the setting would connect next
     monkeypatch.setattr("wanda.main.SlackActions", past_the_check)
     monkeypatch.setattr("wanda.main.SlackWatcher", past_the_check)
     cfg = settings(tmp_path, slack_bot_token="xoxb-x", slack_app_token="xapp-x", alert_channel="C9",
-                   email_triage=False)
-    cfg.mornings = ["fan@8am"]
-    with pytest.raises(SystemExit, match=r"^WANDA_MORNINGS=fan@8am is not a list of name@HH:MM"):
+                   email_triage=False).model_copy(update=change)
+    with pytest.raises(SystemExit, match=said):
         asyncio.run(run_daemon(cfg))
 
 
+def test_doctor_shows_each_look_by_its_member_id(tmp_path, capsys):
+    cfg = settings(tmp_path, claude_bin="/usr/bin/true", email_triage=False)
+    store = Store(cfg.db_path)
+    store.set_meta("clock:outcome:U1", "2026-10-01 08:00 silent")
+    store.close()
+    asyncio.run(run_doctor(cfg, smoke=False))
+    out = capsys.readouterr().out
+    assert " last look for U1 (fan) — 2026-10-01 08:00 silent\n" in out, out
+    assert " last look for U2 (mei) — none yet\n" in out, out
+
+
 def test_doctor_reports_a_clock_setting_and_goes_on(tmp_path, capsys):
-    for kw, line in ((dict(mornings=["fan08:00"]), "✗ clock — WANDA_MORNINGS=fan08:00 is not"),
+    for kw, line in ((dict(mornings=["U108:00"]), "✗ clock — WANDA_MORNINGS=U108:00 is not"),
                      (dict(tz="Mars/Olympus"), "✗ clock — WANDA_TZ=Mars/Olympus is not a time zone")):
         cfg = settings(tmp_path, claude_bin="/usr/bin/true", email_triage=False).model_copy(update=kw)
         asyncio.run(run_doctor(cfg, smoke=False))
@@ -1495,8 +1633,8 @@ def test_doctor_passes_a_look_only_when_one_ran():
 
 def test_a_day_with_no_look_is_said_at_noon(tmp_path, caplog):
     p, store, turns, alerts, mems = processor(tmp_path, FakeSlack(), [])
-    store.set_meta("clock:morning:fan", "2026-10-01")
-    store.set_meta("clock:outcome:mei", "2026-09-30 07:30 silent")
+    store.set_meta("clock:morning:U1", "2026-10-01")
+    store.set_meta("clock:outcome:U2", "2026-09-30 07:30 silent")
     noon = datetime(2026, 10, 1, 12, 0, tzinfo=LA)
     claimed = lambda q: store.get_meta(f"clock:morning:{q}")  # noqa: E731
     assert clock.missed(noon - timedelta(minutes=1), LOOKS, claimed) == []
@@ -1504,9 +1642,9 @@ def test_a_day_with_no_look_is_said_at_noon(tmp_path, caplog):
         for minute in (0, 1):
             for person in clock.missed(noon + timedelta(minutes=minute), LOOKS, claimed):
                 p._skip_look(person, noon + timedelta(minutes=minute))
-    assert store.get_meta("clock:outcome:mei") == "2026-10-01 12:00 skipped"
-    assert store.get_meta("clock:outcome:fan") is None
-    assert [r.getMessage() for r in caplog.records] == ["clock: no look for mei ran before noon; none today"]
+    assert store.get_meta("clock:outcome:U2") == "2026-10-01 12:00 skipped"
+    assert store.get_meta("clock:outcome:U1") is None
+    assert [r.getMessage() for r in caplog.records] == ["clock: no look for U2 ran before noon; none today"]
 
 
 def test_what_mem_says_on_the_side_is_logged_once(tmp_path, monkeypatch, caplog):
@@ -1547,12 +1685,12 @@ def test_the_clocks_own_mem_call_is_ended_when_it_runs_past_its_bound(tmp_path, 
     p._alert_once = alert_once
     store.set_meta("clock:checked", "2026-09-30")
     now = datetime(2026, 10, 1, 8, 0, tzinfo=LA)
-    assert asyncio.run(p._due_wakes(now, PEOPLE)) == []
+    assert asyncio.run(p._due_wakes(now)) == []
     assert store.get_meta("clock:checked") == "2026-09-30"
-    w = clock.morning_wakes(now, {"fan": LOOKS["fan"]}, QUIET, lambda q: None)[0]
+    w = clock.morning_wakes(now, {"U1": LOOKS["U1"]}, QUIET, lambda q: None, NAMES.get)[0]
     asyncio.run(p._clock_session(w, now))
-    assert store.get_meta("clock:morning:fan") is None
-    assert store.get_meta("clock:outcome:fan") == "2026-10-01 08:00 could not start"
+    assert store.get_meta("clock:morning:U1") is None
+    assert store.get_meta("clock:outcome:U1") == "2026-10-01 08:00 could not start"
     assert alerts == [("clock", "a morning look could not start on 2026-10-01; doctor says whose")]
     started = pids.read_text().split()
     assert len(started) == 2
@@ -1618,7 +1756,7 @@ def test_doctors_command_gives_a_reminder_its_session_closed_later(tmp_path, cap
     due = mem("due", "--after", "2026-09-30")
     assert f"`trajectory:{tid}`  2026-10-01T21:00, today" in due and "    asked by: fan" in due, due
     assert REOPENED in mem("show", f"trajectory:{tid}")
-    woke = clock.due_wakes(datetime(2026, 10, 1, 21, 0, tzinfo=LA), clock.items(due), PEOPLE,
+    woke = clock.due_wakes(datetime(2026, 10, 1, 21, 0, tzinfo=LA), clock.items(due), ASKERS,
                            lambda k: False, set())
     assert [w.key for w in woke] == [f"clock:due:{tid}:2026-10-01T21:00:fan"]
 
@@ -1647,9 +1785,9 @@ def test_a_reminder_asked_in_a_turn_of_two_speakers_has_no_one_asker(tmp_path, c
     due = mem("due", "--after", "2026-10-01", MEM_DATE="2026-10-02", MEM_REAL_DATE="2026-10-02")
     assert due.count("    asked by: ") == 1 and "    asked by: fan" in due, due
     with caplog.at_level(logging.WARNING, logger="wanda.clock"):
-        woke = [clock.due_wakes(datetime(2026, 10, 2, h, 0, tzinfo=LA), clock.items(due), PEOPLE,
+        woke = [clock.due_wakes(datetime(2026, 10, 2, h, 0, tzinfo=LA), clock.items(due), ASKERS,
                                 lambda k: False, set()) for h in (17, 18)]
-    assert [[w.person for w in ws] for ws in woke] == [[], ["fan"]]
+    assert [[w.person for w in ws] for ws in woke] == [[], ["U1"]]
     assert any("who asked is not known (no one person)" in r.getMessage() for r in caplog.records)
     # the look at 08:00 is handed both, and marks as still to come only the
     # one the clock will wake for at 6

@@ -128,6 +128,19 @@ def settings_problem(cfg: Config) -> str | None:
     if unnamed:
         return (f"no name in WANDA_SLACK_NAMES for {', '.join(unnamed)}: a session is told "
                 "who is speaking by the name the vault knows them by")
+    # the clock opens the direct message of whoever asked for a reminder by
+    # the name the reminder gives, so a name has to lead to one id, and that
+    # one allowed
+    ids: dict[str, list[str]] = {}
+    for uid, name in cfg.slack_names.items():
+        ids.setdefault(name.strip().lower(), []).append(uid)
+    if shared := sorted(name for name, us in ids.items() if len(us) > 1):
+        return (f"WANDA_SLACK_NAMES gives {', '.join(shared)} to more than one id: the clock would not "
+                "know whose direct message to open")
+    if outside := sorted(u for u in cfg.slack_names if u not in cfg.slack_owner_user_ids):
+        return (f"WANDA_SLACK_NAMES names {', '.join(outside)}, which is not in "
+                "WANDA_SLACK_OWNER_USER_IDS: the clock opens a direct message by name, and a name is "
+                "for an allowed id alone")
     if not cfg.tz:
         return "WANDA_TZ is not set: every session is told the household's date and time in it"
     try:

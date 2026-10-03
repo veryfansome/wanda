@@ -83,8 +83,9 @@ class Config(BaseSettings):
     daily_run_cap: int = 200
     daily_cost_cap_usd: float = 5.0
 
-    # the clock. Whose morning gets a look, and when, as name@HH:MM in the
-    # household's own time (WANDA_TZ), before noon; empty for none.
+    # the clock. Whose morning gets a look, and when, as <member id>@HH:MM in
+    # the household's own time (WANDA_TZ), before noon, each id one of
+    # slack_owner_user_ids; empty for none.
     mornings: CsvList = Field(default_factory=list)
     # No morning look starts in these hours; a reminder asked for at a time in
     # them still comes then, and a message still gets its answer.

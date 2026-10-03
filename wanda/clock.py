@@ -101,16 +101,20 @@ def items(due: str) -> list[Item]:
 @dataclass(frozen=True)
 class Wake:
     key: str      # what the store keeps so this wake fires once
-    person: str   # whose direct message what she says goes to
+    person: str   # the member id whose direct message what she says goes to
     text: str     # the indented lines of the frame: what woke her
     about: str = ""  # for a timed wake, its item's id; `by` is its time; an alert names both
     by: str = ""
+    # for a timed wake, who asked, as its item names them, lower case: its key
+    # and its records keep the name, which is what a look's list shows
+    asked: str = ""
 
-    def arrival(self, listed: list[str] | tuple[str, ...] = ()) -> str:
-        """The frame, with the list a morning look is handed below what woke
-        her, when there is one; the lab composes it the same way."""
+    def arrival(self, speaker: str, listed: list[str] | tuple[str, ...] = ()) -> str:
+        """The frame, naming the person as sessions know them, with the list
+        a morning look is handed below what woke her, when there is one; the
+        lab composes it the same way."""
         text = self.text + ("\n\n    " + "\n    ".join(listed) if listed else "")
-        return CLOCK.format(speaker=self.person, text=text)
+        return CLOCK.format(speaker=speaker, text=text)
 
 
 def hhmm(s: str) -> time:
@@ -119,15 +123,15 @@ def hhmm(s: str) -> time:
 
 
 def mornings(spec: list[str]) -> dict[str, time]:
-    """`fan@08:00` entries, as WANDA_MORNINGS lists them. A name is kept in
-    one spelling, lower case, wherever the clock compares or keys it; an
-    entry with no name, or no time of day, is a ValueError."""
+    """`U0123456789@08:00` entries, as WANDA_MORNINGS lists them, each
+    member id kept as given, as the allowlist keeps it. An entry with no id,
+    or no time of day, is a ValueError."""
     out = {}
     for item in spec:
-        name, at = item.split("@")
-        if not name.strip():
+        uid, at = item.split("@")
+        if not uid.strip():
             raise ValueError(item)
-        out[name.strip().lower()] = hhmm(at)
+        out[uid.strip()] = hhmm(at)
     return out
 
 
@@ -139,39 +143,22 @@ def quiet_hours(spec: str) -> tuple[time, time] | None:
     return hhmm(start), hhmm(end)
 
 
-def people(slack_names: dict[str, str], allowed: list[str]) -> set[str]:
-    """Whom the clock may wake: the name of each allowed id, lower case."""
-    return {slack_names[u].strip().lower() for u in allowed if u in slack_names}
-
-
-def settings_problem(spec: list[str], quiet_spec: str, slack_names: dict[str, str],
-                     allowed: list[str]) -> str | None:
+def settings_problem(spec: list[str], quiet_spec: str, allowed: list[str]) -> str | None:
     """What is wrong with the clock's settings, in one sentence, or None. The
     daemon refuses to start on it and doctor reports it."""
-    # the clock opens a person's direct message by their name, so a name has
-    # to lead to one id, and that one allowed
-    ids: dict[str, list[str]] = {}
-    for uid, name in slack_names.items():
-        ids.setdefault(name.strip().lower(), []).append(uid)
-    if shared := sorted(name for name, us in ids.items() if len(us) > 1):
-        return (f"WANDA_SLACK_NAMES gives {', '.join(shared)} to more than one id: the clock would not "
-                "know whose direct message to open")
-    if outside := sorted(u for u in slack_names if u not in allowed):
-        return (f"WANDA_SLACK_NAMES names {', '.join(outside)}, which is not in "
-                "WANDA_SLACK_OWNER_USER_IDS: the clock opens a direct message by name, and a name is "
-                "for an allowed id alone")
-    names = people(slack_names, allowed)
     try:
         looks = mornings(spec)
     except ValueError:
-        return (f"WANDA_MORNINGS={','.join(spec)} is not a list of name@HH:MM, "
-                "as fan@08:00,mei@08:00")
-    given = [item.split("@")[0].strip().lower() for item in spec]
-    if twice := sorted({name for name in given if given.count(name) > 1}):
+        return (f"WANDA_MORNINGS={','.join(spec)} is not a list of <member id>@HH:MM, "
+                "as U0123456789@08:00,U0987654321@07:30")
+    given = [item.split("@")[0].strip() for item in spec]
+    if twice := sorted({uid for uid in given if given.count(uid) > 1}):
         return f"WANDA_MORNINGS gives {', '.join(twice)} more than one time, and a person has one look a day"
-    if unknown := sorted(set(looks) - names):
-        return (f"WANDA_MORNINGS names {', '.join(unknown)}, who is not an allowed id's name "
-                "in WANDA_SLACK_NAMES")
+    # a look is a session with the household's memory, in the person's own
+    # direct message: only someone allowed to start sessions has one
+    if unknown := sorted(set(looks) - set(allowed)):
+        return (f"WANDA_MORNINGS names {', '.join(unknown)}, which is not in WANDA_SLACK_OWNER_USER_IDS: "
+                "it takes member ids, as U0123456789@08:00")
     if late := sorted(name for name, at in looks.items() if at >= LOOK_BY):
         return (f"WANDA_MORNINGS puts {', '.join(late)} at or after {LOOK_BY:%H:%M}, "
                 "when a look is skipped for the day")
@@ -197,19 +184,20 @@ def is_quiet(t: time, quiet: tuple[time, time] | None) -> bool:
 
 
 def morning_wakes(now: datetime, looks: dict[str, time], quiet: tuple[time, time] | None,
-                  last_look: Callable[[str], str | None]) -> list[Wake]:
-    """Each person whose morning has come and who has had no look today. A
+                  last_look: Callable[[str], str | None], called: Callable[[str], str]) -> list[Wake]:
+    """Each person whose morning has come and who has had no look today, by
+    member id, the look saying the name sessions know them by (`called`). A
     look missed while the daemon was down runs when it is back, before noon,
     and says the time it actually runs at."""
     if is_quiet(now.time(), quiet) or now.time() >= LOOK_BY:
         return []
     today = now.date().isoformat()
     return [
-        Wake(f"clock:morning:{person}", person,
+        Wake(f"clock:morning:{uid}", uid,
              MORNING.format(weekday=WEEKDAYS[now.weekday()], time=now.strftime("%H:%M"),
-                            speaker=person))
-        for person, at in looks.items()
-        if now.time() >= at and last_look(person) != today
+                            speaker=called(uid)))
+        for uid, at in looks.items()
+        if now.time() >= at and last_look(uid) != today
     ]
 
 
@@ -221,10 +209,11 @@ def missed(now: datetime, looks: dict[str, time], last_look: Callable[[str], str
     return [person for person in looks if last_look(person) != today]
 
 
-def due_wakes(now: datetime, due: list[Item], people: set[str], fired: Callable[[str], bool],
+def due_wakes(now: datetime, due: list[Item], askers: dict[str, str], fired: Callable[[str], bool],
               said: set[str], lost: Callable[[Item, str], None] = lambda item, why: None) -> list[Wake]:
     """Each undertaking of hers whose `--by` carries a time of day that has
-    come, for the person who asked for it, at that time whatever the hour. A
+    come, for the person who asked for it, at that time whatever the hour, in
+    the direct message of the member id `askers` leads their name to. A
     bare date is the morning look's: the whole day is its moment. One whose
     time has come and that is not woken (not hers, no one person known to
     have asked, a time no clock shows, or noticed too late) is said once in
@@ -254,7 +243,7 @@ def due_wakes(now: datetime, due: list[Item], people: set[str], fired: Callable[
             continue
         if not mine:
             dropped(item, "it is not an undertaking of hers")
-        elif item.asked_by not in people:
+        elif item.asked_by not in askers:
             dropped(item, f"who asked is not known ({item.asked_by or 'no one person'})")
         else:
             key = f"clock:due:{item.id}:{item.by}:{item.asked_by}"
@@ -266,11 +255,12 @@ def due_wakes(now: datetime, due: list[Item], people: set[str], fired: Callable[
                 lost(item, why)
                 continue
             head = COME_DUE.format(weekday=WEEKDAYS[now.weekday()], time=now.strftime("%H:%M"))
-            out.append(Wake(key, item.asked_by, "\n    ".join((head, *item.lines)), item.id, item.by))
+            out.append(Wake(key, askers[item.asked_by], "\n    ".join((head, *item.lines)), item.id, item.by,
+                            item.asked_by))
     return out
 
 
-def still_to_come(listed: list[str], now: datetime, people: set[str],
+def still_to_come(listed: list[str], now: datetime, askers: dict[str, str],
                   fired: Callable[[str], bool]) -> list[str]:
     """A look's list, with each undertaking of hers whose time has come and
     whose wake has not run marked as still to come, as due.rs marks those
@@ -284,7 +274,7 @@ def still_to_come(listed: list[str], now: datetime, people: set[str],
     wall = now.replace(tzinfo=None)
     waiting = {}
     for item in items("\n".join(listed)):
-        if (item.field(STILL_TO_COME) or not TIMED.match(item.by) or item.asked_by not in people
+        if (item.field(STILL_TO_COME) or not TIMED.match(item.by) or item.asked_by not in askers
                 or not any(n in SELF for n in item.involves)):
             continue
         try:
@@ -295,7 +285,8 @@ def still_to_come(listed: list[str], now: datetime, people: set[str],
             continue
         if (wall - LATE < at <= wall
                 and not fired(f"clock:due:{item.id}:{item.by}:{item.asked_by}")):
-            waiting[item.id] = STILL_TO_COME_LINE.format(asker=item.asked_by, time=item.by[11:])
+            # the asker as `mem due` printed them, as due.rs's own mark does
+            waiting[item.id] = STILL_TO_COME_LINE.format(asker=item.field(ASKED_BY).strip(), time=item.by[11:])
     out: list[str] = []
     owed = ""
     for line in listed:

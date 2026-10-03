@@ -534,6 +534,21 @@ def test_settings_problem():
         assert (vault.settings_problem(c) is None) == ok
 
 
+@pytest.mark.parametrize("names,said", [
+    ({"U1": "fan", "U2": "mei", "U9": "fan"}, "WANDA_SLACK_NAMES gives fan to more than one id"),
+    ({"U1": "fan", "U2": "Fan"}, "WANDA_SLACK_NAMES gives fan to more than one id"),
+    ({"U1": "fan", "U2": "mei", "U9": "jane"}, "WANDA_SLACK_NAMES names U9, which is not in "
+                                               "WANDA_SLACK_OWNER_USER_IDS"),
+])
+def test_a_name_that_leads_to_no_one_allowed_id_is_refused(names, said):
+    """The clock opens the DM of whoever asked for a reminder by the name the
+    reminder gives: a name on a second id, off the allowlist or not, could
+    open someone else's, with the household's memory in the session."""
+    c = Config(_env_file=None, slack_owner_user_ids="U1,U2", slack_names=names, tz="America/Los_Angeles")
+    got = vault.settings_problem(c)
+    assert got is not None and got.startswith(said), got
+
+
 def test_sessions_at_once_are_one_unless_set(monkeypatch):
     """One at a time by default; compose passes a setting .env leaves empty
     as an empty string, which is the default too."""

@@ -94,8 +94,8 @@ def texts() -> list[tuple[str, str]]:
         ("triage system prompt", triage_system_prompt()),
         ("triage batch", build_batch_prompt([EMAIL])[0]),
         ("wanda slack help", slack_help()),
-        ("clock, morning look", clock.Wake("k", "mei", clock.MORNING.format(
-            weekday="Thursday", time="08:00", speaker="mei")).arrival(
+        ("clock, morning look", clock.Wake("k", "U2", clock.MORNING.format(
+            weekday="Thursday", time="08:00", speaker="mei")).arrival("mei",
             # the heading and the mark as `mem due --for` prints them
             # (memory/src/due.rs, LOOK_HEAD and STILL_TO_COME)
             ["Come due for mei after 2026-09-30:",
@@ -103,15 +103,15 @@ def texts() -> list[tuple[str, str]]:
              "`trajectory:bbbbbb`  2026-10-01T17:00, today  I undertook to remind mei at 5",
              "    asked by: mei", "    " + rust_str("memory/src/due.rs", "STILL_TO_COME").replace(
                  "{asker}", "mei").replace("{time}", "17:00")])),
-        ("clock, timed undertaking", clock.Wake("k", "fan", "\n    ".join((
+        ("clock, timed undertaking", clock.Wake("k", "U1", "\n    ".join((
             clock.COME_DUE.format(weekday="Thursday", time="17:00"),
             "`trajectory:aaaaaa`  2026-10-01T17:00, today  I undertook to remind fan at 5",
-            "    involves: me; fan", "    asked by: fan"))).arrival()),
+            "    involves: me; fan", "    asked by: fan"))).arrival("fan")),
         # woken again after a session for it was cut short
-        ("clock, timed undertaking woken again", clock.Wake("k", "fan", "\n    ".join((
+        ("clock, timed undertaking woken again", clock.Wake("k", "U1", "\n    ".join((
             clock.COME_DUE.format(weekday="Thursday", time="17:10"),
             "`trajectory:aaaaaa`  2026-10-01T17:00, today  I undertook to remind fan at 5",
-            "    involves: me; fan", "    asked by: fan", clock.AGAIN.format(speaker="fan")))).arrival()),
+            "    involves: me; fan", "    asked by: fan", clock.AGAIN.format(speaker="fan")))).arrival("fan")),
         # the note doctor's command leaves on a reminder it reopens, which the
         # session woken for it reads among the item's notes
         ("doctor's note on a reminder reopened", REOPENED),

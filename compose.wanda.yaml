@@ -46,9 +46,9 @@ services:
       # shell's, which a session also sees
       WANDA_TZ: ${WANDA_TZ:?set it in .env, as America/Los_Angeles}
       TZ: ${WANDA_TZ}
-      # the clock: whose morning gets a look, and when (empty: no looks), and
-      # the hours no look starts in (unset: 21:30-07:00; empty: none, which
-      # the single dash keeps)
+      # the clock: whose morning gets a look, by member id, and when (empty:
+      # no looks), and the hours no look starts in (unset: 21:30-07:00; empty:
+      # none, which the single dash keeps)
       WANDA_MORNINGS: ${WANDA_MORNINGS:-}
       WANDA_QUIET_HOURS: ${WANDA_QUIET_HOURS-21:30-07:00}
       # how many memory sessions run at once, 1 or 2: passed only when .env

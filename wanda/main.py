@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import dataclasses
 import fcntl
 import json
 import logging
@@ -358,24 +359,34 @@ class Processor:
         that minute."""
         looks = clock.mornings(self.cfg.mornings)
         quiet = clock.quiet_hours(self.cfg.quiet_hours)
-        people = clock.people(self.cfg.slack_names, self.cfg.slack_owner_user_ids)
         last_due = float("-inf")
         while True:
             try:
                 now = datetime.now(self.cfg.zone)
                 claimed = lambda p: self.store.get_meta(f"clock:morning:{p}")  # noqa: E731
-                wakes = clock.morning_wakes(now, looks, quiet, claimed)
+                wakes = clock.morning_wakes(now, looks, quiet, claimed, self._called)
                 for person in clock.missed(now, looks, claimed):
                     self._skip_look(person, now)
                 if time.monotonic() - last_due >= DUE_EVERY_S:
                     last_due = time.monotonic()
-                    wakes += await self._due_wakes(now, people)
+                    wakes += await self._due_wakes(now)
                 self._wake(wakes, now)
             except asyncio.CancelledError:
                 raise
             except Exception:
                 log.exception("clock tick failed")
             await asyncio.sleep(CLOCK_TICK_S)
+
+    def _askers(self) -> dict[str, str]:
+        """Each name a reminder's asker can go by, lower case, to the allowed
+        id whose direct message the clock opens for it."""
+        return {self.cfg.slack_names[u].strip().lower(): u
+                for u in self.cfg.slack_owner_user_ids if u in self.cfg.slack_names}
+
+    def _called(self, uid: str) -> str:
+        """The name a session knows the person with this member id by, which
+        the clock's frames say."""
+        return self.cfg.slack_names[uid]
 
     def _skip_look(self, person: str, now: datetime) -> None:
         # a day with no look looks, in Slack, like a look with nothing to say
@@ -384,7 +395,7 @@ class Processor:
             log.warning("clock: no look for %s ran before noon; none today", person)
             self.store.set_meta(f"clock:outcome:{person}", f"{now:%Y-%m-%d %H:%M} skipped")
 
-    async def _due_wakes(self, now: datetime, people: set[str]) -> list[clock.Wake]:
+    async def _due_wakes(self, now: datetime) -> list[clock.Wake]:
         # back to the day before the last check that ran, so what came due
         # while the daemon was down is seen, and kept as a reminder not given
         # if it is too late to wake for; and two days back at least, so an
@@ -397,7 +408,7 @@ class Processor:
         except Exception as e:
             log.warning("clock: the due check was skipped: %s", e)
             return []
-        wakes = clock.due_wakes(now, clock.items(due), people, lambda k: bool(self.store.get_meta(k)),
+        wakes = clock.due_wakes(now, clock.items(due), self._askers(), lambda k: bool(self.store.get_meta(k)),
                                 self._clock_said, lambda item, why: self._lost(item.id, item.by,
                                                                                  item.asked_by, why))
         self.store.set_meta("clock:checked", now.date().isoformat())
@@ -414,8 +425,8 @@ class Processor:
         # what the store holds of the session cut short can read as given,
         # a note that the reminder was given among it, though nothing reached
         # the person, so the session woken again is told
-        wakes = [clock.Wake(w.key, w.person, w.text + "\n    " + clock.AGAIN.format(speaker=w.person),
-                            w.about, w.by) if waking.get(w.key, {}).get("again") else w for w in wakes]
+        wakes = [dataclasses.replace(w, text=w.text + "\n    " + clock.AGAIN.format(speaker=self._called(w.person)))
+                 if waking.get(w.key, {}).get("again") else w for w in wakes]
         self._check_marked(now, due)
         return wakes
 
@@ -503,8 +514,8 @@ class Processor:
         morning = w.key.startswith("clock:morning:")
         before = self.store.get_meta(w.key) or ""
         try:
-            user = {name.lower(): uid for uid, name in self.cfg.slack_names.items()}[w.person]
-            channel = await self.slack.dm_channel(user)
+            called = self._called(w.person)
+            channel = await self.slack.dm_channel(w.person)
             # the person's own DM task, so a reply to them and this never run
             # at once, and an answer Slack refused is retried like any other
             self.store.create_task(None, channel, DM_TASK_KEY, kind="dm", reply_thread=None)
@@ -514,13 +525,11 @@ class Processor:
                 # what came due for them since their last look that ran and
                 # reported; a first look is handed only what is due today
                 after = self._listed(w.person, task) or (now.date() - timedelta(days=1)).isoformat()
-                listed = (await self._mem(now, "due", "--for", w.person, "--after", after,
+                listed = (await self._mem(now, "due", "--for", called, "--after", after,
                                           "--at", f"{now:%H:%M}")).splitlines()
                 # due.rs marks what is later than the look; one whose time has
                 # come while its wake waits is the clock's to give as well
-                listed = clock.still_to_come(
-                    listed, now, clock.people(self.cfg.slack_names, self.cfg.slack_owner_user_ids),
-                    lambda k: bool(self.store.get_meta(k)))
+                listed = clock.still_to_come(listed, now, self._askers(), lambda k: bool(self.store.get_meta(k)))
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -548,7 +557,7 @@ class Processor:
             # one released at a start to be woken again keeps its entry for
             # a refusal to put back, so the next wake is still told
             prior = json.loads(self.store.get_meta("clock:waking") or "{}").get(w.key)
-            waking = {"id": w.about, "by": w.by, "asked": w.person, "task": task["id"],
+            waking = {"id": w.about, "by": w.by, "asked": w.asked, "task": task["id"],
                       "last": None, "before": before}
             self._mark_waking(w.key, waking)
         claimed = utcnow()
@@ -577,7 +586,7 @@ class Processor:
                     self.store.set_meta(f"clock:trying:{w.person}",
                                         f"{now.date().isoformat()} {task['id']} {last} {after}")
                 try:
-                    error = await self.memory_turn(task, w.arrival(listed), now, channel=channel,
+                    error = await self.memory_turn(task, w.arrival(called, listed), now, channel=channel,
                                                    reply_thread=None, owed=False)
                 finally:
                     # however the runner ends, a raise included, and while the
@@ -622,10 +631,10 @@ class Processor:
         elif outcome == "failed":
             # a timed wake is not tried again: its claim stands
             log.warning("clock: %s failed, and the reminder is not tried again", w.key)
-            self._lost(w.about, w.by, w.person, "its session failed")
+            self._lost(w.about, w.by, w.asked, "its session failed")
         else:
             if run["result_text"] and not run["notified"]:
-                self._owe(run["id"], w.about, w.by, w.person)
+                self._owe(run["id"], w.about, w.by, w.asked)
             if then_failed:
                 # an answer Slack has not taken yet is still owed, and is kept
                 # as not given if delivery gives up on it
@@ -682,9 +691,11 @@ class Processor:
                            f"back more than {clock.LATE.seconds // 3600} h after its time")
             del waking[key]
         self.store.set_meta("clock:waking", json.dumps(waking))
-        for person in clock.people(self.cfg.slack_names, self.cfg.slack_owner_user_ids):
-            if trying := self.store.get_meta(f"clock:trying:{person}"):
-                self._listed(person, {"id": int(trying.split(" ")[1])})
+        # every look a crash cut short hands its list's day on, one whose id
+        # has since left WANDA_MORNINGS included
+        for key, trying in self.store.meta_starting("clock:trying:").items():
+            if trying:
+                self._listed(key.removeprefix("clock:trying:"), {"id": int(trying.split(" ")[1])})
 
     def _owe(self, run_id: int, about: str, by: str, asked: str) -> None:
         # a timed wake's answer not posted yet stays owed: if delivery gives up
@@ -1841,10 +1852,8 @@ async def run_daemon(cfg: Config) -> None:
         sys.exit("missing required settings: WANDA_ALERT_CHANNEL (see .env.example)")
     if problem := vault.settings_problem(cfg):
         sys.exit(problem)
-    # a name the clock wakes for has to be one a DM can be opened to, under
-    # one allowed id, at a time a look can run
-    if problem := clock.settings_problem(cfg.mornings, cfg.quiet_hours, cfg.slack_names,
-                                         cfg.slack_owner_user_ids):
+    # a look is for an allowed id, at a time it can run
+    if problem := clock.settings_problem(cfg.mornings, cfg.quiet_hours, cfg.slack_owner_user_ids):
         sys.exit(problem)
     claude_bin = cfg.resolve_claude_bin()
     if not claude_bin:
@@ -1938,7 +1947,7 @@ async def run_doctor(cfg: Config, smoke: bool) -> int:
         f"{u} as {cfg.slack_names[u]}" for u in cfg.slack_owner_user_ids)
         + f"; time zone {cfg.tz}; {cfg.memory_sessions} session(s) at once")
     report("agent tools", True, f"{vault.TOOLS} (memory sessions), {cfg.agent_allowed_tools} (email tasks)")
-    looks = clock.settings_problem(cfg.mornings, cfg.quiet_hours, cfg.slack_names, cfg.slack_owner_user_ids)
+    looks = clock.settings_problem(cfg.mornings, cfg.quiet_hours, cfg.slack_owner_user_ids)
     # the zone is read only once the memory settings have found it good
     report("clock", not (problem or looks), looks or problem or (
         f"{datetime.now(cfg.zone):%Y-%m-%d %H:%M %Z}; mornings "
@@ -1988,9 +1997,9 @@ async def run_doctor(cfg: Config, smoke: bool) -> int:
         running = timedelta(seconds=2 * cfg.agent_timeout_s + vault.HOUSEKEEPING_TIMEOUT_S + stopping
                             + 2 * (vault.SNAPSHOT_TIMEOUT_S + stopping) + 60)
         quiet = clock.quiet_hours(cfg.quiet_hours) if clock_ok else None
-        for person, at in (clock.mornings(cfg.mornings) if clock_ok else {}).items():
-            last = store.get_meta(f"clock:outcome:{person}")
-            report(f"last look for {person}", clock.look_healthy(
+        for uid, at in (clock.mornings(cfg.mornings) if clock_ok else {}).items():
+            last = store.get_meta(f"clock:outcome:{uid}")
+            report(f"last look for {uid} ({cfg.slack_names[uid]})", clock.look_healthy(
                 last, datetime.now(cfg.zone), running, clock.first_start(at, quiet)), last or "none yet")
         # the timed reminders not given, with who asked and why, which their
         # alert leaves out. Its session may have closed the item, and the
