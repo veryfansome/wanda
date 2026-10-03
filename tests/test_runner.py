@@ -8,10 +8,12 @@ import stat
 import sys
 import time
 import uuid
+from datetime import datetime
 from pathlib import Path
 
 import pytest
 
+from wanda import vault
 from wanda.runner import RunnerService
 
 
@@ -313,3 +315,250 @@ def test_what_will_not_stop_when_asked_is_killed(tmp_path):
     finally:
         with contextlib.suppress(ProcessLookupError):
             os.kill(left, signal.SIGKILL)
+
+
+# --- a session whose input stays open (tests/claude_standin.py replays the
+# shapes the pinned CLI wrote for sessions with their input open) ---
+
+STANDIN = Path(__file__).with_name("claude_standin.py")
+
+
+def standin(tmp_path, monkeypatch, **behaviour) -> str:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("STANDIN", json.dumps(behaviour))
+    return make_fake_claude(tmp_path, f'exec "{sys.executable}" "{STANDIN}" "$@"')
+
+
+async def moment(at, vault_dir):
+    """Waits for `at`: seconds, or (what, n, then): until the session's
+    transcript holds n lines recording `what` (a tool's call or result, or
+    the answer), and `then` seconds more."""
+    if not isinstance(at, tuple):
+        await asyncio.sleep(at)
+        return
+    what, n, then = at
+    d = vault.transcripts_dir(vault_dir)
+    for _ in range(800):
+        lines = [x for f in d.glob("*.jsonl") for x in f.read_text().splitlines()] if d.exists() else []
+        if sum(f'"{what}"' in x for x in lines) >= n:
+            break
+        await asyncio.sleep(0.025)
+    await asyncio.sleep(then)
+
+
+class Feed:
+    """What the runner reads a session's added messages from: next(), close()
+    and results, as the product's feed has them. Each text put on `waiting`
+    is handed over in turn, indented as the product frames a message, after
+    `frame_s`, until it is closed; `written` holds those it handed over."""
+
+    def __init__(self, frame_s=0.0):
+        self.waiting: list[str] = []
+        self.written: list[str] = []
+        self.results: list[dict] = []
+        self.closed = False
+        self.more = asyncio.Event()
+        self.frame_s = frame_s
+
+    def poke(self):
+        self.more.set()
+
+    def close(self):
+        self.closed = True
+        self.more.set()
+
+    async def next(self):
+        while not self.closed:
+            if not self.waiting:
+                self.more.clear()
+                await self.more.wait()
+                continue
+            await asyncio.sleep(self.frame_s)
+            if self.closed:
+                break
+            self.written.append(self.waiting.pop(0))
+            return "    " + self.written[-1]
+        return None
+
+
+def streamed(tmp_path, fake, added=(), timeout_s=20, frame_s=0.0):
+    """One session started with "    first", and each (moment, text) of
+    `added` given to its feed at that moment."""
+    vault_dir = tmp_path / "vault"
+    vault_dir.mkdir(exist_ok=True)
+    feed = Feed(frame_s)
+
+    async def go():
+        async def arrive():
+            for at, text in added:
+                await moment(at, vault_dir)
+                feed.waiting.append(text)
+                feed.poke()
+        arriving = asyncio.create_task(arrive())
+        rr = await RunnerService(fake).run("    first", model="m", max_budget_usd=2, timeout_s=timeout_s,
+                                          session_id="s1", cwd=str(vault_dir), feed=feed)
+        await arriving
+        return rr
+    return run(go()), feed
+
+
+def test_a_message_added_while_a_tool_runs_is_in_the_one_answer(tmp_path, monkeypatch):
+    fake = standin(tmp_path, monkeypatch, steps=[1.0, 0.1])
+    rr, feed = streamed(tmp_path, fake, [(("tool_use", 1, 0.1), "and tell me too")])
+    assert rr.ok and len(rr.results) == 1 and feed.written == ["and tell me too"]
+    assert rr.structured["answer"] == "one answer to 2: first | and tell me too"
+
+
+def test_one_added_after_the_last_step_gets_a_further_turn_whose_result_is_the_sessions(tmp_path, monkeypatch):
+    fake = standin(tmp_path, monkeypatch, steps=[0.2], reply_s=1.5)
+    rr, feed = streamed(tmp_path, fake, [(("tool_result", 1, 0.2), "and tell me too")])
+    assert rr.ok and len(rr.results) == 2 and feed.written == ["and tell me too"]
+    assert rr.structured["answer"] == "one answer to 2: first | and tell me too"
+    # each result's figure is the session's so far, as the CLI's are
+    assert rr.cost_usd == 0.02
+
+
+def opening_blocks(tmp_path):
+    """The text blocks of the session's opening message, as its transcript
+    records them."""
+    f = vault.transcripts_dir(tmp_path / "vault") / "s1.jsonl"
+    entries = [json.loads(x) for x in f.read_text().splitlines()]
+    return next(e["message"]["content"] for e in entries if e.get("type") == "user")
+
+
+def test_a_message_waiting_before_the_first_turn_is_not_taken_with_the_prompt(tmp_path, monkeypatch):
+    """Claude Code takes every message waiting when a turn starts into that
+    turn as one: one written before the first turn began would be part of
+    the prompt."""
+    fake = standin(tmp_path, monkeypatch, startup_s=1.0, steps=[0.6, 0.1])
+    rr, feed = streamed(tmp_path, fake, [(0, "and tell me too")])
+    assert rr.ok and feed.written == ["and tell me too"]
+    assert rr.structured["answer"] == "one answer to 2: first | and tell me too"
+    assert [b["text"] for b in opening_blocks(tmp_path)] == ["    first"]
+
+
+def answered_at(tmp_path) -> float:
+    """When the session gave its first answer, by its transcript's clock."""
+    f = vault.transcripts_dir(tmp_path / "vault") / "s1.jsonl"
+    entries = [json.loads(x) for x in f.read_text().splitlines()]
+    return datetime.fromisoformat(next(e["timestamp"] for e in entries
+                                       if (e.get("attachment") or {}).get("type") == "structured_output")).timestamp()
+
+
+def test_the_input_closes_at_the_first_result_while_a_message_is_framed(tmp_path, monkeypatch):
+    fake = standin(tmp_path, monkeypatch, steps=[0.3], reply_s=0.5)
+    rr, feed = streamed(tmp_path, fake, [(("tool_use", 1, 0), "framed too slowly")], frame_s=15)
+    assert rr.ok and len(rr.results) == 1 and time.time() - answered_at(tmp_path) < 1
+    assert feed.written == [] and feed.waiting == ["framed too slowly"]
+
+
+def test_a_notice_of_a_background_commands_end_is_not_a_message(tmp_path, monkeypatch):
+    """Claude Code hands one at a turn's next step, or runs a turn for it after
+    a result, in a mode of its own; a turn for it may say nothing."""
+    results = {}
+    for when in ("mid", "after"):
+        home = tmp_path / when
+        home.mkdir()
+        rr, _ = streamed(home, standin(home, monkeypatch, steps=[0.2], notify=when))
+        results[when] = [r["structured_output"]["answer"] for r in rr.results]
+    assert results == {"mid": ["one answer to 1: first"], "after": ["one answer to 1: first", ""]}
+
+
+def test_nothing_is_added_once_the_session_has_answered(tmp_path, monkeypatch):
+    fake = standin(tmp_path, monkeypatch, steps=[0.1])
+    rr, feed = streamed(tmp_path, fake, [(("structured_output", 1, 0.3), "too late for this one")])
+    assert rr.ok and len(rr.results) == 1 and feed.written == [] and feed.waiting == ["too late for this one"]
+
+
+def test_a_message_written_but_never_run_is_not_in_the_answer(tmp_path, monkeypatch):
+    """Were the CLI to end at the end of its input without running what it had
+    queued, the session would end with the first turn's result alone."""
+    fake = standin(tmp_path, monkeypatch, steps=[0.2], reply_s=1.5, on_eof="drop")
+    rr, feed = streamed(tmp_path, fake, [(("tool_result", 1, 0.2), "and tell me too")])
+    assert rr.ok and len(rr.results) == 1 and feed.written == ["and tell me too"]
+    assert rr.structured["answer"] == "one answer to 1: first"
+
+
+def test_a_failed_last_turn_fails_the_session(tmp_path, monkeypatch):
+    fake = standin(tmp_path, monkeypatch, steps=[0.2], reply_s=1.5, fail="later")
+    rr, feed = streamed(tmp_path, fake, [(("tool_result", 1, 0.2), "and tell me too")])
+    assert not rr.ok and len(rr.results) == 2 and "error_during_execution" in rr.error
+
+
+def test_an_exit_after_a_successful_result_fails_the_session_without_its_report(tmp_path, monkeypatch):
+    """Ended from outside, or by a crash, in a later turn that gave no result:
+    the answer already given stays among the results, and the error names
+    the exit, never the report a success carries."""
+    fake = standin(tmp_path, monkeypatch, steps=[0.2], reply_s=1.5, crash="later")
+    rr, feed = streamed(tmp_path, fake, [(("tool_result", 1, 0.2), "and tell me too")])
+    assert not rr.ok and rr.envelope is None and rr.exit_code == 1
+    assert rr.error == "claude exited 1 after its last result"
+    assert [r["structured_output"]["answer"] for r in rr.results] == ["one answer to 1: first"]
+
+
+def test_long_lines_and_a_loud_stderr_do_not_stall_it(tmp_path, monkeypatch):
+    fake = standin(tmp_path, monkeypatch, steps=[0.1], big=300_000, stderr=300_000)
+    rr, _ = streamed(tmp_path, fake)
+    assert rr.ok and len(rr.results) == 1
+
+
+def test_a_streamed_session_past_its_time_is_killed(tmp_path, monkeypatch):
+    fake = standin(tmp_path, monkeypatch, hang=True)
+    start = time.monotonic()
+    rr, feed = streamed(tmp_path, fake, [(0.2, "never handed")], timeout_s=2)
+    assert rr.timed_out and rr.cost_usd == 2 and time.monotonic() - start < 15
+    assert feed.written == ["never handed"] and rr.results == []
+
+
+def test_a_streamed_session_reads_its_input_and_output_as_streams(tmp_path):
+    args = tmp_path / "args"
+    fake = make_fake_claude(
+        tmp_path,
+        f'for a in "$@"; do printf "%s\\n" "$a"; done > {args}\n'
+        'echo \'{"type":"result","subtype":"success","is_error":false,"result":"ok","total_cost_usd":0.1,'
+        '"session_id":"s1"}\'\ncat > /dev/null',
+    )
+    rr = run(RunnerService(fake).run("x", model="m", max_budget_usd=1, timeout_s=10, feed=Feed()))
+    argv = args.read_text().splitlines()
+    assert argv[argv.index("--input-format") + 1] == "stream-json"
+    assert argv[argv.index("--output-format") + 1] == "stream-json" and "--verbose" in argv
+    assert rr.ok and len(rr.results) == 1
+
+
+def test_what_a_streamed_session_leaves_running_is_ended(tmp_path, monkeypatch):
+    fake = standin(tmp_path, monkeypatch, steps=[0.1], leave=True)
+    vault_dir = tmp_path / "vault"
+    vault_dir.mkdir()
+    rr = run(RunnerService(fake).run("    first", model="m", max_budget_usd=2, timeout_s=20, session_id="s1",
+                                     cwd=str(vault_dir), feed=Feed(), mark="MEM_SESSION=s1"))
+    left = int((tmp_path / "left.pid").read_text())
+    time.sleep(0.2)
+    with pytest.raises(ProcessLookupError):
+        os.kill(left, 0)
+    assert rr.ok
+
+
+def test_an_output_it_cannot_read_fails_the_session(tmp_path, monkeypatch):
+    monkeypatch.setattr("wanda.runner.STREAM_LINE_LIMIT", 64 * 1024)
+    fake = standin(tmp_path, monkeypatch, steps=[0.1], big=300_000)
+    rr, _ = streamed(tmp_path, fake)
+    assert not rr.ok and rr.error.startswith("could not read the session's output")
+
+
+@pytest.mark.parametrize("shape, said", [
+    ({"event": {"type": "a_new_kind_of_event"}}, "an event of a type this runner does not know: 'a_new_kind_of_event'"),
+    ({"result_without": "is_error"}, "a result without is_error"),
+    ({"result_without": "result"}, "a result without result"),
+    ({"event": {"type": "rate_limit_event", "rate_limit_info": {}}}, None),
+])
+def test_a_stream_shape_it_does_not_know_fails_the_session(tmp_path, monkeypatch, shape, said):
+    """The harness reads Claude Code's output in the shapes of the version
+    the product pins: an event or a result in another fails the session,
+    which the household is told, rather than being read as if nothing had
+    changed. An event of a type that version writes is read past."""
+    fake = standin(tmp_path, monkeypatch, steps=[0.3, 0.1], **shape)
+    rr, _ = streamed(tmp_path, fake)
+    if said is None:
+        assert rr.ok and len(rr.results) == 1
+    else:
+        assert not rr.ok and rr.error == f"could not read the session's output: {said}"

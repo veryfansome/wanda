@@ -27,8 +27,12 @@ ENV HOME=/home/wanda \
     PATH=/home/wanda/.local/bin:/opt/wanda/bin:/usr/local/bin:/usr/bin:/bin \
     DISABLE_AUTOUPDATER=1
 # the CLI version the lab's runs record (lab/harness/src/bin/run.rs prints
-# `claude --version`); changed when a lab round moves to another. Before the
-# code, so an upgrade that changes only the code reuses it.
+# `claude --version`); changed when a lab round moves to another. A message
+# added while a session works rests on this version's undocumented output and
+# transcript shapes, which tests/test_claude_shapes.py reads in a binary and
+# live sessions confirm in the scratch project compose.foldin-check.yaml sets
+# up: a move waits for both. Before the code, so an upgrade that changes only
+# the code reuses it.
 ARG CLAUDE_VERSION=2.1.268
 RUN curl -fsSL https://claude.ai/install.sh | bash -s "$CLAUDE_VERSION" \
  && mkdir -p /home/wanda/.claude/projects

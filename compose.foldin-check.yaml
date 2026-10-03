@@ -1,0 +1,45 @@
+# Live checks of a message added while a session works, and the re-check a
+# move of CLAUDE_VERSION waits for, laid over compose.wanda.yaml in a project
+# of their own, so that the household's vault, run store, home directory,
+# transcripts and image are left alone. The name below takes the place of
+# compose.wanda.yaml's even when -p is left out, so the vault and the run
+# store are this project's own named volumes, wanda-foldin-check_vault and
+# wanda-foldin-check_store, the only ones `down -v` here can remove; the home
+# directory and the transcripts are a directory of its own; and the image is
+# its own, so a re-check's build never retags the household's. It runs no
+# morning look, whatever .env says, and no email triage, even once
+# compose.wanda.yaml turns it on; its clock still gives a timed reminder
+# asked for here at its time, while this runs. Only one daemon may hold the
+# Slack app's connection, so the household's is stopped for as long as this
+# runs, and messages sent meanwhile reach this vault and are not remembered.
+# The checks' lines and this daemon's answers stay in the household's
+# conversations, where the household's sessions read them as earlier lines
+# for 12 hours, so a check uses only facts and requests the household keeps.
+# From the household's worktree:
+#
+#   docker compose -f compose.wanda.yaml stop
+#   mkdir -p ~/wanda-foldin-check/transcripts
+#   C="docker compose -p wanda-foldin-check -f compose.wanda.yaml -f compose.foldin-check.yaml"
+#   $C build --build-arg CLAUDE_VERSION=<the version checked>    a re-check only
+#   $C up -d
+#   ... the checks; then
+#   $C down -v --rmi all && rm -rf ~/wanda-foldin-check
+#   docker compose -f compose.wanda.yaml start
+name: wanda-foldin-check
+services:
+  wanda:
+    image: wanda-foldin-check
+    environment:
+      WANDA_MORNINGS: ""
+      WANDA_EMAIL_TRIAGE: "off"
+    volumes:
+      - type: bind
+        source: ~/wanda-foldin-check
+        target: /srv/wanda/home
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ~/wanda-foldin-check/transcripts
+        target: /home/wanda/.claude/projects
+        bind:
+          create_host_path: false
