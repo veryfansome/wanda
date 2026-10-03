@@ -41,10 +41,14 @@ services:
       WANDA_ALERT_CHANNEL: ${WANDA_ALERT_CHANNEL:?set it in .env, to a private channel or fan's user id}
       WANDA_SLACK_OWNER_USER_IDS: ${WANDA_SLACK_OWNER_USER_IDS:?set it in .env}
       WANDA_SLACK_NAMES: ${WANDA_SLACK_NAMES:?set it in .env, as U0123:fan,U0456:mei}
-      # the household's zone: the local time a session's shell gives, and the
-      # day a `mem` call made by hand dates its writes
+      # the household's day: the date and time a session is given, and the
+      # shell's, which a session also sees
       WANDA_TZ: ${WANDA_TZ:?set it in .env, as America/Los_Angeles}
       TZ: ${WANDA_TZ}
+      # how many memory sessions run at once, 1 or 2: passed only when .env
+      # sets it, so that unset, or set empty, the default in wanda/config.py
+      # holds
+      WANDA_MEMORY_SESSIONS:
       # on: add WANDA_ICLOUD_EMAIL, WANDA_ICLOUD_APP_PASSWORD and
       # WANDA_EMAIL_TRIAGE_SLACK_CHANNEL_ID here, as above
       WANDA_EMAIL_TRIAGE: "off"

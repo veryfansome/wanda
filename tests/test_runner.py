@@ -1,8 +1,16 @@
 import asyncio
 import contextlib
+import fcntl
 import json
+import os
+import signal
 import stat
+import sys
 import time
+import uuid
+from pathlib import Path
+
+import pytest
 
 from wanda.runner import RunnerService
 
@@ -129,3 +137,179 @@ def test_no_append_system_prompt_unless_given(tmp_path):
     fake, args = recording_claude(tmp_path)
     run(RunnerService(fake).run("x", model="m", max_budget_usd=1, timeout_s=10))
     assert "--append-system-prompt" not in args.read_text().splitlines()
+
+
+def test_a_whole_environment_replaces_the_daemons(tmp_path, monkeypatch):
+    """inherit_env=False hands the child exactly what it was given."""
+    monkeypatch.setenv("WANDA_SLACK_BOT_TOKEN", "xoxb-secret")
+    seen = tmp_path / "env"
+    fake = make_fake_claude(tmp_path, f"cat > /dev/null\nenv > {seen}\n"
+                            'echo \'{"type":"result","is_error":false,"result":"ok","session_id":"s1"}\'')
+    run(RunnerService(fake).run("x", model="m", max_budget_usd=1, timeout_s=10,
+                                env={"PATH": "/usr/bin:/bin", "MEM_DATE": "2026-10-01"}, inherit_env=False))
+    child = seen.read_text()
+    assert "MEM_DATE=2026-10-01" in child and "xoxb-secret" not in child
+    run(RunnerService(fake).run("x", model="m", max_budget_usd=1, timeout_s=10, env={"MEM_DATE": "d"}))
+    assert "xoxb-secret" in seen.read_text(), "by default the child inherits the daemon's environment"
+
+
+# A stand-in for claude that runs one Bash command with the CLI's environment,
+# in a session of its own, as Claude Code's code asks (detached), or, with
+# OWN_SESSION=0, in claude's own, where a command can also be left; ends
+# only the command's shell after RUN_FOR seconds, as Claude Code ends a
+# background command's after the session's result, or any command's at its
+# Bash timeout with background tasks off, then waits THEN seconds and answers.
+STAND_IN = """import json, os, subprocess, sys, time
+sys.stdin.read()
+shell = subprocess.Popen(["/bin/sh", "-c", os.environ["COMMAND"]],
+                         start_new_session=os.environ.get("OWN_SESSION") != "0",
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+time.sleep(float(os.environ["RUN_FOR"]))
+shell.kill()
+shell.wait()
+time.sleep(float(os.environ["THEN"]))
+print(json.dumps({"type": "result", "is_error": False, "result": "ok", "session_id": "s1"}))
+"""
+# A `mem` write, as `mem` takes the vault for one: held exclusively, waited for.
+WAITING_MEM = """import fcntl, os
+vault = os.environ["MEM_VAULT"]
+fcntl.flock(os.open(vault, os.O_RDONLY), fcntl.LOCK_EX)
+open(os.path.join(vault, "node.md"), "w").write("written after its session")
+"""
+NO_PROC = pytest.mark.skipif(not Path("/proc").is_dir(),
+                             reason="what a command started in a session of its own carries is read from /proc")
+
+
+def stand_in(tmp_path) -> str:
+    (tmp_path / "stand_in.py").write_text(STAND_IN)
+    return make_fake_claude(tmp_path, f'exec "{sys.executable}" "{tmp_path / "stand_in.py"}"')
+
+
+def running(pid: int) -> bool:
+    """Not ended, a zombie counting as ended."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    stat_file = Path(f"/proc/{pid}/stat")
+    with contextlib.suppress(OSError):
+        return stat_file.read_text().rsplit(")", 1)[1].split()[0] != "Z"
+    return True
+
+
+def gone_soon(pid: int) -> bool:
+    deadline = time.monotonic() + 3
+    while running(pid) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    return not running(pid)
+
+
+def session(tmp_path, command: str, ending: str, own_session: bool, mark: bool):
+    """Runs the stand-in to `ending`, its command leaving a process behind
+    that writes its pid to `pid`; returns that pid."""
+    sid = str(uuid.uuid4())
+    env = {"COMMAND": command, "MEM_SESSION": sid, "OWN_SESSION": "1" if own_session else "0",
+           "RUN_FOR": "0.5", "THEN": "30" if ending in ("timed out", "cancelled") else "0",
+           "MEM_VAULT": str(tmp_path / "vault")}
+
+    async def go():
+        runner = RunnerService(stand_in(tmp_path))
+        task = asyncio.create_task(runner.run(
+            "x", model="m", max_budget_usd=1, timeout_s=2 if ending == "timed out" else 60, env=env,
+            mark=f"MEM_SESSION={sid}" if mark else None))
+        if ending == "cancelled":
+            await asyncio.sleep(1.5)
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            await asyncio.sleep(0.3)
+        else:
+            rr = await task
+            assert rr.ok == (ending == "finished")
+            if ending == "finished":
+                # what doctor counts: a session that left something running
+                assert (rr.left_running > 0) == mark
+
+    run(go())
+    return int((tmp_path / "pid").read_text())
+
+
+@pytest.mark.parametrize("ending", ["finished", "timed out", "cancelled"])
+@pytest.mark.parametrize("own_session", [False, pytest.param(True, marks=NO_PROC)],
+                         ids=["in claude's session", "in a session of its own"])
+def test_what_a_session_leaves_running_is_ended_when_it_ends(tmp_path, ending, own_session):
+    """Claude Code ends neither a command past its timeout nor what the
+    command started; the session's end does, however the session ends."""
+    left = session(tmp_path, f"sleep 60 & echo $! > {tmp_path / 'pid'}; wait", ending, own_session, mark=True)
+    assert gone_soon(left)
+
+
+@pytest.mark.parametrize("own_session", [False, pytest.param(True, marks=NO_PROC)],
+                         ids=["in claude's session", "in a session of its own"])
+def test_a_mem_waiting_for_the_vault_writes_nothing_after_its_session(tmp_path, own_session):
+    """Held behind a snapshot or a hand-run write, a session's `mem` would
+    otherwise write once the vault is free, after the session was recorded."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (tmp_path / "mem.py").write_text(WAITING_MEM)
+    command = f'"{sys.executable}" "{tmp_path / "mem.py"}" & echo $! > {tmp_path / "pid"}; wait'
+    for mark in (False, True):
+        held = os.open(vault, os.O_RDONLY)
+        fcntl.flock(held, fcntl.LOCK_SH)  # as a snapshot holds it
+        try:
+            left = session(tmp_path, command, "finished", own_session, mark=mark)
+            assert running(left) != mark
+        finally:
+            os.close(held)
+        if not mark:
+            # without the mark nothing ends it: it writes once the vault is free
+            deadline = time.monotonic() + 3
+            while not (vault / "node.md").exists() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert (vault / "node.md").exists()
+            (vault / "node.md").unlink()
+            continue
+        time.sleep(0.5)
+        assert not (vault / "node.md").exists()
+
+
+@NO_PROC
+def test_only_what_the_session_started_is_ended(tmp_path):
+    """Another session's processes, and the daemon's own, carry another mark
+    and sit in other process sessions."""
+    import subprocess
+    other = subprocess.Popen(["sleep", "30"], start_new_session=True,
+                             env=os.environ | {"MEM_SESSION": str(uuid.uuid4())})
+    try:
+        left = session(tmp_path, f"sleep 60 & echo $! > {tmp_path / 'pid'}; wait", "finished", True, mark=True)
+        assert gone_soon(left) and running(other.pid)
+    finally:
+        other.kill()
+        other.wait()
+
+
+def test_what_will_not_stop_when_asked_is_killed(tmp_path):
+    """SIGTERM first, then SIGKILL for whatever ignores it, each wait bounded."""
+    import subprocess
+
+    from wanda.runner import end_left_behind
+
+    ready, pid_file = tmp_path / "ready", tmp_path / "pid"
+    stubborn = (f'"{sys.executable}" -c "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); '
+                f"open('{ready}', 'w').write('x'); time.sleep(60)\" & echo $! > {pid_file}")
+    # a session whose leader has ended, as a finished claude's has
+    leader = subprocess.Popen(["/bin/sh", "-c", stubborn], start_new_session=True, stdin=subprocess.DEVNULL,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    leader.wait()
+    deadline = time.monotonic() + 5
+    while not ready.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    left = int(pid_file.read_text())
+    try:
+        t0 = time.monotonic()
+        assert end_left_behind(leader.pid, f"MEM_SESSION={uuid.uuid4()}", grace_s=0.5) == 1
+        # it outlasted SIGTERM's wait, and SIGKILL ended it
+        assert gone_soon(left) and 0.5 <= time.monotonic() - t0 < 3
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(left, signal.SIGKILL)

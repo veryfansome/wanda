@@ -415,8 +415,8 @@ class Store:
         """Agent outcomes the owner never received: killed by a restart, or
         answered successfully but undeliverable at the time."""
         return self._query(
-            "SELECT r.*, t.reply_thread, t.slack_channel FROM runs r JOIN tasks t ON t.id = r.task_id "
-            "WHERE r.notified=0 ORDER BY r.id LIMIT ?",
+            "SELECT r.*, t.reply_thread, t.slack_channel, t.kind AS task_kind FROM runs r "
+            "JOIN tasks t ON t.id = r.task_id WHERE r.notified=0 ORDER BY r.id LIMIT ?",
             (limit,),
         )
 

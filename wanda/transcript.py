@@ -5,6 +5,9 @@ from datetime import datetime
 
 MENTION_RE = re.compile(r"<@([A-Z0-9]+)(?:\|[^>]*)?>")
 LINK_RE = re.compile(r"<(https?://[^|>]+)(?:\|([^>]*))?>")
+CHANNEL_RE = re.compile(r"<#([A-Z0-9]+)(?:\|([^>]*))?>")
+SPECIAL_RE = re.compile(r"<!([a-z]+)[^|>]*(?:\|([^>]*))?>")
+OTHER_RE = re.compile(r"<([^<>|]+)(?:\|([^<>]*))?>")
 BODY_LIMIT = 1200
 
 
@@ -20,6 +23,20 @@ def humanize(text: str, names: dict[str, str]) -> str:
     becomes @alice, <url|label> becomes label (url)."""
     text = MENTION_RE.sub(lambda m: "@" + names.get(m.group(1), m.group(1)), text or "")
     return LINK_RE.sub(lambda m: f"{m.group(2) or m.group(1)} ({m.group(1)})", text)
+
+
+def plain(text: str, names: dict[str, str]) -> str:
+    """A message as its writer saw it on screen, which is what a memory
+    session is handed as their words: names for mentions, a link once, channel
+    and @here references as written, and none of the &amp; &lt; &gt; escaping
+    Slack sends. A raw <@U123> recorded as a name is a person nobody knows."""
+    text = LINK_RE.sub(lambda m: m.group(1) if m.group(2) in (None, "", m.group(1))
+                       else f"{m.group(2)} ({m.group(1)})", text or "")
+    text = humanize(text, names)
+    text = CHANNEL_RE.sub(lambda m: "#" + (m.group(2) or m.group(1)), text)
+    text = SPECIAL_RE.sub(lambda m: m.group(2) or "@" + m.group(1), text)
+    text = OTHER_RE.sub(lambda m: m.group(2) or m.group(1).removeprefix("mailto:"), text)
+    return text.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
 
 
 def user_ids_in(messages: list[dict]) -> set[str]:

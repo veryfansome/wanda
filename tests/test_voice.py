@@ -14,13 +14,15 @@ from pathlib import Path
 
 import pytest
 
-from wanda import slack_cli
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+from wanda import slack_cli, vault
 from wanda.main import (
     ANCHOR,
     HOW_TO_REPLY,
     addressed_to_me,
     agent_seed_prompt,
-    conversation_seed_prompt,
     triage_system_prompt,
 )
 from wanda.triage import build_batch_prompt
@@ -64,9 +66,20 @@ def slack_help() -> str:
 def texts() -> list[tuple[str, str]]:
     found = [
         ("email seed", agent_seed_prompt(EMAIL, "summarize it")),
-        ("conversation seed", conversation_seed_prompt({"kind": "dm", "text": "hi"}, "(none)", "alice")),
         ("later turn", addressed_to_me("alice", "hi")),
         ("anchor", ANCHOR),
+        ("memory system prompt", f"{ANCHOR}\n\n" + vault.date_paragraph(
+            datetime(2026, 10, 1, 9, 5, tzinfo=ZoneInfo("America/Los_Angeles")))),
+        ("memory prompt", vault.prompt("2026-10-01", "(the arrival)")),
+        ("memory frame, dm alone", vault.arrival_text("dm", "alice", "hi", [], [])),
+    ]
+    for place in vault.PLACES:
+        found.append((f"memory frame, {place}", vault.arrival_text(
+            place, "alice", "hi", ["alice", "bob" + vault.GUEST, "Alice" + vault.NAMESAKE],
+            [("Wed 2026-09-30 21:40", "bob", "earlier"), ("09:05", vault.ME, "reply")])))
+    found.append(("memory frame, a turn of two speakers", vault.arrival_text(
+        "group", "alice", "hi", ["alice", "bob"], [("09:05", "bob", "earlier")], also=["bob"])))
+    found += [
         ("triage system prompt", triage_system_prompt()),
         ("triage batch", build_batch_prompt([EMAIL])[0]),
         ("wanda slack help", slack_help()),
@@ -165,12 +178,8 @@ def test_procedures_carry_no_first_person_word(text):
     )
 
 
-@pytest.mark.parametrize("seed", [
-    agent_seed_prompt(EMAIL, "x"),
-    conversation_seed_prompt({"kind": "dm", "text": "hi"}, "(none)", "alice"),
-], ids=["email seed", "conversation seed"])
-def test_the_seeds_keep_the_procedure_in_its_own_paragraph(seed):
-    assert f"\n\n{HOW_TO_REPLY}\n" in seed
+def test_the_email_seed_keeps_the_procedure_in_its_own_paragraph():
+    assert f"\n\n{HOW_TO_REPLY}\n" in agent_seed_prompt(EMAIL, "x")
 
 
 def test_every_text_is_read():
@@ -182,7 +191,7 @@ def test_every_text_is_read():
 
 def test_seeds_and_triage_say_who_she_is():
     assert agent_seed_prompt(EMAIL, "x").startswith("I am wanda, ")
-    assert conversation_seed_prompt({"kind": "dm", "text": "hi"}, "", "alice").startswith("I am wanda, ")
+    assert vault.prompt("2026-10-01", "(the arrival)").startswith("I am wanda.\n\n")
     assert triage_system_prompt().startswith(ANCHOR + "\n\n")
 
 

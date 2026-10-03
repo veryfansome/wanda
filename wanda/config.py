@@ -3,6 +3,7 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 from typing import Annotated, Literal
+from zoneinfo import ZoneInfo
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
@@ -43,7 +44,7 @@ class Config(BaseSettings):
     # channel.
     alert_channel: str = ""
     # Who may start a session. The daemon refuses to start with it empty: a
-    # session has a shell (README, Trust assumption).
+    # session reads the household's whole memory.
     slack_owner_user_ids: CsvList = Field(default_factory=list)
     # Slack user id to the name the vault knows that person by, "U0123:fan".
     # A display name can change, and a second spelling of a person in a
@@ -84,11 +85,23 @@ class Config(BaseSettings):
 
     # daemon
     data_dir: Path = Path("~/.wanda")
+    # The vault, when it is not the data directory's vault/. In Docker it is a
+    # named volume apart from the data directory, which is on the Mac's mount:
+    # a `mem` call takes hundredths of a second on the volume, seconds there.
+    vault: str = ""
     # Where the run store (wanda.db), its dry-run twin and the daemon's lock
     # live, when not in the data directory. In Docker a named volume of its
     # own, which the Mac cannot reach: SQLite's locks do not cross the Mac's
     # mount, and a read there while the daemon writes can corrupt the store.
     run_store: str = ""
+    # How many memory sessions run at once, 1 or 2; email task sessions take
+    # the same places. One unless set: two sessions that overlap can each meet
+    # what the other is writing before it ends, and with one a conversation
+    # waits for another's session instead.
+    memory_sessions: int = 1
+    # The household's time zone, e.g. America/Los_Angeles: the date and time
+    # every memory session is told, and when its day turns over.
+    tz: str = ""
     idle_timeout_s: int = 720  # re-issue IDLE well under RFC 2177's 29-minute cap
     poll_fallback_s: int = 180
     snippet_bytes: int = 4096
@@ -110,6 +123,18 @@ class Config(BaseSettings):
                 raise ValueError("expected id:name pairs, comma-separated")
             return {i.strip(): n.strip() for i, n in pairs}
         return v
+
+    @field_validator("memory_sessions", mode="before")
+    @classmethod
+    def _default_when_empty(cls, v: object) -> object:
+        # compose passes a setting .env leaves empty as "", which means unset
+        if isinstance(v, str) and not v.strip():
+            return cls.model_fields["memory_sessions"].default
+        return v
+
+    @property
+    def zone(self) -> ZoneInfo:
+        return ZoneInfo(self.tz)
 
     @property
     def alerts_to(self) -> str:
@@ -135,6 +160,17 @@ class Config(BaseSettings):
     @property
     def lock_path(self) -> Path:
         return self.run_store_dir / "wanda.lock"
+
+    @property
+    def vault_dir(self) -> Path:
+        return Path(self.vault).expanduser() if self.vault else self.expanded_data_dir / "vault"
+
+    @property
+    def snapshots_dir(self) -> Path:
+        """A bare repository in the data directory, never inside the vault:
+        the vault's own .git stays empty, and its history is not one `git log`
+        away."""
+        return self.expanded_data_dir / "snapshots.git"
 
     def resolve_claude_bin(self) -> str | None:
         return self.claude_bin or shutil.which("claude")

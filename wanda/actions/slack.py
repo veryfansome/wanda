@@ -16,6 +16,7 @@ from wanda.store import Store
 from wanda.tls import ssl_context
 from wanda.transcript import trim_thread
 from wanda.triage import Verdict
+from wanda.vault import ALERT_EVENT, NOTE_EVENT
 
 log = logging.getLogger(__name__)
 
@@ -26,10 +27,6 @@ SNIPPET_LIMIT = 1500
 TEXT_LIMIT = 3500  # well under Slack's 40k text cap, and headers can be huge
 MISSING_THREAD_ERRORS = {"thread_not_found", "message_not_found", "channel_not_found"}
 MAX_CONTEXT_PAGES = 10  # bounds a very long thread at ~2000 messages
-# The mark the harness posts its alerts with (Slack message metadata). An
-# alert is for the people who keep wanda running, not something she said,
-# and the mark tells it apart.
-ALERT_EVENT = "wanda_alert"
 
 
 def truncate_text(text: str) -> str:
@@ -67,7 +64,7 @@ class SlackActions:
         )
         self._pace = asyncio.Lock()
         self._last_call = 0.0
-        self._user_cache: dict[str, str] = {}
+        self._users: dict[str, dict] = {}
         self._own_ids: frozenset[str] = frozenset()
 
     async def _call(self, method: str, /, **kwargs):
@@ -125,15 +122,18 @@ class SlackActions:
                 return m["ts"]
         return None
 
-    async def reply(self, thread_ts: str | None, text: str, *, channel: str) -> None:
+    async def reply(self, thread_ts: str | None, text: str, *, channel: str, note: bool = False) -> None:
         """Both arguments are required and neither defaults. A default channel
         would silently publish a DM answer in the triage channel the one time a
-        caller forgot it — which is exactly what happened before."""
+        caller forgot it — which is exactly what happened before. `note` marks
+        a failure note, which frames leave out."""
         await self._call(
             "chat_postMessage",
             channel=channel,
             thread_ts=thread_ts,
             text=text[:39000],
+            **({"metadata": {"event_type": NOTE_EVENT, "event_payload": {"for": "the household"}}}
+               if note else {}),
         )
 
     # --- conversation context ---
@@ -141,15 +141,17 @@ class SlackActions:
     async def fetch_context(self, channel: str, thread_ts: str | None, limit: int) -> list[dict]:
         """The most RECENT messages, oldest first. A thread reads its replies;
         a channel or DM reads its history."""
+        # with the metadata, which is where the harness marks its alerts
         if not thread_ts:
-            resp = await self._call("conversations_history", channel=channel, limit=limit)
+            resp = await self._call("conversations_history", channel=channel, limit=limit,
+                                    include_all_metadata=True)
             return list(reversed(resp.get("messages") or []))  # history is newest first
         # conversations.replies pages FORWARD from the parent, so a bare limit
         # returns the start of a long thread and drops what was just said.
         msgs: list[dict] = []
         cursor = None
         for _ in range(MAX_CONTEXT_PAGES):
-            kwargs = {"channel": channel, "ts": thread_ts, "limit": 200}
+            kwargs = {"channel": channel, "ts": thread_ts, "limit": 200, "include_all_metadata": True}
             if cursor:
                 kwargs["cursor"] = cursor
             resp = await self._call("conversations_replies", **kwargs)
@@ -171,24 +173,74 @@ class SlackActions:
                 log.warning("could not look up wanda's own Slack ids")
         return self._own_ids
 
+    async def users(self, user_ids: set[str]) -> dict[str, dict]:
+        """users.info for each id found, kept for the process lifetime. A
+        lookup that fails is not kept, so a passing failure costs one message
+        its names rather than leaving someone unnamed until a restart."""
+        for uid in user_ids - self._users.keys():
+            try:
+                self._users[uid] = (await self._call("users_info", user=uid)).get("user") or {}
+            except Exception:
+                log.warning("could not look up Slack user %s", uid)
+        return {uid: self._users[uid] for uid in user_ids if uid in self._users}
+
     async def user_names(self, user_ids: set[str]) -> dict[str, str]:
         """Resolve ids to display names, cached for the process lifetime."""
-        for uid in user_ids - self._user_cache.keys():
-            try:
-                resp = await self._call("users_info", user=uid)
-                u = resp.get("user") or {}
-                prof = u.get("profile") or {}
-                self._user_cache[uid] = (
-                    prof.get("display_name") or prof.get("real_name") or u.get("name") or uid
-                )
-            except Exception:
-                self._user_cache[uid] = uid  # deleted user, or missing users:read
-        return self._user_cache
+        names = {}
+        for uid, u in (await self.users(user_ids)).items():
+            prof = u.get("profile") or {}
+            names[uid] = prof.get("display_name") or prof.get("real_name") or u.get("name") or uid
+        return names
+
+    async def members(self, channel: str) -> list[str]:
+        """Who can read what is posted in a conversation. A channel's members
+        read its threads too, whether or not they have said anything there."""
+        ids: list[str] = []
+        cursor = None
+        for _ in range(MAX_CONTEXT_PAGES):
+            kwargs = {"channel": channel, "limit": 200}
+            if cursor:
+                kwargs["cursor"] = cursor
+            resp = await self._call("conversations_members", **kwargs)
+            ids.extend(resp.get("members") or [])
+            cursor = ((resp.get("response_metadata") or {}).get("next_cursor") or "").strip()
+            if not cursor:
+                break
+        return ids
+
+    async def channel_type(self, channel: str) -> str:
+        """A conversation's type as message events name it: im, mpim, group
+        (a private channel) or channel (a public one)."""
+        c = (await self._call("conversations_info", channel=channel)).get("channel") or {}
+        if c.get("is_im"):
+            return "im"
+        if c.get("is_mpim"):
+            return "mpim"
+        return "group" if c.get("is_private") else "channel"
+
+    async def workspace(self) -> list[dict]:
+        """Everyone in this Slack (users.list): who can open a public channel
+        without joining it. Read each time it is asked, so that someone who
+        joined the Slack a minute ago counts: a turn in a public channel is
+        rare, and the household's Slack is a page of a few accounts."""
+        people: list[dict] = []
+        cursor = None
+        for _ in range(MAX_CONTEXT_PAGES):
+            kwargs = {"limit": 200}
+            if cursor:
+                kwargs["cursor"] = cursor
+            resp = await self._call("users_list", **kwargs)
+            people.extend(resp.get("members") or [])
+            cursor = ((resp.get("response_metadata") or {}).get("next_cursor") or "").strip()
+            if not cursor:
+                break
+        return people
 
     async def alert(self, text: str) -> None:
         await self._call(
             "chat_postMessage", channel=self.cfg.alerts_to,
             text=truncate_text(f"⚠️ {text}"),
+            # the mark that keeps it out of every frame's earlier lines
             metadata={"event_type": ALERT_EVENT, "event_payload": {"for": "the household"}},
         )
 

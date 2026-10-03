@@ -13,11 +13,12 @@ import subprocess
 import sys
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import IO
 
-from wanda import slack_cli
+from wanda import slack_cli, vault
 from wanda.actions.mailbox import MOVED, move_to_trash
 from wanda.actions.slack import SlackActions
 from wanda.config import Config, load_config
@@ -25,7 +26,7 @@ from wanda.events import Event
 from wanda.runner import RunnerService, RunResult
 from wanda.store import Store, utcnow
 from wanda.tls import ssl_context
-from wanda.transcript import render, user_ids_in
+from wanda.transcript import user_ids_in
 from wanda.triage import (
     VERDICT_SCHEMA,
     Verdict,
@@ -53,6 +54,14 @@ MAX_DELIVERY_ATTEMPTS = 8
 RETRY_BASE_S = 60          # backoff 1, 2, 4, 8, 16, 30, 30, 30 minutes
 RETRY_MAX_S = 1800
 DEFER_S = 900  # how long a rate-capped trash waits before the cap is re-tested
+# The local hour from which the snapshots' housekeeping may run. Past git's
+# threshold it packs every loose object over the Mac's mount, for a minute or
+# two in which every snapshot waits, and with it a turn: at this hour the
+# household is asleep.
+HOUSEKEEPING_HOUR = 3
+# How long the look at snapshots.git before the housekeeping may take: it
+# reads one small file over the Mac's mount, in milliseconds.
+SNAPSHOTS_LOOK_S = 10
 # How long a start that cannot open or write the run store waits before it
 # tries again.
 STORE_RETRY_S = 60
@@ -135,32 +144,10 @@ def agent_seed_prompt(row, instruction: str) -> str:
     )
 
 
-def conversation_seed_prompt(p: dict, transcript: str, asker: str) -> str:
-    """Seed for a mention or DM: who addressed wanda, where, and what was
-    being discussed."""
-    if p["kind"] == "dm":
-        where = "a group direct message" if p.get("channel_type") == "mpim" else "a direct message"
-    else:
-        where = "a thread in a Slack channel" if p.get("in_thread") else "a Slack channel"
-    return (
-        f"I am wanda, a helpful assistant in my owner's Slack workspace. "
-        f"{sanitize(asker)} has just addressed me in {where}.\n"
-        f"{UNTRUSTED_NOTE}\n"
-        f"{HOW_TO_REPLY}\n"
-        "Recent conversation, oldest first:\n"
-        "<transcript>\n"
-        # Escaped like the email seed: anyone in the workspace can write these
-        # lines, and an unescaped </transcript> would forge harness framing.
-        f"{sanitize(transcript)}\n"
-        "</transcript>\n\n"
-        f"{addressed_to_me(asker, p['text'])}"
-    )
-
-
 def addressed_to_me(asker: str, text: str) -> str:
-    """The frame for a message someone sent wanda. A conversation seed ends
-    with one and every later turn of a session is one, so an "I" in the
-    sender's words stays theirs."""
+    """The frame for the owner's message in an email task's thread. Every
+    later turn of that session is one, so an "I" in the sender's words stays
+    theirs."""
     return f"The message addressed to me, from {sanitize(asker)}:\n{sanitize(text)}"
 
 
@@ -183,6 +170,14 @@ class Processor:
         self._inflight_runs = 0
         self._inflight_usd = 0.0
         self._delivering: set[int] = set()
+        # per conversation task, the messages waiting for its next turn
+        self._waiting: dict[int, list[dict]] = {}
+        # conversations already given a restart notice in this shutdown
+        self._noticed: set[int] = set()
+        # conversations already logged as having someone else in them
+        self._outside: set[str] = set()
+        # the look at snapshots.git the housekeeping waits on (_housekeep)
+        self._snapshots_look: asyncio.Future | None = None
 
     async def loop(self) -> None:
         """Mail pipeline only. Owner commands are consumed by slack_loop on a
@@ -221,6 +216,8 @@ class Processor:
             except asyncio.QueueEmpty:
                 break
             pl = ev.payload
+            if pl.get("kind") == "deleted":
+                continue
             if pl.get("kind") in CONVERSATION_KINDS:
                 # No task row yet (it is created during handling), so make one
                 # now — otherwise this acked, deduped trigger vanishes silently.
@@ -228,6 +225,12 @@ class Processor:
                                        reply_thread=pl.get("reply_thread"))
             task = self.store.get_task_by_thread(pl["channel"], pl["task_key"])
             if task is None:
+                continue
+            # a memory conversation gets one notice, and only where it is known to
+            # be the household's: a 1:1 DM, read by the one who wrote
+            if task["kind"] != "email" and (
+                    pl.get("channel_type") != "im" or not self._owes_notice(task["id"])):
+                log.info("dropped a message in %s at shutdown", pl["channel"])
                 continue
             log.info("recording dropped trigger in %s", pl["channel"])
             self.store.record_run(
@@ -245,8 +248,9 @@ class Processor:
         await self.deliver_pending()
         await self._flush_abandoned_alert()
         await self._flush_given_up()
-        for kind in ("breaker", "cap"):
+        for kind in ("breaker", "cap", "snapshot", "startup"):
             await self._flush_alert(kind)
+        await self._housekeep()
         if not self.cfg.email_triage:
             return  # mail rows from before triage was turned off stay as they are
         await self.apply_pending()
@@ -534,6 +538,31 @@ class Processor:
         left = [g for g in json.loads(self.store.get_meta("given_up_runs") or "[]") if g["id"] not in named]
         self.store.set_meta("given_up_runs", json.dumps(left))
 
+    async def _housekeep(self) -> None:
+        """The snapshots repository's housekeeping, once a local day, on the
+        mail loop's first pass from HOUSEKEEPING_HOUR in the household's zone;
+        the snapshots themselves leave it out."""
+        now = datetime.now(self.cfg.zone)
+        today = now.date().isoformat()
+        if now.hour < HOUSEKEEPING_HOUR or self.store.get_meta("snapshots_housekept") == today:
+            return
+        # The look goes over the Mac's mount, where a stalled call would hold
+        # the event loop, and with it every Slack event and post. A thread in
+        # such a call cannot be stopped, so one look runs at a time.
+        if self._snapshots_look is None or self._snapshots_look.done():
+            self._snapshots_look = asyncio.ensure_future(asyncio.to_thread(vault.has_snapshots, self.cfg))
+        try:
+            there = await asyncio.wait_for(asyncio.shield(self._snapshots_look), SNAPSHOTS_LOOK_S)
+        except TimeoutError:
+            log.warning("snapshots.git gave no answer in %d s; its housekeeping waits", SNAPSHOTS_LOOK_S)
+            return
+        if not there:
+            return
+        if problem := await asyncio.to_thread(vault.housekeep, self.cfg):
+            log.warning("%s", problem)
+            await self._alert_once("snapshot", f"vault snapshots: {problem}")
+        self.store.set_meta("snapshots_housekept", today)
+
     async def startup_recovery(self) -> None:
         # with triage off, mail rows from before stay as they are
         for row in self.store.fetch_by_status("acting", limit=200) if self.cfg.email_triage else ():
@@ -562,8 +591,18 @@ class Processor:
             text = run["result_text"] or (
                 "⏸ I restarted while working on this — reply again to retry."
             )
+            # a failed run's text is its failure note, marked as when first posted
+            note = bool(run["result_text"]) and run["status"] in ("error", "timeout")
             try:
-                await self.slack.reply(run["reply_thread"], text, channel=run["slack_channel"])
+                if run["task_kind"] != "email" and await self._read_by_others(run["slack_channel"]):
+                    # someone else has come to read the conversation since its
+                    # session ran: what is owed there is not posted, and its
+                    # text stays in the run store
+                    log.warning("not posting run %s in %s: someone besides the household can read it now",
+                                run["id"], run["slack_channel"])
+                    self.store.mark_run_notified(run["id"])
+                    continue
+                await self.slack.reply(run["reply_thread"], text, channel=run["slack_channel"], note=note)
             except Exception:
                 attempts = self.store.bump_delivery_attempt(run["id"])
                 if attempts >= MAX_DELIVERY_ATTEMPTS:
@@ -599,6 +638,9 @@ class Processor:
 
     async def _handle_slack(self, ev: Event) -> None:
         p = ev.payload
+        if p.get("kind") == "deleted":
+            self._withdraw(p["channel"], p["ts"])
+            return
         task = self.store.get_task_by_thread(p["channel"], p["task_key"])
         if task is None:
             if p.get("kind") in CONVERSATION_KINDS:
@@ -616,13 +658,18 @@ class Processor:
                           p["task_key"], p["channel"])
                 return
         state: dict[str, bool] = {}
+        reply = self._run_task_reply if task["kind"] == "email" else self._run_memory_reply
         try:
-            await self._run_task_reply(task, p, state)
+            await reply(task, p, state)
         except asyncio.CancelledError:
             # Cancelled anywhere — queued on the lock or semaphore, mid-run, or
             # while posting. The Slack event id is already committed, so Slack
             # will never redeliver: leave a marker the next start can act on.
-            if not state.get("recorded"):
+            # a memory conversation owes one notice for all its waiting messages,
+            # and none where it was not found to be the household's
+            memory = task["kind"] != "email"
+            if not state.get("recorded") and (
+                    not memory or (state.get("household") and self._owes_notice(task["id"]))):
                 self.store.record_run(
                     kind="agent", task_id=task["id"], session_id=task["claude_session_id"],
                     started_at=utcnow(), exit_code=None, cost_usd=0.0,
@@ -734,6 +781,283 @@ class Processor:
             finally:
                 self._delivering.discard(run_id)
 
+    async def _run_memory_reply(self, task, p: dict, state: dict) -> None:
+        """A message in one of the household's conversations. It waits for the
+        conversation's turn, and the session that turn starts takes every
+        message that arrived since the last one, up to when it holds a session
+        slot: the newest as the message, the rest in the conversation so far.
+        A session per message would answer a burst line by line, each blind to
+        the lines after it."""
+        try:
+            if await self._household_members(p) is None:
+                state["recorded"] = True  # nothing is said there, so nothing is owed
+                return
+        except Exception:
+            # the turn checks again when its session starts, and says so if it
+            # still cannot tell
+            log.warning("could not check who is in %s yet", p["channel"])
+        state["household"] = True
+        waiting = self._waiting.setdefault(task["id"], [])
+        waiting.append(p)
+        async with self._task_locks.setdefault(task["id"], asyncio.Lock()):
+            if p not in waiting:
+                # taken by the turn before, or deleted while it waited
+                state["recorded"] = True
+                return
+            took = False
+
+            async def frame() -> tuple[str, datetime] | None:
+                nonlocal took
+                took = True
+                batch, waiting[:] = list(waiting), []
+                return await self._frame_turn(task, batch, state)
+
+            await self.memory_turn(task, None, None, channel=p["channel"], reply_thread=p.get("reply_thread"),
+                                   owed=True, state=state, frame=frame)
+            if not took:
+                # refused before a session could start: the one reply answers
+                # every message waiting
+                waiting[:] = []
+
+    async def _frame_turn(self, task, batch: list[dict], state: dict) -> tuple[str, datetime] | None:
+        """What a turn's session is handed, built once it holds its slot, which
+        can take a whole session of another conversation: the turn's newest
+        message framed with the others and with who is in the conversation
+        now, and that message's time in the household's zone. None when there
+        is nothing to run: every message withdrawn while it waited, the
+        conversation no longer the household's alone, or who reads it not
+        known, which posts the failure note."""
+        if not batch:
+            return None
+        p = max(batch, key=lambda m: float(m["ts"]))
+        now = datetime.fromtimestamp(float(p["ts"]), self.cfg.zone)
+        try:
+            arrival = await self._memory_arrival(p, batch, now)
+        except Exception as e:
+            # never a frame that names fewer readers than there are
+            log.exception("could not frame %s in %s", p["ts"], p["channel"])
+            text = f"⚠️ my run failed: could not see who reads this conversation: {truncate(str(e), 900)}"
+            run_id = self.store.record_run(
+                kind="agent", task_id=task["id"], session_id=None, started_at=utcnow(),
+                exit_code=None, cost_usd=0.0, status="error", error=truncate(str(e), 1000),
+                result_text=text, notified=0,
+            )
+            state["recorded"] = True
+            await self._post_run(run_id, text, p["channel"], p.get("reply_thread"), note=True)
+            return None
+        return None if arrival is None else (arrival, now)
+
+    async def memory_turn(self, task, arrival: str | None, now: datetime | None, *, channel: str,
+                          reply_thread: str | None, owed: bool, state: dict | None = None,
+                          frame: Callable[[], Awaitable[tuple[str, datetime] | None]] | None = None,
+                          ) -> str | None:
+        """One memory session for an arrival, at `now` in the household's zone:
+        a fresh `claude -p` with the lab's prompt, tools, schema and
+        environment, and its answer, if it has one, posted once. The caller
+        holds the conversation's lock. A message's turn passes `frame` in
+        place of the two: called once the session holds its slot, it returns
+        them, or None to run nothing, so that what the session is shown and
+        who it is told reads its answer are as they are when it starts.
+        `owed` is whether someone is waiting: if not, a refusal, a failure or
+        a restart posts nothing. Returns what went wrong, or None. A post
+        Slack refuses is not something that went wrong: the run stays owed
+        and is posted later."""
+        state = {} if state is None else state
+        reserve = self.cfg.agent_expected_usd
+        if (verdict := await self.check_budget(reserve_usd=reserve)) != "ok":
+            if owed:
+                await self._refused(verdict, channel, reply_thread)
+            state["recorded"] = True
+            return verdict
+        started = utcnow()
+        sid = str(uuid.uuid4())
+        queued = time.monotonic()
+        async with self.runner.agent_sem:
+            # apart from the session's own time: with one session at a time,
+            # another conversation's can come first
+            waited = time.monotonic() - queued
+            if (verdict := await self.check_budget(reserve_usd=reserve)) != "ok":
+                if owed:
+                    await self._refused(verdict, channel, reply_thread)
+                state["recorded"] = True
+                return verdict
+            if frame is not None:
+                if (framed := await frame()) is None:
+                    state["recorded"] = True
+                    return None
+                arrival, now = framed
+            date = now.date().isoformat()
+            t0 = time.monotonic()
+            try:
+                with self._reserve(reserve):
+                    rr = await self.runner.run(
+                        vault.prompt(date, arrival),
+                        model=self.cfg.agent_model,
+                        max_budget_usd=self.cfg.agent_max_budget_usd,
+                        timeout_s=self.cfg.agent_timeout_s,
+                        output_schema=vault.SCHEMA,
+                        # the transcript Claude Code keeps under this id is
+                        # what `mem session` reads, and `made:` names it
+                        session_id=sid,
+                        append_system_prompt=f"{ANCHOR}\n\n{vault.date_paragraph(now)}",
+                        tools=vault.TOOLS,
+                        allowed_tools=vault.TOOLS,
+                        permission_mode="dontAsk",
+                        # loads the vault's CLAUDE.md, its settings and its skills
+                        setting_sources="project",
+                        cwd=str(self.cfg.vault_dir),
+                        env=vault.session_env(self.cfg, sid, now),
+                        inherit_env=False,
+                        # everything the session starts inherits it, so what
+                        # it leaves running is found and ended when it ends
+                        mark=f"MEM_SESSION={sid}",
+                    )
+            except asyncio.CancelledError:
+                self.store.record_run(
+                    kind="agent", task_id=task["id"], session_id=sid, started_at=started,
+                    exit_code=None,
+                    cost_usd=min(
+                        self.cfg.agent_max_budget_usd,
+                        self.cfg.agent_expected_usd * max(1.0, (time.monotonic() - t0) / 60),
+                    ),
+                    status="cancelled", error="daemon shut down mid-run",
+                    notified=0 if owed and self._owes_notice(task["id"]) else 1,
+                )
+                state["recorded"] = True
+                raise
+            ran = time.monotonic() - t0
+        if rr.left_running:
+            # counted since the start for doctor; the runner's log names them
+            left = int(self.store.get_meta("sessions_left_running") or 0) + 1
+            self.store.set_meta("sessions_left_running", str(left))
+        out = vault.report(rr.structured, rr.result_text) if rr.ok else None
+        if out is not None:
+            text, error = vault.answer(out), None
+        else:
+            error = rr.error or "the session ended without its report"
+            text = f"⚠️ my run failed: {truncate(error, 1000)}" if owed else ""
+        # recorded before it is posted and before the snapshot: a restart
+        # while either runs still finds the answer here and delivers it
+        run_id = self.store.record_run(
+            kind="agent", task_id=task["id"], session_id=sid, started_at=started,
+            exit_code=rr.exit_code, cost_usd=rr.cost_usd,
+            status="ok" if out is not None else ("timeout" if rr.timed_out else "error"),
+            error=truncate(error, 1000) if error else None,
+            result_text=text,
+            notified=0 if text else 1,
+        )
+        state["recorded"] = True
+        # posted before the snapshot, which can wait its turn behind another;
+        # _post_run keeps deliver_pending off the run from its first line
+        if text:
+            await self._post_run(run_id, text, channel, reply_thread, note=error is not None)
+        # after the post, which reading the transcript would otherwise hold up
+        looks = await asyncio.to_thread(vault.looks_back, self.cfg, sid)
+        log.info("memory session %s in %s: waited %.1f s for a slot, ran %.1f s, %d mem session call(s) "
+                 "over every transcript, as written in its commands, and %.1f s in the commands holding them; "
+                 "%d recalled, %d recorded, %s",
+                 sid, channel, waited, ran, looks.calls, looks.seconds, len((out or {}).get("recalled") or []),
+                 len((out or {}).get("recorded") or []),
+                 f"{len(text)} characters to post" if text else (f"failed: {error}" if error else "silent"))
+        if said := await asyncio.to_thread(vault.snapshot, self.cfg, f"after {sid}"):
+            log.warning("%s", said)
+            await self._alert_once("snapshot", f"vault snapshots: {said}")
+        return error
+
+    async def _post_run(self, run_id: int, text: str, channel: str, reply_thread: str | None, *,
+                        note: bool = False) -> None:
+        """`note`: the text is a failure note, posted with the mark frames
+        leave out."""
+        self._delivering.add(run_id)  # keep deliver_pending off this row
+        try:
+            await self.slack.reply(reply_thread, text, channel=channel, note=note)
+        except Exception as e:
+            # the run is recorded, so a refused post leaves it owed, and
+            # deliver_pending posts it once Slack takes it
+            log.warning("could not post run %s in %s yet: %s; will retry", run_id, channel, e)
+        else:
+            self.store.mark_run_notified(run_id)
+        finally:
+            self._delivering.discard(run_id)
+
+    async def _refused(self, verdict: str, channel: str, reply_thread: str | None) -> None:
+        try:
+            await self.slack.reply(reply_thread, BUDGET_REPLIES[verdict], channel=channel)
+        except Exception as e:
+            # no run was recorded to deliver it from, and the refusal stands either way
+            log.warning("could not post the budget's %s reply in %s: %s", verdict, channel, e)
+
+    def _owes_notice(self, task_id: int) -> bool:
+        """At most one restart notice per conversation: every message waiting
+        there is answered by the one "reply again"."""
+        if task_id in self._noticed:
+            return False
+        self._noticed.add(task_id)
+        return True
+
+    def _withdraw(self, channel: str, ts: str) -> None:
+        """A message deleted while it waited for its turn is not handed to a
+        session."""
+        for waiting in self._waiting.values():
+            waiting[:] = [m for m in waiting if (m["channel"], m["ts"]) != (channel, ts)]
+
+    async def _read_by_others(self, channel: str) -> bool:
+        """Whether anyone but fan, mei and her can read a conversation now,
+        asked before what is owed there is posted later than its session
+        ran: someone may have been added meanwhile. A 1:1 DM takes no one
+        else."""
+        kind = await self.slack.channel_type(channel)
+        return kind != "im" and await self._household_members({"channel": channel, "channel_type": kind}) is None
+
+    async def _household_members(self, p: dict) -> list[str] | None:
+        """Who reads this conversation, or None when anyone but fan, mei and
+        she can. A public channel is open to everyone in this Slack, so there
+        it is the whole workspace that has to be the household."""
+        if p.get("channel_type") == "im":
+            return [p["user"]]  # read by the one who sent it, whom the watcher let in
+        own = await self.slack.own_ids()
+        if not own:
+            raise RuntimeError("could not look up my own Slack ids")
+        ids = await self.slack.members(p["channel"])
+        can_read = ids + (vault.full_members(await self.slack.workspace())
+                          if p.get("channel_type") == "channel" else [])
+        if others := vault.outsiders(can_read, own, self.cfg.slack_owner_user_ids):
+            if p["channel"] not in self._outside:
+                self._outside.add(p["channel"])
+                log.warning("not taking part in %s: %s can read it besides the household",
+                            p["channel"], ", ".join(others))
+            return None
+        return ids
+
+    async def _memory_arrival(self, p: dict, batch: list[dict], now: datetime) -> str | None:
+        """The newest message of a turn as its session is handed it: who said
+        it, where, who reads the answer, and what came before, the turn's
+        other messages and her answers to the turns before included. None
+        when the conversation is no longer the household's alone."""
+        ids = await self._household_members(p)
+        if ids is None:
+            return None
+        place = vault.where(p)
+        own = await self.slack.own_ids()
+        try:
+            msgs = await self.slack.fetch_context(
+                p["channel"], p["task_key"] if p.get("in_thread") else None, self.cfg.slack_context_limit)
+        except Exception:
+            # what came before is context; the message and its readers are not
+            log.exception("could not load conversation context for %s", p["channel"])
+            msgs = []
+        # the turn's messages are in the history already, unless reading it failed
+        seen = {m.get("ts") for m in msgs}
+        msgs = sorted(msgs + [m for m in batch if m["ts"] not in seen], key=lambda m: float(m.get("ts") or 0))
+        users = await self.slack.users(set(ids) | user_ids_in(msgs) | user_ids_in([p]))
+        named = vault.names(users, self.cfg.slack_names)
+        return vault.arrival_text(
+            place, named[p["user"]], vault.message_text(p.get("text"), p.get("files"), named),
+            vault.readers(ids, users, named, own, self.cfg.slack_names),
+            vault.earlier(msgs, p["ts"], place, named, own, now),
+            also=sorted({named[m["user"]] for m in batch} - {named[p["user"]]}),
+        )
+
     @staticmethod
     def _answered_here(marker: Path, channel: str, reply_thread: str | None) -> bool:
         """True if ANY post the session made reached the triggering
@@ -754,23 +1078,9 @@ class Processor:
         return False
 
     async def _seed_for(self, task, p: dict) -> str:
-        """First turn of a session: email tasks get the email, conversation
-        tasks get a transcript of what was being discussed."""
-        if task["kind"] == "email" and task["message_pk"]:
-            return agent_seed_prompt(self.store.get_message(task["message_pk"]), p["text"])
-        try:
-            msgs = await self.slack.fetch_context(
-                p["channel"],
-                p["task_key"] if p.get("in_thread") else None,
-                self.cfg.slack_context_limit,
-            )
-            names = await self.slack.user_names(user_ids_in(msgs))
-            transcript = render(msgs, names, me=await self.slack.own_ids())
-        except Exception:
-            log.exception("could not load conversation context for %s", p["channel"])
-            names, transcript = {}, "(context unavailable)"
-        asker = names.get(p["user"], p["user"])
-        return conversation_seed_prompt(p, transcript, asker)
+        """First turn of an email task's session: the email, and what the
+        owner asked for."""
+        return agent_seed_prompt(self.store.get_message(task["message_pk"]), p["text"])
 
     async def _later_turn(self, p: dict) -> str:
         names = await self.slack.user_names({p["user"]})
@@ -817,18 +1127,6 @@ def require_settings(cfg: Config, names: list[str]) -> None:
         sys.exit(f"missing required settings: {', '.join('WANDA_' + n.upper() for n in missing)} (see .env.example)")
 
 
-def settings_problem(cfg: Config) -> str | None:
-    """Who may talk to wanda, and what each of them is called."""
-    if not cfg.slack_owner_user_ids:
-        return ("WANDA_SLACK_OWNER_USER_IDS is empty: anyone in the workspace could start "
-                "a session, which has a shell")
-    unnamed = [u for u in cfg.slack_owner_user_ids if u not in cfg.slack_names]
-    if unnamed:
-        return (f"no name in WANDA_SLACK_NAMES for {', '.join(unnamed)}: everyone who may talk to "
-                "wanda is named there")
-    return None
-
-
 async def open_store(cfg: Config) -> Store:
     """The run store, waited for while it cannot be opened or written, as on
     a full disk of the VM, which the volumes, the images and the build cache
@@ -843,8 +1141,9 @@ async def open_store(cfg: Config) -> Store:
             store.prune_slack_events()
             # Only a write proves the store takes one: one a stopped run left
             # with its WAL opens on a full disk, and the prune may have nothing
-            # to delete.
+            # to delete. Doctor counts from when this start began.
             store.set_meta("started_at", utcnow())
+            store.set_meta("sessions_left_running", "0")
             return store
         except (sqlite3.Error, OSError) as e:
             problem = f"the run store {cfg.db_path} could not be opened or written: {e}"
@@ -864,7 +1163,7 @@ async def run_daemon(cfg: Config) -> None:
         ["icloud_email", "icloud_app_password", "email_triage_slack_channel_id"] if cfg.email_triage else []))
     if not cfg.alerts_to:
         sys.exit("missing required settings: WANDA_ALERT_CHANNEL (see .env.example)")
-    if problem := settings_problem(cfg):
+    if problem := vault.settings_problem(cfg):
         sys.exit(problem)
     claude_bin = cfg.resolve_claude_bin()
     if not claude_bin:
@@ -876,7 +1175,23 @@ async def run_daemon(cfg: Config) -> None:
     queue: asyncio.Queue = asyncio.Queue()
     slack_queue: asyncio.Queue = asyncio.Queue()
     slack_actions = SlackActions(cfg, store)
-    processor = Processor(cfg, store, queue, slack_actions, RunnerService(claude_bin), slack_queue)
+    runner = RunnerService(claude_bin, agent_sem=asyncio.Semaphore(cfg.memory_sessions))
+    processor = Processor(cfg, store, queue, slack_actions, runner, slack_queue)
+
+    # before Slack connects: a vault `mem` cannot work in would turn every
+    # message into a session that finds nothing and files nothing, silently.
+    # A restart loop would be as silent, so the first failure of a day is posted.
+    now = datetime.now(cfg.zone)
+    if problem := await asyncio.to_thread(vault.prepare, cfg, now, store.get_meta("vault_since")):
+        await processor._alert_once("startup", f"wanda is not running: memory is not working: {problem}")
+        sys.exit(f"memory is not working: {problem}")
+    # a failed start's alert still waiting for Slack would now be untrue
+    store.set_meta("startup_alert_pending", "")
+    if not store.get_meta("vault_since"):
+        store.set_meta("vault_since", now.date().isoformat())
+    if said := await asyncio.to_thread(vault.snapshot, cfg, "startup"):
+        log.warning("%s", said)
+        await processor._alert_once("snapshot", f"vault snapshots: {said}")
 
     slack_watcher = SlackWatcher(cfg, store, loop, slack_queue)
     slack_watcher.start()
@@ -933,10 +1248,16 @@ async def run_doctor(cfg: Config, smoke: bool) -> int:
     report("alerts to", bool(cfg.alerts_to), cfg.alerts_to or "WANDA_ALERT_CHANNEL is not set")
     report("email triage", True, "on" if cfg.email_triage else "off")
     report("enforcement", True, cfg.enforcement)
-    problem = settings_problem(cfg)
-    report("who can talk to wanda", problem is None, problem or ", ".join(
-        f"{u} as {cfg.slack_names[u]}" for u in cfg.slack_owner_user_ids))
-    report("agent tools", True, cfg.agent_allowed_tools)
+    problem = vault.settings_problem(cfg)
+    report("memory settings", problem is None, problem or ", ".join(
+        f"{u} as {cfg.slack_names[u]}" for u in cfg.slack_owner_user_ids)
+        + f"; time zone {cfg.tz}; {cfg.memory_sessions} session(s) at once")
+    report("agent tools", True, f"{vault.TOOLS} (memory sessions), {cfg.agent_allowed_tools} (email tasks)")
+
+    print("memory:")
+    if problem is None:
+        problem = vault.check(cfg, datetime.now(cfg.zone))
+        report("vault", problem is None, problem or str(cfg.vault_dir))
 
     print("store:")
     try:
@@ -965,6 +1286,14 @@ async def run_doctor(cfg: Config, smoke: bool) -> int:
         for r in given_up:
             print(f"      run {r['id']}, from {r['started_at']}: {r['slack_channel']}"
                   + (f", thread {r['reply_thread']}" if r["reply_thread"] else ""))
+        # Neither is alerted: what a session left running was ended with it,
+        # and a `mem` refused for a busy vault wrote nothing and told its
+        # session so. Each means something held on longer than it should.
+        if started := store.get_meta("started_at"):
+            refused = vault.refused_for_a_busy_vault(cfg, datetime.fromisoformat(started))
+            report("since the last start", True,
+                   f"{started}: {store.get_meta('sessions_left_running') or 0} session(s) left processes "
+                   f"running; {refused} mem call(s) refused for a busy vault")
     except Exception as e:
         report("sqlite", False, str(e))
         store = None

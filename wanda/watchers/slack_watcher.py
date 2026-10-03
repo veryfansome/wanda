@@ -24,7 +24,9 @@ DM_TASK_KEY = "conversation"
 
 class SlackWatcher:
     """Socket Mode listener. Acks every envelope immediately (Slack retries
-    past ~3s), then classifies it into one of four triggers:
+    past ~3s), passes deletions on (kind `deleted`), so that a message still
+    waiting for its turn can be withdrawn, and classifies every other
+    message into one of four triggers:
 
       dm            — any message in a DM or group DM; no mention needed
       task          — a message in a thread wanda owns (e.g. an email task)
@@ -75,6 +77,13 @@ class SlackWatcher:
         # the twin entirely, rather than trying to reconcile two.
         if event.get("type") != "message":
             return
+        if event.get("subtype") == "message_deleted" and event.get("deleted_ts"):
+            # a deleted message still waiting for its conversation's turn is
+            # withdrawn from it
+            self.loop.call_soon_threadsafe(self.queue.put_nowait, Event(
+                source="slack", dedupe_key=f"{event.get('channel')}:{event['deleted_ts']}:deleted",
+                payload={"kind": "deleted", "channel": event.get("channel"), "ts": event["deleted_ts"]}))
+            return
         if event.get("bot_id") or event.get("subtype") not in HUMAN_SUBTYPES:
             return
         user = event.get("user")
@@ -118,10 +127,10 @@ class SlackWatcher:
         if not self.store.slack_event_first_time(f"{channel}:{ts}"):
             return
         if kind == "dm" and not thread_ts:  # noqa: SIM108 — kept explicit
-            # A DM is one ongoing conversation: every top-level message maps to
-            # the same task and resumes the same session. Replies go untreaded,
-            # which also keeps them visible in conversations.history — the very
-            # context the next message is seeded with.
+            # A DM is one conversation: every top-level message maps to one
+            # task, so its turns run one at a time, each a fresh session.
+            # Replies go unthreaded, which keeps them in conversations.history,
+            # where the next turn's conversation so far is read.
             task_key, reply_thread = DM_TASK_KEY, None
         else:
             task_key = reply_thread = thread_ts or ts
@@ -137,6 +146,7 @@ class SlackWatcher:
                 "in_thread": bool(thread_ts),
                 "user": user,
                 "text": event.get("text", ""),
+                "files": [f.get("name") or "file" for f in event.get("files") or []],
                 "ts": ts,
             },
         )

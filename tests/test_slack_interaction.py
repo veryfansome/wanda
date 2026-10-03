@@ -269,25 +269,113 @@ def test_own_ids_lookup_failure_is_not_cached(monkeypatch):
     assert sa.web.calls == 2, "a failure is retried and a success is kept"
 
 
-def test_an_alert_goes_where_set_with_the_harness_mark(monkeypatch):
-    """To WANDA_ALERT_CHANNEL, with a mark of the harness's: an alert is not
-    something she said."""
+def test_a_failed_user_lookup_is_not_kept(monkeypatch):
+    """A passing failure costs one message its names, not every message
+    until a restart."""
     import wanda.actions.slack as actions
+
+    class Web:
+        up, calls = False, 0
+
+        def users_info(self, user):
+            self.calls += 1
+            if not self.up:
+                raise RuntimeError("ratelimited")
+            return {"user": {"id": user, "profile": {"display_name": "jane"}}}
+
+    monkeypatch.setattr(actions, "MIN_INTERVAL_S", 0)
+    sa = actions.SlackActions(cfg(), store=None)
+    sa.web = Web()
+
+    async def lookups():
+        assert await sa.users({"U9"}) == {}
+        sa.web.up = True
+        assert (await sa.users({"U9"}))["U9"]["profile"]["display_name"] == "jane"
+        await sa.users({"U9"})
+
+    asyncio.run(lookups())
+    assert sa.web.calls == 2, "a failure is retried and a success is kept"
+
+
+def test_the_workspace_is_read_each_time_and_a_conversation_has_its_type(monkeypatch):
+    """Someone who joined the Slack a minute ago can open a public channel
+    now, so users.list is read each time it is asked; and conversations.info
+    names a conversation's type as message events do."""
+    import wanda.actions.slack as actions
+
+    class Web:
+        def __init__(self):
+            self.lists, self.people = 0, [{"id": "U1"}]
+
+        def users_list(self, **kw):
+            self.lists += 1
+            return {"members": list(self.people)}
+
+        def conversations_info(self, channel):
+            return {"channel": {"D1": {"is_im": True}, "G1": {"is_mpim": True, "is_private": True},
+                                "C1": {"is_private": True}, "C2": {}}[channel]}
+
+    monkeypatch.setattr(actions, "MIN_INTERVAL_S", 0)
+    sa = actions.SlackActions(cfg(), store=None)
+    sa.web = Web()
+
+    async def go():
+        before = [u["id"] for u in await sa.workspace()]
+        sa.web.people.append({"id": "U3"})
+        after = [u["id"] for u in await sa.workspace()]
+        return before, after, [await sa.channel_type(c) for c in ("D1", "G1", "C1", "C2")]
+
+    before, after, types = asyncio.run(go())
+    assert before == ["U1"] and after == ["U1", "U3"] and sa.web.lists == 2
+    assert types == ["im", "mpim", "group", "channel"]
+
+
+def test_alerts_and_failure_notes_carry_the_marks_frames_leave_out(monkeypatch):
+    """An alert and a failure note are posted with the harness's marks, an
+    answer with none, and the context a frame is built from is read with the
+    marks, so `vault.earlier` can drop them."""
+    import wanda.actions.slack as actions
+    from wanda.vault import ALERT_EVENT, NOTE_EVENT
 
     class Web:
         def __init__(self):
             self.calls = []
 
         def chat_postMessage(self, **kw):
-            self.calls.append(kw)
+            self.calls.append(("post", kw))
             return {"ts": "1.1"}
+
+        def conversations_history(self, **kw):
+            self.calls.append(("history", kw))
+            return {"messages": []}
+
+        def conversations_replies(self, **kw):
+            self.calls.append(("replies", kw))
+            return {"messages": []}
 
     monkeypatch.setattr(actions, "MIN_INTERVAL_S", 0)
     sa = actions.SlackActions(cfg(alert_channel="U0FAN"), store=None)
     sa.web = Web()
-    asyncio.run(sa.alert("the run store could not be opened"))
-    (post,) = sa.web.calls
-    assert post["channel"] == "U0FAN" and post["metadata"]["event_type"] == actions.ALERT_EVENT
+
+    async def go():
+        await sa.alert("a vault snapshot failed")
+        await sa.fetch_context("D1", None, 20)
+        await sa.fetch_context("C1", "5.5", 20)
+        await sa.reply(None, "⚠️ my run failed: x", channel="D1", note=True)
+        await sa.reply(None, "an answer", channel="D1")
+
+    asyncio.run(go())
+    (_, post), (_, history), (_, replies), (_, note), (_, answer) = sa.web.calls
+    assert post["channel"] == "U0FAN" and post["metadata"]["event_type"] == ALERT_EVENT
+    assert note["metadata"]["event_type"] == NOTE_EVENT and "metadata" not in answer
+    assert history["include_all_metadata"] is True and replies["include_all_metadata"] is True
+
+
+def test_a_deleted_message_is_passed_on(store):
+    """So a message still waiting for its conversation's turn can be withdrawn."""
+    ev = fire(store, {"type": "message", "subtype": "message_deleted", "channel": "D1",
+                      "channel_type": "im", "ts": "200.1", "deleted_ts": "100.1", "hidden": True})
+    assert ev.payload == {"kind": "deleted", "channel": "D1", "ts": "100.1"}
 
 
 def test_render_skips_joins_and_empty():

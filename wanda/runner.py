@@ -1,18 +1,25 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
 import signal
+import subprocess
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 log = logging.getLogger(__name__)
 
 KILL_GRACE_S = 10
 MIN_BILLABLE_S = 10  # below this, a failed run bought no tokens
+# How long what a session left running is given to go after each signal:
+# bounded, since a process in a call on a stalled mount ends only when the
+# call returns, and the session's turn waits for this.
+LEFT_GRACE_S = 5
 
 
 @dataclass
@@ -26,6 +33,8 @@ class RunResult:
     session_id: str | None = None
     cost_usd: float = 0.0
     error: str | None = None
+    # how many processes the session left running, ended when it ended
+    left_running: int = 0
 
 
 @dataclass
@@ -56,6 +65,8 @@ class RunnerService:
         setting_sources: str | None = None,
         cwd: str | None = None,
         env: dict[str, str] | None = None,
+        inherit_env: bool = True,
+        mark: str | None = None,
     ) -> RunResult:
         argv = [
             self.claude_bin,
@@ -87,6 +98,9 @@ class RunnerService:
 
         # start_new_session so a timeout can kill the whole process group —
         # claude spawns children for shell tools that would otherwise orphan.
+        # Claude Code may start a Bash command in a session of its own, outside
+        # that group (its code asks for detached): given `mark`,
+        # end_left_behind ends what the command left, in the group or out of it.
         t0 = time.monotonic()
         proc = await asyncio.create_subprocess_exec(
             *argv,
@@ -95,27 +109,38 @@ class RunnerService:
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
             cwd=cwd,
-            env={**os.environ, **env} if env else None,
+            # inherit_env=False: `env` is the child's whole environment, for a
+            # caller that has to keep some of the daemon's own out of it
+            env=({**os.environ, **env} if inherit_env else env) if env else None,
         )
         try:
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(prompt.encode()), timeout=timeout_s
-            )
-        except TimeoutError:
-            await self._kill_group(proc)
-            # The envelope (and the true cost) is lost, so charge the budget
-            # pessimistically rather than letting a killed run look free.
-            return RunResult(
-                ok=False, timed_out=True, cost_usd=max_budget_usd,
-                error=f"timed out after {timeout_s}s",
-            )
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(prompt.encode()), timeout=timeout_s
+                )
+            except TimeoutError:
+                await self._kill_group(proc)
+                left = await self._end_left_behind(proc.pid, mark)
+                # The envelope (and the true cost) is lost, so charge the budget
+                # pessimistically rather than letting a killed run look free.
+                return RunResult(
+                    ok=False, timed_out=True, cost_usd=max_budget_usd,
+                    error=f"timed out after {timeout_s}s", left_running=left,
+                )
+            except asyncio.CancelledError:
+                # Daemon shutdown. Without this the subprocess survives in its own
+                # session (start_new_session), outliving even launchd's cleanup.
+                self._kill_group_now(proc)
+                raise
+            left = await self._end_left_behind(proc.pid, mark)
         except asyncio.CancelledError:
-            # Daemon shutdown. Without this the subprocess survives in its own
-            # session (start_new_session), outliving even launchd's cleanup.
-            self._kill_group_now(proc)
+            if mark:
+                # at shutdown nothing more can be awaited
+                end_left_behind(proc.pid, mark, grace_s=0)
             raise
 
         rr = self._parse(proc.returncode, stdout, stderr)
+        rr.left_running = left
         if rr.envelope is None:
             # No envelope means the true cost is unknown, so charge the ceiling
             # — unless it exited too fast to have bought anything (a bad flag,
@@ -123,6 +148,10 @@ class RunnerService:
             # breaker after a few failures.
             rr.cost_usd = max_budget_usd if time.monotonic() - t0 > MIN_BILLABLE_S else 0.0
         return rr
+
+    @staticmethod
+    async def _end_left_behind(leader: int, mark: str | None) -> int:
+        return await asyncio.to_thread(end_left_behind, leader, mark) if mark else 0
 
     @staticmethod
     def _kill_group_now(proc: asyncio.subprocess.Process) -> None:
@@ -190,3 +219,72 @@ class RunnerService:
         if not result.ok:
             result.error = envelope.get("result") or envelope.get("subtype") or "claude reported an error"
         return result
+
+
+def end_left_behind(leader: int, mark: str, grace_s: float = LEFT_GRACE_S) -> int:
+    """Ends whatever a session left running, and returns how many processes
+    that was: every process in its process session, which `leader`, the
+    claude it ran, heads, and every process carrying `mark`, an entry of the
+    session's environment, which reaches what Claude Code may start in
+    sessions of their own (its code asks for detached), its Bash commands.
+    Claude Code ends none of them: at its Bash timeout a command is moved to
+    the background, or only its shell is ended, and what the command started
+    goes on, a `mem` waiting for the vault among them, to write after the
+    session is recorded and snapshotted. SIGTERM, then SIGKILL, each followed
+    by up to `grace_s` for them to be gone."""
+    found: set[int] = set()
+    left: set[int] = set()
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        left = _left_behind(leader, mark)
+        found |= left
+        for pid in left:
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.kill(pid, sig)
+        deadline = time.monotonic() + grace_s
+        while left and time.monotonic() < deadline:
+            time.sleep(0.05)
+            left &= _left_behind(leader, mark)
+    if found:
+        # without a wait, what is still there says nothing
+        still = sorted(left) if grace_s else []
+        log.warning("%s left %d process(es) running when it ended (%s); ended them%s", mark, len(found),
+                    ", ".join(map(str, sorted(found))),
+                    f", but {', '.join(map(str, still))} still ran {grace_s} s after SIGKILL" if still else "")
+    else:
+        log.info("%s left nothing running when it ended", mark)
+    return len(found)
+
+
+def _left_behind(leader: int, mark: str) -> set[int]:
+    """The processes, ended ones aside, in `leader`'s process session or
+    with `mark` in their environment, but for `leader` itself, the runner's
+    own child, which it ends and waits for. A process's environment is read
+    from /proc; where there is none (macOS, where only the tests run), the
+    process session alone is found."""
+    skip = {os.getpid(), leader}
+    found = set()
+    entry = b"\0" + mark.encode() + b"\0"
+    proc = Path("/proc")
+    if not proc.is_dir():
+        listed = subprocess.run(["ps", "-A", "-o", "pid=,stat="], capture_output=True, text=True).stdout
+        for line in listed.splitlines():
+            pid, state = (line.split() + ["", ""])[:2]
+            if pid.isdigit() and int(pid) not in skip and not state.startswith("Z"):
+                with contextlib.suppress(OSError):
+                    if os.getsid(int(pid)) == leader:
+                        found.add(int(pid))
+        return found
+    for d in proc.iterdir():
+        if not d.name.isdigit() or int(d.name) in skip:
+            continue
+        try:
+            stat = (d / "stat").read_bytes()
+            # the fields after the command's name, which can hold anything
+            state, _, _, session = stat[stat.rindex(b")") + 2:].split()[:4]
+            if state == b"Z":
+                continue
+            if int(session) == leader or entry in b"\0" + (d / "environ").read_bytes():
+                found.add(int(d.name))
+        except (OSError, ValueError):
+            continue
+    return found
