@@ -702,7 +702,7 @@ def test_a_start_that_cannot_open_the_run_store_says_so_and_waits(tmp_path, monk
     asyncio.run(main.run_daemon(c))
     assert opened["n"] == 4 and tries["alert"] == 2
     assert posted == [f"wanda is not running: the run store {c.db_path} could not be opened or written: "
-                      "disk I/O error"]
+                      "disk I/O error (README, State)"]
 
 
 def test_a_start_whose_run_store_opens_and_takes_no_write_says_so_and_waits(tmp_path, monkeypatch):
@@ -744,7 +744,7 @@ def test_a_start_whose_run_store_opens_and_takes_no_write_says_so_and_waits(tmp_
     asyncio.run(main.run_daemon(c))
     assert full["writes"] == 3 and tries["alert"] == 2
     assert posted == [f"wanda is not running: the run store {c.db_path} could not be opened or written: "
-                      "database or disk is full"]
+                      "database or disk is full (README, State)"]
     store = Store(c.db_path)
     assert store.get_meta("started_at") and store.get_meta("sessions_left_running") == "0"
 
@@ -800,7 +800,7 @@ def test_doctor_says_what_happened_since_the_last_start(tmp_path, capsys, monkey
         real(self, key, value)
     monkeypatch.setattr("wanda.store.Store.set_meta", full)
     asyncio.run(run_doctor(c, smoke=False))
-    assert "✗ takes a write — database or disk is full" in capsys.readouterr().out
+    assert "✗ takes a write — database or disk is full (README, State)" in capsys.readouterr().out
 
 
 def test_a_session_that_left_processes_running_is_counted(tmp_path, monkeypatch):

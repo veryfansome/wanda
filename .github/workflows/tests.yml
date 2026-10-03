@@ -15,9 +15,10 @@ concurrency:
 
 jobs:
   pytest:
-    # macOS is the deployment target — wanda runs as a launchd LaunchAgent, and
-    # the runner tests exercise process groups, signals and subprocess teardown,
-    # which are worth running on the platform that will actually host them.
+    # macOS hosts the container wanda runs in and is where it is developed.
+    # The runner's cases that read /proc, how a session's leftovers are found
+    # in the container, skip here: they need Linux, and are run by hand in the
+    # product image (README, Development).
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7

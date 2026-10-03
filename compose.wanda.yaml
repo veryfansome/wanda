@@ -21,7 +21,8 @@
 #
 # The vault and the run store are the named volumes wanda-home_vault and
 # wanda-home_store. `down -v`, `docker volume prune -a`, a Rancher Desktop
-# factory reset or a switch of container engine deletes them.
+# factory reset or a switch of container engine deletes them; README, State,
+# puts the vault back from the last snapshot.
 name: wanda-home
 services:
   wanda:
@@ -50,7 +51,8 @@ services:
       # holds
       WANDA_MEMORY_SESSIONS:
       # on: add WANDA_ICLOUD_EMAIL, WANDA_ICLOUD_APP_PASSWORD and
-      # WANDA_EMAIL_TRIAGE_SLACK_CHANNEL_ID here, as above
+      # WANDA_EMAIL_TRIAGE_SLACK_CHANNEL_ID here, as above, once email task
+      # sessions are ended as memory sessions are (README, Setup, step 9)
       WANDA_EMAIL_TRIAGE: "off"
       # the model, the timeout and the budget the lab measured sessions with;
       # a session is shown the budget at every step

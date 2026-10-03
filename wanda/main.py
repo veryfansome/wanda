@@ -529,7 +529,7 @@ class Processor:
         try:
             await self.slack.alert(
                 f"{len(given_up)} answer(s) could not be posted after {MAX_DELIVERY_ATTEMPTS} tries "
-                f"and were given up: {runs}. `wanda doctor` lists where each was due.")
+                f"and were given up: {runs}. `wanda doctor` lists where each was due (README, State).")
         except Exception:
             log.warning("given-up alert undeliverable; will retry")
             return
@@ -566,9 +566,10 @@ class Processor:
     async def startup_recovery(self) -> None:
         # with triage off, mail rows from before stay as they are
         for row in self.store.fetch_by_status("acting", limit=200) if self.cfg.email_triage else ():
-            # Honour the same backoff as a normal pass: launchd restarts every
-            # 30s, so an unguarded recovery would burn the attempt budget in
-            # minutes during a restart loop.
+            # Honour the same backoff as a normal pass: a daemon that keeps
+            # exiting is started again within a minute, so an unguarded
+            # recovery would burn the attempt budget in minutes during a
+            # restart loop.
             if not self._retry_due(row):
                 continue
             log.info("recovering in-flight message %s", row["dedupe_key"])
@@ -702,8 +703,8 @@ class Processor:
                     "WANDA_SLACK_CONTEXT_CHANNEL": channel,
                     "WANDA_SLACK_CONTEXT_THREAD": p.get("reply_thread") or "",
                     "WANDA_SLACK_POST_MARKER": str(posted),
-                    # launchd gives the daemon a minimal PATH, so the session
-                    # would not otherwise find the `wanda` it is told to run.
+                    # the image keeps the venv off PATH, so the session would
+                    # not otherwise find the `wanda` it is told to run.
                     "PATH": f"{Path(sys.executable).parent}:{os.environ.get('PATH', '')}",
                 }
                 try:
@@ -1151,7 +1152,7 @@ async def open_store(cfg: Config) -> Store:
         today = datetime.now(timezone.utc).date().isoformat()
         if alerted != today:
             try:
-                await SlackActions(cfg, None).alert(f"wanda is not running: {problem}")
+                await SlackActions(cfg, None).alert(f"wanda is not running: {problem} (README, State)")
                 alerted = today
             except Exception:
                 log.warning("startup alert undeliverable; will retry")
@@ -1167,7 +1168,7 @@ async def run_daemon(cfg: Config) -> None:
         sys.exit(problem)
     claude_bin = cfg.resolve_claude_bin()
     if not claude_bin:
-        sys.exit("claude CLI not found; set WANDA_CLAUDE_BIN (required under launchd)")
+        sys.exit("claude CLI not found; set WANDA_CLAUDE_BIN")
     lock = acquire_lock(cfg.lock_path)  # noqa: F841 — held for process lifetime
     store = await open_store(cfg)
 
@@ -1268,7 +1269,7 @@ async def run_doctor(cfg: Config, smoke: bool) -> int:
             store.set_meta("doctor_ran", utcnow())
             report("takes a write", True)
         except sqlite3.Error as e:
-            report("takes a write", False, str(e))
+            report("takes a write", False, f"{e} (README, State)")
         last_poll = store.get_meta("last_successful_poll_at")
         report("last successful poll", True, last_poll or "never (daemon not yet run)")
         report("imap mode", True, store.get_meta("imap_mode") or "idle (not yet connected)")

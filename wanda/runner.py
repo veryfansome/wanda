@@ -129,7 +129,7 @@ class RunnerService:
                 )
             except asyncio.CancelledError:
                 # Daemon shutdown. Without this the subprocess survives in its own
-                # session (start_new_session), outliving even launchd's cleanup.
+                # session (start_new_session), outliving the daemon.
                 self._kill_group_now(proc)
                 raise
             left = await self._end_left_behind(proc.pid, mark)

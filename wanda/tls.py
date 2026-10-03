@@ -15,8 +15,8 @@ def ssl_context() -> ssl.SSLContext:
     points at etc/openssl/cert.pem inside the framework, which only exists
     after someone runs its "Install Certificates.command". Left alone, every
     TLS connection fails with CERTIFICATE_VERIFY_FAILED. Pinning certifi's
-    bundle keeps the daemon working under launchd, where that machine-level
-    setup is easy to miss and awkward to verify.
+    bundle keeps what runs on the Mac working whichever Python runs it, where
+    that machine-level setup is easy to miss and awkward to verify.
 
     SSL_CERT_FILE still wins, so a corporate root or a proxy CA can override.
     """
