@@ -56,6 +56,23 @@ static THREAD_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(concat!(
 static UNPROMPTED_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
     r"(?s)^No message started this session\. What I say now reaches (.+?) alone, in a direct message\.\n\n(.*)$").unwrap());
 
+// a message added to the conversation while its session worked, as the product
+// hands it to that session (wanda/vault.py, ADDED). Every line of the message
+// is indented, so the closing sentence, which is not, ends it.
+static ADDED_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(concat!(
+    r"(?s)^(?P<speaker>[^\n]+?) adds this in the same [^\n]+? at [^\n]+?, ",
+    r"before anything I say back has been sent:\n\n(?P<text>.*?)\n\n",
+    r"Nothing I have said back in this session has been sent yet")).unwrap());
+
+/// Who added a message, and what it said; None for a text not in the
+/// product's shape, which Claude Code's own prompts and continuations are.
+fn parse_added(s: &str) -> Option<(String, String)> {
+    let a = ADDED_RE.captures(s)?;
+    let text: Vec<&str> = crate::text::split_lines(&a["text"]).into_iter()
+        .map(|l| l.strip_prefix("    ").unwrap_or(l)).collect();
+    Some((py_strip(&a["speaker"]).to_string(), py_strip(&text.join("\n")).to_string()))
+}
+
 /// (stated date, channel, speaker, text). A prompt not in this shape comes back
 /// whole, undated, from nobody in particular.
 pub fn parse_prompt(prompt: &str) -> (String, String, String, String) {
@@ -97,10 +114,12 @@ pub fn parse_prompt(prompt: &str) -> (String, String, String, String) {
 pub struct Turn {
     /// HH:MM:SS; the date it belongs to is the exchange's
     pub at: String,
-    /// said · did · aside · answered
+    /// said · added · did · aside · answered
     pub kind: String,
     pub text: String,
     pub result: String,
+    /// who added it, for a message added while the session worked
+    pub who: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -126,25 +145,13 @@ impl Exchange {
         self.turns.iter().filter(|t| t.kind == "did").collect()
     }
 
-    /// Whether the session has given its answer, which can be an empty one.
+    /// Whether the session has given its answer, which can be an empty one,
+    /// since the last message it was handed.
     pub fn answered(&self) -> bool {
-        !self.answer.is_empty() || self.turns.iter().any(|t| t.kind == "answered")
-    }
-
-    /// The answer a listing shows. A message's exchange shows its final
-    /// answer, the one the daemon posts. A clock exchange shows the last of
-    /// its answers that says something, which the daemon posts unless it is
-    /// a placeholder the daemon drops: nobody is waiting on it, and a later
-    /// turn, begun when a command it left running ends, can rightly say
-    /// nothing after the reminder was given.
-    pub fn said(&self) -> &str {
-        if self.channel == "clock" {
-            if let Some(t) = self.turns.iter().rev()
-                .find(|t| t.kind == "answered" && !py_strip(&t.text).is_empty()) {
-                return &t.text;
-            }
+        match self.turns.iter().rposition(|t| t.kind == "added") {
+            Some(a) => self.turns[a..].iter().any(|t| t.kind == "answered"),
+            None => !self.answer.is_empty() || self.turns.iter().any(|t| t.kind == "answered"),
         }
-        &self.answer
     }
 }
 
@@ -252,6 +259,7 @@ pub fn load(path: &Path) -> Exchange {
     let text = std::fs::read_to_string(path).unwrap_or_default();
     let mut results: std::collections::HashMap<String, String> = Default::default();
     let mut pending: Vec<(String, usize)> = Vec::new();
+    let mut opened = false;
 
     for line in crate::text::split_lines(&text) {
         let Ok(d) = serde_json::from_str::<Value>(line) else { continue };
@@ -265,15 +273,21 @@ pub fn load(path: &Path) -> Exchange {
         }
         if t == "attachment" {
             let a = d.get("attachment").cloned().unwrap_or(Value::Null);
+            // a message added while a turn ran, handed to it at its next step
+            // in the product's frame; Claude Code hands a background command's
+            // notice of its end the same way, in a mode of its own, its own
+            // notes as meta, and prompts of its own (a plugin's, `/goal`'s, an
+            // agent team's) in this mode too
+            if a.get("type").and_then(|x| x.as_str()) == Some("queued_command")
+                && a.get("commandMode").and_then(|x| x.as_str()) == Some("prompt")
+                && a.get("isMeta").and_then(|x| x.as_bool()) != Some(true) {
+                for said in message_texts(a.get("prompt")) {
+                    added(&mut ex, &said, ts);
+                }
+            }
             if a.get("type").and_then(|x| x.as_str()) == Some("structured_output") {
                 if let Some(data) = a.get("data").and_then(|x| x.as_object()) {
-                    ex.answer = data.get("answer").map(str_of).unwrap_or_default();
-                    let list = |k: &str| data.get(k).and_then(|x| x.as_array())
-                        .map(|a| a.iter().map(str_of).collect()).unwrap_or_default();
-                    ex.recalled = list("recalled");
-                    ex.recorded = list("recorded");
-                    ex.turns.push(Turn { at: clock(ts), kind: "answered".into(),
-                                         text: ex.answer.clone(), result: String::new() });
+                    answer(&mut ex, data, ts);
                 }
             }
             continue;
@@ -283,13 +297,29 @@ pub fn load(path: &Path) -> Exchange {
         }
         let content = d.get("message").and_then(|m| m.get("content"));
         if t == "user" {
-            if let Some(s) = content.and_then(|c| c.as_str()) {
-                if ex.text.is_empty() && ex.speaker.is_empty() {
-                    let (date, channel, speaker, text) = parse_prompt(s);
+            let said = message_texts(content);
+            if !said.is_empty() {
+                if notice(&d, &said) {
+                    continue;
+                }
+                let mut later = said.iter();
+                if !opened {
+                    // the prompt, a string as the lab writes it, or text
+                    // blocks as a session with open input is handed it; a
+                    // block after it is a message Claude Code took into the
+                    // same turn
+                    opened = true;
+                    let (date, channel, speaker, text) = parse_prompt(later.next().unwrap());
                     ex.date = date; ex.channel = channel; ex.speaker = speaker;
                     ex.text = text.clone();
                     ex.turns.push(Turn { at: clock(ts), kind: "said".into(),
-                                         text, result: String::new() });
+                                         text, result: String::new(), who: String::new() });
+                }
+                // a message that began a later turn of the session, or one
+                // taken into a turn with another; Claude Code begins turns
+                // with words of its own too, which are no one's
+                for s in later {
+                    added(&mut ex, s, ts);
                 }
                 continue;
             }
@@ -302,7 +332,7 @@ pub fn load(path: &Path) -> Exchange {
                 let s = b.get("text").and_then(|x| x.as_str()).unwrap_or("");
                 if !py_strip(s).is_empty() {
                     ex.turns.push(Turn { at: clock(ts), kind: "aside".into(),
-                                         text: py_strip(s).to_string(), result: String::new() });
+                                         text: py_strip(s).to_string(), result: String::new(), who: String::new() });
                 }
             } else if t == "assistant" && bt == "tool_use" {
                 if name == "StructuredOutput" {
@@ -317,7 +347,7 @@ pub fn load(path: &Path) -> Exchange {
                 }
                 let inp = b.get("input").cloned().unwrap_or(Value::Object(Default::default()));
                 ex.turns.push(Turn { at: clock(ts), kind: "did".into(),
-                                     text: command(name, &inp), result: String::new() });
+                                     text: command(name, &inp), result: String::new(), who: String::new() });
                 pending.push((b.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string(),
                               ex.turns.len() - 1));
             } else if t == "user" && bt == "tool_result" {
@@ -341,7 +371,90 @@ pub fn load(path: &Path) -> Exchange {
             .collect();
         ex.turns[idx].result = take_chars(&said.join(" | "), 240);
     }
+    // whoever added a message is named with the speaker, so the exchange is
+    // one person's only when one person spoke in it
+    let named = speakers(&ex.speaker);
+    let mut others: Vec<String> = ex.turns.iter()
+        .filter(|t| t.kind == "added" && !t.who.is_empty() && !named.contains(&t.who))
+        .map(|t| t.who.clone()).collect();
+    others.sort();
+    others.dedup();
+    if !ex.speaker.is_empty() && !others.is_empty() {
+        ex.speaker = format!("{} (then {})", ex.speaker, others.join(" and "));
+    }
     ex
+}
+
+/// The words of a message a session was handed: a string, or text blocks
+/// alone; a tool's result is not one.
+fn message_texts(c: Option<&Value>) -> Vec<String> {
+    match c {
+        Some(Value::String(s)) => vec![s.clone()],
+        Some(Value::Array(a)) if !a.is_empty() && a.iter()
+            .all(|b| b.get("type").and_then(|x| x.as_str()) == Some("text")) =>
+            a.iter().map(|b| b.get("text").map(str_of).unwrap_or_default()).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// A turn Claude Code began with a background command's notice of its end,
+/// not with a message.
+fn notice(d: &Value, said: &[String]) -> bool {
+    d.get("origin").and_then(|o| o.get("kind")).and_then(|k| k.as_str()) == Some("task-notification")
+        || said[0].trim_start().starts_with("<task-notification>")
+}
+
+/// A message added after the opening one, if it is in the product's frame, at
+/// the time Claude Code records for it: for one taken in mid-turn, when it
+/// was queued; for one in a turn's opening message, when that turn began.
+fn added(ex: &mut Exchange, said: &str, ts: &str) {
+    if let Some((who, text)) = parse_added(said) {
+        ex.turns.push(Turn { at: clock(ts), kind: "added".into(), text, result: String::new(), who });
+    }
+}
+
+/// An answer the session gave. The exchange's answer is the last that says
+/// something, which is the one the product posts, a clock session's too, and
+/// the one a lab session gives: an answer before it was never sent, and is
+/// kept as an aside, which nobody was shown either; an empty one after it
+/// changes nothing, and an empty one before it is not shown. The one exception
+/// is a later answer that is a placeholder the product drops: the one before
+/// it was sent.
+fn answer(ex: &mut Exchange, data: &serde_json::Map<String, Value>, ts: &str) {
+    let said = data.get("answer").map(str_of).unwrap_or_default();
+    let says = |t: &Turn| t.kind == "answered" && !py_strip(&t.text).is_empty();
+    if py_strip(&said).is_empty() && ex.turns.iter().any(says) {
+        return;
+    }
+    ex.turns.retain(|t| t.kind != "answered" || says(t));
+    for t in ex.turns.iter_mut().filter(|t| t.kind == "answered") {
+        t.kind = "aside".into();
+    }
+    let list = |k: &str| data.get(k).and_then(|x| x.as_array())
+        .map(|a| a.iter().map(str_of).collect()).unwrap_or_default();
+    ex.recalled = list("recalled");
+    ex.recorded = list("recorded");
+    ex.answer = said;
+    ex.turns.push(Turn { at: clock(ts), kind: "answered".into(),
+                         text: ex.answer.clone(), result: String::new(), who: String::new() });
+}
+
+/// The people a speaker names: one, or one after others ("{speaker} (after
+/// {a} and {b})", a turn that took several people's messages).
+fn speakers(speaker: &str) -> Vec<String> {
+    match speaker.split_once(" (after ") {
+        Some((first, rest)) => std::iter::once(first)
+            .chain(rest.trim_end_matches(')').split(" and "))
+            .map(|s| s.to_string()).collect(),
+        None => vec![speaker.to_string()],
+    }
+}
+
+/// Whether one person alone spoke in an exchange. A turn that took several
+/// people's messages names them all in its speaker, and so does a session
+/// handed another person's message while it worked.
+pub fn one_speaker(ex: &Exchange) -> bool {
+    !ex.speaker.is_empty() && !ex.speaker.contains(" (after ") && !ex.speaker.contains(" (then ")
 }
 
 fn result_text(c: Option<&Value>) -> String {
@@ -362,11 +475,12 @@ const UNPARSED: &str = "the opening message";
 
 /// Who an exchange was with, as its opening line names them. In a clock
 /// exchange nobody spoke, and under "said" the person she spoke to would read
-/// as having started it.
+/// as having started it. Whoever added a message later is shown by it, not as
+/// having opened the exchange.
 fn opened_by(ex: &Exchange) -> String {
     match (ex.speaker.is_empty(), ex.date.is_empty()) {
         (false, _) if ex.channel == "clock" => format!("unprompted, to {}", ex.speaker),
-        (false, _) => format!("{} said", ex.speaker),
+        (false, _) => format!("{} said", ex.speaker.split(" (then ").next().unwrap_or(&ex.speaker)),
         (true, true) => UNPARSED.to_string(),
         (true, false) => "someone said".to_string(),
     }
@@ -388,10 +502,15 @@ pub fn render(ex: &Exchange, full: bool, in_progress: bool) -> String {
         head += " \u{b7} this session, in progress";
     }
     let mut out = vec![head, String::new()];
+    // an answer given before a message the session is still working on has
+    // not been sent, and may never be
+    let last_added = ex.turns.iter().rposition(|t| t.kind == "added");
+    let pending = |i: usize| in_progress && last_added.is_some_and(|a| a > i);
     let who = opened_by(ex);
-    for t in &ex.turns {
+    for (i, t) in ex.turns.iter().enumerate() {
         match t.kind.as_str() {
             "said" => out.push(format!("{}  {who}: {}", t.at, t.text)),
+            "added" => out.push(format!("{}  {} added: {}", t.at, t.who, t.text)),
             "did" => {
                 out.push(format!("{}  I ran: {}", t.at,
                     if full { t.text.clone() } else { take_chars(&t.text, 300) }));
@@ -401,13 +520,18 @@ pub fn render(ex: &Exchange, full: bool, in_progress: bool) -> String {
             }
             "aside" => out.push(format!("{}  I (aside): {}", t.at,
                 if full { t.text.clone() } else { take_chars(&t.text, 200) })),
+            "answered" if pending(i) => if !t.text.is_empty() {
+                out.push(format!("{}  I (aside): {}", t.at,
+                    if full { t.text.clone() } else { take_chars(&t.text, 200) }));
+            },
             "answered" => out.push(format!("{}  I said: {}", t.at,
                 if t.text.is_empty() { "(nothing)" } else { &t.text })),
             _ => {}
         }
     }
-    if !ex.turns.iter().any(|t| t.kind == "answered") {
-        out.push(format!("          I said: {}", if !ex.answer.is_empty() {
+    if !ex.turns.iter().enumerate().any(|(i, t)| t.kind == "answered" && !pending(i)) {
+        let waiting = ex.turns.iter().enumerate().any(|(i, t)| t.kind == "answered" && pending(i));
+        out.push(format!("          I said: {}", if !ex.answer.is_empty() && !waiting {
             &ex.answer
         } else if in_progress {
             "(nothing yet \u{2014} this session is in progress)"
@@ -421,7 +545,7 @@ pub fn render(ex: &Exchange, full: bool, in_progress: bool) -> String {
 /// One line for a listing.
 pub fn line(ex: &Exchange) -> String {
     let said = take_chars(&one_line(&ex.text), 70);
-    let ans = take_chars(&one_line(ex.said()), 70);
+    let ans = take_chars(&one_line(&ex.answer), 70);
     let ans = if ans.is_empty() { "(silent)".to_string() } else { ans };
     let who = match (ex.speaker.is_empty(), ex.date.is_empty()) {
         (false, _) if ex.channel == "clock" => opened_by(ex),
@@ -441,7 +565,7 @@ pub fn line(ex: &Exchange) -> String {
 /// it.
 pub fn was_with(ex: &Exchange, name: &str) -> bool {
     ex.speaker.to_lowercase().contains(&name.to_lowercase())
-        && !(ex.channel == "clock" && py_strip(ex.said()).is_empty())
+        && !(ex.channel == "clock" && py_strip(&ex.answer).is_empty())
 }
 
 /// A session id, or an unambiguous prefix of one.
@@ -556,6 +680,186 @@ mod tests {
         }
     }
 
+    fn entry(v: serde_json::Value) -> String {
+        format!("{v}\n")
+    }
+
+    fn addition(speaker: &str, text: &str) -> String {
+        format!("{speaker} adds this in the same group direct message at 16:42, before anything I say \
+                 back has been sent:\n\n    {text}\n\nNothing I have said back in this session has been \
+                 sent yet. The last answer I give in this session that says something is the one sent, so \
+                 that is where anything said here gets its answer.")
+    }
+
+    fn exchange_of(name: &str, lines: &[String]) -> Exchange {
+        let dir = std::env::temp_dir().join(format!("transcript-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{name}.jsonl"));
+        std::fs::write(&path, lines.concat()).unwrap();
+        let ex = load(&path);
+        std::fs::remove_file(&path).unwrap();
+        ex
+    }
+
+    fn opening() -> String {
+        prompt("In a group direct message that fan, mei and I read. Everyone in it sees what I say \
+                there.\n\nfan says:\n\n    remind me at 5")
+    }
+
+    // as Claude Code 2.1.268 records a session with open input:
+    // the prompt as text blocks, a message taken in at a turn's next step as
+    // a queued_command attachment
+    #[test]
+    fn a_message_added_while_the_session_worked_is_read_back_as_its_speakers() {
+        use serde_json::json;
+        let ts = |s: &str| format!("2026-10-01T23:42:{s}.000Z");
+        let ex = exchange_of("mid-turn", &[
+            entry(json!({"type": "user", "timestamp": ts("00"), "promptSource": "sdk",
+                        "message": {"role": "user", "content": [{"type": "text", "text": opening()}]}})),
+            entry(json!({"type": "assistant", "timestamp": ts("05"), "message": {"role": "assistant",
+                        "content": [{"type": "tool_use", "id": "t1", "name": "Bash",
+                                     "input": {"command": "mem recall plumber"}}]}})),
+            entry(json!({"type": "user", "timestamp": ts("09"), "message": {"role": "user",
+                        "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "(nothing)"}]}})),
+            entry(json!({"type": "attachment", "timestamp": ts("07"), "attachment": {
+                        "type": "queued_command", "commandMode": "prompt",
+                        "prompt": [{"type": "text", "text": addition("mei", "and tell me too")}]}})),
+            entry(json!({"type": "user", "isMeta": true, "timestamp": ts("10"),
+                        "message": {"role": "user", "content": "[structured-output-enforce] x"}})),
+            entry(json!({"type": "attachment", "timestamp": ts("12"), "attachment": {
+                        "type": "structured_output", "data": {"answer": "At 5, both of you.",
+                                                              "recalled": [], "recorded": []}}})),
+        ]);
+        assert_eq!((ex.date.as_str(), ex.channel.as_str(), ex.text.as_str()),
+                   ("2026-01-01", "group dm", "remind me at 5"));
+        assert_eq!(ex.speaker, "fan (then mei)");
+        assert!(!one_speaker(&ex));
+        assert_eq!(ex.answer, "At 5, both of you.");
+        let shown = render(&ex, false, false);
+        assert!(shown.contains("23:42:00  fan said: remind me at 5\n"), "{shown}");
+        assert!(shown.contains("23:42:07  mei added: and tell me too\n"), "{shown}");
+        assert!(shown.ends_with("23:42:12  I said: At 5, both of you."), "{shown}");
+        assert!(line(&ex).contains("fan (then mei): remind me at 5"));
+    }
+
+    // a message that began a later turn: the answer given before it is sent
+    // unless a later one says something, as the product posts them
+    #[test]
+    fn an_answer_stands_until_a_later_one_says_something() {
+        use serde_json::json;
+        let ts = |s: &str| format!("2026-10-01T23:42:{s}Z");
+        let lines = [
+            entry(json!({"type": "user", "timestamp": ts("00"),
+                        "message": {"role": "user", "content": [{"type": "text", "text": opening()}]}})),
+            entry(json!({"type": "attachment", "timestamp": ts("10"), "attachment": {
+                        "type": "structured_output", "data": {"answer": "Will do."}}})),
+            entry(json!({"type": "user", "timestamp": ts("11"), "message": {"role": "user",
+                        "content": [{"type": "text", "text": addition("fan", "thanks!")}]}})),
+        ];
+        // while the later turn works, the earlier answer is not yet sent
+        let ex = exchange_of("later-turn", &lines);
+        assert_eq!(ex.speaker, "fan");
+        assert!(one_speaker(&ex) && ex.answer == "Will do." && !ex.answered());
+        let shown = render(&ex, false, true);
+        assert!(shown.contains("23:42:10  I (aside): Will do.\n23:42:11  fan added: thanks!"), "{shown}");
+        assert!(shown.ends_with("I said: (nothing yet \u{2014} this session is in progress)"), "{shown}");
+        // a later turn that says nothing leaves it the answer
+        let silent = entry(json!({"type": "attachment", "timestamp": ts("15"), "attachment": {
+                                 "type": "structured_output", "data": {"answer": ""}}}));
+        let ex = exchange_of("later-silent", &[lines.concat(), silent]);
+        let shown = render(&ex, false, false);
+        assert!(ex.answer == "Will do." && shown.contains("23:42:10  I said: Will do.\n23:42:11  fan added: thanks!"));
+        assert!(!shown.contains("(nothing)") && line(&ex).ends_with("me: Will do."), "{shown}");
+        // one that says something replaces it
+        let later = entry(json!({"type": "attachment", "timestamp": ts("15"), "attachment": {
+                                "type": "structured_output", "data": {"answer": "At 5, then."}}}));
+        let shown = render(&exchange_of("later-said", &[lines.concat(), later]), false, false);
+        assert!(shown.contains("23:42:10  I (aside): Will do.\n23:42:11  fan added: thanks!\n\
+                                23:42:15  I said: At 5, then."), "{shown}");
+    }
+
+    // an empty answer before one that says something is not shown at all
+    #[test]
+    fn an_empty_answer_a_later_one_replaced_is_not_shown() {
+        use serde_json::json;
+        let ex = exchange_of("empty-first", &[
+            entry(json!({"type": "user", "timestamp": "2026-10-01T23:42:00Z",
+                        "message": {"role": "user", "content": [{"type": "text", "text": opening()}]}})),
+            entry(json!({"type": "attachment", "timestamp": "2026-10-01T23:42:10Z", "attachment": {
+                        "type": "structured_output", "data": {"answer": ""}}})),
+            entry(json!({"type": "user", "timestamp": "2026-10-01T23:42:11Z", "message": {"role": "user",
+                        "content": [{"type": "text", "text": addition("fan", "and the plumber")}]}})),
+            entry(json!({"type": "attachment", "timestamp": "2026-10-01T23:42:20Z", "attachment": {
+                        "type": "structured_output", "data": {"answer": "At 5."}}})),
+        ]);
+        let shown = render(&ex, false, false);
+        assert!(!shown.contains("(aside)") && !shown.contains("(nothing)") && ex.answer == "At 5.", "{shown}");
+    }
+
+    // a message Claude Code took into the opening turn with the prompt is a
+    // later block of the opening message
+    #[test]
+    fn a_message_taken_with_the_prompt_is_added() {
+        use serde_json::json;
+        let ex = exchange_of("merged", &[
+            entry(json!({"type": "user", "timestamp": "2026-10-01T23:42:00Z", "message": {"role": "user",
+                        "content": [{"type": "text", "text": opening()},
+                                    {"type": "text", "text": addition("mei", "and tell me too")}]}})),
+        ]);
+        assert_eq!((ex.text.as_str(), ex.speaker.as_str()), ("remind me at 5", "fan (then mei)"));
+        assert!(!one_speaker(&ex));
+        assert!(render(&ex, false, false).contains("23:42:00  mei added: and tell me too"));
+    }
+
+    // a background command's notice of its end, mid-turn or as a turn of its
+    // own, and Claude Code's own queued notes, are no one's message
+    #[test]
+    fn a_notice_is_not_a_message() {
+        use serde_json::json;
+        let notice = "<task-notification>\n<task-id>b1</task-id>\n<status>completed</status>\n</task-notification>";
+        let ex = exchange_of("notices", &[
+            entry(json!({"type": "user", "timestamp": "2026-10-01T23:42:00Z",
+                        "message": {"role": "user", "content": [{"type": "text", "text": opening()}]}})),
+            entry(json!({"type": "attachment", "timestamp": "2026-10-01T23:42:05Z", "attachment": {
+                        "type": "queued_command", "commandMode": "task-notification", "prompt": notice}})),
+            entry(json!({"type": "attachment", "timestamp": "2026-10-01T23:42:06Z", "attachment": {
+                        "type": "queued_command", "commandMode": "prompt", "isMeta": true, "prompt": "a note"}})),
+            entry(json!({"type": "attachment", "timestamp": "2026-10-01T23:42:10Z", "attachment": {
+                        "type": "structured_output", "data": {"answer": "Will do."}}})),
+            entry(json!({"type": "user", "timestamp": "2026-10-01T23:42:12Z", "origin": {"kind": "task-notification"},
+                        "message": {"role": "user", "content": notice}})),
+            entry(json!({"type": "attachment", "timestamp": "2026-10-01T23:42:15Z", "attachment": {
+                        "type": "structured_output", "data": {"answer": ""}}})),
+        ]);
+        let shown = render(&ex, false, false);
+        assert!(!shown.contains("added") && one_speaker(&ex) && ex.answer == "Will do.", "{shown}");
+        assert!(shown.ends_with("23:42:10  I said: Will do."), "{shown}");
+    }
+
+    // someone already named in a turn of several speakers is not named twice;
+    // words not in the product's shape, as Claude Code queues and begins turns
+    // with its own, are no one's, in a turn's message or handed at a step
+    #[test]
+    fn an_addition_names_only_someone_new() {
+        use serde_json::json;
+        let arrival = "In a group direct message that fan, mei and I read. Everyone in it sees what I \
+                       say there.\n\nThe conversation so far:\n\n    16:41 fan: remind me at 5\n\n\
+                       mei now says, after fan:\n\n    me too";
+        let ex = exchange_of("named-once", &[
+            entry(json!({"type": "user", "message": {"role": "user", "content": prompt(arrival)}})),
+            entry(json!({"type": "attachment", "attachment": {"type": "queued_command", "commandMode": "prompt",
+                        "prompt": [{"type": "text", "text": addition("fan", "at the house")}]}})),
+            entry(json!({"type": "attachment", "attachment": {"type": "queued_command", "commandMode": "prompt",
+                        "prompt": "a prompt of Claude Code's own"}})),
+            entry(json!({"type": "user", "message": {"role": "user",
+                        "content": [{"type": "text", "text": "a shape no frame has"}]}})),
+        ]);
+        assert_eq!(ex.speaker, "mei (after fan)");
+        let shown = render(&ex, false, false);
+        assert!(shown.contains("fan added: at the house") && !shown.contains("a shape no frame has")
+                && !shown.contains("Claude Code's own") && !shown.contains("someone"), "{shown}");
+    }
+
     // a turn that took messages from more than one person is no one person's
     #[test]
     fn a_turn_of_several_speakers_is_no_one_persons() {
@@ -625,21 +929,21 @@ remind mei at 5\n    involves: me; mei");
     #[test]
     fn a_clock_exchange_reads_as_its_last_answer_that_says_something() {
         let ex = transcript("clock", LOOK, &["Morning, it is at 5 today.", ""]);
-        assert_eq!(ex.said(), "Morning, it is at 5 today.");
+        assert_eq!(ex.answer, "Morning, it is at 5 today.");
         assert!(was_with(&ex, "mei"), "listed with the person it reached");
         assert!(line(&ex).ends_with("me: Morning, it is at 5 today."), "{}", line(&ex));
-        // the whole exchange still shows every turn as it was
+        // shown whole, the empty answer after it changes nothing
         let full = render(&ex, true, false);
-        assert!(full.contains("I said: Morning, it is at 5 today.") && full.contains("I said: (nothing)"),
+        assert!(full.ends_with("16:01:00  I said: Morning, it is at 5 today.") && !full.contains("(nothing)"),
                 "{full}");
         // nothing said in any turn is silent
         let ex = transcript("clock-silent", LOOK, &["", " "]);
         assert!(!was_with(&ex, "mei") && line(&ex).ends_with("me: (silent)"));
-        // a message's exchange reads as its final answer, the one posted
+        // a message's exchange reads the same way
         let dm = "I am wanda.\n\nToday is 2031-01-13.\n\nmei says to me, in a direct message:\
 \n\n    morning\n\nDo three things, in this order.\n";
         let ex = transcript("dm", dm, &["Morning.", ""]);
-        assert_eq!(ex.said(), "");
-        assert!(line(&ex).ends_with("me: (silent)"));
+        assert_eq!(ex.answer, "Morning.");
+        assert!(line(&ex).ends_with("me: Morning."));
     }
 }

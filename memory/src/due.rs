@@ -66,8 +66,9 @@ pub struct Item {
     pub summary: String,
     pub involves: Vec<String>,
     pub constrained_by: Vec<String>,
-    /// whose message the thread was made in; empty when the transcript is gone
-    /// or nobody wrote, as with an email or the clock
+    /// whose message the thread was made in; empty when the transcript is gone,
+    /// when nobody wrote, as with an email or the clock, and when more than one
+    /// person spoke in it
     pub asked_by: String,
 }
 
@@ -115,10 +116,11 @@ fn asked_by(v: &Vault, made: &str) -> String {
     }
     let Some(p) = transcript::find(&v.root, made) else { return String::new() };
     let ex = transcript::load(&p);
-    // an email's sender asked her nothing, and on the clock nobody wrote. A
-    // turn that took several people's messages reads back as "{speaker}
-    // (after {others})" (transcript::parse_prompt): no one person asked
-    if ex.channel == "email" || ex.channel == "clock" || ex.speaker.contains(" (after ") {
+    // an email's sender asked her nothing, and on the clock nobody wrote. An
+    // exchange more than one person spoke in, a turn that took several
+    // people's messages or a session handed another's while it worked, has
+    // no one person who asked (transcript::one_speaker)
+    if ex.channel == "email" || ex.channel == "clock" || !transcript::one_speaker(&ex) {
         return String::new();
     }
     ex.speaker
@@ -356,6 +358,36 @@ mod tests {
         assert!(fan.contains(&"`trajectory:iiiiii`  2031-01-12T9:00, today  by hand".to_string())
                 && fan.contains(&"`trajectory:jjjjjj`  2031-01-12 17:00, today  by hand".to_string()), "{fan:?}");
         assert_eq!(fan.iter().filter(|l| l.contains("still to come")).count(), 1, "{fan:?}");
+
+        // fan's request, and a message added while its session worked, as the
+        // product hands one: mei's makes the exchange no one person's, and
+        // fan's own leaves it his
+        let tx = s.1.join("transcripts");
+        for (sid, who, id, by) in [("s-mei-added", "mei", "trajectory:kkkkkk", "2031-01-12T18:00"),
+                                   ("s-fan-added", "fan", "trajectory:llllll", "2031-01-12T19:00")] {
+            transcript(&tx, sid, "In a group direct message that fan, mei and I read. Everyone in it \
+                                  sees what I say there.\n\nfan says:\n\n    remind me at 6");
+            let added = serde_json::json!({"type": "attachment", "timestamp": "2031-01-10T09:00:05Z",
+                "attachment": {"type": "queued_command", "commandMode": "prompt", "prompt": [{"type": "text",
+                    "text": format!("{who} adds this in the same group direct message at 09:00, before \
+                                     anything I say back has been sent:\n\n    and remind mei too\n\n\
+                                     Nothing I have said back in this session has been sent yet. The last \
+                                     answer I give in this session that says something is the one sent, \
+                                     so that is where anything said here gets its answer.")}]}});
+            let path = tx.join(format!("{sid}.jsonl"));
+            let opening = std::fs::read_to_string(&path).unwrap();
+            std::fs::write(&path, format!("{opening}{added}\n")).unwrap();
+            s.0.session = sid.into();
+            s.0.upsert(id, "trajectory", "remind them at 6", "remind them at 6", "",
+                       &[("expect".into(), "it happens".into()), ("expect_by".into(), by.into()),
+                         ("status".into(), "open".into())],
+                       &[edge("involves", "person:3c4d5e"), edge("involves", "person:1a2b3c")], "2031-01-10");
+        }
+        let found = items(&s.0, "2031-01-12", Some("2031-01-11")).unwrap();
+        let item = |id: &str| found.iter().find(|i| i.id == id).unwrap();
+        assert_eq!((item("trajectory:kkkkkk").asked_by.as_str(), item("trajectory:llllll").asked_by.as_str()),
+                   ("", "fan"));
+        assert!(!item("trajectory:kkkkkk").woken_at_its_time() && item("trajectory:llllll").woken_at_its_time());
         std::env::remove_var("MEM_TRANSCRIPTS");
     }
 }
