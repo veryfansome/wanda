@@ -128,6 +128,111 @@ Every session runs on `CLAUDE_CODE_OAUTH_TOKEN`. When Claude Code stops acceptin
 
 The volumes, the images and Docker's build cache share one disk in Rancher Desktop's VM. A start on a full disk stops at the run store: the log, and an alert at most once a UTC day, say `the run store /srv/wanda/store/wanda.db could not be opened or written: …`, and it tries again every minute, so wanda comes back by herself once there is room. A restart while the disk is still full alerts again. A disk that fills while wanda runs raises no alert until a restart: a message that arrives then gets no reply and is lost, since Slack has already been told it arrived and does not send it again, and the log says `Failed to run a request listener: database or disk is full`; an answer whose session ended as the disk filled can be lost too, with `⚠️ I hit an internal error handling that reply.` posted in its place. `doctor` then says that the vault and the run store take no write. `docker system df` shows what fills the disk. Make room by removing by name what is known not to be needed, an old image with `docker image rm` for one, never with a `prune`, which can take the volumes with it.
 
+## Checks to repeat
+
+Three things under wanda are checked live, because no unit test reaches them: the Claude Code version, how Rancher Desktop mounts the Mac's directories, and how many sessions run at once. When one of them changes, its check is repeated before the household relies on the change. Everything below runs from the household's worktree.
+
+**When `CLAUDE_VERSION` moves.** `wanda.Dockerfile` pins Claude Code (`ARG CLAUDE_VERSION`). A message added while a session works (Talking to wanda) reaches it through shapes of that version's output and transcripts that no documentation gives: the types of event on its streamed output, the `queued_command` it writes when it hands a message over at a step, between two of a turn's tool calls, a further turn when the message comes after the last step, two messages waiting for one turn taken as one, and each turn's answer kept in the transcript. `uv run pytest` runs the runner against a stand-in that replays those shapes (`tests/claude_standin.py`), so it passes whatever a new version does. On a version whose shapes differ, an event of a type the runner does not know fails the session it comes in (`⚠️ my run failed: could not read the session's output: an event of a type this runner does not know: …`), and a changed handing can lose an added message or answer it twice. So a new version is read in its code by `tests/test_claude_shapes.py`, then run in live sessions in the scratch project `compose.foldin-check.yaml` lays over `compose.wanda.yaml`, with a vault, run store, home and image of its own, and one session at a time; its header says what else it keeps apart.
+
+First, with the household still running: that the overlay applies, the scratch's image built with the new version, its Claude Code copied out, and its code read.
+
+```
+docker compose -p wanda-foldin-check -f compose.wanda.yaml -f compose.foldin-check.yaml config --no-interpolate | grep -e '^name:' -e 'image:' -e 'source: /'
+docker compose -p wanda-foldin-check -f compose.wanda.yaml -f compose.foldin-check.yaml build --build-arg CLAUDE_VERSION=<new version>
+docker run --rm --network none wanda-foldin-check claude --version
+docker run --rm --network none wanda-foldin-check sh -c 'cat "$(readlink -f "$(command -v claude)")"' > ~/claude-<new version>
+TEST_CLAUDE_BIN=$HOME/claude-<new version> uv run pytest tests/test_claude_shapes.py
+```
+
+Look for `name: wanda-foldin-check`, `image: wanda-foldin-check`, two sources under `~/wanda-foldin-check` and no `wanda-home`; `<new version> (Claude Code)`; `6 passed`. A failure means the stand-in no longer stands for that version: the version stays where it is until the stand-in and the runner are brought to its shapes, read by hand from live sessions of that version; the repo has no script for that. `docker image rm wanda-foldin-check` and `rm ~/claude-<new version>` end the check there.
+
+Then the live part, with the household stopped, since one daemon holds the Slack app's connection. Its clock stops with it: a reminder whose time falls in the stop is given at the restart only while under two hours gone, and a morning look only before noon, so the live part goes at a time with neither due, and the household is started again within two hours. What is said to wanda meanwhile reaches the scratch's vault and is not remembered, and the check's lines and answers stay in the household's conversations, where her sessions read them as earlier lines for 12 hours, so send only real questions and facts the household is content to have there, and ask for no reminder, which the scratch gives only while it runs. `up -d` goes without `--build`, which would build the pinned version again. The `logs` line is run until it shows `wanda running (`, and doctor only after that: until then the start is still preparing the vault and reading names from Slack, and doctor can report a failure that is not one.
+
+```
+docker compose -f compose.wanda.yaml stop
+mkdir -p ~/wanda-foldin-check/transcripts
+docker compose -p wanda-foldin-check -f compose.wanda.yaml -f compose.foldin-check.yaml up -d
+docker compose -p wanda-foldin-check -f compose.wanda.yaml -f compose.foldin-check.yaml logs wanda | tail -20
+docker compose -p wanda-foldin-check -f compose.wanda.yaml -f compose.foldin-check.yaml exec -T wanda /opt/wanda/.venv/bin/wanda doctor --no-smoke
+```
+
+Look for doctor's `binary` line ending `(<new version> (Claude Code))`, its `memory settings` line ending `1 session(s) at once`, and `all checks passed`. fan then sends the messages below in his DM, waiting for each reply, or three minutes of silence, and then for that session's `memory session` line in the log, before the next. Each session is read from that line, `memory session <sid> in <conversation>: waited <w> s for a slot, ran <r> s, …; <A> added, <R> results, <x> recalled, <y> recorded, <outcome>`, and from `mem session`:
+
+```
+docker compose -p wanda-foldin-check -f compose.wanda.yaml -f compose.foldin-check.yaml logs wanda | grep 'memory session '
+docker compose -p wanda-foldin-check -f compose.wanda.yaml -f compose.foldin-check.yaml exec -T wanda timeout 60 mem session <sid>
+```
+
+- A real question. One answer, with no failure note after it; `0 added, 1 results` and `<N> characters to post`, with no `, then failed`; `fan said: …` in `mem session`.
+- A real question, and about 10 s later a line with a real fact about it. One reply covering both; `1 added, 1 results`; `fan added: …`. If the second line reached Slack after the reply, it was sent too late: try again, sooner.
+- A real question, then a line sent after the session's last step, as it writes its answer: as soon as the second of the lines below prints `now`, the first being run before the question is sent and the second right after it; or at about the earlier sessions' `ran` less 10 s. The second waits for a transcript newer than the last to hold the session's `enrich` call, then for that transcript to stop growing for a few seconds (its `wc -l`, read every two seconds, unchanged twice running), as it does once the calls `enrich` makes are over, and also in a pause between them, so the cue lands in the window only now and then: in about one try in six, by the lab's timings.
+
+  ```
+  t=~/wanda-foldin-check/transcripts/-srv-wanda-vault; last=$(ls -t $t/*.jsonl | head -1)
+  until f=$(ls -t $t/*.jsonl | head -1); [ "$f" != "$last" ] && grep -q '"name":"Skill","input":{"skill":"enrich"' "$f"; do sleep 1; done; p=; n=0; while [ $n -lt 2 ]; do sleep 2; c=$(wc -l < "$f"); [ "$c" = "$p" ] && n=$((n+1)) || n=0; p=$c; done; echo now
+  ```
+
+  Three ways: (a) a line adding to the question: one reply covering both, `1 added, 2 results`, `I (aside): …` and then `I said: …`; (b) "thanks!": the first answer posted, with no second reply and no failure note, `1 added, 2 results`, `I said: …` and then `fan added: thanks!`; (c) two lines a second apart: one reply covering all three, `2 added, 2 results`, and both `fan added:` lines. A try that reads `1 added, 1 results` was taken in at a step, and one that comes after the reply gets a session of its own: neither is a failure, and the way is tried again until a try reads `2 results`, within the two hours the household can stay stopped. A way still unchecked then is tried in a second sitting, and the version does not move until every way has been.
+- mei sends a real line in her DM; within about 5 s fan sends one in his, and about 10 s later a second, while her session runs. fan's session: `waited <w> s for a slot` with `<w>` above 0, `0 added`, and one reply answering both.
+- With no session running, two lines about a second apart. `1 added` and one reply; `fan said: <the first>`, then `fan added: <the second>`. Both taken at the start, `0 added`, is not a failure: once more, 2 to 3 s apart.
+
+Then the counts from the log and the transcripts, while the scratch still has them:
+
+```
+docker compose -p wanda-foldin-check -f compose.wanda.yaml -f compose.foldin-check.yaml logs wanda | grep 'memory session '
+python3 lab/fold_counts.py ~/wanda-foldin-check/transcripts/-srv-wanda-vault
+```
+
+Look for, on each session's line, `handed` equal to the `added` of its log line and `further turns` to its `results` less one, and `1 of them opened by more than one message` on the (c) that passed. Two replies where one was due, a message left unanswered, a failure note, or a count that differs is a failure, and the version stays.
+
+Then the scratch removed, and the household started again:
+
+```
+docker compose -p wanda-foldin-check -f compose.wanda.yaml -f compose.foldin-check.yaml down -v --rmi all
+rm -rf ~/wanda-foldin-check ~/claude-<new version>
+docker compose -f compose.wanda.yaml start
+```
+
+Once everything passes, `CLAUDE_VERSION` is changed in `wanda.Dockerfile`, merged into the household's branch, and reaches the household as an upgrade does (Setup, step 7).
+
+**When Rancher Desktop's mount type is switched.** The vault and the run store are Docker volumes on the VM's own disk. `~/wanda-home`, with the snapshots and the transcripts, reaches the container through Rancher Desktop's mount type, which was reverse-sshfs (`fuse.sshfs` in the container's `/proc/mounts`) when the times below were measured. Two holds of the vault go across it: the snapshot after each session holds the vault shared while git writes `snapshots.git`, and the clock's due check, `mem due` every five minutes, holds it shared while it opens the transcript of each item come due, to say who asked. A write waits behind either. A session's `mem` call gives up after 90 s (`(the store could not be held for this call: it stayed busy for 90 s; nothing was read or written)`); a snapshot that waits 60 s for the vault, or runs past 120 s, fails and is alerted (`vault snapshots: …`); the daemon's own `mem` calls stop at 60 s (`clock: the due check was skipped: …`). On reverse-sshfs, with a test vault of 190 files, a first snapshot held the vault 1.6 to 2.8 s, a later one 0.19 to 0.87 s, and a due check 25 to 27 ms, far below those limits; the snapshots' holds grow with the Mac's load, and the due check's reads over the mount are expected to (not measured). Another mount type moves those times, and whether git and Claude Code still write there is seen only after the switch. The unit tests run on the Mac's own disk, with no VM and no mount between, so they cannot show it. The half-minute wait after changing `~/wanda-home` on the Mac (State) is for reverse-sshfs's 20 s cache, and does no harm under another.
+
+Before the switch, and again once the container runs after it, at a quiet moment with nobody messaging wanda: the Mac's load, read on the Mac; the type of the two mounts; a first snapshot and five later ones of the vault as it stands, into a repository of their own beside `snapshots.git` that is removed after, each timed by git's time, which is the hold (no lock is taken here, so nothing in the household waits for it); and, three times each, the due check over the last 30 days, wider than the clock's own two days, so an upper bound on it, and a look-back, which holds nothing but reads every transcript over the mount.
+
+```
+sysctl -n vm.loadavg
+docker compose -f compose.wanda.yaml exec -T wanda grep -e ' /srv/wanda/home ' -e ' /home/wanda/.claude/projects ' /proc/mounts
+docker compose -f compose.wanda.yaml exec -T wanda bash -c 'git init -q --bare /srv/wanda/home/mount-check.git && cd /srv/wanda/vault && export GIT_DIR=/srv/wanda/home/mount-check.git GIT_WORK_TREE=/srv/wanda/vault GIT_AUTHOR_NAME=check GIT_AUTHOR_EMAIL=check@localhost GIT_COMMITTER_NAME=check GIT_COMMITTER_EMAIL=check@localhost TIMEFORMAT="snapshot %R s"; for i in 1 2 3 4 5 6; do time { git add -A -- . ":!.index.db" ":!.obsidian" ":!.*.part" ":!**/.*.part" && git -c gc.auto=0 commit -q --allow-empty -m "$i"; }; done; rm -rf /srv/wanda/home/mount-check.git'
+docker compose -f compose.wanda.yaml exec -T wanda bash -c 'for i in 1 2 3; do TIMEFORMAT="due %R s"; time mem due --after "$(date -d "30 days ago" +%F)" > /dev/null; TIMEFORMAT="look-back %R s"; time mem session --last 5 > /dev/null; done'
+```
+
+Look for, after the switch, the new type on both mount lines, and each time close to the same line's before the switch, the two read at a like load. The first `snapshot` line is a whole vault into an empty repository, as a start into a new `snapshots.git` makes; the five after it are what the next session's writes can wait behind. Later snapshots or due checks several times slower than before the switch lengthen every write that meets one. A first snapshot is met only by a call run by hand during a start into an empty `snapshots.git`. Times that near the 60 s the daemon gives its due check, or the 90 s a write waits: switch back. Once a session has run after the switch: its transcript under `~/wanda-home/transcripts/-srv-wanda-vault`, `docker compose -f compose.wanda.yaml exec -T wanda timeout 60 mem session <sid>` reading it, with `<sid>` from `docker compose -f compose.wanda.yaml logs wanda | grep 'memory session '`, a commit `after <sid>` in `docker compose -f compose.wanda.yaml exec -T wanda git --git-dir /srv/wanda/home/snapshots.git log --oneline -3` if it recorded anything, and no `vault snapshots:` alert.
+
+This times the holds, not a write waiting behind one: where a write was timed beside a snapshot or a due check, it ended just after the hold did, so the hold is the wait. The figures above are from a test vault of 190 files and 141 transcripts with five items due; the household's own will differ, so what counts is its own times before and after the switch. A `mem due` that lists nothing has opened no transcript, and then the look-back alone shows how the mount reads.
+
+**If `WANDA_MEMORY_SESSIONS` is ever set to 2.** One session runs at a time unless `.env` sets it. With two, sessions in two conversations overlap, and the vault's lock, which keeps each `mem` call whole (`memory/tests/together.rs`), does not keep them apart across calls: both can look up a person new to wanda under two spellings, each find no one, and each make a node, since the look-up and the write a turn later are two calls; a session's `mem session` can read the other's exchange before it ends; and Claude Code shows a session the changed lines of some vault files it has seen when something else changes them, so one person's words can reach the other's session unasked. Only two live sessions show what they do.
+
+Set `WANDA_MEMORY_SESSIONS=2` in `.env`, then:
+
+```
+docker compose -f compose.wanda.yaml up -d
+docker compose -f compose.wanda.yaml exec -T wanda /opt/wanda/.venv/bin/wanda doctor --no-smoke
+```
+
+Look for doctor's `memory settings` line ending `2 session(s) at once`. Then fan and mei each send a DM within a few seconds of each other, both about one real thing and both naming someone wanda does not know yet, one by first name and the other by full name. Look for both answered or silent as usual. Then the two sessions' log lines, and, with their ids from those lines, what each did:
+
+```
+docker compose -f compose.wanda.yaml logs wanda | grep 'memory session '
+grep -c -E '("|\\n)\(the store could not be' ~/wanda-home/transcripts/-srv-wanda-vault/<sid 1>.jsonl ~/wanda-home/transcripts/-srv-wanda-vault/<sid 2>.jsonl
+grep -o '"type":"edited_text_file","filename":"[^"]*"' ~/wanda-home/transcripts/-srv-wanda-vault/<sid 1>.jsonl ~/wanda-home/transcripts/-srv-wanda-vault/<sid 2>.jsonl
+grep -o -E '"filename":"[^"]*CLAUDE\.md","snippet":"([^"\\]|\\.)*"' ~/wanda-home/transcripts/-srv-wanda-vault/<sid 1>.jsonl ~/wanda-home/transcripts/-srv-wanda-vault/<sid 2>.jsonl
+docker compose -f compose.wanda.yaml exec -T wanda timeout 60 mem session --full <sid 1>
+docker compose -f compose.wanda.yaml exec -T wanda timeout 60 mem session --full <sid 2>
+docker compose -f compose.wanda.yaml exec -T wanda cat /srv/wanda/vault/people/CLAUDE.md
+```
+
+Look for both `memory session` lines reading `waited 0.0 s for a slot`: one at a time, the second would have waited for the first. Then `0` on both transcripts: no call of theirs refused the vault or a write (the grep counts a refusal only at the start of a result or of one of its lines, since a look-back can quote an earlier one); no file in one session's `edited_text_file` lines that the other session wrote, as its `I ran:` lines in `mem session` and the `→ ok` lines under them show, a node `<kind>:<name>` being the file `<name>.md` in its kind's directory (`person:` in `people/`) (notes of files a session changed itself are expected), and a note of a directory's `CLAUDE.md`, which both sessions' writes regenerate, being the other's only if its `snippet`, which the third grep prints, holds a line for what the other wrote; the new person once in the person index, and nobody in it twice. Any of them found is a reason to go back to one at a time: remove the setting from `.env`, then `docker compose -f compose.wanda.yaml up -d`. A person found twice stays so until wanda is told: say in a DM that the two are one person, then read the index again after that session. Passing shows that these two sessions met nothing this time, not that two at once cannot.
+
 ## Development
 
 ```
