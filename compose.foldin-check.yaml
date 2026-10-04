@@ -6,9 +6,10 @@
 # store are this project's own named volumes, wanda-foldin-check_vault and
 # wanda-foldin-check_store, the only ones `down -v` here can remove; the home
 # directory and the transcripts are a directory of its own; and the image is
-# its own, so a re-check's build never retags the household's. It runs no
-# morning look, whatever .env says, and no email triage, even once
-# compose.wanda.yaml turns it on; its clock still gives a timed reminder
+# its own, so a re-check's build never retags the household's. Whatever
+# .env says, it runs no morning look, and one session at a time, since a
+# check has one session wait for another's to end; and no email triage, even
+# once compose.wanda.yaml turns it on. Its clock still gives a timed reminder
 # asked for here at its time, while this runs. Only one daemon may hold the
 # Slack app's connection, so the household's is stopped for as long as this
 # runs, and messages sent meanwhile reach this vault and are not remembered.
@@ -19,11 +20,12 @@
 #
 #   docker compose -f compose.wanda.yaml stop
 #   mkdir -p ~/wanda-foldin-check/transcripts
-#   C="docker compose -p wanda-foldin-check -f compose.wanda.yaml -f compose.foldin-check.yaml"
-#   $C build --build-arg CLAUDE_VERSION=<the version checked>    a re-check only
-#   $C up -d
+#   docker compose -p wanda-foldin-check -f compose.wanda.yaml -f compose.foldin-check.yaml build --build-arg CLAUDE_VERSION=<the version checked>
+#       a re-check only
+#   docker compose -p wanda-foldin-check -f compose.wanda.yaml -f compose.foldin-check.yaml up -d
 #   ... the checks; then
-#   $C down -v --rmi all && rm -rf ~/wanda-foldin-check
+#   docker compose -p wanda-foldin-check -f compose.wanda.yaml -f compose.foldin-check.yaml down -v --rmi all
+#   rm -rf ~/wanda-foldin-check
 #   docker compose -f compose.wanda.yaml start
 name: wanda-foldin-check
 services:
@@ -31,6 +33,7 @@ services:
     image: wanda-foldin-check
     environment:
       WANDA_MORNINGS: ""
+      WANDA_MEMORY_SESSIONS: "1"
       WANDA_EMAIL_TRIAGE: "off"
     volumes:
       - type: bind
