@@ -46,12 +46,18 @@ class SlackWatcher:
         self.loop = loop
         self.queue = queue
         self.bot_user_id: str | None = None
+        self.bot_id: str | None = None
         self.client: SocketModeClient | None = None
 
     def start(self) -> None:
+        """Connects, once auth.test has named her bot user, and her bot id
+        if it has one: every frame tells her own posts by them."""
         # SocketModeClient takes its websocket TLS context from this client.
         web = WebClient(token=self.cfg.slack_bot_token, ssl=ssl_context())
-        self.bot_user_id = web.auth_test()["user_id"]
+        auth = web.auth_test()
+        self.bot_user_id, self.bot_id = auth.get("user_id"), auth.get("bot_id")
+        if not self.bot_user_id:
+            raise RuntimeError("auth.test named no bot user")
         self.client = SocketModeClient(app_token=self.cfg.slack_app_token, web_client=web)
         self.client.socket_mode_request_listeners.append(self._handle)
         self.client.connect()

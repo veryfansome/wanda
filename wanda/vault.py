@@ -20,6 +20,7 @@ import signal
 import subprocess
 import threading
 import time
+import unicodedata
 from datetime import datetime
 from pathlib import Path
 from typing import NamedTuple
@@ -56,27 +57,92 @@ PLACES = {
     "public thread": ("a Slack thread in a public channel", "The thread so far:"),
 }
 EVERYONE = " Everyone in it sees what I say there."
-GUEST = " (a guest in this Slack)"
-# after someone outside the household whose Slack name is one a member goes
-# or went by, so their words are not read as that person's
+# After the name of everyone neither her nor on the allowlist, a person or an
+# app, wherever a frame other than a 1:1 DM's names them: among its readers,
+# at the head of what they said and where a message mentions them.
+OUTSIDE = " (outside the household)"
+# the same, for one whose chosen name is, or looks like (`alike`), one a
+# member goes or went by, so that their words are not read as that member's
+OUTSIDE_NAMESAKE = " (another person in this Slack, outside the household)"
+# after an allowed id not let in whose name is, or looks like, a member's,
+# and after anyone so named in a 1:1 DM
 NAMESAKE = " (another person in this Slack)"
+# a mention past what a frame looks up, and a poster with no name to use
+SOMEONE = "someone" + OUTSIDE
+# on a public frame's opening line when anyone outside the household can read
+# it; elsewhere the marks on its readers say so
+OUTSIDERS_READ = " Some who can read it are outside the household."
 ME = "me"
-# Past this many, a frame names the household's readers and counts the rest.
+# Who posted one of her alerts, as a frame shows it: an alert carries the
+# harness's words, so it is never shown as something she said.
+ALERTED = "an alert posted in my name"
+# Past this many readers besides her, a frame names the household's, members
+# and allowed ids, and counts the rest without looking them up, as CROWD.
 NAMED_READERS = 12
-# Outside a thread, the conversation so far is its last RECENT_HOURS, at most
-# EARLIER messages: a reply sent after midnight still arrives with what it
-# answers. What came before is in the vault, and in the transcripts `mem
-# session` reads.
+CROWD = "{n} others outside the household"
+# Outside a thread, the conversation so far is its last RECENT_HOURS: the
+# household's newest EARLIER lines, hers among them, and up to OUTSIDE_EARLIER
+# of anyone else's from the oldest of those on, so that others' lines never
+# push the household's out of view. A reply sent after midnight still arrives
+# with what it answers. What came before is in the vault, and in the
+# transcripts `mem session` reads.
 RECENT_HOURS = 12
 EARLIER = 20
+OUTSIDE_EARLIER = 20
+# A post marked outside the household is cut once what the frame shows of it
+# after its line head, its labels and indents included, would pass CUT_AT
+# characters, so that no one else's posts can fill the frame; the household's
+# posts and her alerts never are.
+CUT_AT = 4000
+CUT = " [{n} more characters cut]"
+# What a frame shows of all such posts together, the newest first, each still
+# cut at CUT_AT; one past it shows only how much was cut. In a dense script,
+# CJK or emoji, 49 posts at CUT_AT could pass what a session's context holds,
+# which would fail the member's turn.
+OUTSIDE_CUT_AT = 40000
 # The marks the harness posts its alerts and its failure notes with (Slack
-# message metadata). An alert is for the people who keep wanda running, and a
-# failure note carries Claude Code's reason, in its words, not hers: both are
-# left out of what a session is shown, where they would read as something she
-# said. A session then sees the message a failed run left unanswered as it
-# would after silence.
+# message metadata), which only an app can attach. An alert is for the people
+# who keep wanda running: a session is shown hers as an alert posted in her
+# name, never as something she said. A failure note carries Claude Code's
+# reason, in its words, not hers, and is left out of what a session is shown,
+# which then sees the message a failed run left unanswered as it would after
+# silence.
 ALERT_EVENT = "wanda_alert"
 NOTE_EVENT = "wanda_note"
+
+# What a quote in a chosen name becomes, so that the quotation marks a frame
+# puts around the name are never closed inside it.
+SINGLE = "\u2019"
+# Two or more single quote marks in a row read as a double one (TeX closes a
+# quotation with ''), so a run of them in a chosen name, SINGLE and the marks
+# that look like it, becomes one SINGLE, invisible and combining characters
+# between them included, since they show nothing between the marks.
+SINGLES = frozenset("'`\u00b4\u02b9\u02bb\u02bc\u02c8\u05f3\u1fef\u1ffd\u2019\u2032\u2035\ua78b\ua78c\uff07")
+# The 22 double quotation marks and corner brackets of Unicode's Quotation_Mark
+# property, and 17 marks outside it that look like one. Any other character
+# Unicode files as an opening or closing quote (Pi, Pf) but SINGLE is caught
+# too (`_quote`).
+QUOTES = frozenset(
+    '"\u00ab\u00bb\u201c\u201d\u201e\u201f\u2e42\u300c\u300d\u300e\u300f'
+    '\u301d\u301e\u301f\ufe41\ufe42\ufe43\ufe44\uff02\uff62\uff63'
+    '\u2033\u2036\u02ba\u02dd\u3003\u05f4'
+    '\u02ee\u02f6\u2034\u2057\u275d\u275e\u2760\u1cd3\U0001f676\U0001f677\U0001f678')
+# Unicode's Default_Ignorable_Code_Point, the 17 ranges of
+# DerivedCoreProperties.txt (Unicode 15.0), which Python's unicodedata does
+# not expose: zero-width characters, the soft hyphen and the Hangul fillers
+# among them.
+IGNORABLE = ((0x00AD, 0x00AD), (0x034F, 0x034F), (0x061C, 0x061C), (0x115F, 0x1160), (0x17B4, 0x17B5),
+             (0x180B, 0x180F), (0x200B, 0x200F), (0x202A, 0x202E), (0x2060, 0x206F), (0x3164, 0x3164),
+             (0xFE00, 0xFE0F), (0xFEFF, 0xFEFF), (0xFFA0, 0xFFA0), (0xFFF0, 0xFFF8), (0x1BCA0, 0x1BCA3),
+             (0x1D173, 0x1D17A), (0xE0000, 0xE0FFF))
+# The 50 Cyrillic and Greek letters, upper and lower case, that look Latin, as
+# the Latin letters they look like.
+LOOKALIKE = str.maketrans(
+    "\u0410\u0412\u0415\u041a\u041c\u041d\u041e\u0420\u0421\u0422\u0425\u0405\u0406\u0408"
+    "\u0430\u0435\u043e\u0440\u0441\u0443\u0445\u0455\u0456\u0458\u0501\u04bb\u04cf\u051b\u051d"
+    "\u0391\u0392\u0395\u0396\u0397\u0399\u039a\u039c\u039d\u039f\u03a1\u03a4\u03a5\u03a7"
+    "\u03b1\u03bf\u03c1\u03b9\u03ba\u03bd\u03c5",
+    "ABEKMHOPCTXSIJ" "aeopcyxsijdhlqw" "ABEZHIKMNOPTYX" "aopikvu")
 
 TODAY = "Today is {weekday}, {date}, and it is {time} here ({zone}) as this session begins. "
 AFTER_DATE = (
@@ -162,41 +228,134 @@ def where(p: dict) -> str:
     return {"im": "dm", "mpim": "group", "channel": "public"}.get(p.get("channel_type") or "", "channel")
 
 
-def names(users: dict[str, dict], told: dict[str, str], namesakes: set[str]) -> dict[str, str]:
-    """Slack id to name: the name sessions are told for a member of the
-    household (`told`), the one Slack shows for anyone else, marked when
-    `mem` would read it as one of `namesakes`, lower case, which a member
-    goes or went by."""
+def _ignorable(c: str) -> bool:
+    o = ord(c)
+    return any(lo <= o <= hi for lo, hi in IGNORABLE)
+
+
+def fold(name: str) -> str:
+    """The form two names are compared in to tell whether one looks like the
+    other, and for nothing else: compatibility forms and accents taken apart
+    (NFKD, since NFKC would compose a letter and a dot below back into one
+    letter); format, combining, enclosing and default-ignorable characters
+    dropped; the look-alike Cyrillic and Greek letters made Latin; casefolded."""
+    s = unicodedata.normalize("NFKD", household.spelled(name))
+    s = "".join(c for c in s if unicodedata.category(c) not in ("Cf", "Mn", "Me") and not _ignorable(c))
+    return s.translate(LOOKALIKE).casefold()
+
+
+def alike(name: str, namesakes) -> bool:
+    """Whether `name` is, or looks like, one of `namesakes`: folded, it is one
+    of them folded, or as long as one and different from it only where it
+    holds a character outside ASCII. A name in another script as long as a
+    member's is caught too; the mark that follows, another person, is true of
+    anyone it is given to."""
+    f = fold(name)
+    return any(f == n or (len(f) == len(n) and all(a == b or not a.isascii() for a, b in zip(f, n)))
+               for n in {fold(m) for m in namesakes})
+
+
+def _quote(c: str) -> bool:
+    return c in QUOTES or (c != SINGLE and unicodedata.category(c) in ("Pi", "Pf"))
+
+
+def _fields(u: dict) -> tuple:
+    prof = u.get("profile") or {}
+    return prof.get("display_name"), prof.get("real_name"), u.get("name")
+
+
+def _usable(field: str | None) -> str | None:
+    """A field of someone's Slack profile as the name a frame quotes them by:
+    on one line, each quote in it SINGLE and each run of quote marks one;
+    None when it folds to nothing, `me` or `wanda`, which would read as no
+    one or as her."""
+    name = household.spelled(field)
+    if fold(name) in ("", *household.SELF):
+        return None
+    return _runs("".join(SINGLE if _quote(c) else c for c in name))
+
+
+def _runs(s: str) -> str:
+    out, i = [], 0
+    while i < len(s):
+        if s[i] in SINGLES:
+            j, marks, end = i + 1, 1, i + 1
+            while j < len(s) and (s[j] in SINGLES or _ignorable(s[j]) or unicodedata.category(s[j]) == "Mn"):
+                if s[j] in SINGLES:
+                    marks, end = marks + 1, j + 1
+                j += 1
+            if marks > 1:
+                out.append(SINGLE)
+                i = end
+                continue
+        out.append(s[i])
+        i += 1
+    return "".join(out)
+
+
+def _quoted(name: str | None, uid: str, namesakes, *, outside: bool) -> str:
+    """Anyone neither her nor a member, by `name` in quotation marks, so that
+    it cannot carry the frame's own structure, then their mark; by their id
+    when they have no name to use."""
+    if name is None:
+        return uid + (OUTSIDE if outside else "")
+    same = alike(name, namesakes)
+    mark = (OUTSIDE_NAMESAKE if same else OUTSIDE) if outside else (NAMESAKE if same else "")
+    return f"“{name}”{mark}"
+
+
+def names(ids, users: dict[str, dict], told: dict[str, str], namesakes, own: frozenset[str], kin,
+          marked: bool = True) -> dict[str, str]:
+    """Slack id to the name a frame calls each of `ids` by, and every
+    member's besides. A member is called by the name sessions are told
+    (`told`), and her own ids by Slack's name, so that a mention of her reads
+    as her name. Anyone else, where `marked`, by the first of their display
+    name, full name and Slack name that can be used, in quotation marks: an
+    allowed id (`kin`) unmarked, anyone else outside the household, and either
+    as another person where the name is, or looks like (`alike`), one of
+    `namesakes`, which a member goes or went by. One with no name to use, or
+    whom Slack did not describe (`users`), is called by their id. In a 1:1 DM
+    (`marked` false) by the name Slack shows, marked only as another person."""
     out = {}
-    for uid, u in users.items():
-        prof = u.get("profile") or {}
-        name = prof.get("display_name") or prof.get("real_name") or u.get("name") or uid
-        out[uid] = name + (NAMESAKE if household.spelled(name).lower() in namesakes else "")
+    for uid in ids:
+        if uid in told:
+            continue
+        u = users.get(uid)
+        if uid in own:
+            out[uid] = next((f for f in _fields(u or {}) if f), uid)
+        elif not marked:
+            name = next((n for f in _fields(u or {}) if (n := household.spelled(f))), uid)
+            out[uid] = name + (NAMESAKE if alike(name, namesakes) else "")
+        else:
+            chosen = next((n for f in _fields(u) if (n := _usable(f))), None) if u else None
+            out[uid] = _quoted(chosen, uid, namesakes, outside=uid not in kin)
     return out | told
 
 
-def readers(ids: list[str], users: dict[str, dict], named: dict[str, str],
-            own: frozenset[str], told: dict[str, str]) -> list[str]:
-    """Who can read what is said in a conversation. A guest is marked as one,
-    unless the household names them (`told`); bots, deactivated accounts and
-    her own ids read nothing. A reader Slack would not describe fails the
-    frame, as an unreadable member list does."""
-    out = []
-    for uid in ids:
-        if uid in own:
+def readers(ids: list[str], users: dict[str, dict], named: dict[str, str], own: frozenset[str],
+            told: dict[str, str], kin) -> tuple[list[str], set[str]]:
+    """Who can read what is said in a conversation, as a frame names them,
+    and the ids among them outside the household: neither her nor an allowed
+    id (`kin`). An app is named, since one added to a conversation reads it;
+    a deactivated account is not. A reader Slack did not describe is named by
+    its id and marked outside: if it is a deactivated account, the frame names
+    one reader too many, which errs the safe way. Past NAMED_READERS the
+    household's are named and the rest counted, never looked up."""
+    people = [uid for uid in ids if uid not in own]
+    crowd = len(people) > NAMED_READERS
+    out, outside = [], set()
+    for uid in people:
+        if (users.get(uid) or {}).get("deleted"):
             continue
-        if uid not in told and uid not in users:
-            raise LookupError(f"no Slack record for {uid}")
-        u = users.get(uid) or {}
-        if u.get("is_bot") or u.get("deleted"):
-            continue
-        guest = uid not in told and (u.get("is_restricted") or u.get("is_ultra_restricted"))
-        out.append(named.get(uid, uid) + (GUEST if guest else ""))
+        ours = uid in told or uid in kin
+        if not ours:
+            outside.add(uid)
+        if ours or not crowd:
+            out.append(named.get(uid) or uid + ("" if ours else OUTSIDE))
     out.sort()
-    if len(out) > NAMED_READERS:
-        known = [n for n in out if n in told.values()]
-        out = known + [f"{len(out) - len(known)} others"]
-    return out
+    if crowd:
+        out.append(CROWD.format(n=len(outside)))
+    return out, outside
 
 
 def message_text(text: str | None, files: list | None, named: dict[str, str]) -> str:
@@ -214,51 +373,170 @@ def stamp(at: float, now: datetime) -> str:
     return f"{when:%H:%M}" if when.date() == now.date() else f"{when:%a %Y-%m-%d %H:%M}"
 
 
-def earlier(messages: list[dict], ts: str, place: str, named: dict[str, str],
-            own: frozenset[str], now: datetime) -> list[tuple[str, str, str]]:
-    """The conversation before this message, oldest first, as (when, who,
-    text): a thread whole, anywhere else its recent part, and in either
-    without the harness's alerts and failure notes. Her own posts after the
-    message are kept, in their place: a turn is framed under its
-    conversation's lock, so they are what she said to the turns before, and
-    a message sent while one of those ran would otherwise look unanswered."""
+def _at(m: dict) -> float | None:
+    try:
+        return float(m.get("ts") or 0)
+    except ValueError:
+        return None
+
+
+def from_outside(m: dict, own: frozenset[str], kin) -> bool:
+    """Whether a post is marked outside the household: one whose Slack user
+    is neither hers nor an allowed id, as an app posting as itself is, or one
+    with no Slack user. A post under an allowed id's user is theirs, even one
+    an app sent for them. In a 1:1 DM (`kin` None), where only she and the
+    member post, none is."""
+    return kin is not None and not is_mine(m, own) and m.get("user") not in kin
+
+
+def _showable(m: dict, ts: str, own: frozenset[str]) -> bool:
+    # her failure note carries Claude Code's words; another app's post with
+    # the same mark is shown, its poster marked
+    if _at(m) is None or m.get("subtype") in ("channel_join", "channel_leave"):
+        return False
+    mine = is_mine(m, own)
+    if mine and (m.get("metadata") or {}).get("event_type") == NOTE_EVENT:
+        return False
+    return mine or _at(m) < float(ts)
+
+
+def counts(m: dict, ts: str, own: frozenset[str], kin=None) -> bool:
+    """Whether a message read is one of the household's lines a frame can
+    show before the message `ts`: a member's, an allowed id's or hers, not her
+    note or a join, and after the message hers alone. `shown` counts the
+    household's window by it, and fetch_context stops reading by it."""
+    return _showable(m, ts, own) and not from_outside(m, own, kin)
+
+
+def _newest(lines: list[dict], n: int) -> list[dict]:
+    # lines[-0:] would be every line
+    return lines[-n:] if n > 0 else []
+
+
+def shown(messages: list[dict], ts: str, place: str, own: frozenset[str], now: datetime, *,
+          kin=None, thread: int = 50) -> list[dict]:
+    """The messages a frame shows before the message `ts`, oldest first,
+    picked before their posters are looked up. Outside a thread, the
+    household's newest EARLIER of the last RECENT_HOURS, and of anyone else's
+    the newest OUTSIDE_EARLIER from the oldest of those on, or over the whole
+    span when the household has fewer; in a thread, its first message, where
+    it can be shown, and of the household's replies and of others' the newest
+    `thread` - 1 each, in the same way. So no one else's lines push the
+    household's out of view. `kin`, the allowed ids, is None in a 1:1 DM,
+    where every poster is the household's. Her posts after the message are
+    kept, as `earlier` says."""
     in_thread = place.endswith("thread")
     since = now.timestamp() - RECENT_HOURS * 3600
-    out = []
-    for m in messages:
-        try:
-            at = float(m.get("ts") or 0)
-        except ValueError:
-            continue
-        if m.get("subtype") in ("channel_join", "channel_leave"):
-            continue
-        # whoever posted it: her own ids can be unknown when a frame is built,
-        # only an app can attach metadata, and the household guard keeps every
-        # other app out of these conversations
-        if (m.get("metadata") or {}).get("event_type") in (ALERT_EVENT, NOTE_EVENT):
-            continue
-        mine = is_mine(m, own)
-        if (at >= float(ts) and not mine) or (not in_thread and at < since):
-            continue
-        who = ME if mine else named.get(m.get("user") or "", m.get("username") or "someone")
-        out.append((stamp(at, now), who, message_text(m.get("text"), m.get("files"), named)))
-    return out if in_thread else out[-EARLIER:]
+    lines = [m for m in messages if _showable(m, ts, own) and (in_thread or _at(m) >= since)]
+    first, ours_n, theirs_n = [], EARLIER, OUTSIDE_EARLIER
+    if in_thread:
+        # a thread's first message is the earliest message read; when it
+        # cannot be shown, as her failure note cannot, no reply takes its place
+        first = [m for m in lines[:1] if m is messages[0]]
+        lines, ours_n, theirs_n = lines[len(first):], thread - 1, thread - 1
+    ours = _newest([m for m in lines if counts(m, ts, own, kin)], ours_n)
+    start = _at(ours[0]) if ours and len(ours) == ours_n else float("-inf")
+    theirs = _newest([m for m in lines if from_outside(m, own, kin) and _at(m) >= start], theirs_n)
+    keep = {id(m) for m in ours + theirs}
+    return first + [m for m in lines if id(m) in keep]
+
+
+def _poster(m: dict, named: dict[str, str], namesakes) -> str:
+    """Who posted a post marked outside the household, as a frame names
+    them. A post with no Slack user is named by the name it was posted under,
+    by the same rule as anyone else's chosen name."""
+    if user := m.get("user"):
+        return named.get(user) or user + OUTSIDE
+    name = _usable(m.get("username"))
+    return SOMEONE if name is None else _quoted(name, "", namesakes, outside=True)
+
+
+def _labelled(text: str, label: str, *, cut: int | None = None) -> tuple[str, int]:
+    """A post's text with `label` and ": " at the head of every further line
+    but a blank one, so that none reads as a line of the conversation; and,
+    where `cut` is given, cut on what the frame shows of it after its line
+    head: whole lines while that stays within `cut`, a first line longer than
+    that cut inside, the rest named by how many of the message's own
+    characters it held. Returns the text and the size of what it shows of
+    the post, the measure `cut` bounds."""
+    lines, ends = text.splitlines() or [""], text.splitlines(keepends=True) or [""]
+    out, size, kept = [], 0, 0
+    for i, line in enumerate(lines):
+        head = f"{label}: " if i and line.strip() else ""
+        # a further line is shown on a line of its own, at arrival_text's
+        # indent of eight
+        cost = len(line) if not i else len("\n" + " " * 8 + head + line)
+        if cut is not None and size + cost > cut:
+            if not i:
+                out.append(line[:cut])
+                size = kept = cut
+            else:
+                # the break after the last line kept is not shown either
+                kept -= len(ends[i - 1]) - len(lines[i - 1])
+            break
+        out.append(head + line)
+        size += cost
+        kept += len(ends[i])
+    left = len(text) - kept
+    return "\n".join(out) + (CUT.format(n=f"{left:,}") if left > 0 else ""), size
+
+
+def earlier(messages: list[dict], ts: str, place: str, named: dict[str, str], own: frozenset[str],
+            now: datetime, *, kin=None, thread: int = 50, namesakes=()) -> list[tuple[str, str, str]]:
+    """The conversation before this message as a frame shows it (`shown`),
+    oldest first, as (when, who, text). Her alert is shown as an alert posted
+    in her name, every further line of it labelled so. A post marked outside
+    the household is shown under its poster's marked name, every further line
+    labelled with it, so that none of it reads as the household's, and cut at
+    CUT_AT, all such posts together at OUTSIDE_CUT_AT, the newest kept first,
+    but a thread's first message, cut at CUT_AT alone since it says what the
+    thread is about and would otherwise be charged last;
+    `namesakes` marks a poster with no Slack user as `names` marks anyone.
+    Her own posts after the message are kept, in their place: a turn is
+    framed under its conversation's lock, so they are what she said to the
+    turns before, and a message sent while one of those ran would otherwise
+    look unanswered."""
+    kept = shown(messages, ts, place, own, now, kin=kin, thread=thread)
+    head = kept[0] if place.endswith("thread") and kept and kept[0] is messages[0] else None
+    out, room = [], OUTSIDE_CUT_AT
+    # newest first, so that others' newest posts are the ones kept whole
+    for m in reversed(kept):
+        text = message_text(m.get("text"), m.get("files"), named)
+        if is_mine(m, own):
+            alert = (m.get("metadata") or {}).get("event_type") == ALERT_EVENT
+            who, text = (ALERTED, _labelled(text, ALERTED)[0]) if alert else (ME, text)
+        elif from_outside(m, own, kin):
+            who = _poster(m, named, namesakes)
+            if m is head:
+                text = _labelled(text, who, cut=CUT_AT)[0]
+            else:
+                text, size = _labelled(text, who, cut=min(CUT_AT, room))
+                room -= size
+        else:
+            who = named.get(m.get("user") or "", m.get("username") or "someone")
+        out.append((stamp(_at(m), now), who, text))
+    return out[::-1]
 
 
 def _indent(text: str, n: int) -> str:
     # indented, no line of a message can end the part of the prompt it sits in:
-    # the parser takes a blank line and an unindented one as the next part
-    return text.strip().replace("\n", "\n" + " " * n)
+    # the parser takes a blank line and an unindented one as the next part.
+    # Broken at every boundary str.splitlines() knows, since a reader may take
+    # any of them for the start of a line.
+    return ("\n" + " " * n).join(text.strip().splitlines())
 
 
 def arrival_text(place: str, speaker: str, text: str, readers: list[str],
-                 earlier: list[tuple[str, str, str]], also: list[str] = ()) -> str:
+                 earlier: list[tuple[str, str, str]], also: list[str] = (), *, outside: bool = False) -> str:
     """The message as the session sees it. A direct message with nothing
     before it keeps the lab's frame; any other frame says who reads what is
     said there and shows what came before, each line with when it was sent.
     `also` is everyone else whose message this turn takes. The closing line
     names them too, so that `mem session` reads such an exchange back as no
-    one person's, and nobody's request is taken for the speaker's."""
+    one person's, and nobody's request is taken for the speaker's. `outside`
+    says, in a public channel or a thread in one, which anyone in this Slack
+    can read, that some who can are outside the household; elsewhere the marks
+    on its readers say so."""
     said = _indent(text, 4)
     after = f", after {' and '.join(also)}" if also else ""
     if place == "dm" and not earlier and not also:
@@ -266,7 +544,8 @@ def arrival_text(place: str, speaker: str, text: str, readers: list[str],
     room, heading = PLACES[place]
     who = ", ".join(readers or [speaker])
     if place.startswith("public"):
-        opening = f"In {room} that anyone in this Slack can read; {who} and I are in it."
+        opening = (f"In {room} that anyone in this Slack can read; {who} and I are in it."
+                   + (OUTSIDERS_READ if outside else ""))
     else:
         opening = f"In {room} that {who} and I read." + ("" if place == "dm" else EVERYONE)
     lines = "".join(f"    {when} {sp}: {_indent(tx, 8)}\n" for when, sp, tx in earlier if tx.strip())

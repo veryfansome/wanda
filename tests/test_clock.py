@@ -1150,10 +1150,12 @@ def test_the_daemon_settles_a_wake_cut_short_before_slack_connects(tmp_path, mon
     async def no_clock(self):
         pass
 
-    monkeypatch.setattr("wanda.main.SlackWatcher.start",
-                        lambda self: seen.append((self.store.get_meta("clock:lost"),
-                                                  self.store.get_meta("clock:trying:U2"),
-                                                  self.store.get_meta("clock:listed:U2"))))
+    def start(self):
+        self.bot_user_id, self.bot_id = "UBOT", "BME"
+        seen.append((self.store.get_meta("clock:lost"), self.store.get_meta("clock:trying:U2"),
+                     self.store.get_meta("clock:listed:U2")))
+
+    monkeypatch.setattr("wanda.main.SlackWatcher.start", start)
     monkeypatch.setattr("wanda.main.SlackWatcher.stop", lambda self: None)
     monkeypatch.setattr("wanda.main.Processor.loop", one_pass)
     monkeypatch.setattr("wanda.main.Processor.clock_loop", no_clock)

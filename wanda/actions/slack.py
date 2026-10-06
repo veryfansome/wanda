@@ -4,6 +4,7 @@ import asyncio
 import logging
 import sqlite3
 import time
+from collections.abc import Callable
 from datetime import datetime
 
 from slack_sdk import WebClient
@@ -12,11 +13,11 @@ from slack_sdk.http_retry import default_retry_handlers
 from slack_sdk.http_retry.builtin_handlers import RateLimitErrorRetryHandler
 
 from wanda.config import Config
+from wanda.household import SHUT
 from wanda.store import Store
 from wanda.tls import ssl_context
-from wanda.transcript import trim_thread
 from wanda.triage import Verdict
-from wanda.vault import ALERT_EVENT, NOTE_EVENT
+from wanda.vault import ALERT_EVENT, EARLIER, NOTE_EVENT
 
 log = logging.getLogger(__name__)
 
@@ -26,7 +27,9 @@ MIN_INTERVAL_S = 1.0  # chat.postMessage is ~1/s/channel
 SNIPPET_LIMIT = 1500
 TEXT_LIMIT = 3500  # well under Slack's 40k text cap, and headers can be huge
 MISSING_THREAD_ERRORS = {"thread_not_found", "message_not_found", "channel_not_found"}
-MAX_CONTEXT_PAGES = 10  # bounds a very long thread at ~2000 messages
+# the most pages of 200 any one list is read in: a conversation's history or
+# a thread, a member list, the workspace
+MAX_CONTEXT_PAGES = 10
 
 
 def truncate_text(text: str) -> str:
@@ -144,51 +147,93 @@ class SlackActions:
 
     # --- conversation context ---
 
-    async def fetch_context(self, channel: str, thread_ts: str | None, limit: int) -> list[dict]:
-        """The most RECENT messages, oldest first. A thread reads its replies;
-        a channel or DM reads its history."""
-        # with the metadata, which is where the harness marks its alerts
+    async def fetch_context(self, channel: str, thread_ts: str | None, since: float,
+                            counted: Callable[[dict], bool] | None = None) -> list[dict]:
+        """What a frame is built from, oldest first, with the metadata the
+        harness marks its posts with. Outside a thread, the conversation's
+        history back to `since`, read until EARLIER of the messages read pass
+        `counted`: history comes newest first, so every line a frame can show
+        has been read by then. A thread whole; when it runs past
+        MAX_CONTEXT_PAGES, it is read again from `since`, so that its newest
+        replies are read too, and both reads are kept, leaving unread only the
+        replies between the first read's last and `since`. When more than
+        MAX_CONTEXT_PAGES pages fall after `since`, the rest goes unread: the
+        oldest outside a thread, the newest in one."""
         if not thread_ts:
-            resp = await self._call("conversations_history", channel=channel, limit=limit,
-                                    include_all_metadata=True)
-            return list(reversed(resp.get("messages") or []))  # history is newest first
-        # conversations.replies pages FORWARD from the parent, so a bare limit
-        # returns the start of a long thread and drops what was just said.
+            msgs: list[dict] = []
+            cursor, n = None, 0
+            for _ in range(MAX_CONTEXT_PAGES):
+                kwargs = {"channel": channel, "oldest": f"{since:.6f}", "limit": 200, "include_all_metadata": True}
+                if cursor:
+                    kwargs["cursor"] = cursor
+                resp = await self._call("conversations_history", **kwargs)
+                page = resp.get("messages") or []
+                msgs.extend(page)
+                n += sum(1 for m in page if counted(m)) if counted else 0
+                cursor = ((resp.get("response_metadata") or {}).get("next_cursor") or "").strip()
+                if not cursor or (counted and n >= EARLIER):
+                    break
+            return list(reversed(msgs))
+        msgs, more = await self._replies(channel, thread_ts, None)
+        if not more:
+            return msgs
+        # conversations.replies gives a thread's earliest replies first; from
+        # `since` on, the read reaches its newest. Both reads are kept: the
+        # first holds the thread's first message and its earliest replies, the
+        # household's among them. Whether the second gives that first message
+        # again is not documented, so each message is kept once.
+        again, _ = await self._replies(channel, thread_ts, since)
+        seen = {m.get("ts") for m in msgs}
+        return msgs + [m for m in again if m.get("ts") not in seen]
+
+    async def _replies(self, channel: str, thread_ts: str, since: float | None) -> tuple[list[dict], bool]:
+        """A thread's replies, earliest first, after `since` if given, and
+        whether MAX_CONTEXT_PAGES ran out with more to read."""
         msgs: list[dict] = []
         cursor = None
         for _ in range(MAX_CONTEXT_PAGES):
             kwargs = {"channel": channel, "ts": thread_ts, "limit": 200, "include_all_metadata": True}
+            if since is not None:
+                kwargs["oldest"] = f"{since:.6f}"
             if cursor:
                 kwargs["cursor"] = cursor
             resp = await self._call("conversations_replies", **kwargs)
             msgs.extend(resp.get("messages") or [])
             cursor = ((resp.get("response_metadata") or {}).get("next_cursor") or "").strip()
             if not resp.get("has_more") or not cursor:
-                break
-        return trim_thread(msgs, limit)  # keeps the parent plus the newest
+                return msgs, False
+        return msgs, True
+
+    def know_own_ids(self, ids: frozenset[str]) -> None:
+        """Her bot user id and bot id, from the watcher's auth.test at
+        start-up, which comes before any frame is built."""
+        self._own_ids = ids
 
     async def own_ids(self) -> frozenset[str]:
-        """The bot user id and bot id wanda posts under. Empty when auth.test
-        fails, which leaves her messages under her display name rather than
-        costing the session its whole context; a failure is not cached."""
-        if not self._own_ids:
-            try:
-                auth = await self._call("auth_test")
-                self._own_ids = frozenset(i for i in (auth.get("user_id"), auth.get("bot_id")) if i)
-            except Exception:
-                log.warning("could not look up wanda's own Slack ids")
+        """The bot user id and bot id wanda posts under, as start-up handed
+        them over."""
         return self._own_ids
 
+    def kept(self, user_ids) -> dict[str, dict]:
+        """What `users` holds for these ids, with no call."""
+        return {uid: self._users[uid] for uid in user_ids if uid in self._users}
+
     async def users(self, user_ids: set[str]) -> dict[str, dict]:
-        """users.info for each id found, kept for the process lifetime. A
-        lookup that fails is not kept, so a passing failure costs one message
-        its names rather than leaving someone unnamed until a restart."""
+        """users.info for each id not held, kept for the process lifetime: an
+        empty record when Slack answers that it shows no one, which stands. Any
+        other failure is not kept, so a passing failure costs one message its
+        names rather than leaving someone unnamed until a restart."""
         for uid in user_ids - self._users.keys():
             try:
                 self._users[uid] = (await self._call("users_info", user=uid)).get("user") or {}
+            except SlackApiError as e:
+                if (e.response or {}).get("error") in SHUT:
+                    self._users[uid] = {}
+                else:
+                    log.warning("could not look up Slack user %s: %s", uid, e)
             except Exception:
                 log.warning("could not look up Slack user %s", uid)
-        return {uid: self._users[uid] for uid in user_ids if uid in self._users}
+        return self.kept(user_ids)
 
     async def user_now(self, user_id: str) -> dict:
         """users.info for one id, read now, whatever is kept, and kept in its
@@ -218,8 +263,9 @@ class SlackActions:
             ids.extend(resp.get("members") or [])
             cursor = ((resp.get("response_metadata") or {}).get("next_cursor") or "").strip()
             if not cursor:
-                break
-        return ids
+                return ids
+        # a list cut short would leave readers out of a frame
+        raise RuntimeError(f"{channel} has more members than {MAX_CONTEXT_PAGES} pages of them")
 
     async def channel_type(self, channel: str) -> str:
         """A conversation's type as message events name it: im, mpim, group
@@ -235,7 +281,8 @@ class SlackActions:
         """Everyone in this Slack (users.list): who can open a public channel
         without joining it. Read each time it is asked, so that someone who
         joined the Slack a minute ago counts: a turn in a public channel is
-        rare, and the household's Slack is a page of a few accounts."""
+        rare, and the household's Slack is a page of a few accounts. Each
+        record is kept as `users` keeps one."""
         people: list[dict] = []
         cursor = None
         for _ in range(MAX_CONTEXT_PAGES):
@@ -246,8 +293,10 @@ class SlackActions:
             people.extend(resp.get("members") or [])
             cursor = ((resp.get("response_metadata") or {}).get("next_cursor") or "").strip()
             if not cursor:
-                break
-        return people
+                self._users |= {u["id"]: u for u in people if u.get("id")}
+                return people
+        # a list cut short could leave out someone outside the household
+        raise RuntimeError(f"this Slack has more people than {MAX_CONTEXT_PAGES} pages of them")
 
     async def dm_channel(self, user_id: str) -> str:
         """The direct message with this person, opened if it never has been: a
@@ -261,7 +310,8 @@ class SlackActions:
         await self._call(
             "chat_postMessage", channel=self.cfg.alerts_to,
             text=truncate_text(f"⚠️ {text}"),
-            # the mark that keeps it out of every frame's earlier lines
+            # the mark by which a frame shows it as an alert posted in her
+            # name, never as something she said
             metadata={"event_type": ALERT_EVENT, "event_payload": {"for": "the household"}},
         )
 

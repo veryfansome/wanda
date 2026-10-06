@@ -241,38 +241,12 @@ def test_cli_labels_her_own_posts_and_row_me(monkeypatch, capsys):
     assert "wanda:" not in out and "\twanda" not in out
 
 
-def test_own_ids_lookup_failure_is_not_cached(monkeypatch):
-    """Without the ids, wanda's messages come out under her display name.
-    That is a fallback, not a state to keep, so the next lookup tries again."""
+@pytest.mark.parametrize("error", ["a passing failure", "a Slack error"])
+def test_a_failed_user_lookup_is_not_kept(monkeypatch, error):
+    """A passing failure, or any Slack error but the one saying it shows no
+    one, costs one message its names, not every message until a restart."""
     import wanda.actions.slack as actions
-
-    class Web:
-        up, calls = False, 0
-
-        def auth_test(self):
-            self.calls += 1
-            if not self.up:
-                raise RuntimeError("slack down")
-            return {"user_id": "UBOT", "bot_id": "BME"}
-
-    monkeypatch.setattr(actions, "MIN_INTERVAL_S", 0)
-    sa = actions.SlackActions(cfg(), store=None)
-    sa.web = Web()
-
-    async def lookups():
-        assert await sa.own_ids() == frozenset()
-        sa.web.up = True
-        assert await sa.own_ids() == {"UBOT", "BME"}
-        assert await sa.own_ids() == {"UBOT", "BME"}
-
-    asyncio.run(lookups())
-    assert sa.web.calls == 2, "a failure is retried and a success is kept"
-
-
-def test_a_failed_user_lookup_is_not_kept(monkeypatch):
-    """A passing failure costs one message its names, not every message
-    until a restart."""
-    import wanda.actions.slack as actions
+    from slack_sdk.errors import SlackApiError
 
     class Web:
         up, calls = False, 0
@@ -280,6 +254,8 @@ def test_a_failed_user_lookup_is_not_kept(monkeypatch):
         def users_info(self, user):
             self.calls += 1
             if not self.up:
+                if error == "a Slack error":
+                    raise SlackApiError("The request to the Slack API failed.", {"ok": False, "error": "ratelimited"})
                 raise RuntimeError("ratelimited")
             return {"user": {"id": user, "profile": {"display_name": "jane"}}}
 
@@ -295,6 +271,189 @@ def test_a_failed_user_lookup_is_not_kept(monkeypatch):
 
     asyncio.run(lookups())
     assert sa.web.calls == 2, "a failure is retried and a success is kept"
+
+
+def test_an_id_slack_shows_no_one_for_is_asked_once(monkeypatch):
+    """Slack's answer that it shows no one stands; held as an empty record,
+    it is not asked again at every frame."""
+    import wanda.actions.slack as actions
+    from slack_sdk.errors import SlackApiError
+
+    class Web:
+        calls = 0
+
+        def users_info(self, user):
+            self.calls += 1
+            raise SlackApiError("The request to the Slack API failed.", {"ok": False, "error": "user_not_found"})
+
+    monkeypatch.setattr(actions, "MIN_INTERVAL_S", 0)
+    sa = actions.SlackActions(cfg(), store=None)
+    sa.web = Web()
+
+    async def lookups():
+        assert await sa.users({"U9"}) == {"U9": {}}
+        assert await sa.users({"U9"}) == {"U9": {}}
+
+    asyncio.run(lookups())
+    assert sa.web.calls == 1 and sa.kept(["U9", "U8"]) == {"U9": {}}
+
+
+class Pages:
+    """A Slack that answers every list with a page and a cursor, as one past
+    ten pages does."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def _page(self, member):
+        self.calls += 1
+        return {"members": [member], "response_metadata": {"next_cursor": f"c{self.calls}"}}
+
+    def conversations_members(self, **kw):
+        return self._page(f"U{self.calls}")
+
+    def users_list(self, **kw):
+        return self._page({"id": f"U{self.calls}"})
+
+
+def test_a_list_of_readers_cut_short_by_its_pages_raises(monkeypatch):
+    """Ten pages that end with a cursor still given would leave readers out,
+    so the member list and the workspace raise."""
+    import wanda.actions.slack as actions
+
+    monkeypatch.setattr(actions, "MIN_INTERVAL_S", 0)
+    sa = actions.SlackActions(cfg(), store=None)
+    sa.web = Pages()
+    with pytest.raises(RuntimeError, match="10 pages"):
+        asyncio.run(sa.members("C1"))
+    with pytest.raises(RuntimeError, match="10 pages"):
+        asyncio.run(sa.workspace())
+    assert sa.web.calls == 20
+
+
+def test_the_workspace_read_is_kept_as_lookups_are(monkeypatch):
+    import wanda.actions.slack as actions
+
+    class Web:
+        def users_list(self, **kw):
+            return {"members": [{"id": "U1", "profile": {"display_name": "fan"}}, {"id": "U3", "deleted": True}]}
+
+        def users_info(self, user):
+            raise AssertionError("a person the workspace read gave is not looked up")
+
+    monkeypatch.setattr(actions, "MIN_INTERVAL_S", 0)
+    sa = actions.SlackActions(cfg(), store=None)
+    sa.web = Web()
+    asyncio.run(sa.workspace())
+    assert sa.kept(["U1", "U3", "U9"]) == {"U1": {"id": "U1", "profile": {"display_name": "fan"}},
+                                            "U3": {"id": "U3", "deleted": True}}
+    assert asyncio.run(sa.users({"U1"}))["U1"]["profile"]["display_name"] == "fan"
+
+
+class History:
+    """Slack's two reads as its documentation gives them: history newest
+    first, replies earliest first from the thread's first message, 200 a
+    page, `oldest` exclusive."""
+
+    def __init__(self, msgs):
+        self.msgs, self.calls = sorted(msgs, key=lambda m: float(m["ts"])), []
+
+    def _page(self, rows, kw):
+        at = int(kw.get("cursor") or 0)
+        more = at + 200 < len(rows)
+        return {"messages": rows[at:at + 200], "has_more": more,
+                "response_metadata": {"next_cursor": str(at + 200) if more else ""}}
+
+    def conversations_history(self, **kw):
+        self.calls.append(("history", kw))
+        oldest = float(kw.get("oldest") or 0)
+        return self._page([m for m in reversed(self.msgs) if float(m["ts"]) > oldest], kw)
+
+    def conversations_replies(self, **kw):
+        self.calls.append(("replies", kw))
+        oldest = float(kw["oldest"]) if "oldest" in kw else None
+        return self._page([m for m in self.msgs if oldest is None or float(m["ts"]) > oldest], kw)
+
+
+def test_the_context_is_read_back_to_a_time_until_the_households_lines_are_read(monkeypatch):
+    """Outside a thread, history back to `since`, paged, and no further than
+    the page on which 20 of the messages read are the household's: every
+    line a frame can show is read by then. A 1:1 DM's last 12 hours is one
+    call."""
+    import wanda.actions.slack as actions
+
+    monkeypatch.setattr(actions, "MIN_INTERVAL_S", 0)
+    sa = actions.SlackActions(cfg(), store=None)
+    now, since = 100_000.0, 100_000.0 - 12 * 3600
+    old = [{"ts": f"{since - 60 + i:.6f}", "user": "U1", "text": "yesterday"} for i in range(5)]
+    five = [{"ts": f"{now - 9000 + i:.6f}", "user": "U1", "text": "ours"} for i in range(5)]
+    theirs = [{"ts": f"{now - 8000 + i:.6f}", "user": "U3", "text": "theirs"} for i in range(300)]
+    sa.web = History(old + five + theirs)
+    got = asyncio.run(sa.fetch_context("C1", None, since, lambda m: m["user"] == "U1"))
+    assert got == five + theirs
+    assert [kw["oldest"] for _, kw in sa.web.calls] == [f"{since:.6f}"] * 2
+    assert all(kw["include_all_metadata"] is True and kw["limit"] == 200 for _, kw in sa.web.calls)
+    # ten of the household's lines on each page of 200, newest first
+    straddle = [{"ts": f"{now - 20000 + i:.6f}", "user": "U1" if i % 20 == 0 else "U3", "text": "x"}
+                for i in range(700)]
+    sa.web = History(straddle)
+    got = asyncio.run(sa.fetch_context("C1", None, since, lambda m: m["user"] == "U1"))
+    assert len(sa.web.calls) == 2 and got == straddle[300:]
+    assert [m for m in got if m["user"] == "U1"] == [m for m in straddle if m["user"] == "U1"][-20:]
+    dm = [{"ts": f"{now - 3000 + i:.6f}", "user": "U1" if i % 2 else "UBOT", "text": "x"} for i in range(500)]
+    sa.web = History(dm)
+    got = asyncio.run(sa.fetch_context("D1", None, since, lambda m: True))
+    assert len(sa.web.calls) == 1 and got == dm[-200:]
+    sa.web = History(dm)
+    assert asyncio.run(sa.fetch_context("D1", None, since)) == dm and len(sa.web.calls) == 3
+
+
+def test_a_thread_is_read_whole_and_past_its_pages_again_from_a_time(monkeypatch):
+    """A thread is not trimmed: what a frame shows is picked from all of it.
+    Past ten pages it is read again from `since`, and both reads are kept,
+    each message once: 2,000 old replies keep neither its newest nor the
+    household's among its earliest from being read."""
+    from datetime import datetime, timezone
+
+    import wanda.actions.slack as actions
+    from wanda import vault
+
+    monkeypatch.setattr(actions, "MIN_INTERVAL_S", 0)
+    sa = actions.SlackActions(cfg(), store=None)
+    now, since = 100_000.0, 100_000.0 - 12 * 3600
+    parent = {"ts": f"{since - 20000:.6f}", "user": "U1", "text": "the plan"}
+    short = [parent] + [{"ts": f"{now - 500 + i:.6f}", "user": "U3", "text": "x"} for i in range(300)]
+    sa.web = History(short)
+    assert asyncio.run(sa.fetch_context("C1", parent["ts"], since)) == short
+    assert [name for name, _ in sa.web.calls] == ["replies"] * 2
+    flood = [{"ts": f"{since - 19000 + i:.6f}", "user": "U3", "text": "x"} for i in range(2000)]
+    recent = [{"ts": f"{now - 5000 + i:.6f}", "user": "U1" if i % 3 == 0 else "U3", "text": "y"} for i in range(90)]
+    sa.web = History([parent] + flood + recent)
+    assert asyncio.run(sa.fetch_context("C1", parent["ts"], since)) == [parent] + flood[:1999] + recent
+    assert len(sa.web.calls) == 11 and sa.web.calls[-1][1]["oldest"] == f"{since:.6f}"
+    # fan's 49 replies, then an app's 2,000 over the days since, then someone's in the last hour
+    first = {"ts": f"{since - 100000:.6f}", "user": "U1", "text": "the plan"}
+    ours = [{"ts": f"{since - 90000 + i:.6f}", "user": "U1", "text": "ours"} for i in range(49)]
+    feed = [{"ts": f"{since - 80000 + 30 * i:.6f}", "user": "U7", "bot_id": "B7", "text": "feed"}
+            for i in range(2000)]
+    last = [{"ts": f"{now - 3000 + i:.6f}", "user": "U3", "text": "z"} for i in range(5)]
+    sa.web = History([first] + ours + feed + last)
+    got = asyncio.run(sa.fetch_context("C1", first["ts"], since))
+    shown = vault.shown(got, f"{now:.6f}", "thread", frozenset({"UBOT"}), datetime.fromtimestamp(now, timezone.utc),
+                        kin=["U1"])
+    assert shown[0] is first and [m for m in shown[1:] if m["user"] == "U1"] == ours
+
+    class Parent(History):
+        """Replies that give the thread's first message on every read."""
+
+        def conversations_replies(self, **kw):
+            page = super().conversations_replies(**kw)
+            if "oldest" in kw and not kw.get("cursor"):
+                page["messages"] = [self.msgs[0], *page["messages"]]
+            return page
+    sa.web = Parent([parent] + flood + recent)
+    got = asyncio.run(sa.fetch_context("C1", parent["ts"], since))
+    assert got == [parent] + flood[:1999] + recent
 
 
 def test_a_members_name_is_read_now_on_a_client_of_its_own(monkeypatch):
@@ -388,10 +547,10 @@ def test_the_workspace_is_read_each_time_and_a_conversation_has_its_type(monkeyp
     assert types == ["im", "mpim", "group", "channel"]
 
 
-def test_alerts_and_failure_notes_carry_the_marks_frames_leave_out(monkeypatch):
+def test_alerts_and_failure_notes_carry_the_harness_marks(monkeypatch):
     """An alert and a failure note are posted with the harness's marks, an
     answer with none, and the context a frame is built from is read with the
-    marks, so `vault.earlier` can drop them."""
+    marks, so `vault.earlier` can tell them apart."""
     import wanda.actions.slack as actions
     from wanda.vault import ALERT_EVENT, NOTE_EVENT
 
@@ -417,8 +576,8 @@ def test_alerts_and_failure_notes_carry_the_marks_frames_leave_out(monkeypatch):
 
     async def go():
         await sa.alert("a vault snapshot failed")
-        await sa.fetch_context("D1", None, 20)
-        await sa.fetch_context("C1", "5.5", 20)
+        await sa.fetch_context("D1", None, 0.0)
+        await sa.fetch_context("C1", "5.5", 0.0)
         await sa.reply(None, "⚠️ my run failed: x", channel="D1", note=True)
         await sa.reply(None, "an answer", channel="D1")
 

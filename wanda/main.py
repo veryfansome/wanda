@@ -5,6 +5,7 @@ import asyncio
 import contextlib
 import dataclasses
 import fcntl
+import itertools
 import json
 import logging
 import os
@@ -30,7 +31,7 @@ from wanda.household import NAMES_EVERY_S, SHUT, Found, Household, found, memory
 from wanda.runner import RunnerService, RunResult
 from wanda.store import Store, utcnow
 from wanda.tls import ssl_context
-from wanda.transcript import user_ids_in
+from wanda.transcript import MENTION_RE, is_mine
 from wanda.triage import (
     VERDICT_SCHEMA,
     Verdict,
@@ -85,6 +86,11 @@ REOPENED = "Not given at its time; reopened for a later time."
 # most of WANDA_AGENT_TIMEOUT_S (420 s in compose.wanda.yaml) to answer it.
 FOLD_LIMIT = 3
 FOLD_FOR_S = 180
+# A frame looks up every id a member's line mentions, but of those anyone
+# else's lines mention only the allowed ones, the ones already held and
+# MENTIONED more, newest line first: each lookup is a paced Slack call made
+# while the frame holds a session slot, and one line can mention thousands.
+MENTIONED = 10
 # Kinds that own their conversation and open a task on first contact.
 CONVERSATION_KINDS = ("mention", "mention_guest", "dm")
 BUDGET_REPLIES = {
@@ -193,11 +199,12 @@ class Additions:
         self.readers: frozenset[str] | None = None
         self.place: str | None = None
         self.now: datetime | None = None
-        # the names that frame gave the household's members, and the names it
-        # marked anyone else by: a member called two ways in one session reads
-        # as two people in its transcript
+        # the names that frame gave the household's members, the names it
+        # marked anyone else by, and whether it marked them at all: a member
+        # called two ways in one session reads as two people in its transcript
         self.told: dict[str, str] = {}
         self.namesakes: set[str] = set()
+        self.marked = True
         # (channel, ts) of messages deleted after they were taken
         self.withdrawn: set[tuple[str, str]] = set()
         self.results: list[dict] = []
@@ -2068,8 +2075,6 @@ class Processor:
                             p["channel"], p["user"])
             return None
         own = await self.slack.own_ids()
-        if not own:
-            raise RuntimeError("could not look up my own Slack ids")
         ids = await self.slack.members(p["channel"])
         can_read = ids + (vault.full_members(await self.slack.workspace())
                           if p.get("channel_type") == "channel" else [])
@@ -2084,22 +2089,27 @@ class Processor:
     async def _memory_arrival(self, p: dict, batch: list[dict], now: datetime,
                               more: Additions | None = None) -> str | None:
         """The newest message of a turn as its session is handed it: who said
-        it, where, who reads the answer, and what came before, the turn's
-        other messages and her answers to the turns before included. None
-        when the conversation is no longer the household's alone. `more`
-        keeps the readers, the place and the time it names."""
+        it, where, who reads the answer and which of them are outside the
+        household, and what came before, the turn's other messages and her
+        answers to the turns before included. None when the conversation is
+        no longer the household's alone. `more` keeps the readers, the place,
+        the time and the names it gives."""
         ids = await self._household_members(p)
         if ids is None:
             return None
         place = vault.where(p)
+        # a 1:1 DM is read by the member who wrote and her, and only they post there
+        marked = p.get("channel_type") != "im"
+        kin = self.household.allowed if marked else None
         told, namesakes = self.household.told_names(), self.household.namesakes()
         if more is not None:
             more.readers, more.place, more.now = frozenset(ids), place, now
-            more.told, more.namesakes = told, namesakes
+            more.told, more.namesakes, more.marked = told, namesakes, marked
         own = await self.slack.own_ids()
         try:
             msgs = await self.slack.fetch_context(
-                p["channel"], p["task_key"] if p.get("in_thread") else None, self.cfg.slack_context_limit)
+                p["channel"], p["task_key"] if p.get("in_thread") else None,
+                now.timestamp() - vault.RECENT_HOURS * 3600, lambda m: vault.counts(m, p["ts"], own, kin))
         except Exception:
             # what came before is context; the message and its readers are not
             log.exception("could not load conversation context for %s", p["channel"])
@@ -2107,14 +2117,61 @@ class Processor:
         # the turn's messages are in the history already, unless reading it failed
         seen = {m.get("ts") for m in msgs}
         msgs = sorted(msgs + [m for m in batch if m["ts"] not in seen], key=lambda m: float(m.get("ts") or 0))
-        users = await self.slack.users(set(ids) | user_ids_in(msgs) | user_ids_in([p]))
-        named = vault.names(users, told, namesakes)
+        limit = self.cfg.slack_context_limit
+        shown = vault.shown(msgs, p["ts"], place, own, now, kin=kin, thread=limit)
+        # what the frame looks up: the readers it names, past NAMED_READERS
+        # only the household's; the posters it shows; her user id, so that a
+        # mention of her reads as her name
+        people = [i for i in ids if i not in own]
+        crowd = len(people) > vault.NAMED_READERS
+        want = {i for i in people if not crowd or i in self.household.allowed}
+        want |= {m["user"] for m in shown if m.get("user") and not is_mine(m, own)}
+        want |= {i for i in own if i.startswith(("U", "W"))}
+        want, users, unnamed = await self._look_up(want - told.keys(), shown, [*batch, p], own, kin, told)
+        named = vault.names(want, users, told, namesakes, own, kin, marked)
+        # `plain` names a mention from `named`, so one not looked up is named as someone
+        named |= dict.fromkeys(unnamed, vault.SOMEONE)
+        listed, outsiders = vault.readers(ids, users, named, own, told, self.household.allowed)
+        outside = bool(outsiders)
+        if place.startswith("public") and not outside:
+            try:
+                outside = any(u not in own and u not in self.household.allowed
+                              for u in vault.full_members(await self.slack.workspace()))
+            except Exception as e:
+                # anyone at all may be in this Slack
+                log.warning("could not read who is in this Slack for %s: %s", p["channel"], e)
+                outside = True
         return vault.arrival_text(
-            place, named[p["user"]], vault.message_text(p.get("text"), p.get("files"), named),
-            vault.readers(ids, users, named, own, told),
-            vault.earlier(msgs, p["ts"], place, named, own, now),
-            also=sorted({named[m["user"]] for m in batch} - {named[p["user"]]}),
+            place, named[p["user"]], vault.message_text(p.get("text"), p.get("files"), named), listed,
+            vault.earlier(msgs, p["ts"], place, named, own, now, kin=kin, thread=limit, namesakes=namesakes),
+            also=sorted({named[m["user"]] for m in batch} - {named[p["user"]]}), outside=outside,
         )
+
+    async def _look_up(self, want: set[str], shown: list[dict], turn: list[dict], own: frozenset[str], kin,
+                       told: dict[str, str]) -> tuple[set[str], dict[str, dict], list[str]]:
+        """What a frame looks up besides `want`: every id mentioned in a
+        member's or an allowed id's line, among those it shows and the turn's
+        own; and of the ids mentioned in anyone else's, hers among them, every
+        allowed id, those already held and MENTIONED more, newest line first.
+        In a 1:1 DM (`kin` None) every line is the household's. Returns the ids
+        to name, Slack's records of them, and the mentioned ids left unnamed.
+        Her own ids are looked up only as `want` has them."""
+        theirs, mentioned = [], set()
+        for m in shown + turn:
+            if kin is None or not (vault.from_outside(m, own, kin) or is_mine(m, own)):
+                mentioned |= set(MENTION_RE.findall(m.get("text") or ""))
+            else:
+                theirs.append(m)
+        # each id once, in order, so that a line of thousands costs one pass
+        others = dict.fromkeys(u for m in reversed(theirs) for u in MENTION_RE.findall(m.get("text") or ""))
+        # an allowed id is of the household, never someone outside it, and
+        # there are only as many as the allowlist holds
+        want = want | ((mentioned | {u for u in others if u in kin}) - told.keys() - own)
+        others = [u for u in others if u not in want and u not in told and u not in own]
+        held = self.slack.kept(others)
+        asked = list(itertools.islice((u for u in others if u not in held), MENTIONED))
+        want |= held.keys() | set(asked)
+        return want, await self.slack.users(want), [u for u in others if u not in want]
 
     async def _added_text(self, p: dict, more: Additions) -> str | None:
         """A message added while the conversation's session works, as that
@@ -2127,9 +2184,13 @@ class Processor:
             log.info("leaving %s in %s for the next turn: its readers are not its session's",
                      p["ts"], p["channel"])
             return None
-        users = await self.slack.users({p["user"]} | user_ids_in([p]))
+        own = await self.slack.own_ids()
+        # a member's message: every id it mentions is named
+        want = ({p["user"]} | set(MENTION_RE.findall(p.get("text") or ""))) - more.told.keys()
+        users = await self.slack.users(want)
         # as its opening frame named everyone, whatever has changed since
-        named = vault.names(users, more.told, more.namesakes)
+        named = vault.names(want, users, more.told, more.namesakes, own,
+                            self.household.allowed if more.marked else None, more.marked)
         return vault.added_text(more.place, named[p["user"]],
                                 vault.message_text(p.get("text"), p.get("files"), named),
                                 vault.stamp(float(p["ts"]), more.now))
@@ -2299,7 +2360,12 @@ async def run_daemon(cfg: Config) -> None:
     processor.settle_wakes(datetime.now(cfg.zone))
 
     slack_watcher = SlackWatcher(cfg, store, loop, slack_queue)
-    slack_watcher.start()
+    try:
+        slack_watcher.start()
+    except Exception as e:
+        sys.exit(f"could not connect to Slack: {e}")
+    # before any frame: startup_recovery and every loop start below
+    slack_actions.know_own_ids(frozenset(i for i in (slack_watcher.bot_user_id, slack_watcher.bot_id) if i))
     imap_watcher = None
     if cfg.email_triage:
         imap_watcher = ImapWatcher(

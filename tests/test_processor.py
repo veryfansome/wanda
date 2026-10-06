@@ -628,6 +628,11 @@ def test_the_look_at_the_snapshots_holds_up_nothing(tmp_path, monkeypatch):
     assert len(looks) == 2 and store.get_meta("snapshots_housekept") == datetime.now(p.cfg.zone).date().isoformat()
 
 
+def connected(watcher) -> None:
+    """SlackWatcher.start, as auth.test names her: her bot user, and her bot."""
+    watcher.bot_user_id, watcher.bot_id = "UBOT", "BME"
+
+
 def slack_names(monkeypatch, answers=None) -> list[str]:
     """A start's reads of the household's names: fan and mei unless
     `answers` says what Slack gives each id, a record or an error to raise.
@@ -669,7 +674,7 @@ def test_a_good_start_clears_a_failed_starts_alert(tmp_path, monkeypatch):
             super().__init__(claude_bin, **kw)
 
     monkeypatch.setattr("wanda.actions.slack.SlackActions.alert", alert)
-    monkeypatch.setattr("wanda.main.SlackWatcher.start", lambda self: None)
+    monkeypatch.setattr("wanda.main.SlackWatcher.start", connected)
     monkeypatch.setattr("wanda.main.SlackWatcher.stop", lambda self: None)
     monkeypatch.setattr("wanda.main.Processor.loop", one_pass)
     monkeypatch.setattr("wanda.main.RunnerService", Runner)
@@ -716,7 +721,7 @@ def test_a_start_that_cannot_open_the_run_store_says_so_and_waits(tmp_path, monk
     monkeypatch.setattr("wanda.main.Store", store)
     monkeypatch.setattr("wanda.main.STORE_RETRY_S", 0)
     monkeypatch.setattr("wanda.actions.slack.SlackActions.alert", alert)
-    monkeypatch.setattr("wanda.main.SlackWatcher.start", lambda self: None)
+    monkeypatch.setattr("wanda.main.SlackWatcher.start", connected)
     monkeypatch.setattr("wanda.main.SlackWatcher.stop", lambda self: None)
     monkeypatch.setattr("wanda.main.Processor.loop", one_pass)
     monkeypatch.setattr("wanda.vault.prepare", lambda c, now, since=None: None)
@@ -759,7 +764,7 @@ def test_a_start_whose_run_store_opens_and_takes_no_write_says_so_and_waits(tmp_
     monkeypatch.setattr("wanda.store.Store.set_meta", set_meta)
     monkeypatch.setattr("wanda.main.STORE_RETRY_S", 0)
     monkeypatch.setattr("wanda.actions.slack.SlackActions.alert", alert)
-    monkeypatch.setattr("wanda.main.SlackWatcher.start", lambda self: None)
+    monkeypatch.setattr("wanda.main.SlackWatcher.start", connected)
     monkeypatch.setattr("wanda.main.SlackWatcher.stop", lambda self: None)
     monkeypatch.setattr("wanda.main.Processor.loop", one_pass)
     monkeypatch.setattr("wanda.vault.prepare", lambda c, now, since=None: None)
@@ -775,6 +780,68 @@ def test_a_start_whose_run_store_opens_and_takes_no_write_says_so_and_waits(tmp_
                       "database or disk is full (README, State)"]
     store = Store(c.db_path)
     assert store.get_meta("started_at") and store.get_meta("sessions_left_running") == "0"
+
+
+@pytest.mark.parametrize("auth", [RuntimeError("invalid_auth"), {"ok": True, "bot_id": "BME"},
+                                  {"ok": True, "user_id": "UBOT", "bot_id": "BME"}],
+                         ids=["auth.test fails", "it names no user", "it names both"])
+def test_a_start_knows_her_own_ids_before_any_session_or_exits_saying_why(tmp_path, monkeypatch, auth):
+    """Every frame tells her own posts and mentions by her ids, which the
+    watcher's auth.test gives at the start, before any session: without them
+    the start exits, saying why; with them, they are what every frame is
+    given, with no call to Slack for them again."""
+    from wanda.watchers import slack_watcher
+
+    class Web:
+        def __init__(self, **kw):
+            pass
+
+        def auth_test(self):
+            if isinstance(auth, Exception):
+                raise auth
+            return auth
+
+    class Socket:
+        def __init__(self, **kw):
+            self.socket_mode_request_listeners = []
+
+        def connect(self):
+            pass
+
+        def close(self):
+            pass
+
+    held, calls, sessions = [], [], []
+
+    async def one_pass(self):
+        held.append(await self.slack.own_ids())
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    async def recovery(self):
+        sessions.append("startup recovery")
+
+    async def call(self, method, /, **kw):
+        calls.append(method)
+        return {}
+
+    monkeypatch.setattr(slack_watcher, "WebClient", Web)
+    monkeypatch.setattr(slack_watcher, "SocketModeClient", Socket)
+    monkeypatch.setattr("wanda.actions.slack.SlackActions._call", call)
+    monkeypatch.setattr("wanda.main.Processor.loop", one_pass)
+    monkeypatch.setattr("wanda.main.Processor.startup_recovery", recovery)
+    monkeypatch.setattr("wanda.vault.prepare", lambda c, now, since=None: None)
+    monkeypatch.setattr("wanda.vault.snapshot", lambda cfg, message: None)
+    monkeypatch.setattr("wanda.main.acquire_lock", lambda path: None)
+    slack_names(monkeypatch)
+    c = Config(_env_file=None, data_dir=tmp_path, slack_bot_token="x", slack_app_token="y", alert_channel="C9",
+               slack_owner_user_ids="U1,U2", tz="America/Los_Angeles", email_triage=False, claude_bin="/bin/true")
+    if isinstance(auth, dict) and auth.get("user_id"):
+        asyncio.run(main.run_daemon(c))
+        assert held == [{"UBOT", "BME"}] and sessions == ["startup recovery"] and "auth_test" not in calls
+        return
+    with pytest.raises(SystemExit, match="could not connect to Slack: (invalid_auth|auth.test named no bot user)"):
+        asyncio.run(main.run_daemon(c))
+    assert held == [] and sessions == []
 
 
 def test_doctor_lists_the_answers_given_up_on(tmp_path, capsys):
@@ -921,15 +988,28 @@ class ConversationSlack(FakeSlack):
         self.history = history if history is not None else [
             {"user": "U1", "ts": f"{AT - 120:.1f}", "text": "<@UBOT> can you check the invoice?"},
             {"user": "UBOT", "bot_id": "BME", "ts": f"{AT - 60:.1f}", "text": "Which one?"}]
+        # what users() holds, and every id it asked Slack for
+        self.held: dict[str, dict] = {}
+        self.asked: list[str] = []
+        # each history read's arguments
+        self.fetched: list[tuple] = []
 
-    async def fetch_context(self, channel, thread_ts, limit):
+    async def fetch_context(self, channel, thread_ts, since, counted=None):
+        self.fetched.append((channel, thread_ts, since, counted))
         return list(self.history)
+
+    def kept(self, ids):
+        return {u: self.held[u] for u in ids if u in self.held}
 
     async def users(self, ids):
         known = {"U1": {"profile": {"display_name": "fzhu"}}, "U2": {"profile": {"display_name": "mei"}},
                  "U3": {"profile": {"display_name": "jane"}},
                  "UBOT": {"is_bot": True, "profile": {"display_name": "wanda"}}}
-        return {u: known[u] for u in ids if u in known}
+        for u in set(ids) - self.held.keys():
+            self.asked.append(u)
+            if u in known:
+                self.held[u] = known[u]
+        return self.kept(ids)
 
     async def members(self, channel):
         if self.member_ids is None:
@@ -1102,25 +1182,98 @@ def test_a_failed_snapshot_is_alerted(tmp_path, monkeypatch):
     assert slack.alerts[0].endswith("': failed: the vault stayed locked for 60 s")
 
 
-def test_an_alert_is_never_shown_to_a_session_as_her_words(tmp_path, monkeypatch):
+def test_an_alert_is_shown_to_a_session_as_an_alert_never_as_her_words(tmp_path, monkeypatch):
     """Alerts may go to fan's DM, where his sessions are framed: posted with
-    the harness's mark, they are left out of what came before."""
+    the harness's mark, they are shown as alerts posted in her name."""
     from wanda.vault import ALERT_EVENT
-
-    class NoOwnIds(ConversationSlack):
-        async def own_ids(self):
-            return frozenset()  # auth.test failing, and not cached
 
     history = [{"user": "U1", "ts": f"{AT - 120:.1f}", "text": "the plumber comes thursday"},
                {"user": "UBOT", "bot_id": "BME", "ts": f"{AT - 60:.1f}",
                 "text": "⚠️ wanda is not running: memory is not working: mem entity: exit 1",
                 "metadata": {"event_type": ALERT_EVENT, "event_payload": {}}}]
-    for slack in (ConversationSlack(history=history), NoOwnIds(history=history)):
-        runner = RecordingRunner()
-        p, _, _ = memory_processor(tmp_path, slack, runner, monkeypatch)
-        asyncio.run(p.handle_slack(dm(f"{AT:.1f}", "and the electrician friday")))
-        first = runner.calls[0][0]
-        assert "16:38 fan: the plumber comes thursday" in first and "not running" not in first, first
+    runner = RecordingRunner()
+    p, _, _ = memory_processor(tmp_path, ConversationSlack(history=history), runner, monkeypatch)
+    asyncio.run(p.handle_slack(dm(f"{AT:.1f}", "and the electrician friday")))
+    first = runner.calls[0][0]
+    assert ("    16:38 fan: the plumber comes thursday\n    16:39 an alert posted in my name: ⚠️ wanda is not "
+            "running: memory is not working: mem entity: exit 1\n") in first
+    assert not re.search(r"\d me: ⚠️", first)
+
+
+def test_a_frame_looks_up_every_mention_of_a_members_and_few_of_anyone_elses(tmp_path, monkeypatch):
+    """Each lookup is a paced Slack call made while the frame holds a session
+    slot. An outsider's line mentioning 500 people costs MENTIONED of them,
+    the rest named as someone, and one already held costs nothing; an
+    allowed id, which is of the household, is looked up outside that cap; a
+    member's mentions are all looked up, the turn's own included, and so are
+    the posters shown and her user id, never her bot id."""
+    many = [f"UX{i:03d}" for i in range(500)]
+    twelve = [f"UM{i:02d}" for i in range(12)]
+    history = [{"user": "U3", "ts": f"{AT - 180:.1f}", "text": "<@U5> said so"},
+               {"user": "U3", "ts": f"{AT - 120:.1f}", "text": "<@UK1> " + " ".join(f"<@{u}>" for u in many)},
+               {"user": "U1", "ts": f"{AT - 60:.1f}", "text": " ".join(f"<@{u}>" for u in twelve)}]
+    slack = ConversationSlack(members=["U1", "U2", "UBOT"], history=history)
+    slack.held["UK1"] = {"profile": {"display_name": "kim"}}
+    runner = RecordingRunner()
+    p, store, _ = memory_processor(tmp_path, slack, runner, monkeypatch)
+    p.household = Household.load(store, ["U1", "U2", "U5"])
+    asyncio.run(p.handle_slack(dm(f"{AT:.1f}", "who are they, <@UT1>?", channel_type="mpim", channel="G1")))
+    assert sorted(slack.asked) == sorted(["U3", "UBOT", "U5", "UT1", *twelve, *many[:main.MENTIONED]])
+    first = runner.calls[0][0]
+    assert "16:38 “jane” (outside the household): @“kim” (outside the household) @UX000 (outside the household)" in first
+    assert f"@{many[main.MENTIONED]}" not in first and "@someone (outside the household) @someone" in first
+    assert "16:37 “jane” (outside the household): @U5 said so\n" in first
+    assert "16:39 fan: @UM00 (outside the household) @UM01 (outside the household)" in first
+    assert "fan now says:\n\n    who are they, @UT1 (outside the household)?\n" in first
+
+
+def test_a_thread_of_lines_mentioning_thousands_is_framed_at_once(tmp_path, monkeypatch):
+    """The frame holds a session slot, and the event loop with it, while it
+    picks which mentions to look up: 49 lines of 3,000 ids each take one
+    pass."""
+    lines = [{"user": "U3", "ts": f"{AT - 3000 + i:.1f}",
+              "text": " ".join(f"<@UX{i:02d}{j:04d}>" for j in range(3000))} for i in range(49)]
+    history = [{"user": "U1", "ts": f"{AT - 4000:.1f}", "text": "the plan"}, *lines]
+    slack = ConversationSlack(members=["U1", "U2", "UBOT"], history=history)
+    runner = RecordingRunner()
+    p, _, _ = memory_processor(tmp_path, slack, runner, monkeypatch)
+    turn = dm(f"{AT:.1f}", "what was all that?", channel_type="mpim", channel="G1", thread=f"{AT - 4000:.1f}")
+    started = time.monotonic()
+    asyncio.run(p._memory_arrival(turn.payload, [turn.payload], datetime.fromtimestamp(AT, p.cfg.zone)))
+    assert time.monotonic() - started < 1
+    assert len(slack.asked) == 2 + main.MENTIONED
+
+
+def test_a_frame_reads_back_twelve_hours_until_the_households_lines_are_read(tmp_path, monkeypatch):
+    """The history read stops by the test the frame's window counts by: a
+    member's line or hers, never anyone else's, an app's, her note or a
+    join."""
+    from wanda.vault import NOTE_EVENT
+
+    slack = ConversationSlack(members=["U1", "U2", "UBOT"])
+    p, _, _ = memory_processor(tmp_path, slack, RecordingRunner(), monkeypatch)
+    asyncio.run(p.handle_slack(dm(f"{AT:.1f}", "dinner at 7", channel_type="mpim", channel="G1")))
+    (channel, thread, since, counted), = slack.fetched
+    assert (channel, thread, since) == ("G1", None, AT - 12 * 3600)
+    at = f"{AT - 60:.1f}"
+    assert counted({"user": "U1", "ts": at}) and counted({"user": "UBOT", "bot_id": "BME", "ts": at})
+    assert not any(counted(m) for m in (
+        {"user": "U3", "ts": at}, {"user": "U7", "bot_id": "B7", "ts": at}, {"bot_id": "B8", "ts": at},
+        {"user": "UBOT", "bot_id": "BME", "ts": at, "metadata": {"event_type": NOTE_EVENT}},
+        {"user": "U1", "ts": at, "subtype": "channel_join"}))
+
+
+@pytest.mark.parametrize("thread", [None, f"{AT - 300:.1f}"], ids=["unthreaded", "in a thread"])
+def test_a_1_1_dm_names_everyone_as_slack_shows_them(tmp_path, monkeypatch, thread):
+    """Only she and the member post in a 1:1 DM, so its frames mark no one,
+    in a thread there too, under one of her alerts say."""
+    history = [{"user": "U1", "ts": f"{AT - 120:.1f}", "text": "is <@U3> coming?"}]
+    runner = RecordingRunner()
+    p, _, _ = memory_processor(tmp_path, ConversationSlack(history=history), runner, monkeypatch)
+    asyncio.run(p.handle_slack(dm(f"{AT:.1f}", "ask <@U3>", thread=thread)))
+    first = runner.calls[0][0]
+    assert "16:38 fan: is @jane coming?" in first and "now says:\n\n    ask @jane\n" in first
+    assert "outside the household" not in first
 
 
 def test_a_failure_note_is_marked_and_shown_to_no_session(tmp_path, monkeypatch):
@@ -1634,6 +1787,19 @@ def test_mei_added_to_fans_question_is_framed_as_hers(tmp_path, monkeypatch):
     assert handed_texts(tmp_path) == [[vault.added_text("group", "mei", "I'm out till 8", "16:41")]]
 
 
+@pytest.mark.parametrize("channel_type,said",
+                         [("im", "@jane too"), ("mpim", "@“jane” (outside the household) too")])
+def test_a_message_added_while_its_session_works_names_whom_it_mentions_as_its_frame_does(
+        tmp_path, monkeypatch, channel_type, said):
+    """In a 1:1 DM by the names Slack shows, elsewhere quoted and marked."""
+    slack = ConversationSlack(members=["U1", "U2", "UBOT"], history=[])
+    p, _, _, slack = standin_processor(tmp_path, monkeypatch, slack=slack, steps=[1.0, 0.2])
+    conversation(p, (0, dm(f"{AT:.1f}", "who's coming?", channel_type=channel_type)),
+                 (("tool_use", 1, 0.1), dm(f"{AT + 30:.1f}", "<@U3> too", channel_type=channel_type)))
+    place = "dm" if channel_type == "im" else "group"
+    assert handed_texts(tmp_path) == [[vault.added_text(place, "fan", said, "16:40")]]
+
+
 def test_a_session_no_one_messaged_takes_in_nothing(tmp_path, monkeypatch):
     """A clock session's frame says no message started it, and it owes
     nobody: a message in that DM waits for the session that follows."""
@@ -2000,7 +2166,7 @@ def daemon(tmp_path, monkeypatch, answers=None, *, snapshot="none", then=None, a
         return snapshot
 
     monkeypatch.setattr("wanda.actions.slack.SlackActions.alert", alert)
-    monkeypatch.setattr("wanda.main.SlackWatcher.start", lambda self: None)
+    monkeypatch.setattr("wanda.main.SlackWatcher.start", connected)
     monkeypatch.setattr("wanda.main.SlackWatcher.stop", lambda self: None)
     monkeypatch.setattr("wanda.main.Processor.loop", one_pass)
     monkeypatch.setattr("wanda.vault.prepare", lambda c, now, since=None: None)

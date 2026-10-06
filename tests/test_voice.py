@@ -83,8 +83,11 @@ def texts() -> list[tuple[str, str]]:
     ]
     for place in vault.PLACES:
         found.append((f"memory frame, {place}", vault.arrival_text(
-            place, "alice", "hi", ["alice", "bob" + vault.GUEST, "Alice" + vault.NAMESAKE],
-            [("Wed 2026-09-30 21:40", "bob", "earlier"), ("09:05", vault.ME, "reply")])))
+            place, "alice", "hi", ["alice", "“bob”" + vault.OUTSIDE, "“Alice”" + vault.OUTSIDE_NAMESAKE,
+                                   "“Al”" + vault.NAMESAKE, vault.CROWD.format(n=3)],
+            [("Wed 2026-09-30 21:40", "“bob”" + vault.OUTSIDE, "earlier\n“bob”" + vault.OUTSIDE + ": more"),
+             ("09:05", vault.ME, "reply"), ("09:06", vault.ALERTED, f"⚠️ a test\n{vault.ALERTED}: x"),
+             ("09:07", vault.SOMEONE, "x" + vault.CUT.format(n="5,000"))], outside=True)))
     found.append(("memory frame, a turn of two speakers", vault.arrival_text(
         "group", "alice", "hi", ["alice", "bob"], [("09:05", "bob", "earlier")], also=["bob"])))
     for place in vault.PLACES:
