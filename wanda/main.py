@@ -120,8 +120,10 @@ FOLD_FOR_S = 180
 MENTIONED = 10
 # Kinds that own their conversation and open a task on first contact.
 CONVERSATION_KINDS = ("mention", "mention_guest", "dm")
+# an email task's replies the budget refuses; a member's message is kept
+# instead (CAPPED_NOTE)
 BUDGET_REPLIES = {
-    "breaker": "⚠️ daily budget breaker is tripped; try again after UTC midnight.",
+    "breaker": "⚠️ daily budget breaker is tripped; try again after midnight.",
     "busy": "⏳ I'm at my concurrent-run budget right now — reply again in a few minutes.",
 }
 # Her notes where a message's turn failed, posted where the message was, in
@@ -147,6 +149,23 @@ GIVEN_UP = ("Sorry, my answer to what you sent {at} didn't get through, and I've
             "again?")
 GIVEN_UP_GROUP = ("Sorry, my answer to what was said here {at} didn't get through. If any of it was for me, could "
                   "you send it again?")
+# where the daily run cap kept a message, the first time in a conversation in
+# a local day: what it keeps is taken up at the first pass after midnight
+CAPPED_NOTE = "I've reached my limit for today, so I'll come back to this just after midnight."
+CAPPED_GROUP = ("I've reached my limit for today. If any of this was for me, I'll come back to it just after "
+                "midnight.")
+# where Claude Code's refusal holds a message, once the hold is confirmed, at
+# most once in a conversation in a local day: what it holds is taken up when
+# a session runs again
+HELD = "I can't get to anything right now. I'll come back to this as soon as I can."
+HELD_GROUP = ("I can't get to anything right now. If any of this was for me, I'll come back to it as soon as I "
+              "can.")
+# Claude Code refusing to run a session reaches every session, so its refusal
+# holds them all until one that started after it runs (Processor.hold). From
+# this long after the refusal, the hold is tried at each pass, and a session
+# that meets it again then confirms it, which her note says (HELD): one that
+# clears within it says nothing.
+HOLD_TRIED_AFTER = timedelta(minutes=1)
 # A turn whose newest message is older than this when it is framed reaches its
 # session late, as after a stop: it is framed at the session's start and says
 # so (vault.LATE_TURN). Longer than a wait behind one other session
@@ -282,16 +301,28 @@ class Holding:
         self.store = store
         self.rows: dict[tuple[str, str], dict] = {}
         self.tried: set[tuple[str, str]] = set()
+        # the session each one's kept row names, and the one it named before
+        # (`refused`)
+        self.session: dict[tuple[str, str], str | None] = {}
+        self.before: dict[tuple[str, str], str | None] = {}
 
     def take(self, batch: list[dict]) -> None:
-        self.rows |= {kept_key(m): m for m in batch}
+        for m in batch:
+            self.rows[kept_key(m)] = m
+            self.session.setdefault(kept_key(m), m.get("session"))
 
     def began(self, sid: str) -> None:
         self._took(sid, list(self.rows))
 
     def handed(self, sid: str, p: dict) -> None:
-        self.rows[kept_key(p)] = p
+        self.take([p])
         self._took(sid, [kept_key(p)])
+
+    def refused(self, keys, sid: str) -> tuple:
+        """Each of `keys` with the session its row is to name once the
+        session `sid`, which Claude Code refused to run, is taken off it: the
+        one before, since `sid` wrote nothing for the next to read."""
+        return tuple((k, self.before.get(k) if self.session.get(k) == sid else self.session.get(k)) for k in keys)
 
     def back(self, back: list[dict]) -> None:
         # written to the session's input, never taken in
@@ -304,6 +335,9 @@ class Holding:
     def _took(self, sid: str, keys: list[tuple[str, str]]) -> None:
         self.store.took(sid, keys, {k for k in keys if k not in self.tried})
         self.tried.update(keys)
+        for k in keys:
+            if self.session.get(k) != sid:
+                self.before[k], self.session[k] = self.session.get(k), sid
 
 
 class Additions:
@@ -313,8 +347,9 @@ class Additions:
     `next()`, until the session has answered (`close()`), has taken
     FOLD_LIMIT of them or has run FOLD_FOR_S. `frame` gives None for a
     message that is not this session's to take. `give_back` puts what it was
-    not handed back on the list, for the conversation's next turn, and
-    `run_again` what began a turn of it that failed after an answer.
+    not handed back on the list, for the conversation's next turn,
+    `run_again` what began a turn of it that failed after an answer, and
+    `hold_back` keeps out what began one Claude Code refused to run.
     `results` holds the session's results as the runner reads them. `holding`
     is its turn's kept messages, which are told of the session `sid` as each
     of its turns begins (`began()`) and as one is handed."""
@@ -348,6 +383,9 @@ class Additions:
         # on after an answer: it is that failure's one retry, and its own
         # failure's note says what she did not get to
         self.rerun = False
+        # what began a turn of it Claude Code refused to run after an answer,
+        # held until it runs sessions again (`hold_back`)
+        self.held: list[dict] = []
 
     def poke(self) -> None:
         self.more.set()
@@ -435,6 +473,18 @@ class Additions:
         self._put_first(back)
         return len(back)
 
+    def hold_back(self, texts: list[str]) -> int:
+        """Keeps out of the turn's answer each message it was handed that
+        `texts` holds, the messages that began a turn of its session Claude
+        Code refused to run after an answer, to be held (`held`); their
+        handlers find nothing waiting. Returns how many."""
+        left = list(texts)
+        for p, text in self.taken:
+            if text in left:
+                left.remove(text)
+                self.held.append(p)
+        return len(self.held)
+
     def _put_first(self, back: list[dict]) -> None:
         # oldest first, ahead of what arrived since, but for one deleted
         if back:
@@ -469,6 +519,11 @@ class Processor:
         self._additions: dict[int, Additions] = {}
         # per conversation task, the kept messages its running turn holds
         self._in_turn: dict[int, Holding] = {}
+        # while Claude Code's refusal holds: the try running, a conversation's
+        # take-up or a clock wake, and the time each wake the clock last
+        # offered came due (hold)
+        self._trying: asyncio.Task | None = None
+        self._wakes_due: dict[str, datetime] = {}
         # set once a stop begins: from then on no session starts, and what a
         # message's turn would take stays kept for the next start
         self.stopping = False
@@ -729,12 +784,35 @@ class Processor:
         # Of those waiting, the one that has gone longest without failing to
         # start: one that keeps failing would otherwise stand first every time
         # and hold back every other.
+        held = self._held_since() is not None
+        if held:
+            wakes = self.hold(wakes, now)
         if not wakes or self._bg or self._inflight_runs:
             return
         w = min(wakes, key=lambda w: self._clock_failed.get(w.key, float("-inf")))
         t = asyncio.create_task(self._clock_session(w, now))
         self._bg.add(t)
         t.add_done_callback(self._bg.discard)
+        if held:
+            self._trying = t
+
+    def hold(self, wakes: list[clock.Wake], now: datetime) -> list[clock.Wake]:
+        """While Claude Code's refusal holds, the wake the clock may start:
+        the hold's try, when one is due (_may_try) and this wake has waited
+        longer than any message held, by its time; none otherwise. A wake
+        Claude Code refuses is released and offered again (_clock_session),
+        so with nothing held the first wake to come due is the try."""
+        looks = clock.mornings(self.cfg.mornings)
+        self._wakes_due = {w.key: datetime.fromisoformat(w.by).replace(tzinfo=self.cfg.zone) if w.by
+                           else datetime.combine(now.date(), looks.get(w.person, now.time()), self.cfg.zone)
+                           for w in wakes}
+        if not wakes or not self._may_try():
+            return []
+        w = min(wakes, key=lambda w: self._wakes_due[w.key])
+        held = self._kept_conversations()
+        if any(at < self._wakes_due[w.key] for at, task in held if not self._in_use(task)):
+            return []
+        return [w]
 
     async def _clock_session(self, w: clock.Wake, now: datetime) -> None:
         morning = w.key.startswith("clock:morning:")
@@ -827,9 +905,12 @@ class Processor:
             log.exception("clock session %s failed", w.key)
             error = str(e) or type(e).__name__
         # read from the run it recorded: a post Slack refused leaves it owed
-        # and spoken, and delivery tries it again until it gives up
+        # and spoken, and delivery tries it again until it gives up. One
+        # Claude Code refused to run is released, to wake as the hold's try
+        # or once it ends (hold)
         if run is not None:
-            outcome = ("spoke" if run["result_text"] else "silent") if run["status"] == "ok" else "failed"
+            outcome = (("spoke" if run["result_text"] else "silent") if run["status"] == "ok"
+                       else "not run" if run["status"] == "refused" else "failed")
         else:
             outcome = "not run" if error in BUDGET_REPLIES else "failed"
         # one that gave its answer and then failed in a later turn spoke: a
@@ -1412,6 +1493,7 @@ class Processor:
             # alerts alone: the housekeeping would hold up their snapshots,
             # and triage starts a session
             return
+        await self._take_up_kept()
         await self._housekeep()
         if not self.cfg.email_triage:
             return  # mail rows from before triage was turned off stay as they are
@@ -1459,19 +1541,22 @@ class Processor:
 
     async def check_budget(self, reserve_usd: float = 0.0) -> str:
         """Returns 'ok', 'busy' (only in-flight reservations push us over — a
-        transient condition), or 'breaker' (real recorded spend hit the cap)."""
-        n, cost = self.store.runs_today()
+        transient condition), or 'breaker' (real recorded spend hit the cap),
+        counted from midnight in the household's zone. The alert goes once a
+        UTC day, as every kind does, so a cap that holds past UTC midnight is
+        alerted again then."""
+        n, cost = self.store.runs_today(self.cfg.zone)
         # Recorded spend alone leaves no room: that is the breaker, even if the
         # gap is only the size of this run's reservation. Reporting it as
-        # 'busy' would stall triage silently until UTC midnight.
+        # 'busy' would stall triage silently until midnight.
         if (n >= self.cfg.daily_run_cap
                 or cost >= self.cfg.daily_cost_cap_usd
                 or cost + reserve_usd > self.cfg.daily_cost_cap_usd):
-            await self._alert_once(
-                "breaker",
-                f"daily budget breaker tripped ({n} runs, ${cost:.2f} of "
-                f"${self.cfg.daily_cost_cap_usd:.2f}); pausing claude runs until UTC midnight",
-            )
+            reached = (f"daily run cap reached ({n} runs since midnight, {self.cfg.tz})"
+                       if n >= self.cfg.daily_run_cap else
+                       f"daily cost cap reached (${cost:.2f} of ${self.cfg.daily_cost_cap_usd:.2f} since midnight, "
+                       f"{self.cfg.tz})")
+            await self._alert_once("breaker", f"{reached}; messages are held until midnight")
             return "breaker"
         # Only in-flight work pushes us over: genuinely transient.
         if (n + self._inflight_runs >= self.cfg.daily_run_cap
@@ -1816,7 +1901,8 @@ class Processor:
         her note instead (CUT_SHORT), once in each conversation, before
         anything there runs again. Returns the rest still due, by
         conversation, as (task, keys), for `take_up` once her own ids are
-        known; one answered waits for delivery."""
+        known; one answered waits for delivery, and one capped or held for a
+        pass (_take_up_kept)."""
         due: dict[int, tuple] = {}
         cut: dict[int, tuple] = {}
         for r in self.store.kept():
@@ -2239,7 +2325,8 @@ class Processor:
 
     async def _turn(self, task, p: dict, state: dict) -> None:
         """A turn of the conversation, its lock held, for every message
-        waiting there, `p` among them. The kept messages it takes are
+        waiting there, `p` among them, and every one the run cap or Claude
+        Code's refusal kept there. The kept messages it takes are
         written, before the lock is let go, by its record, or by her note
         when something raises before that; a cancellation, as at a stop,
         writes only what an answer already given answers, and leaves the
@@ -2256,7 +2343,11 @@ class Processor:
             nonlocal took, more
             took = True
             if again is None:
-                batch = list(waiting)
+                # with what the run cap or a hold kept here, the budget
+                # having let the turn run
+                there = {kept_key(m) for m in waiting}
+                batch = sorted(waiting + [m for m in self._kept_here(task, ("capped", "held"))
+                                          if kept_key(m) not in there], key=lambda m: float(m["ts"]))
                 first[:] = batch
             else:
                 batch = [m for m in first + [m for m, _ in more.taken]
@@ -2303,31 +2394,27 @@ class Processor:
             self._additions.pop(task["id"], None)
             self._in_turn.pop(task["id"], None)
 
-    def take_up(self, task, keys) -> None:
-        """Runs again a conversation's kept messages `keys` that are still
-        due, as one turn, from a handler of its own in `_bg`, which `_wake`
-        reads as a session running: messages queued one event each would
-        reach their frames one by one. Once the handler holds the
-        conversation's lock it reads them again, so that one answered or
-        deleted meanwhile is not run, and puts each on the waiting list in
-        its place by time, behind the sender's check (`_let_in`); each is
-        framed with the session that last took it (vault.RETRIED)."""
-        t = asyncio.create_task(self._take_up(task, set(keys)))
+    def take_up(self, task, keys=None, states: tuple[str, ...] = ("due",)) -> asyncio.Task:
+        """Runs again a conversation's kept messages in `states`, those among
+        `keys` when it is given, as one turn, from a handler of its own in
+        `_bg`, which `_wake` reads as a session running: messages queued one
+        event each would reach their frames one by one. Once the handler
+        holds the conversation's lock it reads them again, so that one
+        answered or deleted meanwhile is not run, and puts each on the
+        waiting list in its place by time; each is framed with the session
+        that last took it (vault.RETRIED)."""
+        t = asyncio.create_task(self._take_up(task, None if keys is None else set(keys), states))
         self._bg.add(t)
         t.add_done_callback(self._bg.discard)
+        return t
 
-    async def _take_up(self, task, keys: set[tuple[str, str]]) -> None:
+    async def _take_up(self, task, keys: set[tuple[str, str]] | None, states: tuple[str, ...]) -> None:
         try:
             async with self._task_locks.setdefault(task["id"], asyncio.Lock()):
                 waiting = self._waiting.setdefault(task["id"], [])
                 there = {kept_key(m) for m in waiting}
-                taken = []
-                for r in self.store.kept(task["slack_channel"], task["thread_ts"]):
-                    if r["state"] != "due" or kept_key(r) not in keys or kept_key(r) in there:
-                        continue
-                    m = json.loads(r["payload"]) | ({"session": r["session"]} if r["session"] else {})
-                    if self._let_in(m):
-                        taken.append(m)
+                taken = [m for m in self._kept_here(task, states)
+                         if (keys is None or kept_key(m) in keys) and kept_key(m) not in there]
                 if not taken:
                     return
                 waiting[:] = sorted(waiting + taken, key=lambda m: float(m["ts"]))
@@ -2337,6 +2424,72 @@ class Processor:
         except Exception:
             # left as they are, for the next start
             log.exception("could not run again what was kept in %s", task["slack_channel"])
+
+    def _kept_here(self, task, states: tuple[str, ...]) -> list[dict]:
+        """A conversation's kept messages in `states`, oldest first, each as
+        the watcher handed it on with the session that last took it, behind
+        the sender's check (`_let_in`)."""
+        return [m for r in self.store.kept(task["slack_channel"], task["thread_ts"]) if r["state"] in states
+                for m in [json.loads(r["payload"]) | ({"session": r["session"]} if r["session"] else {})]
+                if self._let_in(m)]
+
+    def _kept_conversations(self, states: tuple[str, ...] = ("held",)) -> list[tuple[datetime, object]]:
+        """Each conversation with kept messages in `states`, as (when its
+        oldest of them was sent, its task)."""
+        oldest: dict[tuple[str, str], float] = {}
+        for r in self.store.kept():
+            if r["state"] in states:
+                oldest.setdefault((r["channel"], r["task_key"]), float(r["ts"]))
+        return [(datetime.fromtimestamp(ts, timezone.utc), task) for (channel, key), ts in oldest.items()
+                if (task := self.store.get_task_by_thread(channel, key)) is not None]
+
+    def _in_use(self, task) -> bool:
+        """Whether a turn holds the conversation: what it keeps there joins
+        that turn's batch, or that of a take-up waiting behind it."""
+        lock = self._task_locks.get(task["id"])
+        return lock is not None and lock.locked()
+
+    def _held_since(self) -> datetime | None:
+        """When Claude Code first refused to run a session, while the hold
+        that refusal began lasts."""
+        since = self.store.get_meta("held_since")
+        return datetime.fromisoformat(since) if since else None
+
+    def _may_try(self) -> bool:
+        """Whether the hold is tried now: from HOLD_TRIED_AFTER on, unless
+        she is stopping, and one try at a time."""
+        since = self._held_since()
+        return (since is not None and not self.stopping and datetime.now(timezone.utc) - since >= HOLD_TRIED_AFTER
+                and (self._trying is None or self._trying.done()))
+
+    async def _take_up_kept(self) -> None:
+        """At a pass: once the budget lets a turn run, what the daily run cap
+        kept in each conversation, as one turn, and what a hold kept once it
+        has ended; while Claude Code's refusal holds, its try, the held
+        conversation whose oldest message has waited longest, unless a wake
+        has waited longer, which the clock starts instead (hold). A
+        conversation in use is passed over (_in_use)."""
+        since = self._held_since()
+        states = ("capped",) if since is not None else ("capped", "held")
+        kept = [task for _, task in self._kept_conversations(states) if not self._in_use(task)]
+        if kept and await self.check_budget(self.cfg.agent_expected_usd) == "ok":
+            for task in kept:
+                self.take_up(task, states=states)
+        if since is None or not self._may_try():
+            return
+        held = [(at, task) for at, task in self._kept_conversations() if not self._in_use(task)]
+        if not held:
+            return
+        at, task = min(held, key=lambda h: h[0])
+        if all(due >= at for key, due in self._wakes_due.items() if not self._cannot_start(key)):
+            self._trying = self.take_up(task, states=("held",))
+
+    def _cannot_start(self, key: str) -> bool:
+        """Whether a clock wake failed before its claim at the clock's last
+        tick or the one before: such a wake starts no session, and one that
+        keeps failing would otherwise stand before every held message for as
+        long as the clock offers it."""
+        return time.monotonic() - self._clock_failed.get(key, float("-inf")) < 2 * CLOCK_TICK_S
 
     async def _frame_turn(self, task, batch: list[dict], state: dict,
                           more: Additions | None = None) -> tuple[str, datetime] | None:
@@ -2416,7 +2569,9 @@ class Processor:
         next start, and what it was not handed is put back for the
         conversation's next turn. The kept messages the turn holds are
         written with its run (`Holding`): answered by what it posts, gone after
-        a silence, or due again.
+        a silence, due again, or held. One the daily run cap refuses keeps
+        them for the first pass after midnight, and says so once a day there
+        (_capped).
 
         A message's session that fails with no turn of a member's reported is
         tried once more, holding the slot, by a session `frame` is given the
@@ -2430,8 +2585,11 @@ class Processor:
         later turn begun by an added message, no later one reporting, has that
         message run again as the conversation's next turn, framed with the
         session that failed, or her note after the answer (FAILED_REST) when
-        that would fail the same way or is that next turn's own failure. Each
-        such failure is kept for the `failed` alert, with Claude Code's reason.
+        that would fail the same way or is that next turn's own failure. One
+        Claude Code refused to run holds its messages, or after an answer
+        those that began the turn it refused, until a session runs again
+        (_claude_refused). Each such failure is kept for the `failed` alert,
+        with Claude Code's reason.
 
         `owed` is whether someone is waiting: if not, as for the clock, a
         refusal, a failure or a restart posts nothing, except that an answer
@@ -2452,7 +2610,7 @@ class Processor:
         reserve = self.cfg.agent_expected_usd
         if (verdict := await self.check_budget(reserve_usd=reserve)) != "ok":
             if owed:
-                await self._refused(verdict, task, channel, reply_thread)
+                await self._capped(task, channel, reply_thread, group)
             state["recorded"] = True
             return verdict
         sid = sid or str(uuid.uuid4())
@@ -2473,7 +2631,7 @@ class Processor:
             while True:
                 if (verdict := await self.check_budget(reserve_usd=reserve)) != "ok":
                     if owed:
-                        await self._refused(verdict, task, channel, reply_thread)
+                        await self._capped(task, channel, reply_thread, group)
                     state["recorded"] = True
                     return verdict
                 more = None
@@ -2486,7 +2644,7 @@ class Processor:
                     # the retry of a first try a stop left untried, which
                     # the frame finds, is not tried once more
                     first = first or state.get("first")
-                started = utcnow()
+                started, began = utcnow(), datetime.now(timezone.utc)
                 date = now.date().isoformat()
                 t0 = time.monotonic()
                 # from here a stop lets the task finish (let_finish)
@@ -2594,8 +2752,9 @@ class Processor:
                 refusal = refused(rr) if error else None
                 # what follows a message's failure: "retry", a second session
                 # now; "note" or "rest", FAILED or FAILED_REST; "again", the
-                # messages that began the failed turn run as the next; or ""
-                # for the log and the alert alone
+                # messages that began the failed turn run as the next; "held",
+                # held while Claude Code refuses; or "" for the log and the
+                # alert alone
                 then, after = "", False
                 if error and owed and more is not None:
                     then, after, text = await self._after_failure(rr, out, more, sid, text, refusal, ran,
@@ -2634,12 +2793,21 @@ class Processor:
             note = ((FAILED_REST_GROUP if group else FAILED_REST) if then == "rest"
                     else FAILED_GROUP if group else FAILED)
         # the kept messages of a message's turn: answered by what is posted,
-        # gone with a silence, but for any run again as the next turn
-        settled = None
+        # gone with a silence, but for any run again as the next turn or held
+        settled, newly = None, False
         if more is not None and more.holding is not None:
+            held = ()
+            if then == "held":
+                back = {kept_key(m) for m in more.held}
+                held = more.holding.refused([k for k in more.holding.rows if not after or k in back], sid)
+                # a try holds again what was held before it, which her note
+                # has said already
+                was = {kept_key(r): r["state"] for r in self.store.kept(task["slack_channel"], task["thread_ts"])}
+                newly = any(was.get(k) != "held" for k, _ in held)
             again = tuple((k, m) for k, m in more.holding.rows.items() if m.get("again") == sid)
-            rest = tuple(k for k in more.holding.rows if k not in dict(again))
-            settled = Settled(answered=rest, again=again) if text or note else Settled(gone=rest, again=again)
+            rest = tuple(k for k in more.holding.rows if k not in dict(again) and k not in dict(held))
+            settled = (Settled(answered=rest, again=again, held=held) if text or note
+                       else Settled(gone=rest, again=again, held=held))
         # recorded before it is posted and before the snapshot: a restart
         # while either runs still finds the answer here and delivers it
         run = dict(
@@ -2671,11 +2839,19 @@ class Processor:
             # after the answer it follows, which delivery posts first while
             # Slack refuses it
             await self._post_run(note_id, note, channel, reply_thread)
+        if refusal:
+            await self._claude_refused(task if newly else None)
+        else:
+            self._claude_ran(began)
         follow = {"retry": "; trying once more", "note": "; a note asks for it again",
-                  "rest": "; a note asks for it again", "again": "; run again as the next turn"}.get(then, "")
-        if error and owed and more is not None:
+                  "rest": "; a note asks for it again", "again": "; run again as the next turn",
+                  "held": "; held"}.get(then, "")
+        # a hold's try that holds again only what it held before is the
+        # log's alone: the alert named the hold when it first held them
+        if error and owed and more is not None and (then != "held" or newly or not (settled and settled.held)):
             why = refusal or ("timeout" if rr.timed_out else "other")
-            told = ", a note asked for it again" if note else ", no note"
+            told = (", a note asked for it again" if note else
+                    ", held until Claude Code runs again" if then == "held" else ", no note")
             retried = first is not None and not after
             if then == "again":
                 self._failed(run_id, started, error, claude, why, "run again as the next turn")
@@ -2726,12 +2902,16 @@ class Processor:
         # failed on after her answer
         told = "rest" if more.rerun else "note"
         if not reported:
-            if (first and not more.rerun and not refusal and not self._fails_again(rr)
-                    and ran <= self.cfg.agent_timeout_s / 2):
+            if refusal:
+                return "held", False, ""
+            if first and not more.rerun and not self._fails_again(rr) and ran <= self.cfg.agent_timeout_s / 2:
                 return "retry", False, ""
             return told, False, ""
         failed = [i for i in range(reported[-1] + 1, n) if member[i] and (i >= len(reports) or reports[i] is None)]
         if failed:
+            if refusal and starts is not None and more.hold_back([t for i in failed if i < len(starts)
+                                                                  for t in starts[i].texts]):
+                return "held", True, text
             if refusal or self._fails_again(rr):
                 return "rest", True, text
             if starts is None:
@@ -2776,19 +2956,86 @@ class Processor:
                  len((out or {}).get("recorded") or []),
                  outcome)
 
-    async def _refused(self, verdict: str, task, channel: str, reply_thread: str | None) -> None:
-        try:
-            await self.slack.reply(reply_thread, BUDGET_REPLIES[verdict], channel=channel)
-        except Exception as e:
-            # no run was recorded to deliver it from, and the refusal stands either way
-            log.warning("could not post the budget's %s reply in %s: %s", verdict, channel, e)
-        # the reply answers what a message's turn holds, and, before its
-        # frame, every message waiting there, which no turn takes then
-        if (holding := self._in_turn.get(task["id"])) is not None:
-            waiting = self._waiting.get(task["id"], [])
-            keys = {*holding.rows} or {kept_key(m) for m in waiting}
-            self._unreact(self.store.forget(keys))
-            waiting[:] = [m for m in waiting if kept_key(m) not in keys]
+    async def _capped(self, task, channel: str, reply_thread: str | None, group: bool) -> None:
+        """A message's turn the daily run cap refused, its retry's included:
+        what it holds, and before its frame every message waiting there, is
+        kept for the first pass after midnight (_take_up_kept), each with her
+        reaction on and the session that last took it. The first time in a
+        conversation in a local day, her note says so (CAPPED_NOTE)."""
+        if (holding := self._in_turn.get(task["id"])) is None:
+            return
+        waiting = self._waiting.get(task["id"], [])
+        keys = tuple(holding.rows) or tuple(kept_key(m) for m in waiting)
+        if not keys:
+            return
+        # no turn takes these now; one that comes while her note is posted
+        # waits for a turn of its own
+        waiting[:] = [m for m in waiting if kept_key(m) not in keys]
+        log.info("the daily run cap keeps %d message(s) in %s until midnight", len(keys), channel)
+        today, noted = datetime.now(self.cfg.zone).date().isoformat(), f"cap_noted:{task['id']}"
+        if self.store.get_meta(noted) == today:
+            self.store.settle(Settled(capped=keys))
+            return
+        text = CAPPED_GROUP if group else CAPPED_NOTE
+        note = self.store.record_run(kind="note", task_id=task["id"], session_id=None, started_at=utcnow(),
+                                     exit_code=None, cost_usd=0.0, status="ok", result_text=text, notified=0,
+                                     settled=Settled(capped=keys), meta=(noted, today))
+        await self._post_run(note, text, channel, reply_thread)
+
+    async def _claude_refused(self, task=None) -> None:
+        """Claude Code refused to run a session, whatever started it. The
+        first refusal holds every session until one that started after it
+        runs (_claude_ran): the clock starts none but the hold's try, which a
+        pass makes too (hold, _take_up_kept). One HOLD_TRIED_AFTER or more on
+        confirms it: then every conversation where a message is held is told
+        (HELD), and from then one is told at once where a message is newly
+        held (`task`), each at most once a local day."""
+        since = self._held_since()
+        now = datetime.now(timezone.utc)
+        if since is None:
+            # to the microsecond, as a session's start is compared with it
+            # (_claude_ran): to the second, one that began just before it
+            # and one just after could read the same
+            self.store.set_meta("held_since", now.isoformat())
+            log.warning("Claude Code refuses to run sessions: what they would take is held, and tried again at "
+                        "each pass from a minute on")
+            return
+        if not self.store.get_meta("held_confirmed"):
+            if now - since < HOLD_TRIED_AFTER:
+                return
+            self.store.set_meta("held_confirmed", now.isoformat(timespec="seconds"))
+            tell = [task for _, task in self._kept_conversations()]
+        else:
+            tell = [task] if task is not None else []
+        today = datetime.now(self.cfg.zone).date().isoformat()
+        for t in tell:
+            if self._held_since() != since:
+                # a session ended the hold while a note before this one was
+                # posted: there is no hold to tell of now, and a mark written
+                # now would keep a second hold that day from being told
+                return
+            noted = f"held_noted:{t['id']}"
+            rows = [r for r in self.store.kept(t["slack_channel"], t["thread_ts"]) if r["state"] == "held"]
+            if not rows or self.store.get_meta(noted) == today:
+                continue
+            text = HELD_GROUP if any(json.loads(r["payload"]).get("channel_type") == "mpim" for r in rows) else HELD
+            note = self.store.record_run(kind="note", task_id=t["id"], session_id=None, started_at=utcnow(),
+                                         exit_code=None, cost_usd=0.0, status="ok", result_text=text, notified=0,
+                                         meta=(noted, today))
+            await self._post_run(note, text, t["slack_channel"], t["reply_thread"])
+
+    def _claude_ran(self, began: datetime) -> None:
+        """A session that began at `began` ran: one that began after the hold
+        did ends it, and what it held is taken up, a turn for each
+        conversation, as the clock wakes what it released."""
+        since = self._held_since()
+        if since is None or began < since:
+            return
+        self.store.end_hold()
+        self._wakes_due = {}
+        log.info("Claude Code runs sessions again: what was held since %s is taken up", since.isoformat())
+        for _, task in self._kept_conversations():
+            self.take_up(task, states=("held",))
 
     def _answered_before_the_stop(self, more: Additions, sid: str) -> Settled:
         """The kept messages an answer the session `sid` gave before a stop
@@ -3255,8 +3502,15 @@ async def run_doctor(cfg: Config, smoke: bool) -> int:
                "none" if stuck == 0 else f"{stuck} set aside — run `wanda requeue` to retry")
         deferred = store.count_by_status("deferred")
         report("deferred by rate cap", True, "none" if not deferred else f"{deferred} waiting for the cap window")
-        n_runs, cost = store.runs_today()
-        report("claude runs today", True, f"{n_runs} runs, ${cost:.2f}")
+        n_runs, _ = store.runs_today(zone)
+        kept = [r["state"] for r in store.kept()]
+        since = store.get_meta("held_since")
+        report("claude runs today", True, (
+            f"{n_runs} since 00:00 {getattr(zone, 'key', 'UTC')} of {cfg.daily_run_cap}, "
+            f"{store.refused_today(zone)} refused and not counted"
+            + (f"; {kept.count('capped')} message(s) held until midnight" if "capped" in kept else "")
+            + (f"; {kept.count('held')} held while Claude Code cannot run, since "
+               f"{vault.stamp(datetime.fromisoformat(since).timestamp(), datetime.now(zone))}" if since else "")))
         # the give-up alert names each by its run and time only: where it was
         # due is for whoever runs this
         given_up = store.given_up_runs(MAX_DELIVERY_ATTEMPTS)
@@ -3478,7 +3732,7 @@ async def run_triage_once(cfg: Config, limit: int) -> None:
 
     total_cost = 0.0
     for i in range(0, len(rows), cfg.triage_batch_size):
-        n_runs, spent = ledger.runs_today()
+        n_runs, spent = ledger.runs_today(cfg.zone if cfg.tz else timezone.utc)
         if n_runs >= cfg.daily_run_cap or spent >= cfg.daily_cost_cap_usd:
             print(f"\nstopping: daily budget reached ({n_runs} runs, ${spent:.2f} today)")
             break

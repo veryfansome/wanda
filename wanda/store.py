@@ -4,7 +4,7 @@ import contextlib
 import json
 import sqlite3
 import threading
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -74,10 +74,12 @@ CREATE TABLE IF NOT EXISTS slack_events (
 
 -- A member's message to her, kept from when it is seen until its answer is
 -- posted: `due` until a turn records what it came to, then `answered` by
--- `run`, the run that posts her answer or note. Slack never sends a message
--- again once it is acknowledged, so this is what a stop or a crash leaves to
--- run again. `session` is the last session that took it, and `tries` how many
--- turns a session began for it and did not finish.
+-- `run`, the run that posts her answer or note; or `capped` by the daily run
+-- cap until it lets a turn run, or `held` while Claude Code refuses to run
+-- sessions. Slack never sends a message again once it is acknowledged, so
+-- this is what a stop or a crash leaves to run again. `session` is the last
+-- session that took it, and `tries` how many turns a session began for it
+-- and did not finish.
 CREATE TABLE IF NOT EXISTS unanswered (
   channel  TEXT NOT NULL,
   ts       TEXT NOT NULL,
@@ -129,16 +131,24 @@ def utcnow() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _midnight(zone: tzinfo) -> datetime:
+    return datetime.now(zone).replace(hour=0, minute=0, second=0, microsecond=0)
+
+
 class Settled(NamedTuple):
     """What a recorded run does to the kept messages of its turn, each by
     (channel, ts): answered by the run that posts the turn's answer or note
-    (the note's, when there is one), gone after a silence, or kept due with
-    its payload, to run again as the conversation's next turn; or, written
-    with no run, kept as they are with a payload naming the turn's first
-    try, which a stop left with no retry."""
+    (the note's, when there is one), gone after a silence, kept due with its
+    payload, to run again as the conversation's next turn, kept for the run
+    cap to let a turn run, or held while Claude Code refuses to run sessions,
+    with the session its row names from then on; or, written with no run,
+    kept as they are with a payload naming the turn's first try, which a
+    stop left with no retry."""
     answered: tuple = ()
     gone: tuple = ()
     again: tuple = ()  # of ((channel, ts), payload)
+    capped: tuple = ()
+    held: tuple = ()  # of ((channel, ts), session)
     first_try: tuple = ()  # of ((channel, ts), payload)
 
 
@@ -444,15 +454,20 @@ class Store:
         result_text: str | None = None,
         notified: int = 1,
         settled: Settled | None = None,
+        meta: tuple[str, str] | None = None,
     ) -> int:
         """notified=0 marks a run whose outcome still owes the owner a Slack
         message, so a restart can deliver it. `settled` is what it does to
-        its turn's kept messages, written with it: a restart finds the run
-        and the messages it answers, or neither."""
+        its turn's kept messages, and `meta` a (key, value) it sets, both
+        written with it: a restart finds the run and the messages it answers,
+        or neither."""
         with self._transaction():
             run_id = self._insert_run(kind, task_id, session_id, started_at, exit_code, cost_usd, status, error,
                                       result_text, notified)
             self._settle(settled, run_id)
+            if meta is not None:
+                self._db.execute("INSERT INTO meta(key, value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET "
+                                 "value=excluded.value", meta)
         return run_id
 
     def record_run_and_note(self, note: str, settled: Settled | None = None, **run) -> tuple[int, int]:
@@ -484,6 +499,12 @@ class Store:
         # is not counted against it
         self._db.executemany("UPDATE unanswered SET state='due', tries=0, payload=? WHERE channel=? AND ts=?",
                              [(json.dumps(p), *k) for k, p in settled.again])
+        # no session ran for them, so each keeps the session it names, which
+        # its take-up is framed with
+        self._db.executemany("UPDATE unanswered SET state='capped', tries=0 WHERE channel=? AND ts=? "
+                             "AND state <> 'answered'", list(settled.capped))
+        self._db.executemany("UPDATE unanswered SET state='held', tries=0, session=? WHERE channel=? AND ts=? "
+                             "AND state <> 'answered'", [(sid, *k) for k, sid in settled.held])
         # the turn that takes them next is the first try's retry, its try
         # still counted
         self._db.executemany("UPDATE unanswered SET payload=? WHERE channel=? AND ts=? AND state <> 'answered'",
@@ -639,10 +660,11 @@ class Store:
 
     def took(self, sid: str, keys, counted) -> None:
         """The session `sid` has taken these kept messages, by (channel, ts):
-        a try is counted for each in `counted`."""
+        a try is counted for each in `counted`. One capped or held stays so
+        while it runs."""
         with self._transaction():
             self._db.executemany("UPDATE unanswered SET session=?, tries=tries+? WHERE channel=? AND ts=? "
-                                 "AND state='due'", [(sid, int(k in counted), *k) for k in keys])
+                                 "AND state <> 'answered'", [(sid, int(k in counted), *k) for k in keys])
 
     def given_back(self, keys) -> None:
         """Kept messages written to a session that never took them in: the
@@ -689,9 +711,25 @@ class Store:
             ran -= max(timedelta(0), min(end, now) - max(start, since))
         return ran
 
-    def runs_today(self) -> tuple[int, float]:
-        midnight_utc = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-        return self.runs_since(midnight_utc)
+    def runs_today(self, zone: tzinfo) -> tuple[int, float]:
+        """The runs counted against the daily cap since midnight in the
+        household's zone."""
+        return self.runs_since(_midnight(zone))
+
+    def refused_today(self, zone: tzinfo) -> int:
+        """The sessions Claude Code refused since midnight in the household's
+        zone, which no daily count includes."""
+        return self._query("SELECT COUNT(*) AS n FROM runs WHERE started_at >= ? AND status = 'refused'",
+                           (_midnight(zone).astimezone(timezone.utc).isoformat(timespec="seconds"),))[0]["n"]
+
+    # --- while Claude Code refuses to run sessions ---
+
+    def end_hold(self) -> None:
+        """Claude Code runs sessions again: the hold, its confirmation and
+        where her note has said so (`held_noted:<task>`) go together."""
+        with self._transaction():
+            self._db.execute("DELETE FROM meta WHERE key IN ('held_since', 'held_confirmed') "
+                             "OR substr(key, 1, 11) = 'held_noted:'")
 
     # --- slack event dedupe ---
 

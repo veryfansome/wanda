@@ -22,7 +22,7 @@ from wanda.config import Config
 from wanda.events import Event
 from wanda import clock, main, vault
 from wanda.household import NAMES_EVERY_S, Household
-from wanda.main import ANCHOR, BUDGET_REPLIES, MAX_APPLY_ATTEMPTS, RETRY_BASE_S, Additions, Processor
+from wanda.main import ANCHOR, MAX_APPLY_ATTEMPTS, RETRY_BASE_S, Additions, Processor
 from wanda.runner import RunResult, RunnerService
 from wanda.store import Settled, Store, utcnow
 from wanda.triage import Verdict
@@ -1803,24 +1803,26 @@ def test_a_retry_whose_runner_raises_gets_her_note(tmp_path, monkeypatch):
         1, "other", "the session ended without its report", "tried once more, a note asked for it again")
 
 
-@pytest.mark.parametrize("retry,why,said", [
-    (RunResult(ok=False, timed_out=True, error="timed out after 420s"), "timeout", "timed out after 420s"),
+@pytest.mark.parametrize("retry,why,said,then", [
+    (RunResult(ok=False, timed_out=True, error="timed out after 420s"), "timeout", "timed out after 420s",
+     "a note asked for it again"),
     (said_by_claude("You've hit your limit · resets 5pm", api_error="rate_limit"), "usage limit",
-     "Claude Code said: You've hit your limit · resets 5pm"),
+     "Claude Code said: You've hit your limit · resets 5pm", "held until Claude Code runs again"),
 ], ids=["out of time", "refused"])
 def test_a_retry_that_fails_otherwise_than_its_first_try_is_alerted_under_its_own_class(tmp_path, monkeypatch,
-                                                                                       retry, why, said):
+                                                                                       retry, why, said, then):
     """A retry that ran out of time, or that Claude Code refused, is named by
     itself, in its own words, under its own class, where a token to renew or
-    a limit is read; the first try it retried is named by its run."""
+    a limit is read; the first try it retried is named by its run. The
+    refused one holds its message."""
     runner = RecordingRunner("I filed it.", retry)
     slack = ConversationSlack(history=[])
     p, store, _ = memory_processor(tmp_path, slack, runner, monkeypatch)
-    asyncio.run(p.handle_slack(dm(f"{AT:.1f}", "hello")))
-    assert len(runner.calls) == 2 and slack.replies == [main.FAILED]
+    keep(store, dm(f"{AT:.1f}", "hello"))
+    settle(p, p.handle_slack(dm(f"{AT:.1f}", "hello")))
+    assert len(runner.calls) == 2 and slack.replies == ([main.FAILED] if why == "timeout" else [])
     [failed] = json.loads(store.get_meta("failed_runs"))
-    assert (failed["id"], failed["why"], failed["said"], failed["then"]) == (
-        2, why, said, "the retry of run 1, a note asked for it again")
+    assert (failed["id"], failed["why"], failed["said"], failed["then"]) == (2, why, said, f"the retry of run 1, {then}")
 
 
 @pytest.mark.parametrize("channel_type,thread,note", [("im", None, main.FAILED), ("mpim", None, main.FAILED_GROUP),
@@ -1877,24 +1879,47 @@ def test_the_failed_alert_names_each_class_once_a_day_with_claude_codes_reason(t
     (RunResult(ok=False, timed_out=True, error="timed out after 420s"), "timeout", "timeout"),
     (said_by_claude("error_max_budget_usd", "error_max_budget_usd"), "error", "other"),
     (RunResult(ok=False, error="could not read the session's output: a result without is_error"), "error", "other"),
-    (said_by_claude("You've hit your limit · resets 5pm", api_error="rate_limit"), "refused", "usage limit"),
-    (said_by_claude("Usage limit reached ∙ resets at 5pm"), "refused", "usage limit"),
-    (said_by_claude("Login expired · Please run /login"), "refused", "authentication"),
-    (said_by_claude("OAuth token revoked · Please run /login"), "refused", "authentication"),
-], ids=["a timeout", "its budget spent", "an output it cannot read", "rate_limit", "Usage limit reached",
-        "Login expired", "OAuth token revoked"])
+], ids=["a timeout", "its budget spent", "an output it cannot read"])
 def test_a_failure_a_second_session_would_meet_gets_her_note_at_once(tmp_path, monkeypatch, ended, status, why):
-    """Not tried once more; a session Claude Code refused, which ran
-    nothing, and her note count toward no daily cap."""
+    """Not tried once more; her note counts toward no daily cap."""
     runner = RecordingRunner(ended, answer("Yes."))
     slack = ConversationSlack(history=[])
     p, store, _ = memory_processor(tmp_path, slack, runner, monkeypatch)
     asyncio.run(p.handle_slack(dm(f"{AT:.1f}", "hello")))
     assert len(runner.calls) == 1 and slack.replies == [main.FAILED]
     assert [r[:2] for r in failed_runs(store)] == [("agent", status), ("note", "ok")]
-    assert store.runs_today()[0] == (0 if status == "refused" else 1)
+    assert store.runs_today(p.cfg.zone)[0] == 1
     [failed] = json.loads(store.get_meta("failed_runs"))
     assert failed["why"] == why and failed["then"] == "not tried again, a note asked for it again"
+
+
+@pytest.mark.parametrize("ended,why", [
+    (said_by_claude("You've hit your limit · resets 5pm", api_error="rate_limit"), "usage limit"),
+    (said_by_claude("Usage limit reached ∙ resets at 5pm"), "usage limit"),
+    (said_by_claude("Login expired · Please run /login"), "authentication"),
+    (said_by_claude("OAuth token revoked · Please run /login"), "authentication"),
+], ids=["rate_limit", "Usage limit reached", "Login expired", "OAuth token revoked"])
+def test_a_session_claude_code_refused_holds_its_message_with_nothing_said(tmp_path, monkeypatch, caplog, ended,
+                                                                           why):
+    """Not tried once more, and no note yet: its message is held, its
+    reaction on, the session that ran nothing counted toward no daily cap,
+    and the hold begins; its line in the log ends "; held"."""
+    import logging
+
+    runner = RecordingRunner(ended, answer("Yes."))
+    slack = ConversationSlack(history=[])
+    p, store, _ = memory_processor(tmp_path, slack, runner, monkeypatch)
+    keep(store, dm(f"{AT:.1f}", "hello"))
+    with caplog.at_level(logging.INFO, logger="wanda"):
+        settle(p, p.handle_slack(dm(f"{AT:.1f}", "hello")))
+    assert [r.getMessage().endswith(f"failed: {ended.error}; held") for r in caplog.records
+            if r.getMessage().startswith("memory session ")] == [True]
+    assert len(runner.calls) == 1 and slack.replies == [] and slack.unreacted == []
+    assert [r[:2] for r in failed_runs(store)] == [("agent", "refused")]
+    assert kept(store) == [(f"{AT:.1f}", "held", 0, None)]
+    assert store.runs_today(p.cfg.zone)[0] == 0 and store.get_meta("held_since")
+    [failed] = json.loads(store.get_meta("failed_runs"))
+    assert failed["why"] == why and failed["then"] == "not tried again, held until Claude Code runs again"
 
 
 def test_a_first_try_past_half_its_time_gets_her_note_at_once(tmp_path, monkeypatch):
@@ -2010,10 +2035,12 @@ def test_a_post_slack_refuses_is_not_a_failure(tmp_path, monkeypatch):
     asyncio.run(p.handle_slack(dm(f"{AT:.1f}", "is it paid?")))
     assert slack.refused == ["The plumber is at 5.", "The plumber is at 5."]
     assert [r["result_text"] for r in store.pending_deliveries()] == ["The plumber is at 5.", "Yes."]
-    # a refusal's reply that Slack refuses leaves the budget's verdict
+    # the cap's refusal, with nothing kept to hold, posts nothing and
+    # returns its verdict
     store.record_run(kind="agent", task_id=None, session_id=None, started_at=utcnow(), exit_code=0,
                      cost_usd=p.cfg.daily_cost_cap_usd, status="ok")
     assert asyncio.run(p.memory_turn(task, "x", now, channel="D1", reply_thread=None, owed=True)) == "breaker"
+    assert len(slack.refused) == 2
     p.slack = ConversationSlack()
     asyncio.run(p.deliver_pending())
     assert p.slack.replies == ["The plumber is at 5.", "Yes."] and store.pending_deliveries() == []
@@ -2412,11 +2439,17 @@ def test_a_turn_takes_its_messages_when_its_session_starts(tmp_path, monkeypatch
     assert "wrong group" not in runner.calls[1][0]
 
 
-def test_a_refusal_answers_every_message_waiting(tmp_path, monkeypatch):
-    """A turn the budget refuses posts its one reply for all the messages it
-    would have taken, as a session would have taken them all, and none of
-    them is kept."""
-    runner = Held()
+def test_a_refusal_holds_every_message_waiting(tmp_path, monkeypatch, fake_time, caplog):
+    """Two lines wait on the lock while a session works when the cap is
+    reached: the turn the cap refuses before its frame keeps both, as a
+    session would have taken them both, each with her reaction on and one
+    note saying so; the cap's day out, a pass leaves them, and the first
+    after midnight takes both up as one turn."""
+    import logging
+
+    caplog.set_level(logging.INFO, logger="wanda")
+    fake_time.at = datetime.fromtimestamp(AT + 30, timezone.utc)
+    runner = Held(answer("Noted."), answer("Both, then."))
     slack = ConversationSlack(history=[])
     p, store, _ = memory_processor(tmp_path, slack, runner, monkeypatch)
     lines = [dm(f"{AT + i:.1f}", text) for i, text in ((0, "one"), (10, "two"), (20, "three"))]
@@ -2432,9 +2465,18 @@ def test_a_refusal_answers_every_message_waiting(tmp_path, monkeypatch):
                          cost_usd=p.cfg.daily_cost_cap_usd, status="ok")
         runner.release.set()
         await asyncio.gather(first, *rest)
+        await reactions_end(p)
     asyncio.run(go())
-    assert len(runner.calls) == 1 and slack.replies == [BUDGET_REPLIES["breaker"]]
-    assert kept(store) == []
+    assert len(runner.calls) == 1 and slack.replies == ["Noted.", main.CAPPED_NOTE]
+    assert [r[:2] for r in kept(store)] == [(f"{AT + 10:.1f}", "capped"), (f"{AT + 20:.1f}", "capped")]
+    assert slack.unreacted == [("D1", f"{AT:.1f}")]
+    a_pass(p)
+    assert len(runner.calls) == 1 and caplog.text.count("the daily run cap keeps 2 message(s) in D1") == 1
+    fake_time.at = datetime(2026, 10, 2, 7, 1, tzinfo=timezone.utc)  # 00:01 in Los Angeles
+    a_pass(p)
+    assert len(runner.calls) == 2 and "    16:40 fan: two\n\nfan now says:\n\n    three" in runner.calls[1][0]
+    assert runner.calls[1][0].count("fan: two") == 1, "each kept line framed once"
+    assert slack.replies[-1] == "Both, then." and kept(store) == []
 
 
 def test_what_is_owed_is_posted_later_wherever_it_is_owed(tmp_path, monkeypatch):
@@ -2864,14 +2906,16 @@ def test_a_message_nothing_will_answer_is_not_left_due(tmp_path, monkeypatch, en
 
 
 class HeldNote(ConversationSlack):
-    """Holds her note's post until `gate` is set, as a slow Slack would."""
+    """Holds each post of her note `note` until `gate` is set, as a slow
+    Slack would; `waiting` once one is held."""
 
-    def __init__(self, **kw):
+    def __init__(self, note=main.FAILED, **kw):
         super().__init__(**kw)
-        self.gate = asyncio.Event()
+        self.note, self.gate, self.waiting = note, asyncio.Event(), False
 
     async def reply(self, thread_ts, text, channel=None):
-        if text == main.FAILED:
+        if text == self.note:
+            self.waiting = True
             await self.gate.wait()
         await super().reply(thread_ts, text, channel)
 
@@ -3782,21 +3826,17 @@ def test_her_reaction_goes_on_each_message_a_member_let_in_sends_while_it_waits(
     assert kept(store) == []
 
 
-@pytest.mark.parametrize("ending", ["her answer", "a silence", "her note", "a deletion", "a budget refusal"])
+@pytest.mark.parametrize("ending", ["her answer", "a silence", "her note", "a deletion"])
 def test_her_reaction_comes_off_once_when_its_message_is_no_longer_kept(tmp_path, monkeypatch, ending):
     """Whatever lets the message go: the post of her answer or of her note,
-    which answers it, a silence, its deletion while its session works, and,
-    until the cap holds what it turns away, the budget's reply. Once, after
-    anything posted to it, and not before."""
+    which answers it, a silence, and its deletion while its session works.
+    Once, after anything posted to it, and not before."""
     runner = Held(*{"her answer": [answer("Yes.")],
                     "her note": [said_by_claude("API Error: 500")] * 2}.get(ending, [answer("")]))
     slack = Watched()
     p, store, _ = memory_processor(tmp_path, slack, runner, monkeypatch)
     line = dm(f"{AT:.1f}", "is it paid?")
     key = keep(store, line)
-    if ending == "a budget refusal":
-        store.record_run(kind="agent", task_id=None, session_id=None, started_at=utcnow(), exit_code=0,
-                         cost_usd=p.cfg.daily_cost_cap_usd, status="ok")
 
     async def go():
         turn = asyncio.create_task(p.handle_slack(line))
@@ -3813,12 +3853,11 @@ def test_her_reaction_comes_off_once_when_its_message_is_no_longer_kept(tmp_path
         await reactions_end(p)
         return working, deleted
     working, deleted = asyncio.run(go())
-    assert working == ([key] if ending == "a budget refusal" else [])
+    assert working == []
     assert deleted == ([key] if ending == "a deletion" else None)
     assert slack.reacted == [key] and slack.unreacted == [key] and kept(store) == []
     assert slack.seen[-1] == ("off", key[1]) and slack.replies == {
-        "her answer": ["Yes."], "her note": [main.FAILED],
-        "a budget refusal": [BUDGET_REPLIES["breaker"]]}.get(ending, [])
+        "her answer": ["Yes."], "her note": [main.FAILED]}.get(ending, [])
 
 
 def test_her_reaction_stays_on_through_the_quiet_retry(tmp_path, monkeypatch):
@@ -4042,6 +4081,664 @@ def test_doctor_says_whether_the_bot_token_can_put_her_reaction_on(tmp_path, cap
     assert f"  {line}" in capsys.readouterr().out
 
 
+# --- the run cap, and Claude Code's limit ---
+
+def a_pass(p):
+    """A pass of the mail loop, then every turn it took up, to its end."""
+    async def go():
+        await p.drain_mail()
+        await until(lambda: not p._bg, "every turn it took up ended")
+        await reactions_end(p)
+    asyncio.run(go())
+
+
+async def until(done, what):
+    """Waits for `done()`, failing the test past a few seconds rather than
+    hanging it."""
+    for _ in range(500):
+        if done():
+            return
+        await asyncio.sleep(0.01)
+    pytest.fail(f"gave up waiting until {what}")
+
+
+LIMIT = "You've hit your limit · resets 5pm"
+
+
+class Limited(RecordingRunner):
+    """Claude Code at its usage limit: every session it is given begins its
+    turn and is refused, until `back`; then each reports as RecordingRunner's
+    does. A session waits for `gate` first, when one is set."""
+
+    def __init__(self, *reports):
+        super().__init__(*reports)
+        self.back = False
+        self.gate: asyncio.Event | None = None
+        self.running = 0
+
+    async def run(self, prompt, **kw):
+        self.running += 1
+        if self.gate is not None:
+            await self.gate.wait()
+        self.running -= 1
+        if self.back:
+            return await super().run(prompt, **kw)
+        if kw.get("feed") is not None:
+            kw["feed"].began()
+        self.calls.append((prompt, kw))
+        return said_by_claude(LIMIT, api_error="rate_limit")
+
+
+@pytest.mark.parametrize("refusal", ["breaker", "busy", "a refused retry", "breaker, in a group DM"])
+def test_at_the_cap_a_conversation_is_told_once_and_its_messages_are_kept(tmp_path, monkeypatch, fake_time, refusal):
+    """Her note the first time in the local day (CAPPED_NOTE, CAPPED_GROUP),
+    nothing for a second message there, both kept with her reaction on,
+    whether the runs recorded reach the cap, one in flight would, or the
+    first try's run does before its quiet retry, which then keeps the first
+    session for the take-up to name. The second is sent after UTC midnight,
+    still the household's day, so the run before it counts and the note is
+    not said again; the alert, kept to the UTC day, is. After local midnight
+    a pass takes both up as one turn."""
+    fake_time.at = datetime.fromtimestamp(AT + 30, timezone.utc)
+    group = "group" in refusal
+    retry = refusal == "a refused retry"
+    runner = RecordingRunner(*([said_by_claude("error_during_execution", "error_during_execution")] if retry else []),
+                             answer("Both noted."))
+    slack = ConversationSlack(members=["U1", "U2", "UBOT"], history=[])
+    p, store, _ = memory_processor(tmp_path, slack, runner, monkeypatch)
+    monkeypatch.setattr(p.cfg, "daily_run_cap", 1)
+    if refusal.startswith("breaker"):
+        store.record_run(kind="agent", task_id=None, session_id=None, started_at=utcnow(), exit_code=0,
+                         cost_usd=0.1, status="ok")
+    p._inflight_runs = int(refusal == "busy")
+    # 16:40 and 17:10 in Los Angeles, either side of UTC midnight
+    lines = [dm(f"{AT + i:.1f}", text, channel_type="mpim" if group else "im", channel="G1" if group else "D1")
+             for i, text in ((0, "is it paid?"), (1800, "and the plumber?"))]
+    for ev in lines:
+        fake_time.at = datetime.fromtimestamp(float(ev.payload["ts"]) + 30, timezone.utc)
+        keep(store, ev)
+        settle(p, p.handle_slack(ev))
+    assert slack.replies == [main.CAPPED_GROUP if group else main.CAPPED_NOTE] and slack.unreacted == []
+    assert (slack.alerts == 2 * ["daily run cap reached (1 runs since midnight, America/Los_Angeles); messages are "
+                                 "held until midnight"]) if refusal != "busy" else slack.alerts == []
+    first = runner.calls[0][1]["session_id"] if retry else None
+    assert kept(store) == [(f"{AT:.1f}", "capped", 0, first), (f"{AT + 1800:.1f}", "capped", 0, None)]
+    fake_time.at = datetime(2026, 10, 2, 7, 1, tzinfo=timezone.utc)  # 00:01 in Los Angeles
+    p._inflight_runs = 0
+    a_pass(p)
+    prompt = runner.calls[-1][0]
+    assert len(runner.calls) == 1 + retry and "is it paid?" in prompt and "and the plumber?" in prompt
+    assert (vault.RETRIED.format(sid8=first[:8]) in prompt) if retry else "An earlier session" not in prompt
+    assert slack.replies[-1] == "Both noted." and kept(store) == []
+
+
+def test_a_line_sent_while_her_note_on_the_cap_posts_is_kept_with_the_one_before(tmp_path, monkeypatch, fake_time):
+    """fan writes again a moment after a line the cap kept, while her note on
+    it is posted: the cap keeps that one too, saying nothing more, and after
+    midnight both are one turn."""
+    fake_time.at = datetime.fromtimestamp(AT + 30, timezone.utc)
+    runner, slack = RecordingRunner(answer("Both, then.")), HeldNote(note=main.CAPPED_NOTE, history=[])
+    p, store, _ = memory_processor(tmp_path, slack, runner, monkeypatch)
+    one, two = dm(f"{AT:.1f}", "one"), dm(f"{AT + 10:.1f}", "two")
+    keep(store, one), keep(store, two)
+    store.record_run(kind="agent", task_id=None, session_id=None, started_at=utcnow(), exit_code=0,
+                     cost_usd=p.cfg.daily_cost_cap_usd, status="ok")
+
+    async def go():
+        first = asyncio.create_task(p.handle_slack(one))
+        await until(lambda: slack.waiting, "her note is being posted")
+        second = asyncio.create_task(p.handle_slack(two))
+        await asyncio.sleep(0.05)
+        slack.gate.set()
+        await asyncio.gather(first, second)
+        await reactions_end(p)
+    asyncio.run(go())
+    assert slack.replies == [main.CAPPED_NOTE] and [r[1] for r in kept(store)] == ["capped", "capped"]
+    fake_time.at = datetime(2026, 10, 2, 7, 1, tzinfo=timezone.utc)  # 00:01 in Los Angeles
+    a_pass(p)
+    assert len(runner.calls) == 1 and "    16:40 fan: one\n\nfan now says:\n\n    two" in runner.calls[0][0]
+    assert slack.replies[-1] == "Both, then." and kept(store) == []
+
+
+def test_what_the_cap_kept_is_one_late_turn_after_midnight_taken_up_once(tmp_path, monkeypatch, fake_time):
+    """At the first pass after local midnight both lines the cap kept in a DM
+    are one turn, framed late; a pass while its session works takes nothing
+    up again."""
+    fake_time.at = datetime(2026, 10, 2, 7, 1, tzinfo=timezone.utc)  # 00:01 in Los Angeles
+    runner = Held(answer("Both noted."))
+    slack = ConversationSlack(history=[])
+    p, store, _ = memory_processor(tmp_path, slack, runner, monkeypatch)
+    monkeypatch.setattr(main, "LATE_TURN_S", LATE_TURN_S)
+    store.create_task(None, "D1", "conversation", kind="dm")
+    store.settle(Settled(capped=tuple(keep(store, dm(f"{AT + i:.1f}", text))
+                                      for i, text in ((0, "is it paid?"), (10, "and the plumber?")))))
+
+    async def go():
+        await p.drain_mail()
+        await until(lambda: runner.running, "a session ran")
+        await p.drain_mail()
+        again = len(p._bg)
+        runner.release.set()
+        await until(lambda: not p._bg, "every turn ended")
+        return again
+    assert asyncio.run(go()) == 1
+    [(prompt, _)] = runner.calls
+    assert ("What fan says below was sent at Thu 2026-10-01 16:40 and reaches me only now.\n\n"
+            "The conversation so far:\n\n    Thu 2026-10-01 16:40 fan: is it paid?") in prompt
+    assert slack.replies == ["Both noted."] and kept(store) == []
+
+
+def test_a_line_sent_while_its_turn_waits_for_a_place_joins_what_the_cap_kept(tmp_path, monkeypatch, fake_time):
+    """After local midnight, through slack_loop: fan sends a third line to
+    his DM, where the cap kept two, while mei's session holds the one place.
+    A pass then passes over his DM, and his turn takes all three."""
+    fake_time.at = datetime(2026, 10, 2, 7, 1, tzinfo=timezone.utc)  # 00:01 in Los Angeles
+    p, store, runner, meis = one_slot_behind_a_dm(ConversationSlack(history=[]), tmp_path, monkeypatch)
+    runner.reports = [answer("Noted."), answer("All three.")]
+    store.create_task(None, "D1", "conversation", kind="dm")
+    store.settle(Settled(capped=tuple(keep(store, dm(f"{AT + i:.1f}", text))
+                                      for i, text in ((0, "one"), (10, "two")))))
+    third = dm(f"{fake_time.at.timestamp():.1f}", "three")
+
+    async def go():
+        loop = asyncio.create_task(p.slack_loop())
+        p.slack_queue.put_nowait(meis)
+        await asyncio.sleep(0.05)
+        keep(store, third)
+        p.slack_queue.put_nowait(third)
+        await asyncio.sleep(0.05)
+        await p.drain_mail()
+        runner.release.set()
+        await until(lambda: not p._bg and p.slack_queue.empty(), "every turn ended")
+        loop.cancel()
+    asyncio.run(go())
+    assert len(runner.calls) == 2
+    assert ("Thu 2026-10-01 16:40 fan: one\n    Thu 2026-10-01 16:40 fan: two\n\nfan now says:\n\n    three"
+            in runner.calls[1][0])
+    assert p.slack.replies == ["Noted.", "All three."] and kept(store) == []
+
+
+def test_sessions_claude_code_refused_count_nothing_and_a_message_then_is_held(tmp_path, monkeypatch, fake_time):
+    """250 refused sessions today, past the cap of 200: a message still runs
+    a session, which Claude Code refuses too, and it is held, never capped."""
+    fake_time.at = datetime.fromtimestamp(AT, timezone.utc)
+    runner = Limited()
+    slack = ConversationSlack(history=[])
+    p, store, _ = memory_processor(tmp_path, slack, runner, monkeypatch)
+    for _ in range(250):
+        store.record_run(kind="agent", task_id=None, session_id=None, started_at=utcnow(), exit_code=1,
+                         cost_usd=0.0, status="refused", error=LIMIT)
+    keep(store, dm(f"{AT:.1f}", "is it paid?"))
+    settle(p, p.handle_slack(dm(f"{AT:.1f}", "is it paid?")))
+    fake_time.at += timedelta(minutes=1)
+    a_pass(p)
+    assert len(runner.calls) == 2 and slack.replies == [main.HELD]
+    assert [r[1] for r in kept(store)] == ["held"]
+
+
+@pytest.mark.parametrize("then", ["refused again", "running again"])
+def test_a_usage_limit_says_nothing_until_a_try_a_minute_on_confirms_it(tmp_path, monkeypatch, fake_time, then):
+    """fan's DM and a group DM meet Claude Code's usage limit: each message
+    held, nothing said. A minute on, a pass's try meets it again: her note in
+    each (HELD, HELD_GROUP), and from then at once where a message is newly
+    held, once a day there. One that has cleared by then says nothing: the
+    try answers, and the hold's end takes up the rest."""
+    fake_time.at = datetime.fromtimestamp(AT, timezone.utc)
+    runner = Limited(answer("Yes, paid."), answer("7 is fine."))
+    slack = ConversationSlack(members=["U1", "U2", "UBOT"], history=[])
+    p, store, _ = memory_processor(tmp_path, slack, runner, monkeypatch)
+    for ev in (dm(f"{AT:.1f}", "is it paid?"), dm(f"{AT + 1:.1f}", "dinner at 7?", channel_type="mpim", channel="G1")):
+        keep(store, ev)
+        settle(p, p.handle_slack(ev))
+    a_pass(p)
+    assert slack.replies == [] and [r[1] for r in kept(store)] == ["held", "held"] and len(runner.calls) == 2
+    fake_time.at += timedelta(minutes=1)
+    runner.back = then == "running again"
+    a_pass(p)
+    if then == "running again":
+        assert slack.replies == ["Yes, paid.", "7 is fine."] and slack.channels == ["D1", "G1"]
+        assert kept(store) == [] and store.get_meta("held_since") is None
+        return
+    assert len(runner.calls) == 3 and "is it paid?" in runner.calls[2][0]
+    assert slack.replies == [main.HELD, main.HELD_GROUP] and slack.channels == ["D1", "G1"]
+    for ev in (dm(f"{AT + 70:.1f}", "and the plumber?"), dm(f"{AT + 71:.1f}", "out Tuesday", channel="D2", user="U2")):
+        keep(store, ev)
+        settle(p, p.handle_slack(ev))
+    assert slack.replies[2:] == [main.HELD] and slack.channels[2:] == ["D2"]
+
+
+def test_the_hold_is_tried_at_each_pass_one_try_at_a_time_and_at_a_start(tmp_path, monkeypatch, fake_time):
+    """From a minute after the refusal, each pass tries the message held
+    longest, none while a try runs, and a start's first pass too."""
+    fake_time.at = datetime.fromtimestamp(AT, timezone.utc)
+    runner = Limited()
+    slack = ConversationSlack(members=["U1", "U2", "UBOT"], history=[])
+    p, store, _ = memory_processor(tmp_path, slack, runner, monkeypatch)
+    for ev in (dm(f"{AT:.1f}", "is it paid?"), dm(f"{AT + 1:.1f}", "out Tuesday", channel="D2", user="U2")):
+        keep(store, ev)
+        settle(p, p.handle_slack(ev))
+    fake_time.at += timedelta(seconds=30)
+    a_pass(p)
+    assert len(runner.calls) == 2
+    fake_time.at += timedelta(seconds=30)
+    runner.gate = asyncio.Event()
+
+    async def two_passes():
+        await p.drain_mail()
+        await until(lambda: runner.running, "a try ran")
+        await p.drain_mail()
+        await asyncio.sleep(0.05)
+        running = runner.running
+        runner.gate.set()
+        await until(lambda: not p._bg, "every turn ended")
+        return running
+    assert asyncio.run(two_passes()) == 1
+    runner.gate = None
+    assert len(runner.calls) == 3 and "is it paid?" in runner.calls[2][0]
+    fake_time.at += timedelta(minutes=1)
+    a_pass(p)
+    assert len(runner.calls) == 4
+    started = Processor(p.cfg, store, asyncio.Queue(), slack, runner)
+    fake_time.at += timedelta(minutes=1)
+    a_pass(started)
+    assert len(runner.calls) == 5 and [r[1] for r in kept(store)] == ["held", "held"]
+
+
+def test_a_message_held_is_answered_within_a_pass_of_claude_code_running_again(tmp_path, monkeypatch, fake_time):
+    """Forty minutes refused at each pass, her note once; then a pass's try
+    answers it."""
+    fake_time.at = datetime.fromtimestamp(AT, timezone.utc)
+    runner = Limited(answer("Yes, paid."))
+    slack = ConversationSlack(history=[])
+    p, store, _ = memory_processor(tmp_path, slack, runner, monkeypatch)
+    keep(store, dm(f"{AT:.1f}", "is it paid?"))
+    settle(p, p.handle_slack(dm(f"{AT:.1f}", "is it paid?")))
+    for _ in range(39):
+        fake_time.at += timedelta(minutes=1)
+        a_pass(p)
+    assert len(runner.calls) == 40 and slack.replies == [main.HELD]
+    fake_time.at += timedelta(minutes=1)
+    runner.back = True
+    a_pass(p)
+    assert slack.replies == [main.HELD, "Yes, paid."] and kept(store) == []
+
+
+def test_a_hold_of_hours_says_no_more_and_ends_at_the_first_session_that_runs(tmp_path, monkeypatch, fake_time):
+    """Five hours of tries: her note once, her reaction kept, Claude Code's
+    reason in one `failed` alert, the tries in none. Then a clock session in
+    mei's DM runs, which ends the hold: fan's message is taken up, framed
+    late."""
+    fake_time.at = datetime.fromtimestamp(AT, timezone.utc)
+    runner = Limited(answer("Morning, mei."), answer("Yes, paid."))
+    slack = ConversationSlack(history=[])
+    p, store, _ = memory_processor(tmp_path, slack, runner, monkeypatch)
+    monkeypatch.setattr(main, "LATE_TURN_S", LATE_TURN_S)
+    keep(store, dm(f"{AT:.1f}", "is it paid?"))
+    settle(p, p.handle_slack(dm(f"{AT:.1f}", "is it paid?")))
+    for _ in range(30):
+        fake_time.at += timedelta(minutes=10)
+        a_pass(p)
+    assert len(runner.calls) == 31 and slack.replies == [main.HELD] and slack.unreacted == []
+    [alert] = [a for a in slack.alerts if "message session(s) failed" in a]
+    assert re.fullmatch(r"1 message session\(s\) failed \(usage limit\): run 1 at 16:40, Claude Code said: "
+                        r"You've hit your limit · resets 5pm, not tried again, held until Claude Code runs again",
+                        alert)
+    assert json.loads(store.get_meta("failed_runs")) == []
+    runner.back = True
+    store.create_task(None, "D2", "conversation", kind="dm")
+    meis = store.get_task_by_thread("D2", "conversation")
+
+    async def look():
+        await p.memory_turn(meis, "(a look)", fake_time.at.astimezone(p.cfg.zone), channel="D2", reply_thread=None,
+                            owed=False)
+        await until(lambda: not p._bg, "every turn ended")
+    asyncio.run(look())
+    assert slack.replies == [main.HELD, "Morning, mei.", "Yes, paid."] and kept(store) == []
+    assert "What fan says below was sent at 16:40 and reaches me only now." in runner.calls[-1][0]
+
+
+def test_her_note_on_a_hold_comes_once_a_day_where_someone_has_written_since(tmp_path, monkeypatch, fake_time):
+    """Held at 23:30 and confirmed at 23:31, her note in fan's DM. Tries past
+    midnight with nobody writing say nothing more; mei writing the next
+    morning is told at once, in her DM alone. A second hold that day is said
+    again there."""
+    fake_time.at = datetime(2026, 10, 2, 6, 30, tzinfo=timezone.utc)  # 23:30 in Los Angeles
+    runner = Limited(answer("Yes, paid."), answer("Noted."), answer("Sure."))
+    slack = ConversationSlack(history=[])
+    p, store, _ = memory_processor(tmp_path, slack, runner, monkeypatch)
+
+    def says(ev):
+        keep(store, ev)
+        settle(p, p.handle_slack(ev))
+    says(dm(f"{fake_time.at.timestamp():.1f}", "is it paid?"))
+    fake_time.at += timedelta(minutes=1)
+    a_pass(p)
+    assert slack.replies == [main.HELD]
+    for _ in range(3):
+        fake_time.at += timedelta(minutes=20)
+        a_pass(p)
+    assert slack.replies == [main.HELD] and len(runner.calls) == 5
+    fake_time.at = datetime(2026, 10, 2, 15, 0, tzinfo=timezone.utc)  # 08:00
+    says(dm(f"{fake_time.at.timestamp():.1f}", "out Tuesday", channel="D2", user="U2"))
+    assert slack.replies == [main.HELD, main.HELD] and slack.channels == ["D1", "D2"]
+    runner.back = True
+    fake_time.at += timedelta(minutes=1)
+    a_pass(p)
+    assert slack.replies[2:] == ["Yes, paid.", "Noted."] and kept(store) == []
+    runner.back = False
+    fake_time.at += timedelta(hours=1)
+    says(dm(f"{fake_time.at.timestamp():.1f}", "and on Wednesday?", channel="D2", user="U2"))
+    fake_time.at += timedelta(minutes=1)
+    a_pass(p)
+    assert slack.replies[4:] == [main.HELD] and slack.channels[4:] == ["D2"]
+
+
+def test_her_note_on_a_hold_is_said_once_in_the_households_day_across_a_utc_midnight(tmp_path, monkeypatch,
+                                                                                      fake_time):
+    """Held and confirmed at 16:40 in Los Angeles, before UTC midnight; fan
+    writes again at 17:10, after it, still the same day there: nothing more
+    is said."""
+    fake_time.at = datetime.fromtimestamp(AT, timezone.utc)
+    runner = Limited()
+    slack = ConversationSlack(history=[])
+    p, store, _ = memory_processor(tmp_path, slack, runner, monkeypatch)
+    keep(store, dm(f"{AT:.1f}", "is it paid?"))
+    settle(p, p.handle_slack(dm(f"{AT:.1f}", "is it paid?")))
+    fake_time.at += timedelta(minutes=1)
+    a_pass(p)
+    assert slack.replies == [main.HELD]
+    fake_time.at = datetime.fromtimestamp(AT + 1800, timezone.utc)
+    keep(store, dm(f"{AT + 1800:.1f}", "and the plumber?"))
+    settle(p, p.handle_slack(dm(f"{AT + 1800:.1f}", "and the plumber?")))
+    assert slack.replies == [main.HELD] and [r[1] for r in kept(store)] == ["held", "held"]
+
+
+def test_a_message_the_cap_kept_that_a_hold_then_refuses_is_told_at_once(tmp_path, monkeypatch, fake_time):
+    """Kept until just after midnight, its take-up then meets Claude Code's
+    limit while a hold stands confirmed: the cap's word has failed, so her
+    note on the hold goes there at that pass."""
+    fake_time.at = datetime(2026, 10, 2, 7, 1, tzinfo=timezone.utc)  # 00:01 in Los Angeles
+    runner = Limited()
+    slack = ConversationSlack(history=[])
+    p, store, _ = memory_processor(tmp_path, slack, runner, monkeypatch)
+    store.create_task(None, "D1", "conversation", kind="dm")
+    store.settle(Settled(capped=(keep(store, dm(f"{AT:.1f}", "is it paid?")),)))
+    since = (fake_time.at - timedelta(minutes=5)).isoformat()
+    store.set_meta("held_since", since)
+    store.set_meta("held_confirmed", since)
+    a_pass(p)
+    assert len(runner.calls) == 1 and slack.replies == [main.HELD] and [r[1] for r in kept(store)] == ["held"]
+
+
+def test_a_message_held_with_no_hold_standing_is_taken_up_at_a_pass(tmp_path, monkeypatch):
+    """As when a stop cancelled the take-ups the hold's end made, the hold
+    gone with it: the next pass takes the held message up."""
+    runner = RecordingRunner(answer("Yes, paid."))
+    slack = ConversationSlack(history=[])
+    p, store, _ = memory_processor(tmp_path, slack, runner, monkeypatch)
+    store.create_task(None, "D1", "conversation", kind="dm")
+    store.settle(Settled(held=((keep(store, dm(f"{AT:.1f}", "is it paid?")), None),)))
+    a_pass(p)
+    assert slack.replies == ["Yes, paid."] and kept(store) == []
+
+
+def test_her_note_on_a_hold_goes_nowhere_more_once_the_hold_has_ended(tmp_path, monkeypatch, fake_time):
+    """Confirming the hold tells each conversation where a message is held,
+    one after another; a session that ends the hold while one is posted
+    leaves the rest unsaid, and no mark of a note that day, so that a second
+    hold says it again."""
+    fake_time.at = datetime.fromtimestamp(AT, timezone.utc)
+    runner, slack = Held(answer("Yes, paid."), answer("Noted.")), HeldNote(note=main.HELD, history=[])
+    p, store, _ = memory_processor(tmp_path, slack, runner, monkeypatch)
+    for channel, user, text in (("D1", "U1", "is it paid?"), ("D2", "U2", "out Tuesday")):
+        store.create_task(None, channel, "conversation", kind="dm")
+        store.settle(Settled(held=((keep(store, dm(f"{AT:.1f}", text, channel=channel, user=user)), None),)))
+    store.set_meta("held_since", (fake_time.at - timedelta(minutes=3)).isoformat())
+
+    async def go():
+        confirming = asyncio.create_task(p._claude_refused())
+        await until(lambda: slack.waiting, "her first note is being posted")
+        p._claude_ran(fake_time.at)
+        # the other conversation's take-up runs its session, its message
+        # still held, as the note's post ends
+        await until(lambda: runner.running, "a take-up's session runs")
+        slack.gate.set()
+        await confirming
+        runner.release.set()
+        await until(lambda: not p._bg, "every turn ended")
+        await reactions_end(p)
+    asyncio.run(go())
+    assert slack.replies.count(main.HELD) == 1 and sorted(slack.replies) == sorted([main.HELD, "Yes, paid.", "Noted."])
+    assert store.get_meta("held_since") is None and store.meta_starting("held_noted:") == {}
+
+
+def test_a_session_that_began_after_the_refusal_in_the_same_second_ends_the_hold(tmp_path, monkeypatch, fake_time):
+    """The starts are compared to the microsecond: one second's clock would
+    read this session as begun before the refusal."""
+    fake_time.at = datetime.fromtimestamp(AT + 0.6, timezone.utc)
+    runner = RecordingRunner(answer("Yes, paid."))
+    slack = ConversationSlack(history=[])
+    p, store, _ = memory_processor(tmp_path, slack, runner, monkeypatch)
+    store.set_meta("held_since", datetime.fromtimestamp(AT + 0.2, timezone.utc).isoformat())
+    keep(store, dm(f"{AT:.1f}", "is it paid?"))
+    settle(p, p.handle_slack(dm(f"{AT:.1f}", "is it paid?")))
+    assert slack.replies == ["Yes, paid."] and store.get_meta("held_since") is None
+
+
+def test_a_wake_that_cannot_start_holds_back_no_held_message(tmp_path, monkeypatch, fake_time):
+    """mei's 07:00 reminder is the hold's oldest waiting thing, but her DM
+    will not open, so it starts no session at any tick: fan's 08:00 message,
+    held, is tried at the pass after the tick, and answered once Claude Code
+    runs again."""
+    fake_time.at = datetime(2026, 10, 1, 15, 0, tzinfo=timezone.utc)  # 08:00 in Los Angeles
+    runner = Limited(answer("Yes, paid."))
+    p, store, _ = memory_processor(tmp_path, ConversationSlack(history=[]), runner, monkeypatch)
+    tick = ticking(p, fake_time)
+
+    async def unopened(user):
+        raise RuntimeError("channel_not_found")
+    p.slack.dm_channel = unopened
+    line = dm(f"{fake_time.at.timestamp():.1f}", "is it paid?")
+    keep(store, line)
+    settle(p, p.handle_slack(line))
+    fake_time.at += timedelta(minutes=1)
+    tick(wake("b6647b", "2026-10-01T07:00", person="U2", asked="mei"))
+    runner.back = True
+    a_pass(p)
+    assert p.slack.replies == ["Yes, paid."] and kept(store) == []
+
+
+def test_a_new_message_in_a_held_conversation_runs_one_session_for_both(tmp_path, monkeypatch, fake_time):
+    fake_time.at = datetime.fromtimestamp(AT, timezone.utc)
+    runner = Limited(answer("Yes, and at 5."))
+    slack = ConversationSlack(history=[])
+    p, store, _ = memory_processor(tmp_path, slack, runner, monkeypatch)
+    for i, text in ((0, "is it paid?"), (30, "and the plumber?")):
+        keep(store, dm(f"{AT + i:.1f}", text))
+        settle(p, p.handle_slack(dm(f"{AT + i:.1f}", text)))
+        runner.back = True
+    assert len(runner.calls) == 2
+    assert "16:40 fan: is it paid?\n\nfan now says:\n\n    and the plumber?" in runner.calls[1][0]
+    assert slack.replies == ["Yes, and at 5."] and kept(store) == []
+
+
+@pytest.mark.parametrize("apart", [5, 0.6], ids=["seconds apart", "in one second"])
+def test_a_session_that_began_before_the_refusal_ends_no_hold(tmp_path, monkeypatch, fake_time, apart):
+    """Two at once: mei's session works when fan's is refused, however soon
+    after hers began; hers answers, and the hold stands, so the try a minute
+    on confirms it, and her note goes to fan's DM alone."""
+    class Mixed(Limited):
+        """Refuses every session but mei's, which waits for `release`."""
+
+        def __init__(self):
+            super().__init__(answer("Noted."))
+            self.release = asyncio.Event()
+
+        async def run(self, prompt, **kw):
+            if "out Tuesday" not in prompt:
+                return await super().run(prompt, **kw)
+            await self.release.wait()
+            return await RecordingRunner.run(self, prompt, **kw)
+
+    fake_time.at = datetime.fromtimestamp(AT + 0.2, timezone.utc)
+    runner = Mixed()
+    slack = ConversationSlack(history=[])
+    p, store, _ = memory_processor(tmp_path, slack, runner, monkeypatch)
+
+    async def go():
+        meis = asyncio.create_task(p.handle_slack(dm(f"{AT:.1f}", "out Tuesday", channel="D2", user="U2")))
+        await asyncio.sleep(0.05)
+        fake_time.at += timedelta(seconds=apart)
+        keep(store, dm(f"{AT + apart:.1f}", "is it paid?"))
+        await p.handle_slack(dm(f"{AT + apart:.1f}", "is it paid?"))
+        runner.release.set()
+        await meis
+        await until(lambda: not p._bg, "every turn ended")
+        await reactions_end(p)
+    asyncio.run(go())
+    assert slack.replies == ["Noted."] and len(runner.calls) == 2 and store.get_meta("held_since")
+    fake_time.at += timedelta(minutes=1)
+    a_pass(p)
+    assert slack.replies == ["Noted.", main.HELD] and slack.channels == ["D2", "D1"]
+
+
+def wake(about, by, person="U1", asked="fan"):
+    """A timed reminder come due for the clock to give."""
+    return clock.Wake(f"clock:due:{about}:{by}:{asked}", person, f"It is {by[11:]}, and this has come due:\n"
+                      f"    `trajectory:{about}`  {by}, today  I undertook to remind {asked}", about, by, asked)
+
+
+def ticking(p, fake_time):
+    """The clock's tick with these wakes, at the time it stands at, and each
+    session it starts, to its end."""
+    async def dm_channel(user):
+        return {"U1": "D1", "U2": "D2"}[user]
+    p.slack.dm_channel = dm_channel
+
+    def tick(*wakes):
+        async def go():
+            p._wake(list(wakes), fake_time.at.astimezone(p.cfg.zone))
+            await until(lambda: not p._bg, "every turn ended")
+        asyncio.run(go())
+    return tick
+
+
+def test_a_wake_claude_code_refused_is_released_and_is_the_holds_try(tmp_path, monkeypatch, fake_time):
+    """With nothing held, a reminder Claude Code refuses is released, as one
+    the budget refuses is; no other wake starts while the hold lasts but as
+    its try. From a minute on the wake due longest is the try, and once one
+    runs the hold has ended and the other wakes."""
+    runner = Limited(answer("It is 8: the bins."), answer("It is 8:01: the gift."))
+    p, store, _ = memory_processor(tmp_path, ConversationSlack(history=[]), runner, monkeypatch)
+    tick = ticking(p, fake_time)
+    bins, gift = wake("b6647b", "2026-10-01T08:00"), wake("c7758c", "2026-10-01T08:01")
+    tick(bins)
+    assert store.get_meta(bins.key) == "" and store.get_meta("held_since") and len(runner.calls) == 1
+    fake_time.at += timedelta(seconds=30)
+    tick(bins, gift)
+    assert len(runner.calls) == 1
+    fake_time.at += timedelta(seconds=30)
+    tick(gift, bins)
+    fake_time.at += timedelta(minutes=1)
+    runner.back = True
+    tick(gift, bins)
+    tick(gift)
+    assert ["b6647b" in prompt for prompt, _ in runner.calls] == [True, True, True, False]
+    assert p.slack.replies == ["It is 8: the bins.", "It is 8:01: the gift."] and not store.get_meta("held_since")
+
+
+@pytest.mark.parametrize("due", ["08:00", "07:58"])
+def test_the_holds_try_is_what_has_waited_longest_a_message_or_a_wake(tmp_path, monkeypatch, fake_time, due):
+    """fan's message held since 07:59, and a reminder for mei: due at 08:00,
+    the clock's tick starts no wake and the pass tries the message; due at
+    07:58, the tick starts the reminder as the try and the pass tries
+    nothing."""
+    fake_time.at = datetime(2026, 10, 1, 14, 59, tzinfo=timezone.utc)  # 07:59 in Los Angeles
+    runner = Limited()
+    p, store, _ = memory_processor(tmp_path, ConversationSlack(history=[]), runner, monkeypatch)
+    tick = ticking(p, fake_time)
+    keep(store, dm(f"{fake_time.at.timestamp():.1f}", "is it paid?"))
+    settle(p, p.handle_slack(dm(f"{fake_time.at.timestamp():.1f}", "is it paid?")))
+    fake_time.at += timedelta(minutes=1)
+    tick(wake("b6647b", f"2026-10-01T{due}", person="U2", asked="mei"))
+    a_pass(p)
+    tried = [("trajectory:b6647b" in prompt, "is it paid?" in prompt) for prompt, _ in runner.calls[1:]]
+    assert tried == ([(False, True)] if due == "08:00" else [(True, False)])
+
+
+def test_a_reminder_due_in_a_hold_a_names_session_began_is_its_next_try(tmp_path, monkeypatch, fake_time):
+    runner = Limited()
+    p, store, _ = memory_processor(tmp_path, ConversationSlack(history=[]), runner, monkeypatch)
+    tick = ticking(p, fake_time)
+    store.create_task(None, "", "names", kind="names")
+    names = store.get_task_by_thread("", "names")
+    asyncio.run(p.memory_turn(names, vault.renamed_text("fan", "Fan Zhu"), fake_time.at.astimezone(p.cfg.zone),
+                              channel=None, reply_thread=None, owed=False))
+    assert store.get_meta("held_since") and len(runner.calls) == 1
+    bins = wake("b6647b", "2026-10-01T08:00")
+    tick(bins)
+    assert len(runner.calls) == 1
+    fake_time.at += timedelta(minutes=1)
+    tick(bins)
+    assert len(runner.calls) == 2 and "trajectory:b6647b" in runner.calls[1][0]
+
+
+def test_a_held_and_a_capped_message_cut_short_at_two_starts_get_her_note_once(tmp_path, monkeypatch):
+    """Each start's first pass takes both up as one turn, which the stop cuts
+    short; at the third start, her note in their place, and nothing runs."""
+    slack = ConversationSlack(history=[])
+    p, store, _ = memory_processor(tmp_path, slack, RecordingRunner(), monkeypatch)
+    store.create_task(None, "D1", "conversation", kind="dm")
+    held, capped = keep(store, dm(f"{AT:.1f}", "is it paid?")), keep(store, dm(f"{AT + 10:.1f}", "and the plumber?"))
+    store.settle(Settled(capped=(capped,), held=((held, None),)))
+
+    def cut_short_at_a_pass(runner):
+        q = Processor(p.cfg, store, asyncio.Queue(), slack, runner)
+
+        async def go():
+            await q.drain_mail()
+            await until(lambda: runner.running, "a session ran")
+            await q.shutdown(grace_s=1)
+        asyncio.run(go())
+    cut_short_at_a_pass(Held())
+    cut_short_at_a_pass(Held())
+    assert [r[1:3] for r in kept(store)] == [("held", 2), ("capped", 2)]
+    third = RecordingRunner(answer("never"))
+    q = started_again(p, third)
+    a_pass(q)
+    assert third.calls == [] and slack.replies == [main.CUT_SHORT] and kept(store) == []
+
+
+def test_doctor_counts_the_days_runs_from_the_households_midnight_and_what_is_held(tmp_path, capsys):
+    from wanda.main import run_doctor
+
+    c = Config(_env_file=None, data_dir=tmp_path, claude_bin="/bin/true", email_triage=False,
+               slack_owner_user_ids="U1,U2", tz="America/Los_Angeles")
+    store = Store(c.db_path)
+    now = datetime.now(timezone.utc)
+    for at, status in ((now, "ok"), (now, "refused"), (now, "refused"), (now - timedelta(hours=26), "ok")):
+        store.record_run(kind="agent", task_id=None, session_id=None, started_at=at.isoformat(timespec="seconds"),
+                         exit_code=0, cost_usd=0.1, status=status)
+    capped, held = (keep(store, dm(f"{now.timestamp() - i:.1f}", "x")) for i in (60, 30))
+    store.settle(Settled(capped=(capped,), held=((held, None),)))
+    since = now - timedelta(minutes=10)
+    store.set_meta("held_since", since.isoformat(timespec="seconds"))
+    asyncio.run(run_doctor(c, smoke=False))
+    stamp = vault.stamp(since.timestamp(), datetime.now(c.zone))
+    assert (f"✓ claude runs today — 1 since 00:00 America/Los_Angeles of 200, 2 refused and not counted; "
+            f"1 message(s) held until midnight; 1 held while Claude Code cannot run, since {stamp}\n"
+            ) in capsys.readouterr().out
+
+
+def test_compose_passes_the_run_cap_and_empty_means_200(monkeypatch):
+    compose = (Path(__file__).resolve().parent.parent / "compose.wanda.yaml").read_text()
+    assert "\n      WANDA_DAILY_RUN_CAP:\n" in compose
+    monkeypatch.setenv("WANDA_DAILY_RUN_CAP", "")
+    assert Config(_env_file=None).daily_run_cap == 200
+    monkeypatch.setenv("WANDA_DAILY_RUN_CAP", "50")
+    assert Config(_env_file=None).daily_run_cap == 50
+
+
 def opening_blocks(tmp_path):
     """How many text blocks each session's opening message holds."""
     out = []
@@ -4219,20 +4916,25 @@ def test_a_session_that_ended_without_its_report_is_tried_once_more(tmp_path, mo
     assert "    16:40 fan: one\n\nfan now says:\n\n    two" in retry
 
 
-def test_a_session_claude_code_refused_gets_her_note_at_once(tmp_path, monkeypatch):
+def test_a_session_claude_code_refused_holds_its_message(tmp_path, monkeypatch):
     """Known by the error its streamed output gives."""
     p, store, _, slack = standin_processor(tmp_path, monkeypatch, refuse={
         "turn": "first", "error": "rate_limit", "said": "You've hit your limit · resets 5pm"})
+    keep(store, dm(f"{AT:.1f}", "hello"))
     conversation(p, (0, dm(f"{AT:.1f}", "hello")))
-    assert slack.replies == [main.FAILED]
-    assert failed_runs(store) == [("agent", "refused", "You've hit your limit · resets 5pm"), ("note", "ok", None)]
-    assert store.runs_today()[0] == 0
+    assert slack.replies == [] and [r[1] for r in kept(store)] == ["held"]
+    assert failed_runs(store) == [("agent", "refused", "You've hit your limit · resets 5pm")]
+    assert store.runs_today(p.cfg.zone)[0] == 0
 
 
-def test_a_clock_session_claude_code_refused_is_known_by_its_words(tmp_path, monkeypatch):
-    """Run with --output-format json, it prints no assistant event."""
+@pytest.mark.parametrize("before", [None, "2026-10-01T23:00:00+00:00"], ids=["no hold", "a hold"])
+def test_a_clock_session_claude_code_refused_is_known_by_its_words(tmp_path, monkeypatch, before):
+    """Run with --output-format json, it prints no assistant event. It
+    begins a hold, or ends none."""
     p, store, _, slack = standin_processor(tmp_path, monkeypatch, refuse={
         "turn": "first", "error": None, "said": "Login expired · Please run /login"})
+    if before:
+        store.set_meta("held_since", before)
     store.create_task(None, "D1", "conversation", kind="dm")
     task = store.get_task_by_thread("D1", "conversation")
     got = asyncio.run(p.memory_turn(task, "It is 17:00, as asked:\n\n    call the plumber",
@@ -4240,7 +4942,9 @@ def test_a_clock_session_claude_code_refused_is_known_by_its_words(tmp_path, mon
                                     owed=False))
     assert got == "Login expired · Please run /login" and slack.replies == []
     assert failed_runs(store) == [("agent", "refused", "Login expired · Please run /login")]
-    assert store.runs_today()[0] == 0
+    assert store.runs_today(p.cfg.zone)[0] == 0
+    held = store.get_meta("held_since")
+    assert held == before if before else held
 
 
 @pytest.mark.parametrize("channel_type,rest", [("im", main.FAILED_REST), ("mpim", main.FAILED_REST_GROUP)],
@@ -4297,14 +5001,18 @@ def test_a_line_sent_after_the_answer_joins_the_turn_that_runs_the_rest_again(tm
         tmp_path, -1)
 
 
-def test_a_later_turn_claude_code_refused_gets_her_note_after_the_answer(tmp_path, monkeypatch):
-    """A second session would meet the same refusal: nothing is run again."""
+def test_a_later_turn_claude_code_refused_holds_only_its_message_after_the_answer(tmp_path, monkeypatch):
+    """A second session would meet the same refusal: nothing is run again,
+    and the message that began the turn it refused is held, the one before
+    answered."""
     p, store, _, slack = standin_processor(tmp_path, monkeypatch, steps=[0.2], reply_s=1.5, refuse={
         "turn": "later", "error": "rate_limit", "said": "You've hit your limit · resets 5pm"})
-    conversation(p, (0, dm(f"{AT:.1f}", "can you remind me at 5")),
-                 (("tool_result", 1, 0.2), dm(f"{AT + 30:.1f}", "to call the plumber")))
-    assert slack.replies == ["one answer to 1: can you remind me at 5", main.FAILED_REST]
-    assert failed_runs(store) == [("agent", "ok", "You've hit your limit · resets 5pm"), ("note", "ok", None)]
+    asked, follow = dm(f"{AT:.1f}", "can you remind me at 5"), dm(f"{AT + 30:.1f}", "to call the plumber")
+    keep(store, asked), keep(store, follow)
+    conversation(p, (0, asked), (("tool_result", 1, 0.2), follow))
+    assert slack.replies == ["one answer to 1: can you remind me at 5"]
+    assert failed_runs(store) == [("agent", "ok", "You've hit your limit · resets 5pm")]
+    assert [r[:2] for r in kept(store)] == [(f"{AT + 30:.1f}", "held")]
 
 
 def test_a_failed_turn_a_background_commands_notice_began_leaves_the_answer_alone(tmp_path, monkeypatch):

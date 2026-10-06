@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Annotated, Literal
 from zoneinfo import ZoneInfo
 
-from pydantic import Field, field_validator
+from pydantic import Field, ValidationInfo, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 CsvList = Annotated[list[str], NoDecode]
@@ -76,6 +76,8 @@ class Config(BaseSettings):
     # under --permission-mode dontAsk), so this grants a session real shell
     # access — acceptable only in a trusted workspace. See README.
     agent_allowed_tools: str = "Bash,Read,WebSearch,Skill"
+    # claude runs a day, counted from midnight in WANDA_TZ; a session Claude
+    # Code refused to run is not one
     daily_run_cap: int = 200
     daily_cost_cap_usd: float = 5.0
 
@@ -118,12 +120,12 @@ class Config(BaseSettings):
             return [s.strip() for s in v.split(",") if s.strip()]
         return v
 
-    @field_validator("memory_sessions", mode="before")
+    @field_validator("memory_sessions", "daily_run_cap", mode="before")
     @classmethod
-    def _default_when_empty(cls, v: object) -> object:
+    def _default_when_empty(cls, v: object, info: ValidationInfo) -> object:
         # compose passes a setting .env leaves empty as "", which means unset
         if isinstance(v, str) and not v.strip():
-            return cls.model_fields["memory_sessions"].default
+            return cls.model_fields[info.field_name].default
         return v
 
     @property

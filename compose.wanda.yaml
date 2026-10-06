@@ -71,6 +71,10 @@ services:
       WANDA_AGENT_MAX_BUDGET_USD: "2.50"
       # a breaker on runs, not on dollars: sessions are on the subscription
       WANDA_DAILY_COST_CAP_USD: "1000"
+      # how many claude runs a day, from midnight in WANDA_TZ: passed only
+      # when .env sets it, so that unset, or set empty, the default in
+      # wanda/config.py holds
+      WANDA_DAILY_RUN_CAP:
       WANDA_DATA_DIR: /srv/wanda/home
       WANDA_VAULT: /srv/wanda/vault
       WANDA_RUN_STORE: /srv/wanda/store

@@ -2,10 +2,13 @@ import json
 import sqlite3
 import threading
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import pytest
 
 from wanda.store import Settled, Store
+
+LA = ZoneInfo("America/Los_Angeles")
 
 
 @pytest.fixture
@@ -141,9 +144,27 @@ def test_runs_accounting(store):
                      exit_code=0, cost_usd=0.02, status="ok")
     store.record_run(kind="agent", task_id=None, session_id="s", started_at=now,
                      exit_code=0, cost_usd=0.5, status="ok")
-    n, cost = store.runs_today()
+    n, cost = store.runs_today(LA)
     assert n == 2
     assert cost == pytest.approx(0.52)
+
+
+def test_the_days_runs_count_from_midnight_where_the_household_is(store, monkeypatch):
+    """At 17:10 in Los Angeles, past UTC midnight: a run at 23:30 there the
+    day before is not counted, those at 00:10 and at 16:50, before UTC
+    midnight, are; a refusal is counted apart."""
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 10, 2, 0, 10, tzinfo=timezone.utc).astimezone(tz)
+    monkeypatch.setattr("wanda.store.datetime", Clock)
+    for (day, hh, mm), status in (((30, 23, 30), "ok"), ((1, 0, 10), "ok"), ((1, 16, 50), "ok"),
+                                  ((1, 16, 55), "refused")):
+        at = datetime(2026, 9 if day == 30 else 10, day, hh, mm, tzinfo=LA).astimezone(timezone.utc)
+        store.record_run(kind="agent", task_id=None, session_id=None, started_at=at.isoformat(timespec="seconds"),
+                         exit_code=0, cost_usd=0.1, status=status)
+    assert store.runs_today(LA) == (2, pytest.approx(0.2))
+    assert store.refused_today(LA) == 1
 
 
 def test_her_notes_and_sessions_claude_code_refused_are_not_counted(store):
@@ -155,7 +176,7 @@ def test_her_notes_and_sessions_claude_code_refused_are_not_counted(store):
                               cost_usd=0.5, status="error", error="x")
     store.record_run(kind="agent", task_id=task, session_id="t", started_at=now, exit_code=1, cost_usd=0.0,
                      status="refused", error="You've hit your limit")
-    assert store.runs_today() == (1, pytest.approx(0.5))
+    assert store.runs_today(LA) == (1, pytest.approx(0.5))
 
 
 def test_a_note_is_written_with_its_run_or_not_at_all(store, monkeypatch):
