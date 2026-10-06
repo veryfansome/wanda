@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+from slack_sdk.errors import SlackApiError
 
 from wanda.config import Config
 from wanda.events import Event
@@ -66,6 +67,21 @@ class FakeSlack:
 
 def cfg(**kw) -> Config:
     return Config(_env_file=None, email_triage_slack_channel_id="C1", **kw)
+
+
+@pytest.fixture
+def fake_time(monkeypatch):
+    """The time as wanda.main and wanda.store read it, standing at `at`,
+    08:00 on Thursday 1 October 2026 in Los Angeles, until a test moves it."""
+    class Clock(datetime):
+        at = datetime(2026, 10, 1, 15, 0, tzinfo=timezone.utc)
+
+        @classmethod
+        def now(cls, tz=None):
+            return cls.at.astimezone(tz) if tz else cls.at.astimezone().replace(tzinfo=None)
+    monkeypatch.setattr("wanda.main.datetime", Clock)
+    monkeypatch.setattr("wanda.store.datetime", Clock)
+    return Clock
 
 
 def make(tmp_path, slack=None, **kw):
@@ -321,7 +337,7 @@ def test_cap_at_triage_time_defers_rather_than_retiring(tmp_path, monkeypatch):
     assert 99 in moves, "deferred spam must be trashed when the window reopens"
 
 
-def test_deliver_pending_skips_in_flight_delivery(tmp_path):
+def test_deliver_pending_waits_on_a_delivery_in_flight(tmp_path):
     p, store = make(tmp_path, FakeSlack())
     store.ingest_message(dedupe_key="k1", message_id="<k1>", folder="INBOX", uidvalidity=1, uid=1,
                          from_addr="a@b.c", subject="s", date_hdr="d", snippet="b")
@@ -329,9 +345,18 @@ def test_deliver_pending_skips_in_flight_delivery(tmp_path):
     tid = store.create_task(pk, "C1", "ts-1")
     run_id = store.record_run(kind="agent", task_id=tid, session_id="s", started_at=utcnow(),
                               exit_code=0, cost_usd=0.4, status="ok", result_text="answer", notified=0)
-    p._delivering.add(run_id)
-    asyncio.run(p.deliver_pending())
-    assert p.slack.replies == [], "must not post an answer another task is delivering"
+
+    async def go():
+        posting = p._delivering[run_id] = asyncio.Event()
+        delivery = asyncio.create_task(p.deliver_pending())
+        await asyncio.sleep(0.05)
+        assert not delivery.done(), "waits for the post another task is making"
+        store.mark_run_notified(run_id)  # as that post does once Slack takes it
+        del p._delivering[run_id]
+        posting.set()
+        await delivery
+    asyncio.run(go())
+    assert p.slack.replies == [], "must not post an answer another task delivered"
 
 
 def test_alert_is_not_suppressed_by_a_failed_post(tmp_path):
@@ -484,11 +509,9 @@ def test_answered_then_failed_surfaces_the_failure(tmp_path):
     # The harness decides using rr.ok as well; see _run_task_reply.
 
 
-def test_delivery_gives_up_and_stops_blocking(tmp_path):
+def test_delivery_gives_up_and_stops_blocking(tmp_path, fake_time):
     """An answer for a channel wanda was removed from used to retry forever,
     blocking every later delivery behind it."""
-    from wanda.main import MAX_DELIVERY_ATTEMPTS
-
     class Boom(FakeSlack):
         async def reply(self, thread_ts, text, channel=None):
             raise RuntimeError("not_in_channel")
@@ -497,19 +520,18 @@ def test_delivery_gives_up_and_stops_blocking(tmp_path):
     tid = store.create_task(None, "C_GONE", "1.1", kind="mention")
     store.record_run(kind="agent", task_id=tid, session_id="s", started_at=utcnow(),
                      exit_code=0, cost_usd=0.4, status="ok", result_text="answer", notified=0)
-    for _ in range(MAX_DELIVERY_ATTEMPTS):
-        asyncio.run(p.deliver_pending())
+    asyncio.run(p.deliver_pending())
+    fake_time.at += timedelta(minutes=122)
+    asyncio.run(p.deliver_pending())
     assert store.pending_deliveries() == [], "must stop retrying and free the queue"
     assert store.get_meta("abandoned_alert_pending") == "1", "and tell the owner"
-    assert [sorted(g) for g in json.loads(store.get_meta("given_up_runs"))] == [["at", "id"]]
+    assert [sorted(g) for g in json.loads(store.get_meta("given_up_runs"))] == [["at", "how", "id"]]
 
 
-def test_an_answer_given_up_on_is_alerted_and_none_is_dropped(tmp_path):
+def test_an_answer_given_up_on_is_alerted_and_none_is_dropped(tmp_path, fake_time):
     """Delivery gives up only while Slack refuses posts, so the alert waits
     for Slack too; later give-ups join it, and one after the day's alert is
     named the next day. It names each run and when, never where or what."""
-    from wanda.main import MAX_DELIVERY_ATTEMPTS
-
     class Down(FakeSlack):
         up = False
 
@@ -528,8 +550,9 @@ def test_an_answer_given_up_on_is_alerted_and_none_is_dropped(tmp_path):
         tid = store.create_task(None, channel, f"{channel}.1", kind="dm")
         run = store.record_run(kind="agent", task_id=tid, session_id="s", started_at=utcnow(),
                                exit_code=0, cost_usd=0.4, status="ok", result_text=text, notified=0)
-        for _ in range(MAX_DELIVERY_ATTEMPTS):
-            asyncio.run(p.drain_mail())
+        asyncio.run(p.drain_mail())
+        fake_time.at += timedelta(minutes=122)
+        asyncio.run(p.drain_mail())
         return run
 
     r1 = owe("D1", "the plumber is at 5")
@@ -550,6 +573,129 @@ def test_an_answer_given_up_on_is_alerted_and_none_is_dropped(tmp_path):
     asyncio.run(p.drain_mail())
     assert len(slack.alerts) == 2 and "1 answer(s)" in slack.alerts[1] and f"run {r3}, from " in slack.alerts[1]
     assert json.loads(store.get_meta("given_up_runs")) == []
+
+
+def owed(store, text, channel="D1", kind="agent", session="s"):
+    """A run recorded in a DM, owed to it."""
+    tid = store.create_task(None, channel, "conversation", kind="dm")
+    return store.record_run(kind=kind, task_id=tid, session_id=session, started_at=utcnow(), exit_code=0,
+                            cost_usd=0.4, status="ok", result_text=text, notified=0)
+
+
+def test_an_answer_slack_refuses_is_tried_at_every_pass_for_two_hours_of_her_running(tmp_path, fake_time, caplog):
+    """Each pass, a minute apart, tries it, what was recorded after it there
+    waiting behind it, and no try counts; the first that fails past 121
+    minutes gives it up, and what waited is posted. The first refusal and
+    the give-up are logged, once each."""
+    import logging
+
+    class Blocked(FakeSlack):
+        """A Slack that takes no post about the plumber."""
+        refused = []
+
+        async def reply(self, thread_ts, text, channel=None):
+            if "plumber" in text:
+                self.refused.append(text)
+                raise RuntimeError("ratelimited")
+            await super().reply(thread_ts, text, channel)
+
+    slack = Blocked()
+    p, store = make(tmp_path, slack, email_triage=False)
+    first, _ = owed(store, "The plumber is at 5."), owed(store, "And it's paid.")
+    with caplog.at_level(logging.WARNING, logger="wanda"):
+        for _ in range(122):  # the last at 121 minutes
+            asyncio.run(p.deliver_pending())
+            fake_time.at += timedelta(minutes=1)
+        assert len(slack.refused) == 122 and slack.replies == [] and len(store.pending_deliveries()) == 2
+        asyncio.run(p.drain_mail())
+    assert len(slack.refused) == 123 and store.pending_deliveries() == []
+    assert slack.replies == ["_(I wrote this at 08:00; it couldn't be sent until now.)_\nAnd it's paid."]
+    assert slack.alerts == [f"1 answer(s) could not be posted and were given up: run {first}, from 08:00, after "
+                            "two hours. `wanda doctor` lists where each was due (README, State)."]
+    said = [r.getMessage() for r in caplog.records if r.getMessage().startswith(("could not post", "gave up"))]
+    assert [s.split(":")[0] for s in said] == [f"could not post run {first} in D1 yet",
+                                               f"gave up posting run {first} in D1 after two hours"]
+
+
+def test_each_pass_marks_her_as_running(tmp_path, fake_time):
+    """A start after a crash, with no stop to mark when she last ran, counts
+    her down from the last pass, not from the stop before."""
+    p, store = make(tmp_path, email_triage=False)
+    store.set_meta("up_at", "2026-09-28T15:00:00+00:00")  # the last stop
+    asyncio.run(p.drain_mail())
+    fake_time.at += timedelta(minutes=5)
+    store.came_up(utcnow())  # the start after a crash
+    assert json.loads(store.get_meta("down")) == [["2026-10-01T15:00:00+00:00", "2026-10-01T15:05:00+00:00"]]
+
+
+def test_an_answer_owed_across_a_stop_is_tried_for_two_hours_of_her_running(tmp_path, fake_time):
+    """The time she was stopped is not counted against it: refused at the
+    first pass after a three-hour stop, it is tried again."""
+    p, store = make(tmp_path, Refusing())
+    owed(store, "The plumber is at 5.")
+    asyncio.run(p.deliver_pending())
+    fake_time.at += timedelta(minutes=1)
+    store.set_meta("up_at", utcnow())  # the stop's end
+    fake_time.at += timedelta(hours=3)
+    store.came_up(utcnow())  # the start
+    asyncio.run(p.deliver_pending())
+    assert len(store.pending_deliveries()) == 1, "refused after three hours, and kept"
+    fake_time.at += timedelta(minutes=119)
+    asyncio.run(p.deliver_pending())
+    assert len(store.pending_deliveries()) == 1, "two hours of her running"
+    fake_time.at += timedelta(minutes=2)
+    asyncio.run(p.deliver_pending())
+    assert store.pending_deliveries() == []
+
+
+@pytest.mark.parametrize("error, given_up", [("channel_not_found", True), ("restricted_action", True),
+                                             ("internal_error", False)])
+def test_what_slack_refuses_there_for_good_is_given_up_at_once(tmp_path, fake_time, error, given_up):
+    class Says(FakeSlack):
+        async def reply(self, thread_ts, text, channel=None):
+            raise SlackApiError("The request to the Slack API failed.", {"ok": False, "error": error})
+
+    p, store = make(tmp_path, Says(), email_triage=False)
+    run = owed(store, "The plumber is at 5.")
+    asyncio.run(p.drain_mail())
+    assert len(store.pending_deliveries()) == (0 if given_up else 1)
+    assert p.slack.alerts == ([f"1 answer(s) could not be posted and were given up: run {run}, from 08:00, at once "
+                               f"({error}). `wanda doctor` lists where each was due (README, State)."]
+                              if given_up else [])
+
+
+@pytest.mark.parametrize("later, kind, mark", [
+    (timedelta(minutes=3), "agent", "_(I wrote this at 08:00; it couldn't be sent until now.)_\n"),
+    (timedelta(days=1, minutes=3), "agent", "_(I wrote this on Thursday at 08:00; it couldn't be sent until now.)_\n"),
+    (timedelta(minutes=1), "agent", ""),
+    (timedelta(minutes=3), "note", ""),
+], ids=["at +3", "the next day", "at +1", "a note"])
+def test_an_answer_posted_late_says_when_she_wrote_it(tmp_path, fake_time, later, kind, mark):
+    p, store = make(tmp_path)
+    owed(store, "The plumber is at 5.", kind=kind)
+    fake_time.at += later
+    asyncio.run(p.deliver_pending())
+    assert p.slack.replies == [mark + "The plumber is at 5."]
+
+
+def test_a_note_after_an_answer_given_up_on_goes_with_it(tmp_path):
+    """Her note follows the answer it was recorded with, under its session,
+    and means nothing without it; another session's answer there is tried."""
+    class Gone(FakeSlack):
+        async def reply(self, thread_ts, text, channel=None):
+            self.replies.append(text)
+            raise SlackApiError("The request to the Slack API failed.", {"ok": False, "error": "is_archived"})
+
+    p, store = make(tmp_path, Gone())
+    tid = store.create_task(None, "D1", "conversation", kind="dm")
+    answered, note = store.record_run_and_note(
+        main.FAILED_REST, kind="agent", task_id=tid, session_id="s1", started_at=utcnow(), exit_code=0,
+        cost_usd=0.4, status="ok", error="error_during_execution", result_text="The plumber is at 5.", notified=0)
+    later = owed(store, "Yes.", session="s2")
+    asyncio.run(p.deliver_pending())
+    assert p.slack.replies == ["The plumber is at 5.", "Yes."] and store.pending_deliveries() == []
+    assert [g["id"] for g in json.loads(store.get_meta("given_up_runs"))] == [answered, later]
+    assert store.run(note)["notified"] == 1
 
 
 def test_the_snapshots_are_looked_after_once_a_day(tmp_path, monkeypatch):
@@ -776,6 +922,57 @@ def test_a_start_whose_run_store_opens_and_takes_no_write_says_so_and_waits(tmp_
     assert store.get_meta("started_at") and store.get_meta("sessions_left_running") == "0"
 
 
+def test_starts_that_die_before_she_runs_leave_one_interval_she_was_down(tmp_path, monkeypatch):
+    """Her running time, which delivery's two hours count: she was down from
+    the last time she was known to run, at a pass or a stop's end, until a
+    start got her running. Starts that die before then, and one that dies
+    after it before a pass, as in a restart loop, leave one interval."""
+    from wanda import main
+
+    async def one_pass(self):
+        await self.drain_mail()  # the mail loop's first pass
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    async def alert(self, text):
+        pass
+
+    recoveries = []
+    real = main.Processor.startup_recovery
+
+    async def recovery(self):
+        recoveries.append(1)
+        if len(recoveries) == 1:
+            raise RuntimeError("the store went away")
+        await real(self)
+
+    monkeypatch.setattr("wanda.actions.slack.SlackActions.alert", alert)
+    monkeypatch.setattr("wanda.main.SlackWatcher.start", connected)
+    monkeypatch.setattr("wanda.main.SlackWatcher.stop", lambda self: None)
+    monkeypatch.setattr("wanda.main.Processor.loop", one_pass)
+    monkeypatch.setattr("wanda.main.Processor.startup_recovery", recovery)
+    monkeypatch.setattr("wanda.vault.snapshot", lambda cfg, message: None)
+    monkeypatch.setattr("wanda.main.acquire_lock", lambda path: None)
+    slack_names(monkeypatch)
+    c = Config(_env_file=None, data_dir=tmp_path, slack_bot_token="x", slack_app_token="y",
+               alert_channel="C9", slack_owner_user_ids="U1,U2",
+               tz="America/Los_Angeles", email_triage=False, claude_bin="/bin/true")
+    last = "2026-10-01T15:00:00+00:00"
+    Store(c.db_path).set_meta("up_at", last)
+    monkeypatch.setattr("wanda.vault.prepare", lambda c, now, since=None: "mem recall me: timed out")
+    for _ in range(3):
+        with pytest.raises(SystemExit):
+            asyncio.run(main.run_daemon(c))
+    monkeypatch.setattr("wanda.vault.prepare", lambda c, now, since=None: None)
+    with pytest.raises(RuntimeError, match="the store went away"):
+        asyncio.run(main.run_daemon(c))
+    started = utcnow()
+    asyncio.run(main.run_daemon(c))
+    store = Store(c.db_path)
+    (since, until), = json.loads(store.get_meta("down"))
+    assert since == last and until >= started
+    assert store.get_meta("up_at") >= until, "moved on by the pass and the stop"
+
+
 @pytest.mark.parametrize("auth", [RuntimeError("invalid_auth"), {"ok": True, "bot_id": "BME"},
                                   {"ok": True, "user_id": "UBOT", "bot_id": "BME"}],
                          ids=["auth.test fails", "it names no user", "it names both"])
@@ -853,9 +1050,8 @@ def test_doctor_lists_the_answers_given_up_on(tmp_path, capsys):
                                 exit_code=0, cost_usd=0.4, status="ok", result_text="x", notified=0)
     given_up, kept, in_thread = run(dm_task), run(dm_task), run(thread_task)
     for r in (given_up, in_thread):
-        for _ in range(MAX_DELIVERY_ATTEMPTS):
-            store.bump_delivery_attempt(r)
-    store.bump_delivery_attempt(kept)
+        store.give_up(r, MAX_DELIVERY_ATTEMPTS)
+    store.first_refusal(kept)
     asyncio.run(run_doctor(c, smoke=False))
     out = capsys.readouterr().out
     assert "answers given up on — 2, newest first" in out
@@ -1173,11 +1369,12 @@ def test_a_redelivery_pass_skips_what_was_posted_while_it_waited(tmp_path, monke
                      for t in ("an older answer", "Yes."))
 
     async def go():
-        p._delivering.add(second)
+        posting = p._delivering[second] = asyncio.Event()
         redelivery = asyncio.create_task(p.deliver_pending())
         await asyncio.sleep(0.1)  # the pass is posting the first
         store.mark_run_notified(second)  # as _post_run does once Slack takes it
-        p._delivering.discard(second)
+        del p._delivering[second]
+        posting.set()
         await redelivery
     asyncio.run(go())
     assert slack.replies == ["an older answer"]
@@ -1742,9 +1939,10 @@ def test_a_post_slack_refuses_is_not_a_failure(tmp_path, monkeypatch):
                                     owed=False))
     assert got is None and [r["result_text"] for r in store.pending_deliveries()] == ["The plumber is at 5."]
     # a message's answer the same way, with no post about an internal error;
-    # behind the answer already owed there, it is not tried before that one
+    # its turn tries the answer already owed there before its frame, and
+    # behind that one, refused again, its own is not tried
     asyncio.run(p.handle_slack(dm(f"{AT:.1f}", "is it paid?")))
-    assert slack.refused == ["The plumber is at 5."]
+    assert slack.refused == ["The plumber is at 5.", "The plumber is at 5."]
     assert [r["result_text"] for r in store.pending_deliveries()] == ["The plumber is at 5.", "Yes."]
     # a refusal's reply that Slack refuses leaves the budget's verdict
     store.record_run(kind="agent", task_id=None, session_id=None, started_at=utcnow(), exit_code=0,
@@ -1753,6 +1951,102 @@ def test_a_post_slack_refuses_is_not_a_failure(tmp_path, monkeypatch):
     p.slack = ConversationSlack()
     asyncio.run(p.deliver_pending())
     assert p.slack.replies == ["The plumber is at 5.", "Yes."] and store.pending_deliveries() == []
+
+
+class Posting(ConversationSlack):
+    """A Slack that takes no post while it is down, and shows what it took
+    in the conversation as hers."""
+
+    def __init__(self, **kw):
+        super().__init__(history=[], **kw)
+        self.down = False
+        self.refused = []
+
+    async def reply(self, thread_ts, text, channel=None):
+        if self.down:
+            self.refused.append(text)
+            raise RuntimeError("ratelimited")
+        await super().reply(thread_ts, text, channel)
+        self.history.append({"user": "UBOT", "bot_id": "BME", "ts": f"{AT + 90 + len(self.history):.1f}",
+                             "text": text})
+
+
+def test_a_follow_up_framed_after_slack_is_back_sees_the_owed_answer_as_hers(tmp_path, monkeypatch):
+    """Its turn posts what is owed there before its frame, which then shows
+    it among what she said, and its own answer follows it."""
+    slack = Posting()
+    runner = RecordingRunner(answer("The plumber is at 5."), answer("Yes, paid on the 3rd."))
+    p, store, _ = memory_processor(tmp_path, slack, runner, monkeypatch)
+    slack.down = True
+    asyncio.run(p.handle_slack(dm(f"{AT:.1f}", "when is the plumber?")))
+    slack.down = False
+    asyncio.run(p.handle_slack(dm(f"{AT + 60:.1f}", "and is it paid?")))
+    assert slack.replies == ["The plumber is at 5.", "Yes, paid on the 3rd."] and store.pending_deliveries() == []
+    assert "me: The plumber is at 5." in runner.calls[1][0]
+
+
+def test_the_owed_runs_a_turn_posts_before_its_frame_stop_at_the_first_slack_refuses(tmp_path, monkeypatch):
+    slack = Refusing()
+    p, store, _ = memory_processor(tmp_path, slack, RecordingRunner(answer("Yes.")), monkeypatch)
+    owed(store, "The plumber is at 5.")
+    owed(store, "And it's paid.")
+    asyncio.run(p.handle_slack(dm(f"{AT:.1f}", "is it paid?")))
+    assert slack.refused == ["The plumber is at 5."]
+    assert [r["result_text"] for r in store.pending_deliveries()] == ["The plumber is at 5.", "And it's paid.",
+                                                                      "Yes."]
+
+
+def test_an_answer_behind_one_still_owed_is_left_for_the_pass_to_post_after_it(tmp_path, monkeypatch):
+    """Slack back while the session ran: its answer is not posted before the
+    one its turn found refused; the mail loop, woken, posts both in order."""
+    slack = Posting()
+
+    class Back(RecordingRunner):
+        async def run(self, prompt, **kw):
+            slack.down = False
+            return await super().run(prompt, **kw)
+
+    p, store, _ = memory_processor(tmp_path, slack, Back(answer("Yes.")), monkeypatch)
+    owed(store, "The plumber is at 5.")
+    slack.down = True
+    asyncio.run(p.handle_slack(dm(f"{AT:.1f}", "is it paid?")))
+    assert slack.refused == ["The plumber is at 5."] and slack.replies == []
+    assert p.queue.qsize() == 1, "the mail loop is woken"
+    asyncio.run(p.deliver_pending())
+    assert slack.replies == ["The plumber is at 5.", "Yes."]
+
+
+@pytest.mark.parametrize("reaches", ["its try", "_post_run"])
+def test_a_pass_mid_post_and_a_turn_there_post_each_run_once(tmp_path, monkeypatch, reaches):
+    """The mail loop's pass, posting slowly, and a message's turn in the same
+    conversation, which reaches its try before its frame, or its own post,
+    while the pass is mid-post: each run is posted once, in its order."""
+    class Slow(ConversationSlack):
+        async def reply(self, thread_ts, text, channel=None):
+            self.posting.set()
+            await asyncio.sleep(0.2)
+            await super().reply(thread_ts, text, channel)
+
+    slack = Slow()
+    p, store, _ = memory_processor(tmp_path, slack, RecordingRunner(answer("Noted.")), monkeypatch)
+    before = ["an older answer", "Yes."] if reaches == "its try" else []
+    for text in before:
+        owed(store, text)
+
+    async def go():
+        slack.posting = asyncio.Event()
+        if reaches == "its try":
+            redelivery = asyncio.create_task(p.deliver_pending())
+            await slack.posting.wait()
+            await p.handle_slack(dm(f"{AT:.1f}", "noted?"))
+        else:
+            turn = asyncio.create_task(p.handle_slack(dm(f"{AT:.1f}", "noted?")))
+            await slack.posting.wait()
+            redelivery = asyncio.create_task(p.deliver_pending())
+            await turn
+        await redelivery
+    asyncio.run(go())
+    assert slack.replies == before + ["Noted."] and store.pending_deliveries() == []
 
 
 def test_a_group_dm_names_its_readers(tmp_path, monkeypatch):
@@ -2421,8 +2715,9 @@ class RefusingAt(ConversationSlack):
 @pytest.mark.parametrize("refused", ["the answer", "the answer twice", "the rest's answer"])
 def test_the_rest_is_answered_after_the_answer_when_slack_refuses_a_post(tmp_path, monkeypatch, refused):
     """The follow-up a later turn failed on is answered by the next turn:
-    when Slack refuses the first answer's post, or the second's, each is
-    kept, and delivery posts the second after the first, never before it."""
+    when Slack refuses the first answer's post, that turn posts it before its
+    frame; refused there too, or when the second's is refused, each is kept,
+    and delivery posts the second after the first, never before it."""
     slack = RefusingAt({"the answer": {0}, "the answer twice": {0, 1}, "the rest's answer": {1}}[refused],
                        history=[])
     p, store, _, slack = standin_processor(tmp_path, monkeypatch, slack=slack, steps=[0.2], reply_s=1.5,
@@ -2433,10 +2728,9 @@ def test_the_rest_is_answered_after_the_answer_when_slack_refuses_a_post(tmp_pat
     assert sorted(handed_texts(tmp_path), key=len) == [
         [], [vault.added_text("dm", "fan", "to call the plumber", "16:40")]]
     answered, rest = "one answer to 1: can you remind me at 5", "one answer to 1: to call the plumber"
-    assert slack.replies == ([answered] if refused == "the rest's answer" else [])
-    if refused == "the answer twice":
-        asyncio.run(p.deliver_pending())
-        assert slack.replies == [] and len(store.pending_deliveries()) == 2
+    assert slack.replies == {"the answer": [answered, rest], "the answer twice": [],
+                             "the rest's answer": [answered]}[refused]
+    assert len(store.pending_deliveries()) == {"the answer": 0, "the answer twice": 2, "the rest's answer": 1}[refused]
     asyncio.run(p.deliver_pending())
     assert slack.replies == [answered, rest]
     assert [dict(r) for r in store._query("SELECT status, error, result_text, notified FROM runs")] == [

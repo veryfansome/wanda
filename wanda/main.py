@@ -55,10 +55,29 @@ log = logging.getLogger("wanda")
 PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 SKILLS_DIR = Path(__file__).resolve().parent.parent / "skills"
 MAX_APPLY_ATTEMPTS = 8
-MAX_DELIVERY_ATTEMPTS = 8
 RETRY_BASE_S = 60          # backoff 1, 2, 4, 8, 16, 30, 30, 30 minutes
 RETRY_MAX_S = 1800
 DEFER_S = 900  # how long a rate-capped trash waits before the cap is re-tested
+# a run's `deliver_attempts` once delivery has given it up, by which
+# `_flush_lost`, `_listed` and doctor tell it from a run posted
+MAX_DELIVERY_ATTEMPTS = 8
+# An owed run is tried at every pass of the mail loop, about a minute apart,
+# and given up at the first try that fails once she has been running longer
+# than this since it was written (Store.ran): two hours of tries, the time
+# she was stopped or down not counted against it, and a minute more, so that
+# a try past the two-hour mark has failed too before one gives it up.
+GIVE_UP_AFTER = timedelta(minutes=121)
+# What Slack says when a post may go through later: its own trouble, its
+# limits, and a token fan can renew. Any other refusal, as of a conversation
+# gone or archived or a thread closed to her, refuses that post every time.
+CLEARS = frozenset({"ratelimited", "rate_limited", "fatal_error", "internal_error", "service_unavailable",
+                    "request_timeout", "message_limit_exceeded", "invalid_auth", "not_authed", "token_revoked",
+                    "token_expired", "account_inactive"})
+# The first line of an answer posted this long or more after she wrote it,
+# saying when that was, in her words: whoever reads it then would otherwise
+# take it as said just now.
+LATE_AFTER = timedelta(minutes=2)
+LATE_MARK = "_(I wrote this {at}; it couldn't be sent until now.)_"
 # The local hour from which the snapshots' housekeeping may run. Past git's
 # threshold it packs every loose object over the Mac's mount, for a minute or
 # two in which every snapshot waits, and with it a message's turn and a
@@ -115,6 +134,19 @@ FAILURE_CLASSES = ("timeout", "usage limit", "authentication", "other")
 def truncate(text: str | None, limit: int) -> str:
     text = text or ""
     return text if len(text) <= limit else text[:limit] + "…"
+
+
+def written_at(when: datetime, now: datetime) -> str:
+    """When she wrote an answer, as LATE_MARK says it, in `now`'s zone: the
+    time on `now`'s day, with the weekday on any other."""
+    when = when.astimezone(now.tzinfo)
+    return f"at {when:%H:%M}" if when.date() == now.date() else f"on {when:%A} at {when:%H:%M}"
+
+
+def undelivered(run) -> bool:
+    """Whether a run's answer has not reached its conversation: still owed,
+    or given up."""
+    return not run["notified"] or run["deliver_attempts"] >= MAX_DELIVERY_ATTEMPTS
 
 
 # Who "I" is in what a session is handed. Claude Code presents the user turn as
@@ -337,7 +369,9 @@ class Processor:
         self._bg: set[asyncio.Task] = set()
         self._inflight_runs = 0
         self._inflight_usd = 0.0
-        self._delivering: set[int] = set()
+        # the runs being posted, each with an event set once its post ends
+        # (_claim)
+        self._delivering: dict[int, asyncio.Event] = {}
         # per conversation task, the messages waiting for its next turn
         self._waiting: dict[int, list[dict]] = {}
         # per conversation task, what its turn's session takes in while it works
@@ -710,13 +744,16 @@ class Processor:
             log.warning("clock: %s failed, and the reminder is not tried again", w.key)
             self._lost(w.about, w.by, w.asked, "its session failed")
         else:
-            if run["result_text"] and not run["notified"]:
+            # still owed, or given up at once where Slack refused it for good:
+            # the next pass keeps the reminder as not given (_flush_lost)
+            if run["result_text"] and undelivered(run):
                 self._owe(run["id"], w.about, w.by, w.asked)
             if then_failed:
                 # an answer Slack has not taken yet is still owed, and is kept
                 # as not given if delivery gives up on it
-                what = ("was given, and its session then failed" if run["notified"] else
-                        "was answered and its post is being tried again; its session then failed")
+                what = ("was given, and its session then failed" if not undelivered(run) else
+                        "was answered and its post is being tried again; its session then failed"
+                        if not run["notified"] else "was answered and its post was given up; its session then failed")
                 await self._alert_once("clock", f"the reminder trajectory:{w.about} due {w.by} {what}")
         if waking is not None:
             # settled here, so the next start leaves it alone; a stop, which
@@ -756,7 +793,7 @@ class Processor:
             if (m["id"], m["by"]) in kept:
                 pass  # kept as not given before the process ended
             elif run is not None and run["status"] == "ok":
-                if run["result_text"] and not run["notified"]:
+                if run["result_text"] and undelivered(run):
                     self._owe(run["id"], m["id"], m["by"], m["asked"])
             elif datetime.fromisoformat(m["by"]) > wall - clock.LATE:
                 log.warning("clock: %s was cut short before it was given, and is woken again", key)
@@ -801,8 +838,7 @@ class Processor:
         if rest:
             run_id, after = rest.split(" ")
             run = self.store.run(int(run_id))
-            if run is not None and run["result_text"] and (
-                    not run["notified"] or run["deliver_attempts"] >= MAX_DELIVERY_ATTEMPTS):
+            if run is not None and run["result_text"] and undelivered(run):
                 return after
         return day or None
 
@@ -1248,6 +1284,9 @@ class Processor:
         await self._flush_memory()
         for kind in ("breaker", "cap", "snapshot", "startup", "clock", "names"):
             await self._flush_alert(kind)
+        # she is running: a start counts her down from the last of these
+        # marks (Store.came_up)
+        self.store.set_meta("up_at", utcnow())
         await self._housekeep()
         if not self.cfg.email_triage:
             return  # mail rows from before triage was turned off stay as they are
@@ -1516,18 +1555,21 @@ class Processor:
         other kind is. The alert is written from the list when it is due, so
         an answer given up on while one waits, or after the day's alert went,
         is named in the next, and none is dropped at a day's end. It names
-        each by its run and time only: a conversation can tell whom an
-        answer was for, and the alerts may be read by the person it is kept
-        from."""
+        each by its run and time only, and whether it was given up after two
+        hours or at once: a conversation can tell whom an answer was for, and
+        the alerts may be read by the person it is kept from."""
         given_up = json.loads(self.store.get_meta("given_up_runs") or "[]")
         today = datetime.now(timezone.utc).date().isoformat()
         if not given_up or self.store.get_meta("given_up_alert_date") == today:
             return
-        runs = "; ".join(f"run {g['id']}, from {g['at']}" for g in given_up)
+        now = datetime.now(self.cfg.zone)
+        # one an earlier version of the daemon listed has no `how`
+        runs = "; ".join(f"run {g['id']}, from {vault.stamp(datetime.fromisoformat(g['at']).timestamp(), now)}"
+                         + (f", {g['how']}" if g.get("how") else "") for g in given_up)
         try:
             await self.slack.alert(
-                f"{len(given_up)} answer(s) could not be posted after {MAX_DELIVERY_ATTEMPTS} tries "
-                f"and were given up: {runs}. `wanda doctor` lists where each was due (README, State).")
+                f"{len(given_up)} answer(s) could not be posted and were given up: {runs}. "
+                "`wanda doctor` lists where each was due (README, State).")
         except Exception:
             log.warning("given-up alert undeliverable; will retry")
             return
@@ -1657,42 +1699,86 @@ class Processor:
                 log.exception("recovery failed for %s", row["dedupe_key"])
         await self.deliver_pending()
 
-    async def deliver_pending(self) -> None:
+    async def deliver_pending(self, task_id: int | None = None) -> None:
         """Agent outcomes the owner never got — killed by a restart, or
-        answered but undeliverable when Slack was failing. In each
-        conversation, in the order they were recorded: once one cannot be
-        posted, those after it there wait for the next pass, so a failure
+        answered but undeliverable when Slack was failing — or only
+        `task_id`'s, as a message's turn posts them before its frame. In
+        each conversation, in the order they were recorded: once one cannot
+        be posted, those after it there wait for the next pass, so a failure
         note never goes before the answer it follows."""
         held: set[int] = set()
-        for run in self.store.pending_deliveries():
-            if run["id"] in self._delivering:
-                continue  # a reply handler is posting this right now
-            if self.store.run_notified(run["id"]):
-                continue  # a reply handler posted it while this pass awaited an earlier one
+        for run in self.store.pending_deliveries(task_id):
             if run["task_id"] in held:
                 continue
             # Cancelled runs carry no text; every other pending run does.
             text = run["result_text"] or (
                 "⏸ I restarted while working on this — reply again to retry."
             )
-            try:
-                await self.slack.reply(run["reply_thread"], text, channel=run["slack_channel"])
-            except Exception:
+            # only her answer in a memory conversation is marked late: her
+            # note, the restart's notice and an email task's text are not
+            answer = bool(run["result_text"]) and run["kind"] != "note" and run["task_kind"] != "email"
+            if not await self._post(run, run["slack_channel"], run["reply_thread"], text, answer):
                 held.add(run["task_id"])
-                attempts = self.store.bump_delivery_attempt(run["id"])
-                if attempts >= MAX_DELIVERY_ATTEMPTS:
-                    log.exception("giving up delivering run %s to %s after %d attempts",
-                                  run["id"], run["slack_channel"], attempts)
-                    self.store.mark_run_notified(run["id"])  # stop blocking the queue
-                    self.store.set_meta("abandoned_alert_pending", "1")
-                    given_up = json.loads(self.store.get_meta("given_up_runs") or "[]")
-                    given_up.append({"id": run["id"], "at": run["started_at"]})
-                    self.store.set_meta("given_up_runs", json.dumps(given_up))
-                else:
-                    log.warning("could not deliver run %s yet (attempt %d); will retry",
-                                run["id"], attempts)
-                continue
+
+    @contextlib.asynccontextmanager
+    async def _claim(self, run_id: int):
+        """Holds a run while one poster posts it: the pass, a turn's try
+        before its frame, `_post_run`, an email task's reply. Another waits
+        until that post has ended; `_post` then reads whether the run is
+        still owed."""
+        while (posting := self._delivering.get(run_id)) is not None:
+            await posting.wait()
+        done = self._delivering[run_id] = asyncio.Event()
+        try:
+            yield
+        finally:
+            del self._delivering[run_id]
+            done.set()
+
+    async def _post(self, run, channel: str, reply_thread: str | None, text: str, answer: bool) -> bool:
+        """Posts an owed run once, whichever poster comes to it first; an
+        `answer` posted LATE_AFTER or more after she wrote it says when she
+        did. Returns whether the run is owed no longer: posted, or given up
+        (`_not_posted`)."""
+        async with self._claim(run["id"]):
+            if self.store.run_notified(run["id"]):
+                return True  # posted while this waited for it
+            now = datetime.now(self.cfg.zone)
+            written = datetime.fromisoformat(run["ended_at"])
+            if answer and now - written >= LATE_AFTER:
+                text = f"{LATE_MARK.format(at=written_at(written, now))}\n{text}"
+            try:
+                await self.slack.reply(reply_thread, text, channel=channel)
+            except Exception as e:
+                return self._not_posted(run, channel, e, now)
             self.store.mark_run_notified(run["id"])
+            return True
+
+    def _not_posted(self, run, channel: str, e: Exception, now: datetime) -> bool:
+        """A post Slack did not take. One it may take later (CLEARS, or a
+        failure Slack gave no error for) leaves the run owed, until a try
+        fails after she has run GIVE_UP_AFTER since it was written; any other
+        refusal gives it up at once, since Slack would refuse it there every
+        time. The first refusal and the give-up are logged. Returns whether
+        the run was given up."""
+        error = e.response.get("error") if isinstance(e, SlackApiError) else None
+        if error and error not in CLEARS:
+            how = f"at once ({error})"
+        elif self.store.ran(datetime.fromisoformat(run["ended_at"]), now) > GIVE_UP_AFTER:
+            how = "after two hours"
+        else:
+            if self.store.first_refusal(run["id"]):
+                log.warning("could not post run %s in %s yet: %s; tried again at every pass for two hours of "
+                            "running", run["id"], channel, e)
+            return False
+        notes = self.store.give_up(run["id"], MAX_DELIVERY_ATTEMPTS)
+        log.warning("gave up posting run %s in %s %s: %s%s", run["id"], channel, how, e,
+                    f"; the note(s) after it, run(s) {', '.join(map(str, notes))}, dropped with it" if notes else "")
+        self.store.set_meta("abandoned_alert_pending", "1")
+        given_up = json.loads(self.store.get_meta("given_up_runs") or "[]")
+        given_up.append({"id": run["id"], "at": run["started_at"], "how": how})
+        self.store.set_meta("given_up_runs", json.dumps(given_up))
+        return True
 
     # --- slack thread replies -> agentic sessions ---
 
@@ -1860,12 +1946,9 @@ class Processor:
             if self_posted:
                 log.info("agent posted its own reply for session %s", sid)
                 return
-            self._delivering.add(run_id)  # keep deliver_pending off this row
-            try:
+            async with self._claim(run_id):  # keep deliver_pending off this row
                 await self.slack.reply(p.get("reply_thread"), text, channel=channel)
                 self.store.mark_run_notified(run_id)
-            finally:
-                self._delivering.discard(run_id)
 
     async def _run_memory_reply(self, task, p: dict, state: dict) -> None:
         """A message from someone on the allowlist, wherever it was sent; one
@@ -2022,7 +2105,7 @@ class Processor:
         nothing. `sid` is the session's id, made here unless the caller made
         it, to find the run by. Returns what went wrong, or None. A post Slack
         refuses is not something that went wrong: the run stays owed and is
-        posted later."""
+        posted later, or is given up (_not_posted)."""
         state = {} if state is None else state
         reserve = self.cfg.agent_expected_usd
         if (verdict := await self.check_budget(reserve_usd=reserve)) != "ok":
@@ -2035,6 +2118,11 @@ class Processor:
         # its run, when it started, why, whether Claude Code said so, and
         # the alert's class
         first = None
+        if frame is not None:
+            # what is still owed here goes first, before the session is
+            # framed, so that it is among what she said there and the
+            # session's answer follows it
+            await self.deliver_pending(task["id"])
         queued = time.monotonic()
         async with self.runner.agent_sem:
             # apart from the session's own time: with one session at a time,
@@ -2285,17 +2373,10 @@ class Processor:
         if self.store.owed_before(run_id):
             self.queue.put_nowait(Event("slack", "owed"))
             return
-        self._delivering.add(run_id)  # keep deliver_pending off this row
-        try:
-            await self.slack.reply(reply_thread, text, channel=channel)
-        except Exception as e:
-            # the run is recorded, so a refused post leaves it owed, and
-            # deliver_pending posts it once Slack takes it
-            log.warning("could not post run %s in %s yet: %s; will retry", run_id, channel, e)
-        else:
-            self.store.mark_run_notified(run_id)
-        finally:
-            self._delivering.discard(run_id)
+        # recorded already, so a post Slack refuses leaves it owed for
+        # deliver_pending, or gives it up (_not_posted)
+        run = self.store.run(run_id)
+        await self._post(run, channel, reply_thread, text, run["kind"] != "note")
 
     def _log_session(self, sid: str, channel: str | None, waited: float, ran: float, added: int, rr: RunResult,
                      more: Additions | None, out: dict | None, outcome: str, looks: vault.LookBack) -> None:
@@ -2552,6 +2633,9 @@ async def open_store(cfg: Config) -> Store:
             # to delete. Doctor counts from when this start began.
             store.set_meta("started_at", utcnow())
             store.set_meta("sessions_left_running", "0")
+            # her running time starts with a store's first start
+            if store.get_meta("up_at") is None:
+                store.set_meta("up_at", utcnow())
             return store
         except (sqlite3.Error, OSError) as e:
             problem = f"the run store {cfg.db_path} could not be opened or written: {e}"
@@ -2651,6 +2735,9 @@ async def run_daemon(cfg: Config) -> None:
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, stop.set)
 
+    # once the start has got this far: one that dies before, as in a restart
+    # loop, leaves `up_at` and the intervals as they were
+    store.came_up(utcnow())
     log.info("wanda running (enforcement=%s, email triage=%s, agent=%s)", cfg.enforcement,
              cfg.email_triage_model if cfg.email_triage else "off", cfg.agent_model)
     # slack_loop starts first: recovery can take many paced Slack calls, and an
@@ -2671,6 +2758,8 @@ async def run_daemon(cfg: Config) -> None:
         t.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
     await processor.shutdown()  # settle agent runs before the store closes
+    # she ran until now: the next start counts her down from here
+    store.set_meta("up_at", utcnow())
     store.close()
 
 

@@ -101,6 +101,10 @@ MIGRATIONS = (
     ("runs", "deliver_attempts", "INTEGER NOT NULL DEFAULT 0"),
 )
 
+# How many of the intervals she was not running are kept, the newest; a
+# restart loop leaves one (Store.came_up).
+DOWN_KEPT = 5
+
 
 def utcnow() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -462,13 +466,15 @@ class Store:
         )
         return rows[0]["n"], rows[0]["cost"]
 
-    def pending_deliveries(self, limit: int = 50) -> list[sqlite3.Row]:
+    def pending_deliveries(self, task_id: int | None = None, limit: int = 50) -> list[sqlite3.Row]:
         """Agent outcomes the owner never received: killed by a restart, or
-        answered successfully but undeliverable at the time."""
+        answered successfully but undeliverable at the time; only `task_id`'s
+        when it is given."""
         return self._query(
             "SELECT r.*, t.reply_thread, t.slack_channel, t.kind AS task_kind FROM runs r "
-            "JOIN tasks t ON t.id = r.task_id WHERE r.notified=0 ORDER BY r.id LIMIT ?",
-            (limit,),
+            "JOIN tasks t ON t.id = r.task_id WHERE r.notified=0 AND (? IS NULL OR r.task_id = ?) "
+            "ORDER BY r.id LIMIT ?",
+            (task_id, task_id, limit),
         )
 
     def mark_run_notified(self, run_id: int) -> None:
@@ -493,18 +499,56 @@ class Store:
             (attempts, limit),
         )
 
-    def bump_delivery_attempt(self, run_id: int) -> int:
-        """Delivery cannot retry forever: an answer for a channel wanda was
-        removed from would block every later delivery behind it."""
+    def first_refusal(self, run_id: int) -> bool:
+        """Whether Slack has refused this run's post for the first time, which
+        is then kept in its `deliver_attempts`: a run refused at every pass
+        for two hours is logged once."""
+        return self._exec("UPDATE runs SET deliver_attempts = 1 WHERE id=? AND deliver_attempts = 0",
+                          (run_id,)).rowcount > 0
+
+    def give_up(self, run_id: int, attempts: int) -> list[int]:
+        """Delivery gives a run up, so that it blocks nothing after it: marked
+        notified with `attempts` as its count, by which a run given up is told
+        from one posted. Her notes owed after it in its task under its
+        session go with it, since each follows that answer and means nothing
+        without it. Returns the notes' ids."""
         with self._lock:
-            self._db.execute(
-                "UPDATE runs SET deliver_attempts = deliver_attempts + 1 WHERE id=?", (run_id,)
-            )
-            row = self._db.execute(
-                "SELECT deliver_attempts FROM runs WHERE id=?", (run_id,)
-            ).fetchone()
+            try:
+                self._db.execute("UPDATE runs SET notified=1, deliver_attempts=? WHERE id=?", (attempts, run_id))
+                notes = [r["id"] for r in self._db.execute(
+                    "SELECT n.id FROM runs r JOIN runs n ON n.task_id = r.task_id AND n.session_id = r.session_id "
+                    "AND n.id > r.id WHERE r.id = ? AND n.kind = 'note' AND n.notified = 0", (run_id,))]
+                self._db.executemany("UPDATE runs SET notified=1 WHERE id=?", [(n,) for n in notes])
+            except BaseException:
+                self._db.rollback()
+                raise
             self._db.commit()
-        return row["deliver_attempts"] if row else 0
+        return notes
+
+    # --- her running time ---
+
+    def came_up(self, at: str) -> None:
+        """A start that reached running, at `at`: she was not running from the
+        last time she was known to be (`up_at`) until then. A start that got
+        as far and died before a pass moved `up_at` on began from the same
+        time, and this one's interval replaces its, so that a restart loop
+        leaves one."""
+        up = self.get_meta("up_at")
+        if up is None:
+            return
+        down = json.loads(self.get_meta("down") or "[]")
+        if down and down[-1][0] == up:
+            down.pop()
+        self.set_meta("down", json.dumps((down + [[up, at]])[-DOWN_KEPT:]))
+
+    def ran(self, since: datetime, now: datetime) -> timedelta:
+        """How long she has been running between `since` and `now`: the time
+        between, less what of it falls in the intervals she was not."""
+        ran = now - since
+        for start, end in json.loads(self.get_meta("down") or "[]"):
+            start, end = datetime.fromisoformat(start), datetime.fromisoformat(end)
+            ran -= max(timedelta(0), min(end, now) - max(start, since))
+        return ran
 
     def runs_today(self) -> tuple[int, float]:
         midnight_utc = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)

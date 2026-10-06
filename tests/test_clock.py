@@ -71,6 +71,21 @@ def _scrub_env(monkeypatch):
             monkeypatch.delenv(key, raising=False)
 
 
+@pytest.fixture
+def fake_time(monkeypatch):
+    """The time as wanda.main and wanda.store read it, standing at `at`,
+    08:00 on Thursday 1 October 2026 in Los Angeles, until a test moves it."""
+    class Clock(datetime):
+        at = datetime(2026, 10, 1, 8, 0, tzinfo=LA)
+
+        @classmethod
+        def now(cls, tz=None):
+            return cls.at.astimezone(tz) if tz else cls.at.astimezone().replace(tzinfo=None)
+    monkeypatch.setattr("wanda.main.datetime", Clock)
+    monkeypatch.setattr("wanda.store.datetime", Clock)
+    return Clock
+
+
 def minutes(start: datetime, end: datetime):
     """Every minute between two instants, as the household's wall clock shows
     it — stepping in UTC, so a clock change is lived through, not skipped."""
@@ -755,9 +770,9 @@ def refused_post(tmp_path, monkeypatch, answer):
     """The daemon's own `memory_turn` with a Slack that opens DMs and takes no
     post, and `mem` standing in."""
     slack = Refusing()
-    store = named(Store(tmp_path / "p.db"))
-    p = Processor(settings(tmp_path, email_triage=False), store, asyncio.Queue(), slack,
-                  RunnerService("/bin/true"))
+    c = settings(tmp_path, email_triage=False)
+    store = named(Store(c.db_path))
+    p = Processor(c, store, asyncio.Queue(), slack, RunnerService("/bin/true"))
     p.runner = Answers(answer)
     monkeypatch.setattr("wanda.vault.snapshot", lambda cfg, message: None)
     monkeypatch.setattr("wanda.vault.housekeep", lambda cfg: None)
@@ -789,36 +804,58 @@ def test_a_look_whose_post_slack_refused_spoke_and_is_delivered_later(tmp_path, 
     assert p._listed("U1", task) == "2026-10-01"
 
 
-def test_a_look_whose_answer_delivery_gave_up_on_hands_its_day_on(tmp_path, monkeypatch):
-    """Delivery gives up after its tries and alerts the run: the person never
-    saw the look, so the next look is handed what it was."""
-    from wanda.main import MAX_DELIVERY_ATTEMPTS
+def test_a_look_whose_answer_delivery_gave_up_on_hands_its_day_on(tmp_path, monkeypatch, fake_time):
+    """Delivery gives up after two hours of her running and alerts the run:
+    the person never saw the look, so the next look is handed what it was."""
     p, slack, store = refused_post(tmp_path, monkeypatch, "Morning. The plumber is at 5.")
     now = datetime(2026, 10, 1, 8, 0, tzinfo=LA)
     w = clock.morning_wakes(now, {"U1": LOOKS["U1"]}, QUIET, lambda q: None, NAMES.get)[0]
     asyncio.run(p._clock_session(w, now))
-    for _ in range(MAX_DELIVERY_ATTEMPTS):
-        asyncio.run(p.drain_mail())
+    fake_time.at += timedelta(minutes=122)
+    asyncio.run(p.drain_mail())
     assert store.pending_deliveries() == [] and len(slack.alerts) == 1, slack.alerts
     task = store.get_task_by_thread("D-U1", "conversation")
     assert p._listed("U1", task) == "2026-09-30"
 
 
-def test_a_timed_wake_whose_answer_delivery_gave_up_on_is_a_reminder_not_given(tmp_path, monkeypatch):
-    from wanda.main import MAX_DELIVERY_ATTEMPTS
+def test_a_timed_wake_whose_answer_delivery_gave_up_on_is_a_reminder_not_given(tmp_path, monkeypatch, fake_time):
     p, slack, store = refused_post(tmp_path, monkeypatch, "It is 7: the gift for mei.")
-    at7 = datetime(2026, 10, 1, 19, 3, tzinfo=LA)
+    at7 = fake_time.at = datetime(2026, 10, 1, 19, 3, tzinfo=LA)
     w = due_at(at7, {"clock:due:a24e0d:2026-10-01T17:00:mei"})[0]
     asyncio.run(p._clock_session(w, at7))
     asyncio.run(p.drain_mail())
     assert json.loads(store.get_meta("clock:lost") or "[]") == [], "still owed, still tried"
-    for _ in range(MAX_DELIVERY_ATTEMPTS):
-        asyncio.run(p.drain_mail())
+    fake_time.at += timedelta(minutes=122)
+    asyncio.run(p.drain_mail())
     lost = json.loads(store.get_meta("clock:lost"))
     assert [(r["id"], r["by"], r["asked"], r["why"]) for r in lost] == [
         ("b6647b", "2026-10-01T19:00", "fan", "its answer could not be posted")]
     assert "1 timed reminder(s) not given at their time: trajectory:b6647b due 2026-10-01T19:00." in "".join(
         slack.alerts), slack.alerts
+
+
+def test_a_timed_wake_whose_answer_slack_refuses_for_good_is_a_reminder_not_given(tmp_path, monkeypatch, capsys):
+    """Its own post gives it up at once, where Slack would refuse it every
+    time: the next pass keeps the reminder as not given, and doctor lists
+    both."""
+    from slack_sdk.errors import SlackApiError
+
+    p, slack, store = refused_post(tmp_path, monkeypatch, "It is 7: the gift for mei.")
+
+    async def gone(thread_ts, text, channel=None):
+        raise SlackApiError("The request to the Slack API failed.", {"ok": False, "error": "channel_not_found"})
+    slack.reply = gone
+    at7 = datetime(2026, 10, 1, 19, 3, tzinfo=LA)
+    w = due_at(at7, {"clock:due:a24e0d:2026-10-01T17:00:mei"})[0]
+    asyncio.run(p._clock_session(w, at7))
+    assert store.pending_deliveries() == []
+    asyncio.run(p.drain_mail())
+    lost = json.loads(store.get_meta("clock:lost"))
+    assert [(r["id"], r["why"]) for r in lost] == [("b6647b", "its answer could not be posted")]
+    asyncio.run(run_doctor(p.cfg, smoke=False))
+    out = capsys.readouterr().out
+    assert "answers given up on — 1, newest first" in out, out
+    assert "trajectory:b6647b due 2026-10-01T19:00, asked by fan (U1): its answer could not be posted" in out, out
 
 
 class Turns:
