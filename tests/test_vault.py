@@ -150,6 +150,25 @@ def test_the_parser_reads_every_frame_back(place, readers, earlier, chan):
     assert parser()(text) == ("2026-10-01", chan, "fan", SAID)
 
 
+@pytest.mark.parametrize("place,chan", [("dm", "dm"), ("group", "group dm"), ("channel", "channel"),
+                                        ("public", "public channel"), ("thread", "thread"),
+                                        ("public thread", "public thread")])
+def test_a_retry_is_read_back_as_the_message_it_retries(place, chan):
+    """One RETRIED for each earlier session, after the sentences on who
+    reads, on the opening line: read back as fan saying what he said. A
+    direct message with nothing before it takes the opening line every
+    other frame has, since the lab's has none to hold them."""
+    again = tuple(vault.RETRIED.format(sid8=sid) for sid in ("3f9a1c2e", "7b20d4e1"))
+    for earlier in ([], [("09:00", "mei", "earlier")]):
+        arrival = vault.arrival_text(place, "fan", SAID, ["fan", "mei"], earlier, outside=place.startswith("public"),
+                                     unlisted=True, opening=again)
+        assert parser()(vault.prompt("2026-10-01", arrival)) == ("2026-10-01", chan, "fan", SAID)
+        assert f"I could not find out who else is in it. {again[0]} {again[1]}\n\n" in arrival
+    assert vault.arrival_text("dm", "fan", SAID, ["fan"], [], opening=again[:1]).startswith(
+        "In a direct message that fan and I read. An earlier session of mine for this, 3f9a1c2e, ended before I "
+        "answered; what it wrote to memory is still there.\n\nfan says:\n\n    one line")
+
+
 OWN = frozenset({"UBOT", "BBOT"})
 KIN = ["U1", "U2", "U5"]
 TOLD = {"U1": "fan", "U2": "mei"}
@@ -349,6 +368,9 @@ def test_what_a_session_was_handed_is_read_from_its_transcript(tmp_path, monkeyp
     (d / "s1.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows) + "not json\n")
     assert vault.handed(v, "s1") == ["taken with it", "added mid-turn", "a later turn", "and another"]
     assert vault.handed(v, "s2") is None
+    # each turn, as the message or the notice that began it, the prompt left out
+    assert vault.turn_starts(v, "s1") == [(True, ["taken with it"]), (False, []), (True, ["a later turn", "and another"])]
+    assert vault.turn_starts(v, "s2") is None
 
 
 def test_frames_name_who_reads_and_what_came_before():
@@ -658,29 +680,33 @@ def test_earlier_lines_say_when_and_reach_back_twelve_hours():
     assert len(vault.earlier(many, f"{at}", "dm", named, own, NOW)) == vault.EARLIER
 
 
-def test_her_alerts_are_shown_as_alerts_and_her_failure_notes_not_at_all():
-    """An alert is for people, and a failure note carries Claude Code's
-    words: posted with the harness's marks, neither is shown to a session as
-    something she said, in a thread or out of one. Her alert is shown as an
-    alert posted in her name, in fan's DM too; her note is left out; another
-    app's post with either mark is that app's, outside the household."""
+def test_her_alerts_are_shown_as_alerts_her_marked_failure_notes_not_at_all_and_her_notes_as_hers():
+    """An alert is for people, and a marked failure note carries Claude
+    Code's words: posted with the harness's marks, neither is shown to a
+    session as something she said, in a thread or out of one. Her alert is
+    shown as an alert posted in her name, in fan's DM too; the marked note is
+    left out; her note in her words, unmarked, is hers; another app's post
+    with either mark is that app's, outside the household."""
+    from wanda.main import FAILED
+
     at = NOW.timestamp()
     note = {"event_type": vault.NOTE_EVENT, "event_payload": {}}
     msgs = [{"ts": f"{at - 90}", "user": "UBOT", "bot_id": "BBOT", "text": "⚠️ a vault snapshot failed",
              "metadata": ALERT},
             {"ts": f"{at - 80}", "user": "UBOT", "bot_id": "BBOT", "text": "⚠️ my run failed: You've hit your limit",
              "metadata": note},
+            {"ts": f"{at - 70}", "user": "UBOT", "bot_id": "BBOT", "text": FAILED},
             {"ts": f"{at - 60}", "user": "UBOT", "bot_id": "BBOT", "text": "Which one?"},
             {"ts": f"{at - 30}", "user": "U9", "text": "an app's post", "metadata": ALERT},
             {"ts": f"{at - 20}", "user": "U7", "bot_id": "B7", "text": "an app's note", "metadata": note}]
     named = vault.names(["U9", "U7"], {"U9": JANE, "U7": POLLY}, TOLD, NAMESAKES, OWN, KIN)
     for place in ("group", "thread"):
         assert vault.earlier(msgs, f"{at}", place, named, OWN, NOW, kin=KIN) == [
-            ("16:38", "an alert posted in my name", "⚠️ a vault snapshot failed"), ("16:39", "me", "Which one?"),
-            ("16:39", "“jane”" + vault.OUTSIDE, "an app's post"),
+            ("16:38", "an alert posted in my name", "⚠️ a vault snapshot failed"), ("16:38", "me", FAILED),
+            ("16:39", "me", "Which one?"), ("16:39", "“jane”" + vault.OUTSIDE, "an app's post"),
             ("16:39", "“Polly”" + vault.OUTSIDE, "an app's note")]
     two = dict(msgs[0], text="⚠️ a vault snapshot failed\nits second line")
-    assert vault.earlier([two] + msgs[1:3], f"{at}", "dm", {}, OWN, NOW) == [
+    assert vault.earlier([two, msgs[1], msgs[3]], f"{at}", "dm", {}, OWN, NOW) == [
         ("16:38", vault.ALERTED, f"⚠️ a vault snapshot failed\n{vault.ALERTED}: its second line"),
         ("16:39", "me", "Which one?")]
 

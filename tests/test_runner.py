@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 
 from wanda import vault
-from wanda.runner import RunnerService
+from wanda.runner import RunnerService, RunResult, refused
 
 
 def make_fake_claude(tmp_path, script: str) -> str:
@@ -496,6 +496,18 @@ def test_an_exit_after_a_successful_result_fails_the_session_without_its_report(
     assert [r["structured_output"]["answer"] for r in rr.results] == ["one answer to 1: first"]
 
 
+@pytest.mark.parametrize("script, error", [
+    ("echo 'Login expired · Please run /login' >&2\nexit 1",
+     "no result (exit 1); Claude Code said: Login expired · Please run /login"),
+    ("exit 1", "no result (exit 1)"),
+], ids=["with its words", "without"])
+def test_what_claude_code_wrote_on_its_error_output_is_named_as_its_words(tmp_path, script, error):
+    """After the harness's own words for the failure, as the `failed` alert,
+    which sessions are shown, has every word of Claude Code's."""
+    rr, _ = streamed(tmp_path, make_fake_claude(tmp_path, script))
+    assert not rr.ok and rr.error == error
+
+
 def test_long_lines_and_a_loud_stderr_do_not_stall_it(tmp_path, monkeypatch):
     fake = standin(tmp_path, monkeypatch, steps=[0.1], big=300_000, stderr=300_000)
     rr, _ = streamed(tmp_path, fake)
@@ -562,3 +574,37 @@ def test_a_stream_shape_it_does_not_know_fails_the_session(tmp_path, monkeypatch
         assert rr.ok and len(rr.results) == 1
     else:
         assert not rr.ok and rr.error == f"could not read the session's output: {said}"
+
+
+@pytest.mark.parametrize("error, said, why", [
+    ("rate_limit", "You've hit your limit · resets 5pm (America/Los_Angeles)", "usage limit"),
+    ("authentication_failed", "OAuth token revoked · Please run /login", "authentication"),
+    # where the assistant event says what failed, its words are not read
+    ("server_error", "API Error: 500 · Please run /login", None),
+    (None, "OAuth token revoked · Please run /login", "authentication"),
+], ids=["a usage limit", "a token refused", "another error", "no error given"])
+def test_a_streamed_session_claude_code_refused_says_why(tmp_path, monkeypatch, error, said, why):
+    fake = standin(tmp_path, monkeypatch, refuse={"turn": "first", "error": error, "said": said})
+    rr, _ = streamed(tmp_path, fake)
+    assert not rr.ok and rr.api_error == error and rr.error == said and refused(rr) == why
+
+
+@pytest.mark.parametrize("said, why", [
+    ("You've hit your limit · resets 5pm", "usage limit"),
+    ("Usage limit reached ∙ resets at 5pm", "usage limit"),
+    ("Claude AI usage limit reached|1759700000", "usage limit"),
+    ("Login expired · Please run /login", "authentication"),
+    ("Not logged in · Please run /login", "authentication"),
+    ("OAuth token revoked · Please run /login", "authentication"),
+    ("API Error: 401 Invalid API key · Please run /login", "authentication"),
+    ('API Error: 401 {"type":"error","error":{"type":"authentication_error"}}', "authentication"),
+    ("API Error: 4010 request req_240157 failed", None),
+    ("Invalid API key · Fix external API key", "authentication"),
+    ("Context limit reached · /compact or /clear to continue", None),
+    ("API Error: 500 request req_240157 failed", None),
+    ("error_during_execution", None),
+])
+def test_what_claude_code_says_when_it_will_not_run_is_read_where_no_error_is_given(said, why):
+    """A session run with --output-format json, as the clock's are, prints no
+    assistant event: its error's words are read, in any case."""
+    assert refused(RunResult(ok=False, error=said)) == why

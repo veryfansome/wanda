@@ -396,13 +396,38 @@ class Store:
     ) -> int:
         """notified=0 marks a run whose outcome still owes the owner a Slack
         message, so a restart can deliver it."""
-        cur = self._exec(
+        with self._lock:
+            run_id = self._insert_run(kind, task_id, session_id, started_at, exit_code, cost_usd, status, error,
+                                      result_text, notified)
+            self._db.commit()
+        return run_id
+
+    def record_run_and_note(self, note: str, **run) -> tuple[int, int]:
+        """A run, and her note in its conversation after it, a run of kind
+        `note` owed to the same task under the same session, written in one
+        transaction: a restart finds both or neither, so a failure is never
+        left with nothing said for it. Returns both ids."""
+        with self._lock:
+            try:
+                run_id = self._insert_run(**run)
+                note_id = self._insert_run("note", run["task_id"], run["session_id"], run["started_at"], None, 0.0,
+                                           "ok", None, note, 0)
+            except BaseException:
+                # or the next write's commit would keep the run alone
+                self._db.rollback()
+                raise
+            self._db.commit()
+        return run_id, note_id
+
+    def _insert_run(self, kind: str, task_id: int | None, session_id: str | None, started_at: str,
+                    exit_code: int | None, cost_usd: float | None, status: str, error: str | None = None,
+                    result_text: str | None = None, notified: int = 1) -> int:
+        return self._db.execute(
             "INSERT INTO runs(kind, task_id, session_id, started_at, ended_at, exit_code, cost_usd, "
             "status, error, result_text, notified) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
             (kind, task_id, session_id, started_at, utcnow(), exit_code, cost_usd, status, error,
              result_text, notified),
-        )
-        return cur.lastrowid
+        ).lastrowid
 
     def newest_run(self, task_id: int) -> int:
         """The id of the newest run recorded for this task, 0 for none."""
@@ -410,8 +435,9 @@ class Store:
         return rows[0]["id"]
 
     def run_after(self, task_id: int, run_id: int) -> sqlite3.Row | None:
-        """The first run recorded for this task after the run `run_id`."""
-        rows = self._query("SELECT * FROM runs WHERE task_id=? AND id > ? ORDER BY id LIMIT 1",
+        """The first session's run recorded for this task after the run
+        `run_id`: a note is not one."""
+        rows = self._query("SELECT * FROM runs WHERE task_id=? AND id > ? AND kind <> 'note' ORDER BY id LIMIT 1",
                            (task_id, run_id))
         return rows[0] if rows else None
 
@@ -427,8 +453,11 @@ class Store:
         return rows[0] if rows else None
 
     def runs_since(self, since: datetime) -> tuple[int, float]:
+        """The runs counted against the daily cap: not her notes, which run
+        nothing, nor a session Claude Code refused, which ran nothing."""
         rows = self._query(
-            "SELECT COUNT(*) AS n, COALESCE(SUM(cost_usd), 0) AS cost FROM runs WHERE started_at >= ?",
+            "SELECT COUNT(*) AS n, COALESCE(SUM(cost_usd), 0) AS cost FROM runs WHERE started_at >= ? "
+            "AND kind <> 'note' AND COALESCE(status, '') <> 'refused'",
             (since.astimezone(timezone.utc).isoformat(timespec="seconds"),),
         )
         return rows[0]["n"], rows[0]["cost"]
@@ -444,6 +473,13 @@ class Store:
 
     def mark_run_notified(self, run_id: int) -> None:
         self._exec("UPDATE runs SET notified=1 WHERE id=?", (run_id,))
+
+    def owed_before(self, run_id: int) -> bool:
+        """Whether a run recorded before this one in its task still owes its
+        conversation a post."""
+        return bool(self._query(
+            "SELECT 1 FROM runs r JOIN runs o ON o.task_id = r.task_id AND o.id < r.id AND o.notified = 0 "
+            "WHERE r.id = ? LIMIT 1", (run_id,)))
 
     def run_notified(self, run_id: int) -> bool:
         rows = self._query("SELECT notified FROM runs WHERE id=?", (run_id,))

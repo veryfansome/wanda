@@ -72,6 +72,69 @@ def test_runs_accounting(store):
     assert cost == pytest.approx(0.52)
 
 
+def test_her_notes_and_sessions_claude_code_refused_are_not_counted(store):
+    """A note runs nothing, and a session Claude Code refused ran nothing:
+    neither counts toward the daily cap."""
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    task = store.create_task(None, "D1", "conversation", kind="dm")
+    store.record_run_and_note("Sorry.", kind="agent", task_id=task, session_id="s", started_at=now, exit_code=1,
+                              cost_usd=0.5, status="error", error="x")
+    store.record_run(kind="agent", task_id=task, session_id="t", started_at=now, exit_code=1, cost_usd=0.0,
+                     status="refused", error="You've hit your limit")
+    assert store.runs_today() == (1, pytest.approx(0.5))
+
+
+def test_a_note_is_written_with_its_run_or_not_at_all(store, monkeypatch):
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    task = store.create_task(None, "D1", "conversation", kind="dm")
+    run, note = store.record_run_and_note("Sorry.", kind="agent", task_id=task, session_id="s", started_at=now,
+                                          exit_code=1, cost_usd=0.1, status="error", error="x")
+    assert [dict(r) for r in store._query("SELECT id, kind, session_id, result_text, notified FROM runs")] == [
+        {"id": run, "kind": "agent", "session_id": "s", "result_text": None, "notified": 1},
+        {"id": note, "kind": "note", "session_id": "s", "result_text": "Sorry.", "notified": 0}]
+    insert = store._insert_run
+
+    def fails_second(*a, **kw):
+        if a and a[0] == "note":
+            raise OSError("disk full")
+        return insert(*a, **kw)
+    monkeypatch.setattr(store, "_insert_run", fails_second)
+    with pytest.raises(OSError):
+        store.record_run_and_note("Sorry.", kind="agent", task_id=task, session_id="t", started_at=now,
+                                  exit_code=1, cost_usd=0.1, status="error", error="x")
+    store.set_meta("next", "write")  # a later write commits nothing of it
+    assert len(store._query("SELECT id FROM runs")) == 2
+
+
+def test_a_clock_wakes_run_is_found_past_a_note(store):
+    """The clock finds a wake's run as the first after the newest before it,
+    and a note can be written in the DM meanwhile, by a pass that does not
+    take the conversation's lock."""
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    task = store.create_task(None, "D1", "conversation", kind="dm")
+    before = store.newest_run(task)
+    store.record_run(kind="note", task_id=task, session_id=None, started_at=now, exit_code=None, cost_usd=0.0,
+                     status="ok", result_text="Sorry.", notified=0)
+    wake = store.record_run(kind="agent", task_id=task, session_id="w", started_at=now, exit_code=0, cost_usd=0.0,
+                            status="ok")
+    assert store.run_after(task, before)["id"] == wake
+
+
+def test_a_run_knows_whether_one_before_it_there_is_owed(store):
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    here, there = (store.create_task(None, c, "conversation", kind="dm") for c in ("D1", "D2"))
+
+    def run(task, owed):
+        return store.record_run(kind="agent", task_id=task, session_id=None, started_at=now, exit_code=0,
+                                cost_usd=0.0, status="ok", result_text="x", notified=0 if owed else 1)
+    first = run(here, True)
+    run(there, True)
+    second = run(here, False)
+    assert store.owed_before(second) and not store.owed_before(first)
+    store.mark_run_notified(first)
+    assert not store.owed_before(second)
+
+
 def test_trash_count_counts_moves_not_verdicts(store):
     ingest(store, "k1", 1)
     ingest(store, "k2", 2)

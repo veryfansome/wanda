@@ -732,7 +732,7 @@ class Refusing(FakeSlack):
         super().__init__()
         self.alerts = []
 
-    async def reply(self, thread_ts, text, channel=None, note=False):
+    async def reply(self, thread_ts, text, channel=None):
         raise RuntimeError("ratelimited")
 
     async def alert(self, text):
@@ -782,7 +782,7 @@ def test_a_look_whose_post_slack_refused_spoke_and_is_delivered_later(tmp_path, 
     task = store.get_task_by_thread("D-U1", "conversation")
     assert p._listed("U1", task) == "2026-09-30", "not delivered yet"
 
-    async def takes(thread_ts, text, channel=None, note=False):
+    async def takes(thread_ts, text, channel=None):
         pass
     slack.reply = takes
     asyncio.run(p.deliver_pending())
@@ -852,8 +852,8 @@ class Posts(FakeSlack):
         super().__init__()
         self.posts = []
 
-    async def reply(self, thread_ts, text, channel=None, note=False):
-        self.posts.append((channel, text, note))
+    async def reply(self, thread_ts, text, channel=None):
+        self.posts.append((channel, text))
 
 
 # a report filled with scaffolding, which is no report
@@ -896,7 +896,7 @@ def test_a_clock_session_posts_the_last_answer_it_gave_that_says_something(tmp_p
     now = datetime(2026, 10, 1, 8, 0, tzinfo=LA)
     asyncio.run(p._clock_session(clock.morning_wakes(now, {"U1": LOOKS["U1"]}, QUIET, lambda q: None,
                                                      NAMES.get)[0], now))
-    assert slack.posts == ([("D-U1", posted, False)] if posted else [])
+    assert slack.posts == ([("D-U1", posted)] if posted else [])
     run = store.run(1)
     assert (run["status"], run["result_text"]) == (
         ("ok", posted) if posted else ("timeout" if timed_out else "error", ""))
@@ -927,7 +927,7 @@ def test_a_timed_wake_that_gave_its_reminder_and_then_failed_gave_it(tmp_path, m
     asyncio.run(p._flush_lost())
     assert store.get_meta("clock:lost") is None and json.loads(store.get_meta("clock:waking")) == {}
     if posted:
-        assert slack.posts == [("D-U1", "It is 7: the gift for mei.", False)]
+        assert slack.posts == [("D-U1", "It is 7: the gift for mei.")]
         assert slack.alerts == ["the reminder trajectory:b6647b due 2026-10-01T19:00 was given, and its "
                                 "session then failed"]
     else:
@@ -1010,7 +1010,7 @@ class Held:
     async def alert(self, text):
         self.posted.append(("alert", text))
 
-    async def reply(self, thread_ts, text, channel=None, note=False):
+    async def reply(self, thread_ts, text, channel=None):
         if self.step == "post":
             self.reached.set()
             await asyncio.Event().wait()

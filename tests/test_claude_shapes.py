@@ -2,14 +2,15 @@
 checked in the code of a Claude Code binary, without starting a session: run
 with TEST_CLAUDE_BIN naming the binary of the version CLAUDE_VERSION in
 wanda.Dockerfile would move to, before it moves. A message added while a
-session works rests on shapes the pinned version (2.1.268) showed in
-sessions run against it with their input open, and that its code reads,
-none of them documented. A failure here means the stand-in
-(tests/claude_standin.py) no longer stands for that version: the version
-stays where it is until sessions run against it show those shapes again.
-Passing, the move still waits for live sessions in the scratch project
-compose.foldin-check.yaml sets up: sessions handed a message mid-turn, one
-after their last step, and two at once at a further turn's start."""
+session works rests on shapes the pinned version (2.1.268) showed in sessions
+run against it with their input open, and that its code reads, none of them
+documented; so does reading Claude Code's refusal to run a session, from the
+`error` its assistant event can carry, which no session has shown. A failure
+here means the stand-in (tests/claude_standin.py) no longer stands for that
+version: the version stays where it is until sessions run against it show those
+shapes again. Passing, the move still waits for live sessions in the scratch
+project compose.foldin-check.yaml sets up: sessions handed a message mid-turn,
+one after their last step, and two at once at a further turn's start."""
 
 import os
 import re
@@ -17,7 +18,7 @@ from pathlib import Path
 
 import pytest
 
-from wanda.runner import STREAM_EVENTS
+from wanda.runner import REFUSALS, STREAM_EVENTS
 
 BIN = os.environ.get("TEST_CLAUDE_BIN")
 pytestmark = pytest.mark.skipif(not BIN, reason="TEST_CLAUDE_BIN names no Claude Code binary to read")
@@ -78,6 +79,21 @@ def test_a_result_carries_what_the_runner_reads(code):
         missing = [[f for f in fields if f not in m[1].split(b"}))")[0]]
                    for _, _, m in find(code, b'("result"),subtype:', NAME + rb"\(" + subtype + rb"(.*)")]
         assert missing and min(missing, key=len) == [], (subtype, missing)
+
+
+def test_the_error_an_assistant_event_can_carry_names_each_refusal_the_runner_knows(code):
+    """Claude Code refusing to run a session is read from that field, from a
+    fixed list in its code, before any words: a refusal named otherwise there
+    would be read as an ordinary failure, and tried once more."""
+    event = next(find(code, b'("assistant"),message:', NAME + rb"\(\),parent_tool_use_id:[^,]*,error:(" + NAME
+                      + rb")\(\)\.optional\(\)"), None)
+    assert event, "no assistant event with an optional error"
+    at, _, m = event
+    enum = min(find(code, m[1] + b"=", NAME + rb'\(\(\)=>' + NAME + rb'\(\[("[a-z_]+"(?:,"[a-z_]+")*)\]\)\)',
+                    rb"(?<![\w$])"), key=lambda f: abs(f[0] - at), default=None)
+    assert enum, f"no list of values for {m[1]!r}"
+    values = {v.decode() for v in re.findall(rb'"([a-z_]+)"', enum[2][1])}
+    assert REFUSALS.keys() <= values, sorted(REFUSALS.keys() - values)
 
 
 def test_a_message_handed_mid_turn_is_a_queued_command_of_its_mode(code):

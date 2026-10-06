@@ -18,7 +18,7 @@ from wanda.store import Store
 from wanda.tls import ssl_context
 from wanda.transcript import harmless
 from wanda.triage import Verdict
-from wanda.vault import ALERT_EVENT, EARLIER, NOTE_EVENT
+from wanda.vault import ALERT_EVENT, EARLIER
 
 log = logging.getLogger(__name__)
 
@@ -132,19 +132,17 @@ class SlackActions:
                 return m["ts"]
         return None
 
-    async def reply(self, thread_ts: str | None, text: str, *, channel: str, note: bool = False) -> None:
+    async def reply(self, thread_ts: str | None, text: str, *, channel: str) -> None:
         """Both arguments are required and neither defaults. A default channel
         would silently publish a DM answer in the triage channel the one time a
-        caller forgot it — which is exactly what happened before. `note` marks
-        a failure note, which frames leave out. The text is rendered harmless
-        first."""
+        caller forgot it — which is exactly what happened before. The text is
+        rendered harmless first, and carries no mark: an answer and her note
+        are both hers."""
         await self._call(
             "chat_postMessage",
             channel=channel,
             thread_ts=thread_ts,
             text=harmless(text)[:39000],
-            **({"metadata": {"event_type": NOTE_EVENT, "event_payload": {"for": "the household"}}}
-               if note else {}),
         )
 
     # --- conversation context ---

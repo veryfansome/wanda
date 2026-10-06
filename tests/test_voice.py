@@ -90,6 +90,11 @@ def texts() -> list[tuple[str, str]]:
              ("09:07", vault.SOMEONE, "x" + vault.CUT.format(n="5,000"))], outside=True, unlisted=True)))
     found.append(("memory frame, a turn of two speakers", vault.arrival_text(
         "group", "alice", "hi", ["alice", "bob"], [("09:05", "bob", "earlier")], also=["bob"])))
+    # a turn whose messages earlier sessions took and did not answer
+    for place in vault.PLACES:
+        found.append((f"memory frame, a retry, {place}", vault.arrival_text(
+            place, "alice", "hi", ["alice"], [], unlisted=True,
+            opening=tuple(vault.RETRIED.format(sid8=sid) for sid in ("3f9a1c2e", "7b20d4e1")))))
     for place in vault.PLACES:
         found.append((f"a message added while the session works, {place}",
                       vault.added_text(place, "alice", "hi", "09:06")))

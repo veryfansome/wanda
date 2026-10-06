@@ -75,6 +75,13 @@ OUTSIDERS_READ = " Some who can read it are outside the household."
 # on the opening line, after OUTSIDERS_READ, when Slack would not say who is
 # in the conversation: the readers named are then the turn's speakers
 UNLISTED = " I could not find out who else is in it."
+# on the opening line, after those, once for each earlier session that took
+# the turn's messages and ended without answering them, oldest first: the
+# session it retries, or the one whose later turn failed after an answer.
+# {sid8} is the session's first eight characters, which `mem session` takes
+# as a prefix of its id.
+RETRIED = ("An earlier session of mine for this, {sid8}, ended before I answered; what it wrote to memory is "
+           "still there.")
 ME = "me"
 # Who posted one of her alerts, as a frame shows it: an alert carries the
 # harness's words, so it is never shown as something she said.
@@ -103,13 +110,12 @@ CUT = " [{n} more characters cut]"
 # CJK or emoji, 49 posts at CUT_AT could pass what a session's context holds,
 # which would fail the member's turn.
 OUTSIDE_CUT_AT = 40000
-# The marks the harness posts its alerts and its failure notes with (Slack
-# message metadata), which only an app can attach. An alert is for the people
-# who keep wanda running: a session is shown hers as an alert posted in her
-# name, never as something she said. A failure note carries Claude Code's
-# reason, in its words, not hers, and is left out of what a session is shown,
-# which then sees the message a failed run left unanswered as it would after
-# silence.
+# The mark the harness posts its alerts with (Slack message metadata), which
+# only an app can attach. An alert is for the people who keep wanda running: a
+# session is shown hers as an alert posted in her name, never as something she
+# said. NOTE_EVENT is on failure notes posted in Claude Code's words, which
+# conversations still hold: a session is not shown one. Her own notes carry no
+# mark, and are shown as hers.
 ALERT_EVENT = "wanda_alert"
 NOTE_EVENT = "wanda_note"
 
@@ -385,8 +391,8 @@ def from_outside(m: dict, own: frozenset[str], kin) -> bool:
 
 
 def _showable(m: dict, ts: str, own: frozenset[str]) -> bool:
-    # her failure note carries Claude Code's words; another app's post with
-    # the same mark is shown, its poster marked
+    # her marked failure note carries Claude Code's words; another app's post
+    # with the same mark is shown, its poster marked
     if _at(m) is None or m.get("subtype") in ("channel_join", "channel_leave"):
         return False
     mine = is_mine(m, own)
@@ -523,7 +529,7 @@ def _indent(text: str, n: int) -> str:
 
 def arrival_text(place: str, speaker: str, text: str, readers: list[str],
                  earlier: list[tuple[str, str, str]], also: list[str] = (), *, outside: bool = False,
-                 unlisted: bool = False) -> str:
+                 unlisted: bool = False, opening: tuple[str, ...] = ()) -> str:
     """The message as the session sees it. A direct message with nothing
     before it keeps the lab's frame; any other frame says who reads what is
     said there and shows what came before, each line with when it was sent.
@@ -533,22 +539,25 @@ def arrival_text(place: str, speaker: str, text: str, readers: list[str],
     says, in a public channel or a thread in one, which anyone in this Slack
     can read, that some who can are outside the household; elsewhere the marks
     on its readers say so. `unlisted` says that Slack would not say who else
-    is in the conversation."""
+    is in the conversation. `opening` is the sentences that go after those on
+    the opening line, RETRIED's; a direct message with any takes the shape
+    every other frame has, since the lab's has no line to hold them."""
     said = _indent(text, 4)
     after = f", after {' and '.join(also)}" if also else ""
-    if place == "dm" and not earlier and not also:
+    if place == "dm" and not earlier and not also and not opening:
         return f"{speaker} says to me, in a direct message:\n\n    {said}"
     room, heading = PLACES[place]
     who = ", ".join(readers or [speaker])
     if place.startswith("public"):
-        opening = (f"In {room} that anyone in this Slack can read; {who} and I are in it."
-                   + (OUTSIDERS_READ if outside else ""))
+        head = (f"In {room} that anyone in this Slack can read; {who} and I are in it."
+                + (OUTSIDERS_READ if outside else ""))
     else:
-        opening = f"In {room} that {who} and I read." + ("" if place == "dm" else EVERYONE)
-    opening += UNLISTED if unlisted else ""
+        head = f"In {room} that {who} and I read." + ("" if place == "dm" else EVERYONE)
+    head += UNLISTED if unlisted else ""
+    head += "".join(" " + sentence for sentence in opening)
     lines = "".join(f"    {when} {sp}: {_indent(tx, 8)}\n" for when, sp, tx in earlier if tx.strip())
     block, now = (f"{heading}\n\n{lines}\n", "now ") if lines else ("", "")
-    return f"{opening}\n\n{block}{speaker} {now}says{after}:\n\n    {said}"
+    return f"{head}\n\n{block}{speaker} {now}says{after}:\n\n    {said}"
 
 
 def prompt(date: str, arrival: str) -> str:
@@ -650,6 +659,39 @@ def handed(vault: Path, sid: str) -> list[str] | None:
             texts = _texts((e.get("message") or {}).get("content"))
             out += texts if opened else texts[1:]
             opened = opened or bool(texts)
+    return out
+
+
+class Turn(NamedTuple):
+    # begun by a message, not by a background command's notice of its end
+    member: bool
+    # the messages that began it, as `handed` gives them: the first turn's
+    # without the prompt
+    texts: list[str]
+
+
+def turn_starts(vault: Path, sid: str) -> list[Turn] | None:
+    """Each turn of a session, in order, as its transcript records the
+    message or the notice that began it. Claude Code gives each turn a
+    result, in the same order, so a turn past the session's last result
+    failed. None when the transcript cannot be read."""
+    try:
+        lines = (transcripts_dir(vault) / f"{sid}.jsonl").read_text(errors="replace").splitlines()
+    except OSError:
+        return None
+    out, opened = [], False
+    for line in lines:
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(e, dict) or e.get("type") != "user" or e.get("isMeta"):
+            continue
+        if _notice(e):
+            out.append(Turn(False, []))
+        elif texts := _texts((e.get("message") or {}).get("content")):
+            out.append(Turn(True, texts if opened else texts[1:]))
+            opened = True
     return out
 
 

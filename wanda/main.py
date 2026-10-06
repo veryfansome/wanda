@@ -28,7 +28,7 @@ from wanda.actions.slack import SlackActions
 from wanda.config import Config, load_config
 from wanda.events import Event
 from wanda.household import NAMES_EVERY_S, SHUT, Found, Household, found, memory_said, same, settle, tries
-from wanda.runner import RunnerService, RunResult
+from wanda.runner import RunnerService, RunResult, refused
 from wanda.store import Store, utcnow
 from wanda.tls import ssl_context
 from wanda.transcript import MENTION_RE, is_mine
@@ -97,6 +97,19 @@ BUDGET_REPLIES = {
     "breaker": "⚠️ daily budget breaker is tripped; try again after UTC midnight.",
     "busy": "⏳ I'm at my concurrent-run budget right now — reply again in a few minutes.",
 }
+# Her notes where a message's turn failed, posted where the message was, in
+# her words and with no mark, so that later sessions read each as a line of
+# hers. Claude Code's reason goes to the `failed` alert. A group DM's speaks to
+# everyone there, any of whom may have written what she missed.
+FAILED = "Sorry, I couldn't finish that one. Could you send it again in a little while?"
+FAILED_GROUP = "Sorry, I missed what was just said here. If any of it was for me, could you send it again?"
+# after her answer, for the message that began a later turn of her session
+# that failed, and failed again when run as the conversation's next turn
+FAILED_REST = "Sorry, I didn't get to what you added after that. Could you send it again?"
+FAILED_REST_GROUP = ("Sorry, I didn't get to what was said after that. If any of it was for me, could you send it "
+                     "again?")
+# the `failed` alert's classes of reason, each alerted at most once a UTC day
+FAILURE_CLASSES = ("timeout", "usage limit", "authentication", "other")
 
 
 def truncate(text: str | None, limit: int) -> str:
@@ -189,8 +202,9 @@ class Additions:
     `next()`, until the session has answered (`close()`), has taken
     FOLD_LIMIT of them or has run FOLD_FOR_S. `frame` gives None for a
     message that is not this session's to take. `give_back` puts what it was
-    not handed back on the list, for the conversation's next turn. `results`
-    holds the session's results as the runner reads them."""
+    not handed back on the list, for the conversation's next turn, and
+    `run_again` what began a turn of it that failed after an answer.
+    `results` holds the session's results as the runner reads them."""
 
     def __init__(self, waiting: list[dict], frame):
         self.waiting = waiting
@@ -212,6 +226,13 @@ class Additions:
         # (channel, ts) of messages deleted after they were taken
         self.withdrawn: set[tuple[str, str]] = set()
         self.results: list[dict] = []
+        # the earlier sessions that took the turn's messages and did not
+        # answer them, oldest first, which its frame names (vault.RETRIED)
+        self.earlier: list[str] = []
+        # whether the turn runs again what a later turn of a session failed
+        # on after an answer: it is that failure's one retry, and its own
+        # failure's note says what she did not get to
+        self.rerun = False
 
     def poke(self) -> None:
         self.more.set()
@@ -261,18 +282,41 @@ class Additions:
         """Puts each message taken back on the waiting list unless `handed`,
         the messages the session's transcript shows it was handed, holds it:
         every one when the transcript could not be read (None). Returns how
-        many it was handed."""
+        many it was handed, which `taken` then holds alone."""
         left = list(handed or [])
+        back, kept = [], []
+        for p, text in self.taken:
+            if text in left:
+                left.remove(text)
+                kept.append((p, text))
+            else:
+                back.append(p)
+        self.taken = kept
+        self._put_first(back)
+        return len(kept)
+
+    def run_again(self, texts: list[str], sid: str) -> int:
+        """Puts each message it was handed that `texts` holds, the messages
+        that began a turn of the session `sid` that failed after an answer,
+        back on the waiting list, marked with that session, for the
+        conversation's next turn to run again (`rerun`). The handlers of those
+        messages still wait for the conversation's lock, and find them there.
+        Returns how many."""
+        left = list(texts)
         back = []
         for p, text in self.taken:
             if text in left:
                 left.remove(text)
-            else:
+                p["again"] = sid
                 back.append(p)
+        self._put_first(back)
+        return len(back)
+
+    def _put_first(self, back: list[dict]) -> None:
+        # oldest first, ahead of what arrived since, but for one deleted
         if back:
             self.waiting[:0] = sorted((m for m in back if (m["channel"], m["ts"]) not in self.withdrawn),
                                       key=lambda m: float(m["ts"]))
-        return len(self.taken) - len(back)
 
 
 class Processor:
@@ -1193,6 +1237,7 @@ class Processor:
         await self.deliver_pending()
         await self._flush_abandoned_alert()
         await self._flush_given_up()
+        await self._flush_failed()
         await self._flush_lost()
         await self._flush_names()
         # a file left out for now, when snapshots.git or the vault did not
@@ -1491,6 +1536,41 @@ class Processor:
         left = [g for g in json.loads(self.store.get_meta("given_up_runs") or "[]") if g["id"] not in named]
         self.store.set_meta("given_up_runs", json.dumps(left))
 
+    def _failed(self, run_id: int, at: str, error: str, claude: bool, why: str, then: str) -> None:
+        """A message's turn that ended in her note, or in its messages run
+        again, or that failed after its answer with nothing more said: kept
+        for the `failed` alert of its class, `why`, by the run that failed,
+        when it started, the reason, Claude Code's own words marked as its,
+        and what followed."""
+        failed = json.loads(self.store.get_meta("failed_runs") or "[]")
+        failed.append({"id": run_id, "at": at, "why": why, "then": then,
+                       "said": truncate(f"Claude Code said: {error}" if claude else error, 300)})
+        self.store.set_meta("failed_runs", json.dumps(failed))
+
+    async def _flush_failed(self) -> None:
+        """The `failed` alert: one for each class of reason that has entries,
+        at most once a UTC day each, so that a day of timeouts holds back no
+        token Claude Code refused. Written from the list when it is due, so
+        none is dropped at a day's end. Each is named by its run and time,
+        never by its conversation, as an answer given up on is."""
+        today = datetime.now(timezone.utc).date().isoformat()
+        now = datetime.now(self.cfg.zone)
+        for why in FAILURE_CLASSES:
+            listed = [f for f in json.loads(self.store.get_meta("failed_runs") or "[]") if f["why"] == why]
+            if not listed or self.store.get_meta(f"failed_alert_date:{why}") == today:
+                continue
+            runs = "; ".join(f"run {f['id']} at {vault.stamp(datetime.fromisoformat(f['at']).timestamp(), now)}, "
+                             f"{f['said']}, {f['then']}" for f in listed)
+            try:
+                await self.slack.alert(f"{len(listed)} message session(s) failed ({why}): {runs}")
+            except Exception:
+                log.warning("failed alert (%s) undeliverable; will retry", why)
+                continue
+            self.store.set_meta(f"failed_alert_date:{why}", today)
+            named = {f["id"] for f in listed}
+            left = [f for f in json.loads(self.store.get_meta("failed_runs") or "[]") if f["id"] not in named]
+            self.store.set_meta("failed_runs", json.dumps(left))
+
     async def put_back(self) -> None:
         """Each node file `mem` cannot read put back from the snapshots, or
         left out (vault.put_back), each named in the `memory` alert, and named
@@ -1595,10 +1675,8 @@ class Processor:
             text = run["result_text"] or (
                 "⏸ I restarted while working on this — reply again to retry."
             )
-            # a failed run's text is its failure note, marked as when first posted
-            note = bool(run["result_text"]) and run["status"] in ("error", "timeout")
             try:
-                await self.slack.reply(run["reply_thread"], text, channel=run["slack_channel"], note=note)
+                await self.slack.reply(run["reply_thread"], text, channel=run["slack_channel"])
             except Exception:
                 held.add(run["task_id"])
                 attempts = self.store.bump_delivery_attempt(run["id"])
@@ -1628,10 +1706,20 @@ class Processor:
             # with no trace beyond an asyncio 'never retrieved' warning.
             log.exception("handling slack event %s failed", ev.dedupe_key)
             with contextlib.suppress(Exception):
-                await self.slack.reply(
-                    ev.payload.get("reply_thread"), "⚠️ I hit an internal error handling that reply.",
-                    channel=ev.payload.get("channel"),
-                )
+                await self.slack.reply(ev.payload.get("reply_thread"), self._unhandled(ev.payload),
+                                       channel=ev.payload.get("channel"))
+
+    def _unhandled(self, p: dict) -> str:
+        """What a message whose handling raised is told. A memory
+        conversation's turn records her note itself, so one reaches here only
+        when the store or Slack failed before it could, or as it did: her
+        note, posted with no run. An email task keeps its own text."""
+        task = None
+        with contextlib.suppress(Exception):
+            task = self.store.get_task_by_thread(p["channel"], p["task_key"])
+        if task is not None and task["kind"] == "email":
+            return "⚠️ I hit an internal error handling that reply."
+        return FAILED_GROUP if p.get("channel_type") == "mpim" else FAILED
 
     async def _handle_slack(self, ev: Event) -> None:
         p = ev.payload
@@ -1788,7 +1876,8 @@ class Processor:
         would answer a burst line by line, each blind to the lines after it.
         One that arrives while that session works is offered to it
         (Additions), so that its one answer takes it in; what it does not take
-        waits for the next turn."""
+        waits for the next turn. Whatever raises before the turn's outcome is
+        recorded gets her note in its place."""
         if not self._let_in(p):
             state["recorded"] = True  # nothing is said there, so nothing is owed
             return
@@ -1802,70 +1891,127 @@ class Processor:
                 state["recorded"] = True
                 return
             took = False
-            more = Additions(waiting, lambda m: self._added_text(m, more))
+            first: list[dict] = []
+            more = None
 
-            async def frame() -> tuple[str, datetime] | None:
-                nonlocal took
+            async def frame(again: str | None) -> tuple[str, datetime, Additions] | None:
+                # what waits, or for the retry of the session `again`, what
+                # that session took and what has waited since
+                nonlocal took, more
                 took = True
-                batch, waiting[:] = list(waiting), []
-                # what arrives from here on is offered to this turn's session first
-                self._additions[task["id"]] = more
-                return await self._frame_turn(task, batch, state, more)
+                if again is None:
+                    batch = list(waiting)
+                    first[:] = batch
+                else:
+                    batch = [m for m in first + [m for m, _ in more.taken]
+                             if (m["channel"], m["ts"]) not in more.withdrawn] + waiting
+                waiting[:] = []
+                fresh = Additions(waiting, lambda m: self._added_text(m, fresh))
+                fresh.earlier = list(dict.fromkeys(
+                    [m["again"] for m in sorted(batch, key=lambda m: float(m["ts"])) if m.get("again")]
+                    + ([again] if again else [])))
+                fresh.rerun = any(m.get("again") for m in batch)
+                # what arrives from here on is offered to this session first
+                more = self._additions[task["id"]] = fresh
+                framed = await self._frame_turn(task, batch, state, fresh)
+                return None if framed is None else (*framed, fresh)
 
             try:
                 await self.memory_turn(task, None, None, channel=p["channel"], reply_thread=p.get("reply_thread"),
-                                       owed=True, state=state, frame=frame, more=more)
+                                       owed=True, state=state, frame=frame, group=p.get("channel_type") == "mpim")
+            except Exception as e:
+                log.exception("the turn for %s in %s failed", p["ts"], p["channel"])
+                if not state.get("recorded"):
+                    await self._note_failure(task, p, f"an internal error: {str(e) or type(e).__name__}", state,
+                                             rest=took and more is not None and more.rerun)
             finally:
                 self._additions.pop(task["id"], None)
             if not took:
-                # refused before a session could start: the one reply answers
-                # every message waiting
+                # refused or failed before a session could start: the one
+                # reply answers every message waiting
                 waiting[:] = []
 
     async def _frame_turn(self, task, batch: list[dict], state: dict,
                           more: Additions | None = None) -> tuple[str, datetime] | None:
         """What a turn's session is handed, built once it holds its slot, which
         can take a whole session of another conversation: the turn's newest
-        message framed with the others and with who is in the conversation
-        now, and that message's time in the household's zone. None when there
-        is nothing to run: every message withdrawn while it waited, or a frame
-        that could not be built, which posts the failure note."""
+        message framed with the others, with who is in the conversation now
+        and with the earlier sessions that took its messages, and that
+        message's time in the household's zone. None when there is nothing to
+        run: every message withdrawn while it waited, or a frame that could
+        not be built, which posts her note."""
         if not batch:
             return None
         p = max(batch, key=lambda m: float(m["ts"]))
         now = datetime.fromtimestamp(float(p["ts"]), self.cfg.zone)
+        opening = tuple(vault.RETRIED.format(sid8=s[:8]) for s in (more.earlier if more is not None else ()))
         try:
-            arrival = await self._memory_arrival(p, batch, now, more)
+            arrival = await self._memory_arrival(p, batch, now, more, opening=opening)
         except Exception as e:
             log.exception("could not frame %s in %s", p["ts"], p["channel"])
-            text = f"⚠️ my run failed: I could not gather what was said here: {truncate(str(e), 900)}"
-            run_id = self.store.record_run(
-                kind="agent", task_id=task["id"], session_id=None, started_at=utcnow(),
-                exit_code=None, cost_usd=0.0, status="error", error=truncate(str(e), 1000),
-                result_text=text, notified=0,
-            )
-            state["recorded"] = True
-            await self._post_run(run_id, text, p["channel"], p.get("reply_thread"), note=True)
+            await self._note_failure(task, p, f"could not gather what was said here: {e}", state,
+                                     rest=more is not None and more.rerun)
             return None
         return arrival, now
 
+    async def _note_failure(self, task, p: dict, error: str, state: dict, rest: bool = False) -> None:
+        """A message's turn that failed outside a session, its frame or the
+        harness: a run that owes nothing, with the error, and her note in its
+        place; FAILED_REST when the turn ran again what a later turn failed
+        on after her answer (`rest`). A retry that failed so is named in the
+        `failed` alert by its first try, as one whose session failed is."""
+        group = p.get("channel_type") == "mpim"
+        note = (FAILED_REST_GROUP if group else FAILED_REST) if rest else FAILED_GROUP if group else FAILED
+        started = utcnow()
+        run_id, note_id = self.store.record_run_and_note(
+            note, kind="agent", task_id=task["id"], session_id=None, started_at=started, exit_code=None,
+            cost_usd=0.0, status="error", error=truncate(error, 1000))
+        state["recorded"] = True
+        if first := state.get("first"):
+            self._failed(*first[1:], "tried once more, a note asked for it again")
+        else:
+            self._failed(run_id, started, error, False, "other", "not tried again, a note asked for it again")
+        await self._post_run(note_id, note, p["channel"], p.get("reply_thread"))
+
+    @staticmethod
+    def _fails_again(rr: RunResult) -> bool:
+        """Whether a second session would fail as this one did: out of time,
+        its budget spent, or an output the runner cannot read."""
+        return (rr.timed_out or (rr.envelope or {}).get("subtype") == "error_max_budget_usd"
+                or (rr.error or "").startswith("could not read the session's output"))
+
     async def memory_turn(self, task, arrival: str | None, now: datetime | None, *, channel: str | None,
                           reply_thread: str | None, owed: bool, state: dict | None = None,
-                          frame: Callable[[], Awaitable[tuple[str, datetime] | None]] | None = None,
-                          more: Additions | None = None, sid: str | None = None) -> str | None:
+                          frame: Callable[[str | None], Awaitable[tuple[str, datetime, Additions] | None]]
+                          | None = None, sid: str | None = None, group: bool = False) -> str | None:
         """One memory session for an arrival, at `now` in the household's zone:
         a fresh `claude -p` with the lab's prompt, tools, schema and
         environment, and its answer, if it has one, posted once. Messages and
         the clock both start sessions here, the caller holding the
         conversation's lock. A message's turn passes `frame` in place of the
-        two: called once the session holds its slot, it returns them, or None
-        to run nothing, so that what the session is shown and who it is told
-        reads its answer are as they are when it starts. It passes `more` too:
-        the session's input then stays open for what is added to the
-        conversation while it works, the last of its answers that says
-        something is the one posted, an answer it gave before a stop cut a
-        later turn short is the run's, delivered at the next start, and what
-        it was not handed is put back for the conversation's next turn.
+        two: called once the session holds its slot, it returns them and the
+        Additions the session takes in while it works, or None to run nothing,
+        so that what the session is shown and who it is told reads its answer
+        are as they are when it starts. The session's input then stays open
+        for what is added to the conversation while it works, the last of its
+        answers that says something is the one posted, an answer it gave
+        before a stop cut a later turn short is the run's, delivered at the
+        next start, and what it was not handed is put back for the
+        conversation's next turn.
+
+        A message's session that fails with no turn of a member's reported is
+        tried once more, holding the slot, by a session `frame` is given the
+        first's id for; not when a second would fail the same way
+        (`_fails_again`), Claude Code refused to run it, or the first ran past
+        half its time. Its failure otherwise, or the retry's, gets her note
+        (FAILED; `group`, in a group DM, its words for everyone there). One
+        that answered and then failed in a later turn begun by an added
+        message, no later one reporting, has that message run again as the
+        conversation's next turn, framed with the session that failed, or her
+        note after the answer (FAILED_REST) when that would fail the same way
+        or is that next turn's own failure. Each such failure is kept for the
+        `failed` alert, with Claude Code's reason.
+
         `owed` is whether someone is waiting: if not, as for the clock, a
         refusal, a failure or a restart posts nothing, except that an answer
         an earlier turn gave is still posted when a later turn fails or runs
@@ -1884,178 +2030,264 @@ class Processor:
                 await self._refused(verdict, channel, reply_thread)
             state["recorded"] = True
             return verdict
-        started = utcnow()
         sid = sid or str(uuid.uuid4())
+        # the first session's failure, once it is tried once more: its id,
+        # its run, when it started, why, whether Claude Code said so, and
+        # the alert's class
+        first = None
         queued = time.monotonic()
         async with self.runner.agent_sem:
             # apart from the session's own time: with one session at a time,
             # another conversation's can come first
             waited = time.monotonic() - queued
-            if (verdict := await self.check_budget(reserve_usd=reserve)) != "ok":
-                if owed:
-                    await self._refused(verdict, channel, reply_thread)
-                state["recorded"] = True
-                return verdict
-            if frame is not None:
-                if (framed := await frame()) is None:
+            while True:
+                if (verdict := await self.check_budget(reserve_usd=reserve)) != "ok":
+                    if owed:
+                        await self._refused(verdict, channel, reply_thread)
                     state["recorded"] = True
-                    return None
-                arrival, now = framed
-            date = now.date().isoformat()
-            t0 = time.monotonic()
-            try:
-                with self._reserve(reserve):
-                    rr = await self.runner.run(
-                        vault.prompt(date, arrival),
-                        model=self.cfg.agent_model,
-                        max_budget_usd=self.cfg.agent_max_budget_usd,
-                        timeout_s=self.cfg.agent_timeout_s,
-                        output_schema=vault.SCHEMA,
-                        # the transcript Claude Code keeps under this id is
-                        # what `mem session` reads, and `made:` names it
-                        session_id=sid,
-                        append_system_prompt=f"{ANCHOR}\n\n{vault.date_paragraph(now)}",
-                        tools=vault.TOOLS,
-                        allowed_tools=vault.TOOLS,
-                        permission_mode="dontAsk",
-                        # loads the vault's CLAUDE.md, its settings and its skills
-                        setting_sources="project",
-                        cwd=str(self.cfg.vault_dir),
-                        env=vault.session_env(self.cfg, sid, now),
-                        inherit_env=False,
-                        # everything the session starts inherits it, so what
-                        # it leaves running is found and ended when it ends
-                        mark=f"MEM_SESSION={sid}",
-                        feed=more,
+                    return verdict
+                more = None
+                if frame is not None:
+                    if (framed := await frame(first and first[0])) is None:
+                        state["recorded"] = True
+                        return None
+                    arrival, now, more = framed
+                started = utcnow()
+                date = now.date().isoformat()
+                t0 = time.monotonic()
+                try:
+                    with self._reserve(reserve):
+                        rr = await self.runner.run(
+                            vault.prompt(date, arrival),
+                            model=self.cfg.agent_model,
+                            max_budget_usd=self.cfg.agent_max_budget_usd,
+                            timeout_s=self.cfg.agent_timeout_s,
+                            output_schema=vault.SCHEMA,
+                            # the transcript Claude Code keeps under this id is
+                            # what `mem session` reads, and `made:` names it
+                            session_id=sid,
+                            append_system_prompt=f"{ANCHOR}\n\n{vault.date_paragraph(now)}",
+                            tools=vault.TOOLS,
+                            allowed_tools=vault.TOOLS,
+                            permission_mode="dontAsk",
+                            # loads the vault's CLAUDE.md, its settings and its skills
+                            setting_sources="project",
+                            cwd=str(self.cfg.vault_dir),
+                            env=vault.session_env(self.cfg, sid, now),
+                            inherit_env=False,
+                            # everything the session starts inherits it, so what
+                            # it leaves running is found and ended when it ends
+                            mark=f"MEM_SESSION={sid}",
+                            feed=more,
+                        )
+                except asyncio.CancelledError:
+                    # an answer the session gave before a later turn was cut
+                    # short is the run's, delivered at the next start; the
+                    # conversation's one restart notice is left for what was
+                    # added after it
+                    given = vault.last_said(vault.answers(more.results)) if owed and more is not None else ""
+                    self.store.record_run(
+                        kind="agent", task_id=task["id"], session_id=sid, started_at=started,
+                        exit_code=None,
+                        cost_usd=min(
+                            self.cfg.agent_max_budget_usd,
+                            self.cfg.agent_expected_usd * max(1.0, (time.monotonic() - t0) / 60),
+                        ),
+                        status="ok" if given else "cancelled", error="daemon shut down mid-run",
+                        result_text=given or None,
+                        notified=0 if given or (owed and self._owes_notice(task["id"])) else 1,
                     )
-            except asyncio.CancelledError:
-                # an answer the session gave before a later turn was cut short
-                # is the run's, delivered at the next start; the conversation's
-                # one restart notice is left for what was added after it
-                given = vault.last_said(vault.answers(more.results)) if owed and more is not None else ""
-                self.store.record_run(
+                    state["recorded"] = True
+                    raise
+                ran = time.monotonic() - t0
+                if rr.left_running:
+                    # counted since the start for doctor; the runner's log names them
+                    left = int(self.store.get_meta("sessions_left_running") or 0) + 1
+                    self.store.set_meta("sessions_left_running", str(left))
+                # handed or not, by its transcript: what it was not handed has
+                # had no answer, and waits for the conversation's next turn
+                added = 0
+                if more and more.taken:
+                    added = more.give_back(await asyncio.to_thread(vault.handed, self.cfg.vault_dir, sid))
+                out = vault.report(rr.structured, rr.result_text) if rr.ok else None
+                final = vault.answer(out) if out is not None else ""
+                # an answer a turn before the last gave stands unless a later
+                # one says something: a turn begun by a message added after it
+                # may rightly say nothing more, or fail
+                earlier = rr.results[:-1] if rr.envelope is not None else rr.results
+                kept = vault.last_said(vault.answers(earlier))
+                if more is None and not final:
+                    # A session without a feed is one the clock starts, which
+                    # owes nobody. With its input closed after the prompt,
+                    # Claude Code prints the last turn's result alone, and a
+                    # turn begun by a background command's end after the
+                    # session gave its answer may say nothing, or fail. The
+                    # transcript keeps every turn's answer, and the last that
+                    # says something is posted when a later turn says nothing,
+                    # fails or runs out of time; a session a stop cancels
+                    # before then posts nothing, and the next start settles it
+                    # (settle_wakes).
+                    kept = vault.last_said(await asyncio.to_thread(vault.transcript_answers, self.cfg.vault_dir,
+                                                                   sid))
+                # a turn before the last that failed, as the runner reads a
+                # result's error, or ended without its report, told when
+                # nothing was said; a success's text is the model's, never
+                # posted as an error. The flag is whether the words are
+                # Claude Code's.
+                failed = next(((ev.get("result") or ev.get("subtype") or "claude reported an error", True)
+                               if ev.get("is_error") else ("the session ended without its report", False)
+                               for ev in earlier
+                               if ev.get("is_error")
+                               or vault.report(ev.get("structured_output"), ev.get("result")) is None),
+                              None)
+                if out is not None:
+                    text, error, claude = final or kept, None, False
+                    if not text and failed is not None:
+                        error, claude = failed
+                else:
+                    error, text = rr.error or "the session ended without its report", kept
+                    claude = rr.error is not None and bool((rr.envelope or {}).get("is_error"))
+                refusal = refused(rr) if error else None
+                # what follows a message's failure: "retry", a second session
+                # now; "note" or "rest", FAILED or FAILED_REST; "again", the
+                # messages that began the failed turn run as the next; or ""
+                # for the log and the alert alone
+                then, after = "", False
+                if error and owed and more is not None:
+                    then, after, text = await self._after_failure(rr, out, more, sid, text, refusal, ran,
+                                                                  first is None)
+                if then != "retry":
+                    break
+                # recorded quietly, owing nothing: the retry's outcome is the
+                # turn's
+                run_id = self.store.record_run(
                     kind="agent", task_id=task["id"], session_id=sid, started_at=started,
-                    exit_code=None,
-                    cost_usd=min(
-                        self.cfg.agent_max_budget_usd,
-                        self.cfg.agent_expected_usd * max(1.0, (time.monotonic() - t0) / 60),
-                    ),
-                    status="ok" if given else "cancelled", error="daemon shut down mid-run",
-                    result_text=given or None,
-                    notified=0 if given or (owed and self._owes_notice(task["id"])) else 1,
-                )
-                state["recorded"] = True
-                raise
-            ran = time.monotonic() - t0
-        if rr.left_running:
-            # counted since the start for doctor; the runner's log names them
-            left = int(self.store.get_meta("sessions_left_running") or 0) + 1
-            self.store.set_meta("sessions_left_running", str(left))
-        # handed or not, by its transcript: what it was not handed has had no
-        # answer, and waits for the conversation's next turn
-        added = 0
-        if more and more.taken:
-            added = more.give_back(await asyncio.to_thread(vault.handed, self.cfg.vault_dir, sid))
-        out = vault.report(rr.structured, rr.result_text) if rr.ok else None
-        final = vault.answer(out) if out is not None else ""
-        # an answer a turn before the last gave stands unless a later one says
-        # something: a turn begun by a message added after it may rightly say
-        # nothing more, or fail
-        earlier = rr.results[:-1] if rr.envelope is not None else rr.results
-        kept = vault.last_said(vault.answers(earlier))
-        if more is None and not final:
-            # A session without a feed is one the clock starts, which owes
-            # nobody. With its input closed after the prompt, Claude Code
-            # prints the last turn's result alone, and a turn begun by a
-            # background command's end after the session gave its answer may
-            # say nothing, or fail. The transcript keeps every turn's answer,
-            # and the last that says something is posted when a later turn
-            # says nothing, fails or runs out of time; a session a stop cancels
-            # before then posts nothing, and the next start settles it
-            # (settle_wakes).
-            kept = vault.last_said(await asyncio.to_thread(vault.transcript_answers, self.cfg.vault_dir, sid))
-        # a turn before the last that failed, as the runner reads a result's
-        # error, or ended without its report, told when nothing was said; a
-        # success's text is the model's, never posted as an error
-        failed = next(((ev.get("result") or ev.get("subtype") or "claude reported an error")
-                       if ev.get("is_error") else "the session ended without its report"
-                       for ev in earlier
-                       if ev.get("is_error") or vault.report(ev.get("structured_output"), ev.get("result")) is None),
-                      None)
-        if out is not None:
-            text, error = final or kept, None
-            if not text and failed is not None:
-                error = failed
-        else:
-            error = rr.error or "the session ended without its report"
-            text = kept
-        if not text and error and owed:
-            text = f"⚠️ my run failed: {truncate(error, 1000)}"
-        note = f"⚠️ my run failed: {truncate(error, 1000)}" if error and kept and owed else ""
+                    exit_code=rr.exit_code, cost_usd=rr.cost_usd, status="error", error=truncate(error, 1000))
+                looks = await asyncio.to_thread(vault.looks_back, self.cfg, sid)
+                self._log_session(sid, channel, waited, ran, added, rr, more, out,
+                                  f"failed: {error}; trying once more", looks)
+                # neither a timeout nor a refusal is tried once more; kept in
+                # `state` too, for her note when the retry fails outside its
+                # session
+                first = state["first"] = (sid, run_id, started, error, claude, "other")
+                sid, waited = str(uuid.uuid4()), 0.0
+        note = ""
+        if then in ("note", "rest"):
+            note = ((FAILED_REST_GROUP if group else FAILED_REST) if then == "rest"
+                    else FAILED_GROUP if group else FAILED)
         # recorded before it is posted and before the snapshot: a restart
         # while either runs still finds the answer here and delivers it
-        run_id = self.store.record_run(
+        run = dict(
             kind="agent", task_id=task["id"], session_id=sid, started_at=started,
             exit_code=rr.exit_code, cost_usd=rr.cost_usd,
             # answered, by a turn before the one that failed: the run is the
             # answer's, which a later delivery posts as an answer, its error
-            # kept beside it
-            status=("ok" if (out is not None and error is None) or kept
-                    else "timeout" if rr.timed_out else "error"),
+            # kept beside it; refused, a session Claude Code would not run,
+            # which no daily count includes
+            status=("ok" if (out is not None and error is None) or text
+                    else "refused" if refusal else "timeout" if rr.timed_out else "error"),
             error=truncate(error, 1000) if error else None,
             result_text=text,
             # an answer that reaches no one is kept, and owed to no one
             notified=0 if text and channel is not None else 1,
         )
+        if note:
+            run_id, note_id = self.store.record_run_and_note(note, **run)
+        else:
+            run_id = self.store.record_run(**run)
         state["recorded"] = True
         # posted before the snapshot, which can wait its turn behind another;
         # _post_run keeps deliver_pending off the run from its first line
         if text and channel is not None:
-            await self._post_run(run_id, text, channel, reply_thread, note=error is not None and not kept)
+            await self._post_run(run_id, text, channel, reply_thread)
         if note:
-            # after the answer it follows, once; it says the last turn failed,
-            # and is all a message handed to that turn is told
-            posted = False
-            if self.store.run_notified(run_id):
-                try:
-                    await self.slack.reply(reply_thread, note, channel=channel, note=True)
-                    posted = True
-                except Exception as e:
-                    log.warning("could not post the failure note after run %s in %s yet: %s; will retry",
-                                run_id, channel, e)
-            if not posted:
-                # Slack refused the answer or the note: the note is kept as a
-                # run of its own after the answer's, which deliver_pending
-                # posts once the answer is through or given up on
-                self.store.record_run(
-                    kind="agent", task_id=task["id"], session_id=sid, started_at=started, exit_code=None,
-                    cost_usd=0.0, status="error", error=truncate(error, 1000), result_text=note, notified=0)
+            # after the answer it follows, which delivery posts first while
+            # Slack refuses it
+            await self._post_run(note_id, note, channel, reply_thread)
+        follow = {"retry": "; trying once more", "note": "; a note asks for it again",
+                  "rest": "; a note asks for it again", "again": "; run again as the next turn"}.get(then, "")
+        if error and owed and more is not None:
+            why = refusal or ("timeout" if rr.timed_out else "other")
+            told = ", a note asked for it again" if note else ", no note"
+            retried = first is not None and not after
+            if then == "again":
+                self._failed(run_id, started, error, claude, why, "run again as the next turn")
+            elif retried and why == first[5]:
+                # a retry that failed as its first try did: named by the first
+                self._failed(*first[1:], "tried once more" + told)
+            elif retried:
+                # one that ran out of time or that Claude Code refused, under
+                # its own class, in its own words
+                self._failed(run_id, started, error, claude, why, f"the retry of run {first[1]}" + told)
+            else:
+                self._failed(run_id, started, error, claude, why, "not tried again" + told)
         # after the post, which reading the transcript would otherwise hold up
         looks = await asyncio.to_thread(vault.looks_back, self.cfg, sid)
-        log.info("memory session %s in %s: waited %.1f s for a slot, ran %.1f s, %d mem session call(s) "
-                 "over every transcript, as written in its commands, and %.1f s in the commands holding them; "
-                 "%d added, %d results, %d recalled, %d recorded, %s",
-                 sid, channel or "no conversation", waited, ran, looks.calls, looks.seconds, added,
-                 # a session without a feed prints its last result alone
-                 len(rr.results) if more is not None else int(rr.envelope is not None),
-                 len((out or {}).get("recalled") or []),
-                 len((out or {}).get("recorded") or []),
-                 (f"{len(text)} characters" + (" to post" if channel is not None else ", posted nowhere")
-                  + (f", then failed: {error}" if kept and error else ""))
-                 if text else (f"failed: {error}" if error else "silent"))
+        self._log_session(sid, channel, waited, ran, added, rr, more, out,
+                          (f"{len(text)} characters" + (" to post" if channel is not None else ", posted nowhere")
+                           + (f", then failed: {error}{follow}" if error else "")) if text
+                          else (f"{'silent, then ' if after else ''}failed: {error}{follow}" if error else "silent"),
+                          looks)
         if said := await asyncio.to_thread(vault.snapshot, self.cfg, f"after {sid}"):
             log.warning("%s", said)
             await self._alert_once("snapshot", f"vault snapshots: {said}")
         await self.put_back()
         return error
 
-    async def _post_run(self, run_id: int, text: str, channel: str, reply_thread: str | None, *,
-                        note: bool = False) -> None:
-        """`note`: the text is a failure note, posted with the mark frames
-        leave out."""
+    async def _after_failure(self, rr: RunResult, out: dict | None, more: Additions, sid: str, text: str,
+                             refusal: str | None, ran: float, first: bool) -> tuple[str, bool, str]:
+        """What follows a message's session that failed somewhere, by which of
+        its turns a member's message began (vault.turn_starts) and which of
+        those reported: what follows (memory_turn's `then`), whether it
+        failed after a member's turn reported, and the answer to post."""
+        starts = await asyncio.to_thread(vault.turn_starts, self.cfg.vault_dir, sid)
+        # each turn's report, None for one that failed; a session that gave
+        # no result is read as one turn, by its outcome
+        reports = [None if ev.get("is_error") else vault.report(ev.get("structured_output"), ev.get("result"))
+                   for ev in rr.results] or [out]
+        # a turn the transcript shows past the last result failed; with no
+        # transcript, every turn is read as a member's
+        n = max(len(starts or ()), len(reports))
+        member = [starts is None or i >= len(starts) or starts[i].member for i in range(n)]
+        reported = [i for i in range(n) if member[i] and i < len(reports) and reports[i] is not None]
+        # her note: FAILED_REST when the turn ran again what a later turn
+        # failed on after her answer
+        told = "rest" if more.rerun else "note"
+        if not reported:
+            if (first and not more.rerun and not refusal and not self._fails_again(rr)
+                    and ran <= self.cfg.agent_timeout_s / 2):
+                return "retry", False, ""
+            return told, False, ""
+        failed = [i for i in range(reported[-1] + 1, n) if member[i] and (i >= len(reports) or reports[i] is None)]
+        if failed:
+            if refusal or self._fails_again(rr):
+                return "rest", True, text
+            if starts is None:
+                # what it was handed is back on the waiting list already, its
+                # transcript showing nothing handed
+                return "again", True, text
+            if more.run_again([t for i in failed if i < len(starts) for t in starts[i].texts], sid):
+                return "again", True, text
+            return "rest", True, text
+        # nothing said, and a member's turn failed before the one that
+        # reported: the failure is told. A turn a background command's notice
+        # began, or an exit, after the last report is the log's and the
+        # alert's alone.
+        if not text and any(member[i] and (i >= len(reports) or reports[i] is None) for i in range(reported[-1])):
+            return told, False, text
+        return "", False, text
+
+    async def _post_run(self, run_id: int, text: str, channel: str, reply_thread: str | None) -> None:
+        """Posts a recorded run's text, unless a run recorded before it there
+        is still owed: it is left owed then, and the mail loop, woken, posts
+        both in their order, so that a note never goes before the answer it
+        follows."""
+        if self.store.owed_before(run_id):
+            self.queue.put_nowait(Event("slack", "owed"))
+            return
         self._delivering.add(run_id)  # keep deliver_pending off this row
         try:
-            await self.slack.reply(reply_thread, text, channel=channel, note=note)
+            await self.slack.reply(reply_thread, text, channel=channel)
         except Exception as e:
             # the run is recorded, so a refused post leaves it owed, and
             # deliver_pending posts it once Slack takes it
@@ -2064,6 +2296,20 @@ class Processor:
             self.store.mark_run_notified(run_id)
         finally:
             self._delivering.discard(run_id)
+
+    def _log_session(self, sid: str, channel: str | None, waited: float, ran: float, added: int, rr: RunResult,
+                     more: Additions | None, out: dict | None, outcome: str, looks: vault.LookBack) -> None:
+        """A session's line in the log: its wait for a slot, its time, its
+        looks back, what it was handed and reported, and what it came to."""
+        log.info("memory session %s in %s: waited %.1f s for a slot, ran %.1f s, %d mem session call(s) "
+                 "over every transcript, as written in its commands, and %.1f s in the commands holding them; "
+                 "%d added, %d results, %d recalled, %d recorded, %s",
+                 sid, channel or "no conversation", waited, ran, looks.calls, looks.seconds, added,
+                 # a session without a feed prints its last result alone
+                 len(rr.results) if more is not None else int(rr.envelope is not None),
+                 len((out or {}).get("recalled") or []),
+                 len((out or {}).get("recorded") or []),
+                 outcome)
 
     async def _refused(self, verdict: str, channel: str, reply_thread: str | None) -> None:
         try:
@@ -2112,13 +2358,14 @@ class Processor:
         return await self.slack.members(p["channel"])
 
     async def _memory_arrival(self, p: dict, batch: list[dict], now: datetime,
-                              more: Additions | None = None) -> str:
+                              more: Additions | None = None, opening: tuple[str, ...] = ()) -> str:
         """The newest message of a turn as its session is handed it: who said
         it, where, who reads the answer and which of them are outside the
         household, and what came before, the turn's other messages and her
         answers to the turns before included. When Slack will not say who
         reads, the session is told so, and the turn's speakers are named.
-        `more` keeps the place, the time and the names it gives."""
+        `opening` is the further sentences of its opening line. `more` keeps
+        the place, the time and the names it gives."""
         try:
             ids, unlisted = await self._readers(p), False
         except Exception as e:
@@ -2173,7 +2420,7 @@ class Processor:
             place, named[p["user"]], vault.message_text(p.get("text"), p.get("files"), named), listed,
             vault.earlier(msgs, p["ts"], place, named, own, now, kin=kin, thread=limit, namesakes=namesakes),
             also=sorted({named[m["user"]] for m in batch} - {named[p["user"]]}), outside=outside,
-            unlisted=unlisted,
+            unlisted=unlisted, opening=opening,
         )
 
     async def _look_up(self, want: set[str], shown: list[dict], turn: list[dict], own: frozenset[str], kin,

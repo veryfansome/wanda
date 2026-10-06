@@ -574,12 +574,13 @@ def test_the_workspace_is_read_each_time(monkeypatch):
     assert before == ["U1"] and after == ["U1", "U3"] and sa.web.lists == 2
 
 
-def test_alerts_and_failure_notes_carry_the_harness_marks(monkeypatch):
-    """An alert and a failure note are posted with the harness's marks, an
-    answer with none, and the context a frame is built from is read with the
-    marks, so `vault.earlier` can tell them apart."""
+def test_alerts_carry_the_harness_mark_and_her_answers_and_notes_none(monkeypatch):
+    """An alert is posted with the harness's mark, an answer or her note with
+    none, and the context a frame is built from is read with the marks, so
+    `vault.earlier` can tell them apart."""
     import wanda.actions.slack as actions
-    from wanda.vault import ALERT_EVENT, NOTE_EVENT
+    from wanda.main import FAILED
+    from wanda.vault import ALERT_EVENT
 
     class Web:
         def __init__(self):
@@ -605,13 +606,13 @@ def test_alerts_and_failure_notes_carry_the_harness_marks(monkeypatch):
         await sa.alert("a vault snapshot failed")
         await sa.fetch_context("D1", None, 0.0)
         await sa.fetch_context("C1", "5.5", 0.0)
-        await sa.reply(None, "⚠️ my run failed: x", channel="D1", note=True)
+        await sa.reply(None, FAILED, channel="D1")
         await sa.reply(None, "an answer", channel="D1")
 
     asyncio.run(go())
     (_, post), (_, history), (_, replies), (_, note), (_, answer) = sa.web.calls
     assert post["channel"] == "U0FAN" and post["metadata"]["event_type"] == ALERT_EVENT
-    assert note["metadata"]["event_type"] == NOTE_EVENT and "metadata" not in answer
+    assert "metadata" not in note and "metadata" not in answer
     assert history["include_all_metadata"] is True and replies["include_all_metadata"] is True
 
 

@@ -5,6 +5,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import signal
 import subprocess
 import time
@@ -38,6 +39,21 @@ STREAM_EVENTS = frozenset({
 # what a result must carry for the harness to read it: its outcome and cost,
 # and a successful one its text
 RESULT_FIELDS = (("subtype", str), ("is_error", bool), ("total_cost_usd", (int, float)))
+# Claude Code refusing to run a session at all, which a second session would
+# meet the same way: its usage limit, or a token it no longer takes. A streamed
+# session's assistant event carries an `error` from a fixed list, which
+# decides wherever there is one; a session run with --output-format json
+# prints none, and its error's words are read for Claude Code's phrases
+# instead. "Context limit reached" is not one of them, and is a failure like
+# any other.
+REFUSALS = {"rate_limit": "usage limit", "billing_error": "usage limit",
+            "authentication_failed": "authentication", "oauth_org_not_allowed": "authentication",
+            "account_on_hold": "authentication"}
+REFUSED_SAYING = (
+    ("usage limit", re.compile(r"you['’]ve hit your|usage limit reached", re.IGNORECASE)),
+    ("authentication", re.compile(r"please run /login|oauth token|invalid api key|api error:\s*401\b",
+                                  re.IGNORECASE)),
+)
 
 
 @dataclass
@@ -55,6 +71,25 @@ class RunResult:
     left_running: int = 0
     # every result a streamed session gave, in order, one a turn
     results: list[dict] = field(default_factory=list)
+    # the `error` of a streamed session's last assistant event, which says
+    # why the API would not answer
+    api_error: str | None = None
+
+
+def refused(rr: RunResult) -> str | None:
+    """Why Claude Code would not run a session, "usage limit" or
+    "authentication", or None for any other failure (REFUSALS)."""
+    if rr.api_error is not None:
+        return REFUSALS.get(rr.api_error)
+    return next((why for why, saying in REFUSED_SAYING if saying.search(rr.error or "")), None)
+
+
+def said(err: str) -> str:
+    """What Claude Code wrote on its error output, put after the harness's
+    own words for a failure and marked as Claude Code's: the `failed` alert
+    is shown to sessions, which would otherwise read an imperative there,
+    such as "Please run /login", as the harness's or her own."""
+    return f"; Claude Code said: {err[:500]}" if err else ""
 
 
 def user_line(text: str) -> bytes:
@@ -203,6 +238,7 @@ class RunnerService:
         # caller every answer the session gave
         results: list[dict] = feed.results
         began = asyncio.Event()
+        api_error: str | None = None
 
         async def write_input() -> None:
             try:
@@ -223,6 +259,7 @@ class RunnerService:
                     proc.stdin.close()
 
         async def read_output() -> None:
+            nonlocal api_error
             async for line in proc.stdout:
                 if not line.strip():
                     continue
@@ -239,7 +276,9 @@ class RunnerService:
                         missing.append("result")
                     if missing:
                         raise ValueError(f"a result without {', '.join(missing)}")
-                if ev.get("type") == "system" and ev.get("subtype") == "init":
+                if kind == "assistant":
+                    api_error = ev.get("error")
+                elif kind == "system" and ev.get("subtype") == "init":
                     began.set()
                 elif ev.get("type") == "result":
                     results.append(ev)
@@ -259,7 +298,7 @@ class RunnerService:
                 await self._kill_group(proc)
                 left = await self._end_left_behind(proc.pid, mark)
                 return RunResult(ok=False, timed_out=True, cost_usd=max_budget_usd, results=results,
-                                 error=f"timed out after {timeout_s}s", left_running=left)
+                                 error=f"timed out after {timeout_s}s", left_running=left, api_error=api_error)
             except asyncio.CancelledError:
                 self._kill_group_now(proc)
                 raise
@@ -268,7 +307,7 @@ class RunnerService:
                 # that ran out of time
                 await self._kill_group(proc)
                 left = await self._end_left_behind(proc.pid, mark)
-                return RunResult(ok=False, cost_usd=max_budget_usd, results=results,
+                return RunResult(ok=False, cost_usd=max_budget_usd, results=results, api_error=api_error,
                                  error=f"could not read the session's output: {e}", left_running=left)
             finally:
                 feed.close()
@@ -286,11 +325,11 @@ class RunnerService:
         if not results:
             err = stderr.decode("utf-8", "replace").strip()
             return RunResult(
-                ok=False, exit_code=proc.returncode, left_running=left,
+                ok=False, exit_code=proc.returncode, left_running=left, api_error=api_error,
                 # as for an envelope that never came: the ceiling, unless it
                 # ended too soon to have bought anything
                 cost_usd=max_budget_usd if time.monotonic() - t0 > MIN_BILLABLE_S else 0.0,
-                error=f"no result (exit {proc.returncode}): {err[:500]}",
+                error=f"no result (exit {proc.returncode})" + said(err),
             )
         if proc.returncode != 0 and not results[-1].get("is_error"):
             # an exit that says it failed after a result that says it
@@ -299,12 +338,13 @@ class RunnerService:
             # session's report, never an error to post
             err = stderr.decode("utf-8", "replace").strip()
             return RunResult(ok=False, exit_code=proc.returncode, results=results, left_running=left,
+                             api_error=api_error,
                              cost_usd=max_budget_usd if time.monotonic() - t0 > MIN_BILLABLE_S else 0.0,
-                             error=f"claude exited {proc.returncode} after its last result"
-                             + (f": {err[:500]}" if err else ""))
+                             error=f"claude exited {proc.returncode} after its last result" + said(err))
         rr = self._parse(proc.returncode, json.dumps(results[-1]).encode(), stderr)
         rr.results = results
         rr.left_running = left
+        rr.api_error = api_error
         return rr
 
     @staticmethod

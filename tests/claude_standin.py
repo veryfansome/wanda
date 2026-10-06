@@ -28,7 +28,9 @@ clock starts runs: the prompt is all of stdin, recorded as a string, the
 turns run as above, and only the last turn's result is printed, once it
 exits, as 2.1.268's code reads.
 
-What it does is set by the JSON in the STANDIN environment variable:
+What it does is set by the JSON in the STANDIN environment variable, or by
+each of a list of them, one for each session in the order they start under
+the same home, the last for every one after:
 `startup_s`, `steps` (seconds each tool call of the first turn takes),
 `reply_s` (time from the last tool call to the result), `steps_later` (the
 tool calls of a later turn), `fail` ("first" or "later": that turn's result
@@ -46,7 +48,11 @@ this long, in characters),
 outlives it, its pid written to ~/left.pid), `answer_new` (a later turn
 answers only what it was handed since the turn before), `event` (an event
 written after the first tool call), `result_without` (a field every result
-leaves out).
+leaves out), `refuse` (`turn`, "first" or "later": that turn is refused
+before any step, Claude Code saying `said` in an assistant message whose
+`error` is `error`, one of the list its output schema gives that field, or
+none when `error` is null, and in a result that is an error; no session has
+shown this result's shape, which follows the error results above).
 
 Its answer says how many messages it was handed, and which, so a test can
 tell what the one answer covered."""
@@ -93,6 +99,12 @@ def said(text):
 def main():
     argv = sys.argv[1:]
     cfg = json.loads(os.environ.get("STANDIN") or "{}")
+    if isinstance(cfg, list):
+        counted = os.path.join(os.path.expanduser("~"), "standin-sessions")
+        n = int(open(counted).read()) if os.path.exists(counted) else 0
+        with open(counted, "w") as f:
+            f.write(str(n + 1))
+        cfg = cfg[min(n, len(cfg) - 1)]
     streamed = arg(argv, "--output-format") == "stream-json"
     if (arg(argv, "--input-format") == "stream-json") != streamed or arg(argv, "--output-format") not in (
             "json", "stream-json"):
@@ -205,6 +217,18 @@ def main():
               "claude_code_version": "2.1.268", "uuid": str(uuid.uuid4())})
         if not notice:
             handed.extend(texts(msg))
+        if (refuse := cfg.get("refuse")) and refuse["turn"] == ("later" if index else "first"):
+            words = {"type": "text", "text": refuse["said"]}
+            emit({"type": "assistant", "message": {"role": "assistant", "content": [words]},
+                  "parent_tool_use_id": None, "session_id": sid, "uuid": str(uuid.uuid4()),
+                  **({"error": refuse["error"]} if refuse.get("error") else {})})
+            record({"type": "assistant", "message": {"role": "assistant", "content": [words]}, "timestamp": now(),
+                    "sessionId": sid})
+            emit({"type": "result", "subtype": "success", "is_error": True, "num_turns": 1, "result": refuse["said"],
+                  "session_id": sid, "total_cost_usd": round(cost, 4), "result_index": index,
+                  "queued_turn_count": 0, "uuid": str(uuid.uuid4())})
+            index += 1
+            return
         if cfg.get("hang") in (True, "later" if index else "first"):
             time.sleep(3600)
         for n, secs in enumerate(steps):
