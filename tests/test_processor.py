@@ -20,7 +20,7 @@ from slack_sdk.errors import SlackApiError
 
 from wanda.config import Config
 from wanda.events import Event
-from wanda import main, vault
+from wanda import clock, main, vault
 from wanda.household import NAMES_EVERY_S, Household
 from wanda.main import ANCHOR, BUDGET_REPLIES, MAX_APPLY_ATTEMPTS, RETRY_BASE_S, Additions, Processor
 from wanda.runner import RunResult, RunnerService
@@ -3066,12 +3066,15 @@ def test_a_message_kept_a_week_runs_late_saying_when_she_was_not_running(tmp_pat
 
 
 def a_start(tmp_path, monkeypatch, runner, slack, *, connect=(), dies=False,
-            recovery=Processor.startup_recovery):
+            recovery=Processor.startup_recovery, loop=None, snapshot=None, watcher_stops=None):
     """A daemon start on the run store in `tmp_path`, as run_daemon makes
     it, against fakes: Slack is `slack`, each session runs on `runner`, and
-    `connect` is what the watcher is handed as it connects. It stops once
-    what the start ran again has ended and the mail loop has had a pass, or
-    dies once what was kept is taken up."""
+    `connect` is what the watcher is handed as it connects, the watcher
+    then being `slack.watcher`. It stops once what the start ran again has
+    ended and the mail loop has had a pass, or dies once what was kept is
+    taken up; or `loop` is the mail loop, and the test stops it. `snapshot`
+    stands in for the vault's snapshots, and `watcher_stops` is called as
+    the watcher is stopped."""
     slack.know_own_ids = lambda ids: None
 
     async def user_now(uid):
@@ -3080,6 +3083,7 @@ def a_start(tmp_path, monkeypatch, runner, slack, *, connect=(), dies=False,
 
     def start(watcher):
         connected(watcher)
+        slack.watcher = watcher
         for event in connect:
             watcher._handle(SimpleNamespace(send_socket_mode_response=lambda r: None),
                             SimpleNamespace(type="events_api", envelope_id="e", payload={"event": event}))
@@ -3097,13 +3101,13 @@ def a_start(tmp_path, monkeypatch, runner, slack, *, connect=(), dies=False,
     monkeypatch.setattr("wanda.main.SlackActions", lambda cfg, store: slack)
     monkeypatch.setattr("wanda.main.RunnerService", lambda claude_bin, **kw: runner)
     monkeypatch.setattr("wanda.main.SlackWatcher.start", start)
-    monkeypatch.setattr("wanda.main.SlackWatcher.stop", lambda self: None)
-    monkeypatch.setattr("wanda.main.Processor.loop", one_pass)
+    monkeypatch.setattr("wanda.main.SlackWatcher.stop", lambda self: watcher_stops and watcher_stops())
+    monkeypatch.setattr("wanda.main.Processor.loop", loop or one_pass)
     monkeypatch.setattr("wanda.main.Processor.startup_recovery", dying if dies else recovery)
     # framed at their own time, as in memory_processor
     monkeypatch.setattr(main, "LATE_TURN_S", 10 ** 9)
     monkeypatch.setattr("wanda.vault.prepare", lambda c, now, since=None: None)
-    monkeypatch.setattr("wanda.vault.snapshot", lambda cfg, message: None)
+    monkeypatch.setattr("wanda.vault.snapshot", snapshot or (lambda cfg, message: None))
     monkeypatch.setattr("wanda.vault.last_snapshot", lambda cfg: "none")
     monkeypatch.setattr("wanda.main.acquire_lock", lambda path: None)
     asyncio.run(main.run_daemon(start_config(tmp_path)))
@@ -3309,6 +3313,333 @@ def test_two_earlier_sessions_in_one_batch_are_each_named_oldest_first(tmp_path,
     started_again(p, runner)
     assert (f"{vault.RETRIED.format(sid8='3f9a1c2e')} {vault.RETRIED.format(sid8='7b20d4e1')}\n\n"
             in runner.calls[0][0])
+
+
+# --- a planned stop ---
+
+def test_a_stop_lets_the_running_session_answer_record_and_snapshot_before_the_store_closes(tmp_path, monkeypatch,
+                                                                                            caplog):
+    """SIGTERM while the session a start took up works: the stop says so,
+    ends the clock and the reads of names at once, and waits for it, the mail
+    loop passing meanwhile and Slack still connected, so that what fan sends
+    then is kept, dispatched and offered to the session; its answer is
+    posted and recorded and the vault snapshotted, and only then does the
+    daemon shut down, stopping the watcher and writing when she last ran
+    just before the store closes. What fan sent, never taken in, is left due
+    for the next start."""
+    import logging
+
+    events = []
+
+    class Into(logging.Handler):
+        def emit(self, record):
+            events.append(record.getMessage())
+
+    class Stopped(RecordingRunner):
+        """Stops the daemon as its session starts, fan writing again in its
+        DM while it works, and answers a little later."""
+
+        async def run(self, prompt, **kw):
+            events.append("the session starts")
+            os.kill(os.getpid(), signal.SIGTERM)
+            await asyncio.sleep(0.1)
+            slack.watcher._handle(SimpleNamespace(send_socket_mode_response=lambda r: None), SimpleNamespace(
+                type="events_api", envelope_id="e2", payload={"event": {
+                    "type": "message", "user": "U1", "channel": "D1", "channel_type": "im", "ts": f"{AT + 60:.1f}",
+                    "text": "and the water?"}}))
+            for _ in range(100):
+                if any(m["ts"] == f"{AT + 60:.1f}" for m in kw["feed"].waiting):
+                    events.append("offered to the session")
+                    break
+                await asyncio.sleep(0.01)
+            await asyncio.sleep(0.2)
+            events.append("the session ends")
+            return await super().run(prompt, **kw)
+
+    def every(what):
+        async def loop(self):
+            while True:
+                await asyncio.sleep(0.05)
+                events.append(what)
+        return loop
+
+    set_meta, close = Store.set_meta, Store.close
+
+    def marked(self, key, value):
+        if key == "up_at":
+            events.append("up_at")
+        set_meta(self, key, value)
+
+    def closed(self):
+        events.append("the store closes")
+        close(self)
+    monkeypatch.setattr(Store, "set_meta", marked)
+    monkeypatch.setattr(Store, "close", closed)
+    monkeypatch.setattr("wanda.main.Processor.clock_loop", every("a tick"))
+    monkeypatch.setattr("wanda.main.Processor.names_loop", every("a tick"))
+    store = Store(start_config(tmp_path).db_path)
+    keep(store, dm(f"{AT:.1f}", "is it paid?"))
+    slack, into = ConversationSlack(history=[]), Into()
+    logging.getLogger("wanda").addHandler(into)
+    try:
+        with caplog.at_level(logging.INFO, logger="wanda"):
+            a_start(tmp_path, monkeypatch, Stopped(answer("Yes, on Monday.")), slack, loop=every("a pass"),
+                    snapshot=lambda cfg, message: events.append(f"snapshot {message}"),
+                    watcher_stops=lambda: events.append("the watcher stops"))
+    finally:
+        logging.getLogger("wanda").removeHandler(into)
+    stopping = "stopping: letting 1 session(s) finish, for up to 960 s"
+    session = next(e for e in events if e.startswith("memory session "))
+    at = events.index
+    assert (at("the session starts") < at(stopping) < at("offered to the session") < at("the session ends")
+            < at(session) < at(f"snapshot after {session.split()[2]}") < at("shutting down")
+            < at("the watcher stops")), events
+    assert "a pass" in events[at(stopping):at("shutting down")] and "a tick" not in events[at(stopping):]
+    assert events[at("shutting down"):][-2:] == ["up_at", "the store closes"]
+    assert slack.replies == ["Yes, on Monday."] and kept(store) == [(f"{AT + 60:.1f}", "due", 0, None)]
+    assert [r["status"] for r in store._query("SELECT status FROM runs")] == ["ok"]
+
+
+def test_a_stop_folds_a_message_into_the_running_session_and_starts_no_other(tmp_path, monkeypatch, caplog):
+    """While fan's session works, mei's message waits for the one session's
+    place; the stop cancels her turn and waits for his. What he adds
+    meanwhile is taken into his session's one answer, and what she sends
+    starts nothing: both of hers are left due, untried, for the next start."""
+    import logging
+
+    p, store, _, slack = standin_processor(tmp_path, monkeypatch, steps=[1.0, 0.2])
+    asked, added = dm(f"{AT:.1f}", "can you remind me at 5"), dm(f"{AT + 30:.1f}", "to call the plumber")
+    waits, later = (dm(f"{AT + i:.1f}", text, channel="D2", user="U2")
+                    for i, text in ((10, "is the gas paid?"), (40, "and the water?")))
+
+    def handled(ev):
+        # as the watcher keeps it and slack_loop dispatches it
+        keep(store, ev)
+        t = asyncio.create_task(p.handle_slack(ev))
+        p._bg.add(t)
+        return t
+
+    async def go():
+        handled(asked)
+        await moment(("tool_use", 1, 0.1), p.cfg.vault_dir)
+        waiting = handled(waits)
+        await asyncio.sleep(0.1)
+        stop = asyncio.create_task(p.let_finish(30))
+        await asyncio.sleep(0.05)
+        handled(added), handled(later)
+        await asyncio.wait_for(stop, 10)
+        await p.shutdown(grace_s=1)
+        return waiting
+    with caplog.at_level(logging.INFO, logger="wanda"):
+        waiting = asyncio.run(go())
+    assert "stopping: letting 1 session(s) finish, for up to 30 s" in caplog.text
+    assert waiting.cancelled()
+    assert slack.replies == ["one answer to 2: can you remind me at 5 | to call the plumber"]
+    assert [r["status"] for r in store._query("SELECT status FROM runs")] == ["ok"]
+    assert kept(store) == [(f"{AT + 10:.1f}", "due", 0, None), (f"{AT + 40:.1f}", "due", 0, None)]
+
+
+def test_a_stop_cancels_a_clock_wake_waiting_for_the_dm_a_session_works_in(tmp_path, monkeypatch):
+    """fan's 19:00 reminder, claimed while his message's session works in his
+    DM, waits for it: the stop cancels it there, as before, and the next
+    start wakes it again; his session answers."""
+    class InHisDM(ConversationSlack):
+        async def dm_channel(self, user):
+            return "D1"
+
+    runner = Held(answer("Yes, on Monday."))
+    p, store, _ = memory_processor(tmp_path, InHisDM(history=[]), runner, monkeypatch)
+    at = datetime(2026, 10, 1, 19, 3, tzinfo=p.cfg.zone)
+    w = clock.Wake("clock:due:b6647b:2026-10-01T19:00:fan", "U1", "    I undertook to remind fan at 7",
+                   about="b6647b", by="2026-10-01T19:00", asked="fan")
+
+    async def go():
+        turn = asyncio.create_task(p.handle_slack(dm(f"{AT:.1f}", "is it paid?")))
+        p._bg.add(turn)
+        while not runner.running:
+            await asyncio.sleep(0.01)
+        wake = asyncio.create_task(p._clock_session(w, at))
+        p._bg.add(wake)
+        while not store.get_meta(w.key):
+            await asyncio.sleep(0.01)  # claimed, and waiting for his DM
+        stop = asyncio.create_task(p.let_finish(30))
+        await asyncio.sleep(0.05)
+        cancelled = wake.cancelled()
+        runner.release.set()
+        await asyncio.wait_for(stop, 5)
+        await p.shutdown(grace_s=1)
+        return cancelled
+    assert asyncio.run(go())
+    assert len(runner.calls) == 1 and p.slack.replies == ["Yes, on Monday."]
+    p.settle_wakes(at + timedelta(minutes=5))
+    assert json.loads(store.get_meta("clock:waking"))[w.key]["again"] and store.get_meta(w.key) == ""
+
+
+@pytest.mark.parametrize("then", ["answers", "fails"])
+def test_a_session_that_fails_while_she_is_stopping_is_not_tried_again_and_runs_at_the_next_start(
+        tmp_path, monkeypatch, caplog, then):
+    """Its quiet retry would be a second session the stop waits for: its
+    message is left due, with nothing said, and the next start runs it,
+    framed with the session that failed, as that session's one retry: one
+    that fails too gets her note, and the alert names the first."""
+    import logging
+
+    runner = Held(FILLER)
+    p, store, snaps = memory_processor(tmp_path, ConversationSlack(history=[]), runner, monkeypatch)
+    line = dm(f"{AT:.1f}", "is it paid?")
+    keep(store, line)
+
+    async def go():
+        turn = asyncio.create_task(p.handle_slack(line))
+        p._bg.add(turn)
+        while not runner.running:
+            await asyncio.sleep(0.01)
+        stop = asyncio.create_task(p.let_finish(30))
+        await asyncio.sleep(0.05)
+        runner.release.set()
+        await asyncio.wait_for(stop, 5)
+    with caplog.at_level(logging.INFO, logger="wanda"):
+        asyncio.run(go())
+    [run] = store._query("SELECT session_id, status, result_text, notified FROM runs")
+    sid = run["session_id"]
+    assert len(runner.calls) == 1 and p.slack.replies == []
+    assert (run["status"], run["result_text"], run["notified"]) == ("error", None, 1)
+    assert kept(store) == [(f"{AT:.1f}", "due", 1, sid)] and snaps == [f"after {sid}"]
+    assert "failed: the session ended without its report; run again at the next start" in caplog.text
+    again = RecordingRunner(answer("Yes, on Monday.") if then == "answers" else FILLER)
+    started_again(p, again)
+    assert len(again.calls) == 1 and vault.RETRIED.format(sid8=sid[:8]) in again.calls[0][0]
+    assert p.slack.replies == (["Yes, on Monday."] if then == "answers" else [main.FAILED]) and kept(store) == []
+    if then == "fails":
+        [failed] = json.loads(store.get_meta("failed_runs"))
+        assert (failed["id"], failed["then"]) == (1, "tried once more, a note asked for it again")
+
+
+def test_a_stop_while_a_retry_is_framed_cancels_the_turn(tmp_path, monkeypatch):
+    """No session runs between a failed first try and its retry: a stop then
+    cancels the turn, as it cancels one waiting for a session's place, and
+    its message is left due with the first try's session."""
+    class Stalled(ConversationSlack):
+        """Reads the conversation for the first frame, and never for the retry's."""
+
+        def __init__(self, **kw):
+            super().__init__(**kw)
+            self.stalled = asyncio.Event()
+
+        async def fetch_context(self, channel, thread_ts, since, counted=None):
+            if self.fetched:
+                self.stalled.set()
+                await asyncio.Event().wait()
+            return await super().fetch_context(channel, thread_ts, since, counted)
+
+    runner, slack = RecordingRunner(FILLER), Stalled(history=[])
+    p, store, _ = memory_processor(tmp_path, slack, runner, monkeypatch)
+    line = dm(f"{AT:.1f}", "is it paid?")
+    keep(store, line)
+
+    async def go():
+        turn = asyncio.create_task(p.handle_slack(line))
+        p._bg.add(turn)
+        await asyncio.wait_for(slack.stalled.wait(), 5)
+        began = time.monotonic()
+        await asyncio.wait_for(p.let_finish(30), 5)
+        took = time.monotonic() - began
+        await asyncio.sleep(0.05)
+        return took, turn.cancelled()
+    took, cancelled = asyncio.run(go())
+    assert took < 1 and cancelled and len(runner.calls) == 1 and slack.replies == []
+    [run] = store._query("SELECT session_id, status FROM runs")
+    assert run["status"] == "error" and kept(store) == [(f"{AT:.1f}", "due", 1, run["session_id"])]
+
+
+def test_a_session_that_outlasts_the_stops_wait_is_cancelled_and_its_message_left_due(tmp_path, monkeypatch):
+    runner = Held()
+    p, store, _ = memory_processor(tmp_path, ConversationSlack(history=[]), runner, monkeypatch)
+    line = dm(f"{AT:.1f}", "is it paid?")
+    keep(store, line)
+
+    async def go():
+        turn = asyncio.create_task(p.handle_slack(line))
+        p._bg.add(turn)
+        while not runner.running:
+            await asyncio.sleep(0.01)
+        began = time.monotonic()
+        await asyncio.wait_for(p.let_finish(0.3), 5)
+        waited, running = time.monotonic() - began, not turn.done()
+        await p.shutdown(grace_s=1)
+        return waited, running
+    waited, running = asyncio.run(go())
+    assert waited >= 0.3 and running
+    [run] = store._query("SELECT session_id, status FROM runs")
+    assert run["status"] == "cancelled" and kept(store) == [(f"{AT:.1f}", "due", 1, run["session_id"])]
+    assert p.slack.replies == []
+
+
+def test_a_stop_with_no_session_running_returns_at_once(tmp_path, monkeypatch, caplog):
+    """A turn waiting for its conversation, which a clock wake holds, say, is
+    cancelled with its message as it was."""
+    import logging
+
+    runner = Held()
+    p, store, _ = memory_processor(tmp_path, ConversationSlack(history=[]), runner, monkeypatch)
+    line = dm(f"{AT:.1f}", "is it paid?")
+    keep(store, line)
+
+    async def go():
+        await p._task_locks.setdefault(store.create_task(None, "D1", "conversation", kind="dm"),
+                                       asyncio.Lock()).acquire()
+        turn = asyncio.create_task(p.handle_slack(line))
+        p._bg.add(turn)
+        await asyncio.sleep(0.05)
+        began = time.monotonic()
+        await asyncio.wait_for(p.let_finish(30), 5)
+        took = time.monotonic() - began
+        await asyncio.sleep(0.05)
+        return took, turn.cancelled()
+    with caplog.at_level(logging.INFO, logger="wanda"):
+        took, cancelled = asyncio.run(go())
+    assert took < 1 and cancelled
+    assert "stopping: letting 0 session(s) finish, for up to 30 s" in caplog.text
+    assert runner.calls == [] and kept(store) == [(f"{AT:.1f}", "due", 0, None)]
+
+
+def test_a_pass_while_she_is_stopping_posts_what_is_owed_and_starts_nothing_else(tmp_path, monkeypatch):
+    """The stop waits for the sessions running, whose snapshots the
+    housekeeping would hold up, and starts none of its own: a pass then
+    delivers and alerts, and neither looks after the snapshots nor triages
+    mail."""
+    slack = FakeSlack()
+    p, store = make(tmp_path, slack, email_triage=True, tz="America/Los_Angeles")
+    housekept, triaged = [], []
+    monkeypatch.setattr("wanda.vault.housekeep", lambda cfg: housekept.append(cfg.snapshots_dir) or None)
+    monkeypatch.setattr(main, "HOUSEKEEPING_HOUR", 0)
+
+    async def triage_batch(rows):
+        triaged.extend(r["dedupe_key"] for r in rows)
+        for r in rows:
+            store.set_message_status(r["dedupe_key"], "done")
+    monkeypatch.setattr(p, "triage_batch", triage_batch)
+    p.cfg.snapshots_dir.mkdir()
+    (p.cfg.snapshots_dir / "HEAD").write_text("ref: refs/heads/master\n")
+    store.ingest_message(dedupe_key="k1", message_id="<k1>", folder="INBOX", uidvalidity=1, uid=1,
+                         from_addr="a@x.example", subject="s", date_hdr="d", snippet="b")
+    owed(store, "Yes, on Monday.")
+    p.stopping = True
+    asyncio.run(p.drain_mail())
+    assert slack.replies == ["Yes, on Monday."] and housekept == [] and triaged == []
+    p.stopping = False
+    asyncio.run(p.drain_mail())
+    assert housekept == [p.cfg.snapshots_dir] and triaged == ["k1"]
+
+
+def test_compose_lets_a_stop_wait_for_a_session_before_docker_kills_the_daemon():
+    """Docker kills the daemon once stop_grace_period has passed: past the
+    session's timeout and the stop's minute more, and the shutdown's grace."""
+    compose = (Path(__file__).resolve().parent.parent / "compose.wanda.yaml").read_text()
+    grace = re.search(r"\n    stop_grace_period: (\d+)(s|m)\n", compose)
+    timeout = re.search(r'\n      WANDA_AGENT_TIMEOUT_S: "(\d+)"\n', compose)
+    assert main.STOP_AFTER_TIMEOUT_S + main.SHUTDOWN_GRACE_S == 80
+    assert int(grace[1]) * (60 if grace[2] == "m" else 1) > int(timeout[1]) + 80
 
 
 def opening_blocks(tmp_path):

@@ -150,6 +150,13 @@ LATE_TURN_S = 600
 DOWN_NAMED = timedelta(minutes=1)
 # the `failed` alert's classes of reason, each alerted at most once a UTC day
 FAILURE_CLASSES = ("timeout", "usage limit", "authentication", "other")
+# A planned stop waits for the sessions running to finish for up to their
+# timeout (WANDA_AGENT_TIMEOUT_S) and this long more, for the post and the
+# snapshot after each; then it cancels what is left and gives that
+# SHUTDOWN_GRACE_S to settle. compose.wanda.yaml's stop_grace_period covers
+# both, or Docker kills the daemon part way.
+STOP_AFTER_TIMEOUT_S = 60
+SHUTDOWN_GRACE_S = 20
 
 
 def truncate(text: str | None, limit: int) -> str:
@@ -454,6 +461,12 @@ class Processor:
         self._additions: dict[int, Additions] = {}
         # per conversation task, the kept messages its running turn holds
         self._in_turn: dict[int, Holding] = {}
+        # set once a stop begins: from then on no session starts, and what a
+        # message's turn would take stays kept for the next start
+        self.stopping = False
+        # the tasks whose session has started, until they end, its post and
+        # snapshot included: a stop lets these finish (let_finish)
+        self._running: set[asyncio.Task] = set()
         # allowed ids already logged as not let in
         self._outside: set[str] = set()
         # the look at snapshots.git the housekeeping waits on (_housekeep)
@@ -490,12 +503,29 @@ class Processor:
             self._bg.add(t)
             t.add_done_callback(self._bg.discard)
 
-    async def shutdown(self, grace_s: float = 20.0) -> None:
-        """Cancel in-flight agent runs and let them settle before the store
-        closes — otherwise their claude subprocesses are orphaned and their
-        spend is never recorded. A member's message to her that a stop cuts
-        short, or that is still queued, is kept in the run store, and the
-        next start runs it again (`kept`)."""
+    async def let_finish(self, wait_s: float) -> None:
+        """The start of a planned stop: no session starts from here on, and
+        every task not running one is cancelled, a turn waiting for its
+        conversation or a session's place and a clock wake waiting for its
+        DM among them, each leaving what it would have taken as it was, for
+        the next start. Those running one are waited for until they end or
+        `wait_s` passes. Meanwhile a message is still kept, and offered to its
+        conversation's session if one is running (Additions)."""
+        self.stopping = True
+        running = set(self._running)
+        log.info("stopping: letting %d session(s) finish, for up to %d s", len(running), wait_s)
+        for t in self._bg - running:
+            t.cancel()
+        if running:
+            await asyncio.wait(running, timeout=wait_s)
+
+    async def shutdown(self, grace_s: float = SHUTDOWN_GRACE_S) -> None:
+        """Cancel what still runs once a stop has waited (let_finish), and
+        let it settle before the store closes — otherwise claude
+        subprocesses are orphaned and their spend is never recorded. A
+        member's message to her that a stop cuts short, or that is still
+        queued, is kept in the run store, and the next start runs it again
+        (`kept`)."""
         if self._bg:
             log.info("waiting on %d in-flight agent task(s)", len(self._bg))
             for t in self._bg:
@@ -824,8 +854,8 @@ class Processor:
                         if not run["notified"] else "was answered and its post was given up; its session then failed")
                 await self._alert_once("clock", f"the reminder trajectory:{w.about} due {w.by} {what}")
         if waking is not None:
-            # settled here, so the next start leaves it alone; a stop, which
-            # cancels the session, never reaches this line. A refusal puts
+            # settled here, so the next start leaves it alone; a stop that
+            # cancels the session never reaches this line. A refusal puts
             # back what was there before the claim
             self._mark_waking(w.key, prior if outcome == "not run" else None)
 
@@ -847,9 +877,10 @@ class Processor:
         given, its answer, if not yet posted, followed as one Slack refused.
         One that posted nothing is released to be woken again while its time
         is no more than LATE gone, and is otherwise a reminder not given.
-        Every upgrade's stop cancels a wake in flight. A look's run is found
-        the same way, so its day is handed on unless it was recorded ok; a
-        look is not run again that day."""
+        An upgrade's stop cancels a wake still waiting for its DM or for a
+        session's place, and one whose session outlasts the stop's wait
+        (let_finish). A look's run is found the same way, so its day is handed
+        on unless it was recorded ok; a look is not run again that day."""
         waking = json.loads(self.store.get_meta("clock:waking") or "{}")
         kept = {(r["id"], r["by"]) for r in json.loads(self.store.get_meta("clock:lost") or "[]")}
         wall = now.replace(tzinfo=None)
@@ -1117,10 +1148,11 @@ class Processor:
                     # under the session it is given, a stop's included
                     run = self.store.session_run(sid)
             except asyncio.CancelledError:
-                # A stop reads nothing, since the shutdown waits only so long.
-                # With no run the change is due again at once; with a stop's
-                # run the model may have written, and memory is read first;
-                # after a run that ended, the try stands for the start
+                # A stop that cancels it reads nothing, since the shutdown
+                # waits only so long. With no run the change is due again at
+                # once; with a stop's run the model may have written, and
+                # memory is read first; after a run that ended, the try
+                # stands for the start
                 if run is None:
                     self.household.stopped(uid, later())
                 elif run["status"] == "cancelled":
@@ -1354,6 +1386,11 @@ class Processor:
         # she is running: a start counts her down from the last of these
         # marks (Store.came_up)
         self.store.set_meta("up_at", utcnow())
+        if self.stopping:
+            # while a stop waits for the sessions running, a pass delivers and
+            # alerts alone: the housekeeping would hold up their snapshots,
+            # and triage starts a session
+            return
         await self._housekeep()
         if not self.cfg.email_triage:
             return  # mail rows from before triage was turned off stay as they are
@@ -2127,6 +2164,13 @@ class Processor:
                 batch = [m for m in first + [m for m, _ in more.taken]
                          if (m["channel"], m["ts"]) not in more.withdrawn] + waiting
             waiting[:] = []
+            # a message whose first try failed as she stopped carries that
+            # try (Settled.first_try), and this turn is its retry; the mark
+            # comes off here, so that a payload this turn writes back, as for
+            # a message it runs again, does not carry it
+            for m in batch:
+                if tried := m.pop("first_try", None):
+                    state["first"] = tuple(tried)
             holding.take(batch)
             fresh = Additions(waiting, lambda m: self._added_text(m, fresh), holding)
             # every earlier session that took one of them, oldest first: one
@@ -2280,14 +2324,16 @@ class Processor:
         tried once more, holding the slot, by a session `frame` is given the
         first's id for; not when a second would fail the same way
         (`_fails_again`), Claude Code refused to run it, or the first ran past
-        half its time. Its failure otherwise, or the retry's, gets her note
-        (FAILED; `group`, in a group DM, its words for everyone there). One
-        that answered and then failed in a later turn begun by an added
-        message, no later one reporting, has that message run again as the
-        conversation's next turn, framed with the session that failed, or her
-        note after the answer (FAILED_REST) when that would fail the same way
-        or is that next turn's own failure. Each such failure is kept for the
-        `failed` alert, with Claude Code's reason.
+        half its time; nor once she is stopping (let_finish), when its
+        messages are left due for the next start, as are those of a message's
+        turn that has not started its session by then. Its failure otherwise,
+        or the retry's, gets her note (FAILED; `group`, in a group DM, its
+        words for everyone there). One that answered and then failed in a
+        later turn begun by an added message, no later one reporting, has that
+        message run again as the conversation's next turn, framed with the
+        session that failed, or her note after the answer (FAILED_REST) when
+        that would fail the same way or is that next turn's own failure. Each
+        such failure is kept for the `failed` alert, with Claude Code's reason.
 
         `owed` is whether someone is waiting: if not, as for the clock, a
         refusal, a failure or a restart posts nothing, except that an answer
@@ -2301,6 +2347,10 @@ class Processor:
         refuses is not something that went wrong: the run stays owed and is
         posted later, or is given up (_not_posted)."""
         state = {} if state is None else state
+        if frame is not None and self.stopping:
+            # a stop starts no session: what the turn would take stays kept,
+            # for the next start
+            return None
         reserve = self.cfg.agent_expected_usd
         if (verdict := await self.check_budget(reserve_usd=reserve)) != "ok":
             if owed:
@@ -2335,9 +2385,16 @@ class Processor:
                         return None
                     arrival, now, more = framed
                     more.sid = sid
+                    # the retry of a first try a stop left untried, which
+                    # the frame finds, is not tried once more
+                    first = first or state.get("first")
                 started = utcnow()
                 date = now.date().isoformat()
                 t0 = time.monotonic()
+                # from here a stop lets the task finish (let_finish)
+                running = asyncio.current_task()
+                self._running.add(running)
+                running.add_done_callback(self._running.discard)
                 try:
                     with self._reserve(reserve):
                         rr = await self.runner.run(
@@ -2453,8 +2510,22 @@ class Processor:
                     kind="agent", task_id=task["id"], session_id=sid, started_at=started,
                     exit_code=rr.exit_code, cost_usd=rr.cost_usd, status="error", error=truncate(error, 1000))
                 looks = await asyncio.to_thread(vault.looks_back, self.cfg, sid)
+                if self.stopping:
+                    # a stop starts no retry: what the turn holds stays due,
+                    # and the next start's turn there is this one's retry,
+                    # framed with this session and named by it in the alert
+                    tried = [sid, run_id, started, error, claude, "other"]
+                    self.store.settle(Settled(first_try=tuple((k, m | {"first_try": tried})
+                                                             for k, m in more.holding.rows.items())))
+                    self._log_session(sid, channel, waited, ran, added, rr, more, out,
+                                      f"failed: {error}; run again at the next start", looks)
+                    await self._snapshot(sid)
+                    return error
                 self._log_session(sid, channel, waited, ran, added, rr, more, out,
                                   f"failed: {error}; trying once more", looks)
+                # until the retry starts no session runs, so a stop meanwhile
+                # cancels the turn
+                self._running.discard(running)
                 # neither a timeout nor a refusal is tried once more; kept in
                 # `state` too, for her note when the retry fails outside its
                 # session
@@ -2524,11 +2595,16 @@ class Processor:
                            + (f", then failed: {error}{follow}" if error else "")) if text
                           else (f"{'silent, then ' if after else ''}failed: {error}{follow}" if error else "silent"),
                           looks)
+        await self._snapshot(sid)
+        return error
+
+    async def _snapshot(self, sid: str) -> None:
+        """The vault's snapshot after the session `sid`, then a look for node
+        files `mem` cannot read."""
         if said := await asyncio.to_thread(vault.snapshot, self.cfg, f"after {sid}"):
             log.warning("%s", said)
             await self._alert_once("snapshot", f"vault snapshots: {said}")
         await self.put_back()
-        return error
 
     async def _after_failure(self, rr: RunResult, out: dict | None, more: Additions, sid: str, text: str,
                              refusal: str | None, ran: float, first: bool) -> tuple[str, bool, str]:
@@ -2989,16 +3065,21 @@ async def run_daemon(cfg: Config) -> None:
     # with triage off nothing reaches the mail queue, and the loop still
     # retries undelivered answers and flushes alerts
     tasks.append(asyncio.create_task(processor.loop()))
-    tasks.append(asyncio.create_task(processor.clock_loop()))
-    tasks.append(asyncio.create_task(processor.names_loop()))
+    # what starts sessions nobody's message asks for, which a stop ends first
+    starting = [asyncio.create_task(processor.clock_loop()), asyncio.create_task(processor.names_loop())]
     await stop.wait()
+    for t in starting:
+        t.cancel()
+    # the watcher, slack_loop and the mail loop go on meanwhile: a message
+    # is still kept, and what is owed posted
+    await processor.let_finish(cfg.agent_timeout_s + STOP_AFTER_TIMEOUT_S)
     log.info("shutting down")
     if imap_watcher:
         imap_watcher.stop()
     slack_watcher.stop()
     for t in tasks:
         t.cancel()
-    await asyncio.gather(*tasks, return_exceptions=True)
+    await asyncio.gather(*tasks, *starting, return_exceptions=True)
     await processor.shutdown()  # settle agent runs before the store closes
     # she ran until now: the next start counts her down from here
     store.set_meta("up_at", utcnow())

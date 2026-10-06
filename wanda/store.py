@@ -133,10 +133,13 @@ class Settled(NamedTuple):
     """What a recorded run does to the kept messages of its turn, each by
     (channel, ts): answered by the run that posts the turn's answer or note
     (the note's, when there is one), gone after a silence, or kept due with
-    its payload, to run again as the conversation's next turn."""
+    its payload, to run again as the conversation's next turn; or, written
+    with no run, kept as they are with a payload naming the turn's first
+    try, which a stop left with no retry."""
     answered: tuple = ()
     gone: tuple = ()
     again: tuple = ()  # of ((channel, ts), payload)
+    first_try: tuple = ()  # of ((channel, ts), payload)
 
 
 class Store:
@@ -465,7 +468,12 @@ class Store:
             self._settle(settled, note_id)
         return run_id, note_id
 
-    def _settle(self, settled: Settled | None, run_id: int) -> None:
+    def settle(self, settled: Settled) -> None:
+        """What a turn that recorded no run does to its kept messages."""
+        with self._transaction():
+            self._settle(settled, None)
+
+    def _settle(self, settled: Settled | None, run_id: int | None) -> None:
         if settled is None:
             return
         self._db.executemany("UPDATE unanswered SET state='answered', run=? WHERE channel=? AND ts=?",
@@ -476,6 +484,10 @@ class Store:
         # is not counted against it
         self._db.executemany("UPDATE unanswered SET state='due', tries=0, payload=? WHERE channel=? AND ts=?",
                              [(json.dumps(p), *k) for k, p in settled.again])
+        # the turn that takes them next is the first try's retry, its try
+        # still counted
+        self._db.executemany("UPDATE unanswered SET payload=? WHERE channel=? AND ts=? AND state <> 'answered'",
+                             [(json.dumps(p), *k) for k, p in settled.first_try])
 
     def _insert_run(self, kind: str, task_id: int | None, session_id: str | None, started_at: str,
                     exit_code: int | None, cost_usd: float | None, status: str, error: str | None = None,

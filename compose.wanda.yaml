@@ -11,7 +11,10 @@
 #   docker compose -f compose.wanda.yaml exec -T wanda timeout 60 mem recall fan
 #       the same without a terminal (a script, an agent's shell): stopping the
 #       client there leaves `mem` waiting in here, and its write lands later
-#   docker compose -f compose.wanda.yaml stop             stop; `start` brings it back
+#   docker compose -f compose.wanda.yaml stop             stop, once a running session has
+#       finished, up to eight minutes; `start` brings it back
+#   docker compose -f compose.wanda.yaml stop -t 30       stop sooner: what it cuts short runs
+#       again at the next start
 #
 # The values come from .env, which compose reads for these substitutions and
 # does not mount: the daemon is given what it uses and nothing else of the
@@ -32,9 +35,12 @@ services:
     image: wanda-home
     restart: unless-stopped
     init: true
-    # shutdown gives running sessions 20 s to settle, and docker's default
-    # would kill the daemon at 10
-    stop_grace_period: 30s
+    # a stop lets a running session finish, waiting up to its timeout
+    # (WANDA_AGENT_TIMEOUT_S below) and a minute more, then gives what is
+    # left 20 s to settle, 500 s in all. Docker kills the daemon once
+    # stop_grace_period has passed, an `up -d` that makes the container
+    # again included, so it is set past that
+    stop_grace_period: 9m
     environment:
       CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:?set it in .env}
       WANDA_SLACK_BOT_TOKEN: ${WANDA_SLACK_BOT_TOKEN:?set it in .env}
