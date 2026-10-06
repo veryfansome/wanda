@@ -329,11 +329,6 @@ class FakeSlack:
             raise RuntimeError("conversations.open: user_not_found")
         return f"D-{user}"
 
-    async def channel_type(self, channel):
-        # asked before an answer owed is posted later: a clock session's DM
-        # is a 1:1 DM
-        return "im"
-
 
 # What the daemon's runner did, as (what it returns, the answer it recorded): a
 # budget verdict before the model runs, an error, or None with the answer.
@@ -998,9 +993,6 @@ class Held:
 
     async def dm_channel(self, user):
         return f"D-{user}"
-
-    async def channel_type(self, channel):
-        return "im"
 
     async def alert(self, text):
         self.posted.append(("alert", text))

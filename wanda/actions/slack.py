@@ -16,6 +16,7 @@ from wanda.config import Config
 from wanda.household import SHUT
 from wanda.store import Store
 from wanda.tls import ssl_context
+from wanda.transcript import harmless
 from wanda.triage import Verdict
 from wanda.vault import ALERT_EVENT, EARLIER, NOTE_EVENT
 
@@ -135,12 +136,13 @@ class SlackActions:
         """Both arguments are required and neither defaults. A default channel
         would silently publish a DM answer in the triage channel the one time a
         caller forgot it — which is exactly what happened before. `note` marks
-        a failure note, which frames leave out."""
+        a failure note, which frames leave out. The text is rendered harmless
+        first."""
         await self._call(
             "chat_postMessage",
             channel=channel,
             thread_ts=thread_ts,
-            text=text[:39000],
+            text=harmless(text)[:39000],
             **({"metadata": {"event_type": NOTE_EVENT, "event_payload": {"for": "the household"}}}
                if note else {}),
         )
@@ -267,16 +269,6 @@ class SlackActions:
         # a list cut short would leave readers out of a frame
         raise RuntimeError(f"{channel} has more members than {MAX_CONTEXT_PAGES} pages of them")
 
-    async def channel_type(self, channel: str) -> str:
-        """A conversation's type as message events name it: im, mpim, group
-        (a private channel) or channel (a public one)."""
-        c = (await self._call("conversations_info", channel=channel)).get("channel") or {}
-        if c.get("is_im"):
-            return "im"
-        if c.get("is_mpim"):
-            return "mpim"
-        return "group" if c.get("is_private") else "channel"
-
     async def workspace(self) -> list[dict]:
         """Everyone in this Slack (users.list): who can open a public channel
         without joining it. Read each time it is asked, so that someone who
@@ -307,13 +299,30 @@ class SlackActions:
         return self._dms[user_id]
 
     async def alert(self, text: str) -> None:
-        await self._call(
+        """Posts an alert, rendered harmless, and outside a DM records its
+        thread as a conversation of hers, so that a member's reply under it
+        reaches her as one in a thread begun with @wanda does. In a DM every
+        reply already does, and a thread recorded there would read as a
+        channel's. Nothing is recorded with no store open, and a record that
+        fails is logged, not raised: the alert is posted, and a caller that
+        retried it would post it twice."""
+        resp = await self._call(
             "chat_postMessage", channel=self.cfg.alerts_to,
-            text=truncate_text(f"⚠️ {text}"),
+            text=truncate_text(f"⚠️ {harmless(text)}"),
             # the mark by which a frame shows it as an alert posted in her
             # name, never as something she said
             metadata={"event_type": ALERT_EVENT, "event_payload": {"for": "the household"}},
         )
+        channel, ts = resp.get("channel") or "", resp.get("ts")
+        # an alert to a user's id goes to their DM with her, and which channel
+        # Slack answers with for one is not documented
+        dm = self.cfg.alerts_to.startswith(("U", "W")) or channel.startswith("D")
+        if self.store is None or dm or not channel or not ts:
+            return
+        try:
+            self.store.create_task(None, channel, ts, kind="mention")
+        except Exception as e:
+            log.warning("could not record the thread of the alert %s in %s: %s", ts, channel, e)
 
     # --- daily digest ---
 

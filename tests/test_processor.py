@@ -64,11 +64,6 @@ class FakeSlack:
         self.threads.append(thread_ts)
         self.notes.append(note)
 
-    async def channel_type(self, channel):
-        # what is owed in these tests is owed in a 1:1 DM, unless a test says
-        # otherwise
-        return "im"
-
 
 def cfg(**kw) -> Config:
     return Config(_env_file=None, email_triage_slack_channel_id="C1", **kw)
@@ -980,10 +975,9 @@ AT = 1790898000.0
 class ConversationSlack(FakeSlack):
     """A DM in which fan asked something a minute ago and wanda answered."""
 
-    def __init__(self, members=None, workspace=None, history=None, types=None, **kw):
+    def __init__(self, members=None, workspace=None, history=None, **kw):
         super().__init__(**kw)
         self.member_ids = members
-        self.types = types or {}
         self.people = workspace or [{"id": "U1"}, {"id": "U2"}, {"id": "UBOT", "is_bot": True}]
         self.history = history if history is not None else [
             {"user": "U1", "ts": f"{AT - 120:.1f}", "text": "<@UBOT> can you check the invoice?"},
@@ -1021,9 +1015,6 @@ class ConversationSlack(FakeSlack):
 
     async def own_ids(self):
         return frozenset({"UBOT", "BME"})
-
-    async def channel_type(self, channel):
-        return self.types.get(channel, "im")
 
 
 class RecordingRunner:
@@ -1200,26 +1191,114 @@ def test_an_alert_is_shown_to_a_session_as_an_alert_never_as_her_words(tmp_path,
     assert not re.search(r"\d me: ⚠️", first)
 
 
+ALERTED_AT = f"{AT - 60:.6f}"
+
+
+class AlertWeb:
+    """chat.postMessage as Slack answers it: the channel it posted in, and
+    the post's ts."""
+
+    def __init__(self, channel):
+        self.channel = channel
+
+    def chat_postMessage(self, **kw):
+        return {"ok": True, "channel": self.channel, "ts": ALERTED_AT}
+
+
+def alert_to(monkeypatch, to, answered, store, text="a vault snapshot failed"):
+    import wanda.actions.slack as actions
+
+    monkeypatch.setattr(actions, "MIN_INTERVAL_S", 0)
+    sa = actions.SlackActions(cfg(alert_channel=to), store)
+    sa.web = AlertWeb(answered)
+    asyncio.run(sa.alert(text))
+
+
+def test_an_alert_records_its_thread_as_hers_only_outside_a_dm(tmp_path, monkeypatch, caplog):
+    """Under the channel and ts Slack answered with, as a conversation begun
+    with @wanda. Not where every reply already reaches her as a DM's: an
+    alert to a user's id, whatever channel Slack answers with, or one Slack
+    answers with a DM's channel; not with no store open; and a record that
+    fails is logged, never raised, since the alert is posted."""
+    import logging
+
+    for i, (to, answered, recorded) in enumerate((("C9", "C9", [("mention", "C9", ALERTED_AT)]),
+                                                  ("U0FAN", "C7", []), ("W0FAN", "C7", []), ("C9", "D7", []))):
+        store = Store(tmp_path / f"{i}.db")
+        alert_to(monkeypatch, to, answered, store)
+        assert [tuple(r) for r in store._query("SELECT kind, slack_channel, thread_ts FROM tasks")] == recorded, to
+    with caplog.at_level(logging.WARNING, logger="wanda"):
+        alert_to(monkeypatch, "C9", "C9", None)
+        assert caplog.text == ""
+        store.close()
+        alert_to(monkeypatch, "C9", "C9", store)
+    assert f"could not record the thread of the alert {ALERTED_AT} in C9" in caplog.text
+
+
+def test_a_members_reply_under_an_alert_in_a_channel_is_a_turn_of_hers(tmp_path, monkeypatch):
+    """With no @wanda: the reply runs a session whose thread opens with the
+    alert under its label. A threaded reply under an alert in fan's DM opens
+    a DM's task, as any reply there does."""
+    from types import SimpleNamespace
+
+    from wanda.vault import ALERT_EVENT
+    from wanda.watchers.slack_watcher import SlackWatcher
+
+    alert = {"user": "UBOT", "bot_id": "BME", "ts": ALERTED_AT, "text": "⚠️ a vault snapshot failed",
+             "metadata": {"event_type": ALERT_EVENT, "event_payload": {}}}
+    runner = RecordingRunner(answer("A snapshot failed; nothing is lost."))
+    slack = ConversationSlack(members=["U1", "UBOT"], history=[alert])
+    p, store, _ = memory_processor(tmp_path, slack, runner, monkeypatch)
+
+    def reply_under(channel, kind):
+        loop = asyncio.new_event_loop()
+        queue = asyncio.Queue()
+        w = SlackWatcher(p.cfg, store, loop, queue)
+        w.bot_user_id = "UBOT"
+        w._handle(SimpleNamespace(send_socket_mode_response=lambda r: None), SimpleNamespace(
+            type="events_api", envelope_id="e", payload={"event": {
+                "type": "message", "user": "U1", "channel": channel, "channel_type": kind, "ts": f"{AT:.6f}",
+                "thread_ts": ALERTED_AT, "text": "what does this mean?"}}))
+        loop.run_until_complete(asyncio.sleep(0))
+        loop.close()
+        return queue.get_nowait()
+
+    alert_to(monkeypatch, "C9", "C9", store)
+    ev = reply_under("C9", "group")
+    assert ev.payload["kind"] == "task"
+    asyncio.run(p.handle_slack(ev))
+    assert ("In a Slack thread that fan and I read. Everyone in it sees what I say there.\n\nThe thread so far:\n\n"
+            "    16:39 an alert posted in my name: ⚠️ a vault snapshot failed\n\nfan now says:\n\n"
+            "    what does this mean?") in runner.calls[0][0]
+    assert slack.replies == ["A snapshot failed; nothing is lost."] and slack.threads == [ALERTED_AT]
+    alert_to(monkeypatch, "U1", "D1", store)
+    ev = reply_under("D1", "im")
+    assert ev.payload["kind"] == "dm"
+    asyncio.run(p.handle_slack(ev))
+    assert store.get_task_by_thread("D1", ALERTED_AT)["kind"] == "dm"
+
+
 def test_a_frame_looks_up_every_mention_of_a_members_and_few_of_anyone_elses(tmp_path, monkeypatch):
     """Each lookup is a paced Slack call made while the frame holds a session
     slot. An outsider's line mentioning 500 people costs MENTIONED of them,
     the rest named as someone, and one already held costs nothing; an
     allowed id, which is of the household, is looked up outside that cap; a
     member's mentions are all looked up, the turn's own included, and so are
-    the posters shown and her user id, never her bot id."""
+    the readers, the posters shown and her user id, never her bot id."""
     many = [f"UX{i:03d}" for i in range(500)]
     twelve = [f"UM{i:02d}" for i in range(12)]
     history = [{"user": "U3", "ts": f"{AT - 180:.1f}", "text": "<@U5> said so"},
                {"user": "U3", "ts": f"{AT - 120:.1f}", "text": "<@UK1> " + " ".join(f"<@{u}>" for u in many)},
                {"user": "U1", "ts": f"{AT - 60:.1f}", "text": " ".join(f"<@{u}>" for u in twelve)}]
-    slack = ConversationSlack(members=["U1", "U2", "UBOT"], history=history)
+    slack = ConversationSlack(members=["U1", "U2", "U6", "UBOT"], history=history)
     slack.held["UK1"] = {"profile": {"display_name": "kim"}}
     runner = RecordingRunner()
     p, store, _ = memory_processor(tmp_path, slack, runner, monkeypatch)
     p.household = Household.load(store, ["U1", "U2", "U5"])
     asyncio.run(p.handle_slack(dm(f"{AT:.1f}", "who are they, <@UT1>?", channel_type="mpim", channel="G1")))
-    assert sorted(slack.asked) == sorted(["U3", "UBOT", "U5", "UT1", *twelve, *many[:main.MENTIONED]])
+    assert sorted(slack.asked) == sorted(["U3", "U6", "UBOT", "U5", "UT1", *twelve, *many[:main.MENTIONED]])
     first = runner.calls[0][0]
+    assert "In a group direct message that U6 (outside the household), fan, mei and I read." in first
     assert "16:38 “jane” (outside the household): @“kim” (outside the household) @UX000 (outside the household)" in first
     assert f"@{many[main.MENTIONED]}" not in first and "@someone (outside the household) @someone" in first
     assert "16:37 “jane” (outside the household): @U5 said so\n" in first
@@ -1324,6 +1403,24 @@ def test_a_placeholder_is_not_posted(tmp_path, monkeypatch):
     assert slack.replies == []
 
 
+def test_an_answer_pings_no_group_and_hides_no_link(tmp_path, monkeypatch):
+    """Rendered harmless before it is recorded, so it is posted so at once,
+    kept so, and delivered so later."""
+    said = "<!channel> dinner's at 7, <https://x.example/a|the menu>"
+    shown = "@channel dinner's at 7, the menu (https://x.example/a)"
+    slack = ConversationSlack(history=[])
+    p, store, _ = memory_processor(tmp_path, slack, RecordingRunner(answer(said)), monkeypatch)
+    asyncio.run(p.handle_slack(dm(f"{AT:.1f}", "when's dinner?")))
+    assert slack.replies == [shown]
+    assert [r["result_text"] for r in store._query("SELECT result_text FROM runs")] == [shown]
+    refusing = Refusing(history=[])
+    p, store, _ = memory_processor(tmp_path / "later", refusing, RecordingRunner(answer(said)), monkeypatch)
+    asyncio.run(p.handle_slack(dm(f"{AT:.1f}", "when's dinner?")))
+    p.slack = ConversationSlack()
+    asyncio.run(p.deliver_pending())
+    assert refusing.refused == [shown] and p.slack.replies == [shown]
+
+
 @pytest.mark.parametrize("runner", [RecordingRunner("I filed it."), RecordingRunner(ok=False)],
                          ids=["no report", "failed run"])
 def test_a_session_that_reports_nothing_is_a_failure(tmp_path, monkeypatch, runner):
@@ -1393,35 +1490,119 @@ def test_a_group_dm_names_its_readers(tmp_path, monkeypatch):
         in runner.calls[0][0]
 
 
-def test_no_session_where_anyone_else_can_read(tmp_path, monkeypatch):
-    runner = RecordingRunner()
-    slack = ConversationSlack(members=["U1", "U3", "UBOT"])
-    p, store, _ = memory_processor(tmp_path, slack, runner, monkeypatch)
-    for i in range(2):
-        asyncio.run(p.handle_slack(dm(f"{AT + i:.1f}", "dinner at 7", channel_type="mpim")))
-    assert runner.calls == [] and slack.replies == [] and store._query("SELECT * FROM runs") == []
-    assert p._outside == {"D1"}
+def test_a_member_is_answered_where_someone_outside_reads(tmp_path, monkeypatch, caplog):
+    """Someone outside the household in a group keeps no member's message
+    from its session: each runs, framed with them marked, and is answered."""
+    import logging
+
+    runner = RecordingRunner(answer("Seven works."), answer("Noted."))
+    slack = ConversationSlack(members=["U1", "U3", "UBOT"], history=[])
+    p, _, _ = memory_processor(tmp_path, slack, runner, monkeypatch)
+    with caplog.at_level(logging.INFO, logger="wanda"):
+        for i in range(2):
+            asyncio.run(p.handle_slack(dm(f"{AT + i:.1f}", "dinner at 7", channel_type="mpim")))
+    assert len(runner.calls) == 2 and slack.replies == ["Seven works.", "Noted."]
+    for prompt, _ in runner.calls:
+        assert ("In a group direct message that fan, “jane” (outside the household) and I read. Everyone in it "
+                "sees what I say there.\n\n") in prompt
+    assert "not taking part" not in caplog.text and p._outside == set()
 
 
-def test_a_public_channel_is_the_whole_workspaces(tmp_path, monkeypatch):
+def test_a_public_channel_says_when_anyone_in_the_workspace_is_outside(tmp_path, monkeypatch):
+    """Anyone in this Slack can open a public channel, so its frame says that
+    some who can read it are outside the household once anyone in the
+    workspace is, and the session runs either way."""
     runner = RecordingRunner()
     slack = ConversationSlack(members=["U1", "UBOT"])
     p, _, _ = memory_processor(tmp_path, slack, runner, monkeypatch)
     asyncio.run(p.handle_slack(dm(f"{AT:.1f}", "<@UBOT> note this", channel_type="channel", channel="C1")))
-    assert "In a public Slack channel that anyone in this Slack can read; fan and I are in it." in runner.calls[0][0]
     slack.people = slack.people + [{"id": "U3"}]
     asyncio.run(p.handle_slack(dm(f"{AT + 1:.1f}", "<@UBOT> and this", channel_type="channel", channel="C2")))
-    assert len(runner.calls) == 1, "someone else in the workspace can open it"
+    (first, _), (second, _) = runner.calls
+    opening = "In a public Slack channel that anyone in this Slack can read; fan and I are in it."
+    assert f"{opening}\n\n" in first
+    assert f"{opening} Some who can read it are outside the household.\n\n" in second
 
 
-def test_no_session_without_knowing_who_reads(tmp_path, monkeypatch):
-    runner = RecordingRunner()
+class NoWorkspace(ConversationSlack):
+    async def workspace(self):
+        raise RuntimeError("ratelimited")
+
+
+def test_who_can_read_is_said_as_far_as_slack_says(tmp_path, monkeypatch, caplog):
+    """A deactivated account reads nothing, so a public channel in a Slack of
+    the household alone has no mark and no sentence; a reader outside the
+    household brings the sentence whether or not the workspace holds them,
+    as it does not hold a Slack Connect one; a Slack whose people cannot be
+    read may hold anyone, which the frame says; a member list that cannot be
+    read is said after that; a reader Slack will not describe is named by its
+    id, outside the household."""
+    import logging
+
+    public = "In a public Slack channel that anyone in this Slack can read; fan and I are in it."
+    outside = f"{public} Some who can read it are outside the household."
+    gone = {"id": "U9", "deleted": True}
+    household = ConversationSlack(members=["U1", "U9", "UBOT"], workspace=[{"id": "U1"}, {"id": "U2"}, gone])
+    household.held["U9"] = gone
+    cases = [
+        (household, "channel", f"{public}\n\n"),
+        (ConversationSlack(members=["U1", "U3", "UBOT"]), "channel",
+         "In a public Slack channel that anyone in this Slack can read; fan, “jane” (outside the household) and I are "
+         "in it. Some who can read it are outside the household.\n\n"),
+        (NoWorkspace(members=["U1", "UBOT"]), "channel", f"{outside}\n\n"),
+        (ConversationSlack(members=None, workspace=[{"id": "U1"}, {"id": "U3"}]), "channel",
+         f"{outside} I could not find out who else is in it.\n\n"),
+        (ConversationSlack(members=["U1", "U4", "UBOT"]), "mpim",
+         "In a group direct message that U4 (outside the household), fan and I read. Everyone in it sees what I "
+         "say there.\n\n"),
+    ]
+    for i, (slack, kind, opening) in enumerate(cases):
+        runner = RecordingRunner()
+        p, _, _ = memory_processor(tmp_path / str(i), slack, runner, monkeypatch)
+        with caplog.at_level(logging.WARNING, logger="wanda"):
+            asyncio.run(p.handle_slack(dm(f"{AT:.1f}", "<@UBOT> note this", channel_type=kind, channel="C1")))
+        assert len(runner.calls) == 1 and opening in runner.calls[0][0], i
+    assert "could not read who is in this Slack for C1: ratelimited" in caplog.text
+
+
+def test_a_session_runs_when_slack_will_not_say_who_reads(tmp_path, monkeypatch, caplog):
+    """Told so, naming the turn's speakers, and answered; no failure note,
+    and the reason logged."""
+    import logging
+
+    runner = RecordingRunner(answer("Seven it is."))
     slack = ConversationSlack(members=None)
     p, _, _ = memory_processor(tmp_path, slack, runner, monkeypatch)
+    with caplog.at_level(logging.WARNING, logger="wanda"):
+        asyncio.run(p.handle_slack(dm(f"{AT:.1f}", "dinner at 7", channel_type="mpim")))
+    assert "could not read who is in D1: missing_scope" in caplog.text
+    unlisted = "Everyone in it sees what I say there. I could not find out who else is in it.\n\n"
+    assert f"In a group direct message that fan and I read. {unlisted}" in runner.calls[0][0]
+    assert slack.replies == ["Seven it is."] and slack.notes == [False]
+    turn = [dm(f"{AT + i:.1f}", text, channel_type="mpim", user=u).payload
+            for i, u, text in ((1, "U1", "dinner at 7?"), (2, "U2", "or 8"))]
+    framed = asyncio.run(p._memory_arrival(turn[1], turn, datetime.fromtimestamp(AT + 2, p.cfg.zone)))
+    assert framed.startswith(f"In a group direct message that fan, mei and I read. {unlisted}")
+    # a 1:1 DM's reader is the member who wrote, and Slack is not asked
+    framed = asyncio.run(p._memory_arrival(dm(f"{AT:.1f}", "hi").payload, [dm(f"{AT:.1f}", "hi").payload],
+                                           datetime.fromtimestamp(AT, p.cfg.zone)))
+    assert framed.startswith("In a direct message that fan and I read.\n\n")
+
+
+def test_a_frame_that_cannot_be_built_posts_a_note_and_runs_nothing(tmp_path, monkeypatch):
+    """Whatever else raises while the frame is built, the note says what
+    failed, and is marked as notes are."""
+    class Broken(ConversationSlack):
+        async def users(self, ids):
+            raise RuntimeError("boom")
+
+    runner = RecordingRunner()
+    slack = Broken(members=["U1", "U2", "UBOT"])
+    p, store, _ = memory_processor(tmp_path, slack, runner, monkeypatch)
     asyncio.run(p.handle_slack(dm(f"{AT:.1f}", "dinner at 7", channel_type="mpim")))
-    assert runner.calls == []
-    assert slack.replies == ["⚠️ my run failed: could not see who reads this conversation: missing_scope"]
-    assert slack.notes == [True]
+    assert runner.calls == [] and slack.notes == [True]
+    assert slack.replies == ["⚠️ my run failed: I could not gather what was said here: boom"]
+    assert store.pending_deliveries() == []
 
 
 class Held(RecordingRunner):
@@ -1544,11 +1725,13 @@ def one_slot_behind_a_dm(slack, tmp_path, monkeypatch):
 def test_who_reads_a_turn_is_who_is_there_when_its_session_starts(tmp_path, monkeypatch):
     """A turn can wait a whole session of another conversation for its slot.
     Who is in the conversation is read once it has the slot: someone invited
-    meanwhile keeps the session from starting and nothing is posted there,
-    and someone who left meanwhile is not named."""
-    for later, ran in ((["U1", "U2", "U3", "UBOT"], False), (["U1", "UBOT"], True)):
+    meanwhile is named, marked, and the answer is posted; someone who left
+    meanwhile is not named."""
+    for i, (later, readers) in enumerate(((["U1", "U2", "U3", "UBOT"], "fan, mei, “jane” (outside the household)"),
+                                          (["U1", "UBOT"], "fan"))):
         slack = ConversationSlack(members=["U1", "U2", "UBOT"], history=[])
-        p, store, runner, meis = one_slot_behind_a_dm(slack, tmp_path / str(ran), monkeypatch)
+        p, store, runner, meis = one_slot_behind_a_dm(slack, tmp_path / str(i), monkeypatch)
+        runner.reports = [answer("Noted."), answer("The blue one.")]
 
         async def wait_for_the_slot():
             first = asyncio.create_task(p.handle_slack(meis))
@@ -1560,14 +1743,9 @@ def test_who_reads_a_turn_is_who_is_there_when_its_session_starts(tmp_path, monk
             runner.release.set()
             await asyncio.gather(first, group)
         asyncio.run(wait_for_the_slot())
-        assert "out Tuesday" in runner.calls[0][0]
-        if ran:
-            assert len(runner.calls) == 2
-            assert "In a group direct message that fan and I read." in runner.calls[1][0]
-        else:
-            assert len(runner.calls) == 1 and slack.replies == [] and p._outside == {"G1"}
-            assert store._query("SELECT * FROM runs WHERE task_id = (SELECT id FROM tasks "
-                                "WHERE slack_channel = 'G1')") == []
+        assert "out Tuesday" in runner.calls[0][0] and len(runner.calls) == 2
+        assert f"In a group direct message that {readers} and I read." in runner.calls[1][0]
+        assert slack.replies == ["Noted.", "The blue one."] and slack.channels == ["D2", "G1"]
 
 
 def test_a_turn_takes_its_messages_when_its_session_starts(tmp_path, monkeypatch):
@@ -1613,27 +1791,26 @@ def test_a_refusal_answers_every_message_waiting(tmp_path, monkeypatch):
     assert len(runner.calls) == 1 and slack.replies == [BUDGET_REPLIES["breaker"]]
 
 
-def test_what_is_owed_is_posted_later_only_where_the_household_alone_reads(tmp_path, monkeypatch):
+def test_what_is_owed_is_posted_later_wherever_it_is_owed(tmp_path, monkeypatch):
     """An answer Slack refused at first is posted at a later pass, or at a
-    start, which can be hours on: who is in the conversation is read again
-    then. Where someone else has come in, it is not posted and stays in the
-    run store; where who is there cannot be read, it waits for the next
-    pass, as a post Slack refuses does."""
-    slack = Refusing(members=["U1", "U2", "UBOT"], history=[], types={"G1": "mpim"})
+    start, which can be hours on, where it is owed, with no read of who is
+    there by then: in a group someone outside reads, and where Slack would
+    not say who is in it; and an email task's too."""
+    slack = Refusing(members=["U1", "U3", "UBOT"], history=[])
     p, store, _ = memory_processor(
         tmp_path, slack, RecordingRunner(answer("The plumber is at 5."), answer("Yes.")), monkeypatch)
     asyncio.run(p.handle_slack(dm(f"{AT:.1f}", "when is the plumber?", channel_type="mpim", channel="G1")))
     asyncio.run(p.handle_slack(dm(f"{AT + 1:.1f}", "is it paid?")))
-    assert [r["result_text"] for r in store.pending_deliveries()] == ["The plumber is at 5.", "Yes."]
-    p.slack = ConversationSlack(members=None, types={"G1": "mpim"})
+    task = store.create_task(None, "C1", "5.5", kind="email")
+    store.record_run(kind="agent", task_id=task, session_id=None, started_at=utcnow(), exit_code=0, cost_usd=0.0,
+                     status="ok", result_text="Filed it.", notified=0)
+    owed = ["The plumber is at 5.", "Yes.", "Filed it."]
+    assert [r["result_text"] for r in store.pending_deliveries()] == owed
+    # a member list read now would raise, and nothing reads a conversation's type
+    p.slack = ConversationSlack(members=None)
     asyncio.run(p.deliver_pending())
-    assert p.slack.replies == ["Yes."], "a 1:1 DM takes no one else"
-    assert [r["result_text"] for r in store.pending_deliveries()] == ["The plumber is at 5."]
-    p.slack = ConversationSlack(members=["U1", "U2", "U3", "UBOT"], types={"G1": "mpim"})
-    asyncio.run(p.deliver_pending())
-    assert p.slack.replies == [] and store.pending_deliveries() == [] and p._outside == {"G1"}
-    kept = store._query("SELECT result_text, notified FROM runs WHERE result_text LIKE 'The plumber%'")
-    assert [dict(r) for r in kept] == [{"result_text": "The plumber is at 5.", "notified": 1}]
+    assert p.slack.replies == owed and p.slack.channels == ["G1", "D1", "C1"]
+    assert store.pending_deliveries() == []
 
 
 def test_conversations_run_side_by_side(tmp_path, monkeypatch):
@@ -2062,7 +2239,7 @@ def test_a_message_deleted_after_its_session_took_it_is_not_put_back(tmp_path, m
     assert len(store._query("SELECT * FROM runs")) == 1
 
 
-@pytest.mark.parametrize("ending", ["the session answered", "its readers changed", "the session still working"])
+@pytest.mark.parametrize("ending", ["the session answered", "its frame given up", "the session still working"])
 def test_a_message_deleted_while_it_is_framed_is_not_answered(tmp_path, monkeypatch, ending):
     """Deleted while the session framed it: whether the frame is then given
     up or built while the session still works, it is neither handed to the
@@ -2071,7 +2248,7 @@ def test_a_message_deleted_while_it_is_framed_is_not_answered(tmp_path, monkeypa
 
     async def slow_frame(self, p, more):
         await asyncio.sleep(2.0)
-        return None if ending == "its readers changed" else await real(self, p, more)
+        return None if ending == "its frame given up" else await real(self, p, more)
     monkeypatch.setattr(Processor, "_added_text", slow_frame)
     p, store, _, slack = standin_processor(tmp_path, monkeypatch,
                                            steps=[1.0, 0.2] if ending == "the session answered" else [4.0, 0.2])
@@ -2084,9 +2261,10 @@ def test_a_message_deleted_while_it_is_framed_is_not_answered(tmp_path, monkeypa
 
 
 class ChangingSlack(ConversationSlack):
-    """A private channel whose member list changes once the session's opening
-    frame has been built: each message is checked when it arrives, and the
-    first again for its frame."""
+    """A private channel whose member list is `first` when the session's
+    frame is built and `later` after it; a message added while the session
+    works reads no list. A list given as None raises, as one Slack will not
+    give does."""
 
     def __init__(self, first, later):
         super().__init__(members=first, history=[])
@@ -2095,33 +2273,34 @@ class ChangingSlack(ConversationSlack):
 
     async def members(self, channel):
         self.calls += 1
-        if self.calls > 2:
-            if self.later is None:
-                raise RuntimeError("ratelimited")
-            return self.later
-        return self.member_ids
+        ids = self.member_ids if self.calls == 1 else self.later
+        if ids is None:
+            raise RuntimeError("ratelimited")
+        return ids
 
 
-def test_a_message_whose_readers_changed_gets_a_turn_of_its_own(tmp_path, monkeypatch):
+def test_a_message_added_after_someone_joined_is_taken_in(tmp_path, monkeypatch):
+    """The one answer reaches whoever reads when it is posted, the newcomer
+    included, as any answer does."""
     slack = ChangingSlack(["U1", "UBOT"], ["U1", "U2", "UBOT"])
     p, _, _, slack = standin_processor(tmp_path, monkeypatch, slack=slack, steps=[1.0, 0.2])
     conversation(p, (0, dm(f"{AT:.1f}", "what should I get mei for her birthday?", channel_type="group",
                           channel="C1")),
-                 (("tool_use", 1, 0.1), dm(f"{AT + 30:.1f}", "keep it quiet", channel_type="group",
+                 (("tool_use", 1, 0.1), dm(f"{AT + 30:.1f}", "keep it quiet from <@U3>", channel_type="group",
                                             channel="C1")))
-    assert slack.replies == ["one answer to 1: what should I get mei for her birthday?",
-                             "one answer to 1: keep it quiet"]
-    assert handed_texts(tmp_path) == [[], []]
+    said = "keep it quiet from @“jane” (outside the household)"
+    assert slack.replies == [f"one answer to 2: what should I get mei for her birthday? | {said}"]
+    assert slack.calls == 1
+    assert handed_texts(tmp_path) == [[vault.added_text("channel", "fan", said, "16:40")]]
 
 
-def test_a_message_whose_household_check_failed_is_not_taken_in(tmp_path, monkeypatch):
-    p, _, _, slack = standin_processor(tmp_path, monkeypatch, slack=ChangingSlack(["U1", "U2", "UBOT"], None),
-                                       steps=[1.0, 0.2])
+def test_a_session_that_could_not_list_its_readers_takes_an_added_message(tmp_path, monkeypatch):
+    p, _, _, slack = standin_processor(tmp_path, monkeypatch, slack=ChangingSlack(None, None), steps=[1.0, 0.2])
     conversation(p, (0, dm(f"{AT:.1f}", "dinner at 7?", channel_type="group", channel="C1")),
                  (("tool_use", 1, 0.1), dm(f"{AT + 30:.1f}", "and the gift", channel_type="group",
                                             channel="C1")))
-    assert slack.replies == ["one answer to 1: dinner at 7?",
-                             "⚠️ my run failed: could not see who reads this conversation: ratelimited"]
+    assert slack.replies == ["one answer to 2: dinner at 7? | and the gift"]
+    assert handed_texts(tmp_path) == [[vault.added_text("channel", "fan", "and the gift", "16:40")]]
 
 
 def test_a_follow_up_in_a_thread_a_mention_began_is_framed_where_the_mention_was(tmp_path, monkeypatch):
@@ -2512,13 +2691,49 @@ def test_a_round_of_reads_that_raises_is_followed_by_the_next(tmp_path, monkeypa
     asyncio.run(asyncio.wait_for(go(), 3))
 
 
-def test_a_group_with_an_allowed_id_not_let_in_is_not_the_households(tmp_path, monkeypatch):
-    """Who is let in, not the allowlist, decides, in a group as in a DM."""
-    p, store, _ = memory_processor(tmp_path, ConversationSlack(members=["U1", "U2", "UBOT"]),
-                                   RecordingRunner(), monkeypatch)
+def test_an_allowed_id_not_let_in_is_of_the_household_and_starts_nothing(tmp_path, monkeypatch, caplog):
+    """An allowed id Slack has given no usable name is not let in: its own
+    messages start nothing, logged once. In a member's frame it is of the
+    household, quoted by the name Slack shows, not marked outside."""
+    import logging
+
+    runner = RecordingRunner()
+    p, store, _ = memory_processor(tmp_path, ConversationSlack(members=["U1", "U2", "UBOT"], history=[]),
+                                   runner, monkeypatch)
     store._exec("DELETE FROM meta WHERE key='names:U2'")
     p.household = Household.load(store, p.cfg.slack_owner_user_ids)
-    assert asyncio.run(p._household_members({"channel": "G1", "channel_type": "mpim", "user": "U1"})) is None
+    with caplog.at_level(logging.WARNING, logger="wanda"):
+        for i in range(2):
+            asyncio.run(p.handle_slack(dm(f"{AT + i:.1f}", "hello?", channel_type="mpim", channel="G1", user="U2")))
+        asyncio.run(p.handle_slack(dm(f"{AT + 2:.1f}", "dinner at 7", channel_type="mpim", channel="G1")))
+    assert len(runner.calls) == 1
+    assert ("In a group direct message that fan, “mei” and I read. Everyone in it sees what I say there.\n\n"
+            in runner.calls[0][0])
+    assert caplog.text.count("not taking part in G1: U2 is not let in") == 1
+
+
+def test_messages_queued_at_a_stop_where_someone_outside_reads_leave_one_notice(tmp_path, monkeypatch):
+    """Whether they are still on the queue or waiting for a session's slot
+    when the stop cancels them."""
+    p, store, _ = memory_processor(tmp_path, ConversationSlack(members=["U1", "U3", "UBOT"]), RecordingRunner(),
+                                   monkeypatch)
+    for i in range(2):
+        p.slack_queue.put_nowait(dm(f"{AT + i:.1f}", "dinner at 7?", channel_type="mpim", channel="G1"))
+    asyncio.run(p.shutdown(grace_s=1))
+    owed = "SELECT t.slack_channel FROM runs r JOIN tasks t ON t.id = r.task_id WHERE r.notified=0"
+    assert [r["slack_channel"] for r in store._query(owed)] == ["G1"]
+    slack = ConversationSlack(members=["U1", "U3", "UBOT"], history=[])
+    p, store, _, meis = one_slot_behind_a_dm(slack, tmp_path / "waiting", monkeypatch)
+
+    async def go():
+        for ev in (meis, dm(f"{AT:.1f}", "dinner at 7?", channel_type="mpim", channel="G1"),
+                   dm(f"{AT + 1:.1f}", "or 8", channel_type="mpim", channel="G1")):
+            t = asyncio.create_task(p.handle_slack(ev))
+            p._bg.add(t)
+            await asyncio.sleep(0.05)
+        await p.shutdown(grace_s=1)
+    asyncio.run(go())
+    assert sorted(r["slack_channel"] for r in store._query(owed)) == ["D2", "G1"]
 
 
 def test_a_queued_message_from_an_id_not_let_in_gets_no_restart_notice(tmp_path, monkeypatch):

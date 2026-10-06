@@ -39,6 +39,44 @@ def plain(text: str, names: dict[str, str]) -> str:
     return text.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
 
 
+TOKEN_RE = re.compile(r"<([^<>]*)>")
+PERSON_RE = re.compile(r"(?:@[UW]|#[CG])[A-Z0-9]+(?:\|[^<>]*)?")
+SCHEME_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*:[^\s|]+")
+
+
+def _shown(text: str) -> str:
+    # Slack shows an escaped angle bracket as typed
+    return text.replace("<", "&lt;").replace(">", "&gt;")
+
+
+def harmless(text: str) -> str:
+    """A post as the harness sends it: nothing in it pings a channel, @here,
+    @everyone or a user group, and no link hides its address. Each innermost
+    <...> is read once: a mention of a person or a channel, and a link shown
+    as its own address, are kept; any other <!...> becomes its label, or @
+    and its word; any other link becomes "label (address)"; every other < and
+    > is escaped, so that no rendered piece joins another into markup and a
+    second pass changes nothing."""
+    text = text or ""
+    out, at = [], 0
+    for m in TOKEN_RE.finditer(text):
+        out.append(_shown(text[at:m.start()]))
+        at = m.end()
+        body = m.group(1)
+        target, _, label = body.partition("|")
+        link = bool(SCHEME_RE.fullmatch(target))
+        if PERSON_RE.fullmatch(body) or (link and label in ("", target, target.removeprefix("mailto:"))):
+            out.append(m.group(0))
+        elif target.startswith("!"):
+            out.append(label or "@" + re.split(r"[\^\s|]", target[1:].strip() + " ")[0])
+        elif link:
+            out.append(f"{label} ({target.removeprefix('mailto:')})")
+        else:
+            out.append(_shown(m.group(0)))
+    out.append(_shown(text[at:]))
+    return "".join(out)
+
+
 def user_ids_in(messages: list[dict]) -> set[str]:
     ids: set[str] = set()
     for m in messages:

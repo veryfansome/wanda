@@ -13,7 +13,7 @@ from slack_sdk.http_retry.builtin_handlers import RateLimitErrorRetryHandler
 
 from wanda.config import Config
 from wanda.tls import ssl_context
-from wanda.transcript import is_mine, render, trim_thread, user_ids_in
+from wanda.transcript import harmless, is_mine, render, trim_thread, user_ids_in
 
 # Set by the harness for an agent session, so `post` can default to the
 # conversation that triggered it and record that a reply was sent.
@@ -140,7 +140,8 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
             if channel != os.environ.get(ENV_CHANNEL):
                 env_thread = None
             thread = None if args.no_thread else (args.thread or env_thread)
-            resp = web.chat_postMessage(channel=channel, thread_ts=thread, text=args.text[:39000])
+            # no post in her name pings a group or hides a link, a session's included
+            resp = web.chat_postMessage(channel=channel, thread_ts=thread, text=harmless(args.text)[:39000])
             # Record WHERE this landed. The harness suppresses its own reply
             # only when the agent answered the conversation that triggered it —
             # a post to some other channel must not discharge that obligation.

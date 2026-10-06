@@ -28,7 +28,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from wanda import household
 from wanda.config import Config
-from wanda.transcript import is_mine, plain
+from wanda.transcript import harmless, is_mine, plain
 
 log = logging.getLogger(__name__)
 
@@ -72,6 +72,9 @@ SOMEONE = "someone" + OUTSIDE
 # on a public frame's opening line when anyone outside the household can read
 # it; elsewhere the marks on its readers say so
 OUTSIDERS_READ = " Some who can read it are outside the household."
+# on the opening line, after OUTSIDERS_READ, when Slack would not say who is
+# in the conversation: the readers named are then the turn's speakers
+UNLISTED = " I could not find out who else is in it."
 ME = "me"
 # Who posted one of her alerts, as a frame shows it: an alert carries the
 # harness's words, so it is never shown as something she said.
@@ -203,14 +206,6 @@ def settings_problem(cfg: Config) -> str | None:
 
 
 # --- who is in a conversation ---
-
-def outsiders(ids: list[str], own: frozenset[str], members: list[str]) -> list[str]:
-    """Who in a conversation is neither one of the household's let-in
-    members nor her. A memory session runs only where this is no one:
-    another person's words would reach a session that holds the household's
-    whole memory and has a shell."""
-    return sorted(set(ids) - own - set(members))
-
 
 def full_members(people: list[dict]) -> list[str]:
     """Everyone in this Slack who can open a public channel without joining
@@ -527,7 +522,8 @@ def _indent(text: str, n: int) -> str:
 
 
 def arrival_text(place: str, speaker: str, text: str, readers: list[str],
-                 earlier: list[tuple[str, str, str]], also: list[str] = (), *, outside: bool = False) -> str:
+                 earlier: list[tuple[str, str, str]], also: list[str] = (), *, outside: bool = False,
+                 unlisted: bool = False) -> str:
     """The message as the session sees it. A direct message with nothing
     before it keeps the lab's frame; any other frame says who reads what is
     said there and shows what came before, each line with when it was sent.
@@ -536,7 +532,8 @@ def arrival_text(place: str, speaker: str, text: str, readers: list[str],
     one person's, and nobody's request is taken for the speaker's. `outside`
     says, in a public channel or a thread in one, which anyone in this Slack
     can read, that some who can are outside the household; elsewhere the marks
-    on its readers say so."""
+    on its readers say so. `unlisted` says that Slack would not say who else
+    is in the conversation."""
     said = _indent(text, 4)
     after = f", after {' and '.join(also)}" if also else ""
     if place == "dm" and not earlier and not also:
@@ -548,6 +545,7 @@ def arrival_text(place: str, speaker: str, text: str, readers: list[str],
                    + (OUTSIDERS_READ if outside else ""))
     else:
         opening = f"In {room} that {who} and I read." + ("" if place == "dm" else EVERYONE)
+    opening += UNLISTED if unlisted else ""
     lines = "".join(f"    {when} {sp}: {_indent(tx, 8)}\n" for when, sp, tx in earlier if tx.strip())
     block, now = (f"{heading}\n\n{lines}\n", "now ") if lines else ("", "")
     return f"{opening}\n\n{block}{speaker} {now}says{after}:\n\n    {said}"
@@ -807,11 +805,13 @@ def report(structured, result_text: str | None) -> dict | None:
 
 
 def answer(out: dict) -> str:
+    """The answer a report gives, rendered harmless, as it is posted: the
+    answer the run store keeps is the one posted, at once or later."""
     text = out["answer"].strip()
     if text and normalised(text) in PLACEHOLDER:
         log.warning("dropping a placeholder answer: %r", text)
         return ""
-    return text
+    return harmless(text)
 
 
 def answers(results: list[dict]) -> list[str]:

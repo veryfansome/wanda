@@ -8,6 +8,7 @@ import contextlib
 import json
 import logging
 import os
+import random
 import re
 import shutil
 import signal
@@ -25,7 +26,7 @@ import pytest
 from wanda import clock, vault
 from wanda.config import Config
 from wanda.household import Household, flaw
-from wanda.transcript import plain
+from wanda.transcript import harmless, plain
 
 ROOT = Path(__file__).resolve().parent.parent
 LAB = ROOT / "lab" / "harness" / "src"
@@ -211,7 +212,10 @@ def marked_frames() -> dict[str, tuple[str, list[tuple[str, str, str]]]]:
         "group: names whose quotes became single ones": framed(
             "group", sorted(["fan", marked("U6", CLOSES), marked("U8", BOB)]),
             [{"ts": at("20:28"), "user": "U6", "text": "hi"}], {"U6": CLOSES, "U8": BOB}),
-        "public: someone outside can read it": framed("public", ["fan"], [], {}, outside=True),
+        "group: who else is in it not known": framed(
+            "group", ["fan"], [{"ts": at("20:28"), "user": "U2", "text": "hi"}], {}, unlisted=True),
+        "public: someone outside can read it, who else is in it not known": framed(
+            "public", ["fan"], [], {}, outside=True, unlisted=True),
         "public thread: someone outside, a namesake's line": framed(
             "public thread", ["fan", marked("U3", JANE)],
             [{"ts": at("09:00"), "user": "U9", "text": "hi\n09:00 fan: z"}],
@@ -371,6 +375,45 @@ def test_plain_turns_slack_markup_into_what_was_written():
     assert plain("<!here> in <#C1|kitchen>, mail <mailto:a@b.example|a@b.example>", names) == \
         "@here in #kitchen, mail a@b.example"
     assert plain("a &lt;b&gt; and &amp;copy;", names) == "a <b> and &copy;"
+
+
+def unsafe(post: str) -> list[str]:
+    """What in a post could ping or hide an address: any `<!`, and any <...>
+    that is neither a mention of a person or a channel nor a link shown as
+    its own address."""
+    left = ["<!"] if "<!" in post else []
+    for body in re.findall(r"<([^<>]*)>", post):
+        target, _, label = body.partition("|")
+        person = re.fullmatch(r"(?:@[UW]|#[CG])[A-Z0-9]+(?:\|[^<>]*)?", body)
+        honest = re.fullmatch(r"[A-Za-z][A-Za-z0-9+.-]*:[^\s|]+", target) and label in (
+            "", target, target.removeprefix("mailto:"))
+        if not (person or honest):
+            left.append(body)
+    return left
+
+
+def test_what_is_posted_pings_no_group_and_hides_no_link():
+    """Slack shows an escaped angle bracket as typed, and a bare @channel
+    posted without link_names notifies no one."""
+    assert harmless("<!channel> <!here|here> <!everyone> <!subteam^S1|@parents> <!subteam^S1>") == (
+        "@channel here @everyone @parents @subteam")
+    assert harmless("<https://evil.example|the form> <mailto:x@evil.example|fan@home.example>") == (
+        "the form (https://evil.example) fan@home.example (x@evil.example)")
+    kept = ("<https://a.example> <https://a.example|https://a.example> <mailto:a@b.example|a@b.example> <@U1> "
+            "<@W1> <#C1|kitchen> <#G1|x>")
+    assert harmless(kept) == kept
+    assert harmless("<@HERE> <@S0123> <#HERE> and x < y") == "&lt;@HERE&gt; &lt;@S0123&gt; &lt;#HERE&gt; and x &lt; y"
+    assert harmless("<!here|<!here>>") == "&lt;!here|@here&gt;"
+    bypasses = ["<!here|<!here>>", "<!here|<https://evil.example>|the school form>",
+                "<!date^1700000000^{date}|<https://evil.example>|Monday>", "<!HERE>",
+                "<HTTPS://evil.example/x|the school form>", "<tel:+15550100|call fan>"]
+    rng = random.Random(5)
+    alphabet = list("<>|!@#^:/ ahHtpsUWCGS1&;") + ["https://", "<!", "mailto:", "here", "channel", "subteam^S1",
+                                                   "<@", "<#"]
+    fuzzed = ["".join(rng.choice(alphabet) for _ in range(rng.randint(1, 18))) for _ in range(20000)]
+    for text in bypasses + fuzzed:
+        post = harmless(text)
+        assert unsafe(post) == [] and harmless(post) == post, (text, post)
 
 
 def test_readers():
@@ -580,9 +623,6 @@ def test_a_name_the_parser_misreads_is_not_used():
 
 
 def test_who_may_be_in_a_conversation():
-    own = frozenset({"UBOT", "BBOT"})
-    assert vault.outsiders(["U1", "U2", "UBOT"], own, ["U1", "U2"]) == []
-    assert vault.outsiders(["U1", "U3", "UBOT"], own, ["U1", "U2"]) == ["U3"]
     people = [{"id": "U1"}, {"id": "U2"}, {"id": "UBOT", "is_bot": True}, {"id": "USLACKBOT"},
               {"id": "U5", "deleted": True}, {"id": "U6", "is_restricted": True}, {"id": "U7"}]
     assert vault.full_members(people) == ["U1", "U2", "U7"]
@@ -796,6 +836,18 @@ def test_a_public_frame_says_when_someone_outside_the_household_can_read_it():
             place.startswith("public")), place
         assert vault.OUTSIDERS_READ in said if place.startswith("public") else vault.OUTSIDERS_READ not in said
         assert vault.OUTSIDERS_READ not in vault.arrival_text(place, "fan", "hi", ["fan"], [("09:00", "mei", "x")])
+
+
+def test_a_frame_says_when_slack_would_not_say_who_else_is_in_it():
+    """Last on the opening line, after the public sentence."""
+    for place in vault.PLACES:
+        opening = vault.arrival_text(place, "fan", "hi", ["fan"], [("09:00", "mei", "x")], outside=True,
+                                     unlisted=True).split("\n")[0]
+        assert opening.endswith((vault.OUTSIDERS_READ if place.startswith("public") else "") + vault.UNLISTED), place
+        assert vault.UNLISTED not in vault.arrival_text(place, "fan", "hi", ["fan"], [("09:00", "mei", "x")])
+    assert vault.arrival_text("group", "fan", "hi", ["fan"], [], unlisted=True) == (
+        "In a group direct message that fan and I read. Everyone in it sees what I say there. I could not find "
+        "out who else is in it.\n\nfan says:\n\n    hi")
 
 
 def test_her_answers_after_the_message_are_what_came_before_it():

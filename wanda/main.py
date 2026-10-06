@@ -194,9 +194,8 @@ class Additions:
         self.closed = False
         self.started: float | None = None
         self.more = asyncio.Event()
-        # who reads the conversation, where it is and the time of the turn's
-        # message, as the session's opening frame named them
-        self.readers: frozenset[str] | None = None
+        # where the conversation is and the time of the turn's message, as
+        # the session's opening frame named them
         self.place: str | None = None
         self.now: datetime | None = None
         # the names that frame gave the household's members, the names it
@@ -296,7 +295,6 @@ class Processor:
         self._additions: dict[int, Additions] = {}
         # conversations already given a restart notice in this shutdown
         self._noticed: set[int] = set()
-        # conversations already logged as having someone else in them, and
         # allowed ids already logged as not let in
         self._outside: set[str] = set()
         # the look at snapshots.git the housekeeping waits on (_housekeep)
@@ -360,11 +358,10 @@ class Processor:
             task = self.store.get_task_by_thread(pl["channel"], pl["task_key"])
             if task is None:
                 continue
-            # a memory conversation gets one notice, and only where it is known to
-            # be the household's: a 1:1 DM, read by the one who wrote, who is let in
+            # a memory conversation gets one notice, wherever a let-in member's
+            # message waited
             if task["kind"] != "email" and (
-                    pl.get("channel_type") != "im" or pl.get("user") not in self.household.told_names()
-                    or not self._owes_notice(task["id"])):
+                    pl.get("user") not in self.household.told_names() or not self._owes_notice(task["id"])):
                 log.info("dropped a message in %s at shutdown", pl["channel"])
                 continue
             log.info("recording dropped trigger in %s", pl["channel"])
@@ -1546,14 +1543,6 @@ class Processor:
             # a failed run's text is its failure note, marked as when first posted
             note = bool(run["result_text"]) and run["status"] in ("error", "timeout")
             try:
-                if run["task_kind"] != "email" and await self._read_by_others(run["slack_channel"]):
-                    # someone else has come to read the conversation since its
-                    # session ran: what is owed there is not posted, and its
-                    # text stays in the run store
-                    log.warning("not posting run %s in %s: someone besides the household can read it now",
-                                run["id"], run["slack_channel"])
-                    self.store.mark_run_notified(run["id"])
-                    continue
                 await self.slack.reply(run["reply_thread"], text, channel=run["slack_channel"], note=note)
             except Exception:
                 held.add(run["task_id"])
@@ -1618,11 +1607,12 @@ class Processor:
             # Cancelled anywhere — queued on the lock or semaphore, mid-run, or
             # while posting. The Slack event id is already committed, so Slack
             # will never redeliver: leave a marker the next start can act on.
-            # a memory conversation owes one notice for all its waiting messages,
-            # and none where it was not found to be the household's
+            # a memory conversation owes one notice for all its waiting
+            # messages. Nothing awaits before the sender's check (_let_in),
+            # which marks a message it turns away recorded, so one cancelled
+            # unrecorded is a let-in member's.
             memory = task["kind"] != "email"
-            if not state.get("recorded") and (
-                    not memory or (state.get("household") and self._owes_notice(task["id"]))):
+            if not state.get("recorded") and (not memory or self._owes_notice(task["id"])):
                 self.store.record_run(
                     kind="agent", task_id=task["id"], session_id=task["claude_session_id"],
                     started_at=utcnow(), exit_code=None, cost_usd=0.0,
@@ -1735,23 +1725,18 @@ class Processor:
                 self._delivering.discard(run_id)
 
     async def _run_memory_reply(self, task, p: dict, state: dict) -> None:
-        """A message in one of the household's conversations. It waits for the
-        conversation's turn, and the session that turn starts takes every
-        message that arrived since the last one, up to when it holds a session
-        slot: the newest as the message, the rest in the conversation so far.
-        A session per message would answer a burst line by line, each blind to
-        the lines after it. One that arrives while that session works is
-        offered to it (Additions), so that its one answer takes it in; what it
-        does not take waits for the next turn."""
-        try:
-            if await self._household_members(p) is None:
-                state["recorded"] = True  # nothing is said there, so nothing is owed
-                return
-        except Exception:
-            # the turn checks again when its session starts, and says so if it
-            # still cannot tell
-            log.warning("could not check who is in %s yet", p["channel"])
-        state["household"] = True
+        """A message from someone on the allowlist, wherever it was sent; one
+        not let in owes nothing. It waits for the conversation's turn, and the
+        session that turn starts takes every message that arrived since the
+        last one, up to when it holds a session slot: the newest as the
+        message, the rest in the conversation so far. A session per message
+        would answer a burst line by line, each blind to the lines after it.
+        One that arrives while that session works is offered to it
+        (Additions), so that its one answer takes it in; what it does not take
+        waits for the next turn."""
+        if not self._let_in(p):
+            state["recorded"] = True  # nothing is said there, so nothing is owed
+            return
         waiting = self._waiting.setdefault(task["id"], [])
         waiting.append(p)
         if more := self._additions.get(task["id"]):
@@ -1788,9 +1773,8 @@ class Processor:
         can take a whole session of another conversation: the turn's newest
         message framed with the others and with who is in the conversation
         now, and that message's time in the household's zone. None when there
-        is nothing to run: every message withdrawn while it waited, the
-        conversation no longer the household's alone, or who reads it not
-        known, which posts the failure note."""
+        is nothing to run: every message withdrawn while it waited, or a frame
+        that could not be built, which posts the failure note."""
         if not batch:
             return None
         p = max(batch, key=lambda m: float(m["ts"]))
@@ -1798,9 +1782,8 @@ class Processor:
         try:
             arrival = await self._memory_arrival(p, batch, now, more)
         except Exception as e:
-            # never a frame that names fewer readers than there are
             log.exception("could not frame %s in %s", p["ts"], p["channel"])
-            text = f"⚠️ my run failed: could not see who reads this conversation: {truncate(str(e), 900)}"
+            text = f"⚠️ my run failed: I could not gather what was said here: {truncate(str(e), 900)}"
             run_id = self.store.record_run(
                 kind="agent", task_id=task["id"], session_id=None, started_at=utcnow(),
                 exit_code=None, cost_usd=0.0, status="error", error=truncate(str(e), 1000),
@@ -1809,7 +1792,7 @@ class Processor:
             state["recorded"] = True
             await self._post_run(run_id, text, p["channel"], p.get("reply_thread"), note=True)
             return None
-        return None if arrival is None else (arrival, now)
+        return arrival, now
 
     async def memory_turn(self, task, arrival: str | None, now: datetime | None, *, channel: str | None,
                           reply_thread: str | None, owed: bool, state: dict | None = None,
@@ -2050,60 +2033,49 @@ class Processor:
         for more in self._additions.values():
             more.withdrawn.add((channel, ts))
 
-    async def _read_by_others(self, channel: str) -> bool:
-        """Whether anyone but the household and her can read a conversation now,
-        asked before what is owed there is posted later than its session
-        ran: someone may have been added meanwhile. A 1:1 DM takes no one
-        else."""
-        kind = await self.slack.channel_type(channel)
-        return kind != "im" and await self._household_members({"channel": channel, "channel_type": kind}) is None
+    def _let_in(self, p: dict) -> bool:
+        """Whether the sender of a message, whom the watcher found on the
+        allowlist, starts a session: a member, with a name sessions are told,
+        which Slack gave. One without is not let in yet, and is logged once.
+        Asks Slack nothing: who else can read the conversation is the frame's
+        to say."""
+        if p["user"] in self.household.told_names():
+            return True
+        if p["user"] not in self._outside:
+            self._outside.add(p["user"])
+            log.warning("not taking part in %s: %s is not let in until Slack gives a name for them (doctor)",
+                        p["channel"], p["user"])
+        return False
 
-    async def _household_members(self, p: dict) -> list[str] | None:
-        """Who reads this conversation, or None when anyone but the household's
-        members and she can. A member is an allowed id with a name sessions
-        are told, which Slack gave; one without is not let in yet. A public
-        channel is open to everyone in this Slack, so there it is the whole
-        workspace that has to be the household."""
-        members = self.household.told_names()
+    async def _readers(self, p: dict) -> list[str]:
+        """Who can read what is said in a message's conversation: in a 1:1 DM
+        the member who wrote, otherwise its members as Slack lists them.
+        Raises when Slack will not say."""
         if p.get("channel_type") == "im":
-            # read by the one who sent it, whom the watcher found on the allowlist
-            if p["user"] in members:
-                return [p["user"]]
-            if p["user"] not in self._outside:
-                self._outside.add(p["user"])
-                log.warning("not taking part in %s: %s is not let in until Slack gives a name for them (doctor)",
-                            p["channel"], p["user"])
-            return None
-        own = await self.slack.own_ids()
-        ids = await self.slack.members(p["channel"])
-        can_read = ids + (vault.full_members(await self.slack.workspace())
-                          if p.get("channel_type") == "channel" else [])
-        if others := vault.outsiders(can_read, own, list(members)):
-            if p["channel"] not in self._outside:
-                self._outside.add(p["channel"])
-                log.warning("not taking part in %s: %s can read it besides the household",
-                            p["channel"], ", ".join(others))
-            return None
-        return ids
+            return [p["user"]]
+        return await self.slack.members(p["channel"])
 
     async def _memory_arrival(self, p: dict, batch: list[dict], now: datetime,
-                              more: Additions | None = None) -> str | None:
+                              more: Additions | None = None) -> str:
         """The newest message of a turn as its session is handed it: who said
         it, where, who reads the answer and which of them are outside the
         household, and what came before, the turn's other messages and her
-        answers to the turns before included. None when the conversation is
-        no longer the household's alone. `more` keeps the readers, the place,
-        the time and the names it gives."""
-        ids = await self._household_members(p)
-        if ids is None:
-            return None
+        answers to the turns before included. When Slack will not say who
+        reads, the session is told so, and the turn's speakers are named.
+        `more` keeps the place, the time and the names it gives."""
+        try:
+            ids, unlisted = await self._readers(p), False
+        except Exception as e:
+            log.warning("could not read who is in %s: %s", p["channel"], e)
+            # the session runs, told so, naming the readers it knows of
+            ids, unlisted = sorted({m["user"] for m in batch}), True
         place = vault.where(p)
         # a 1:1 DM is read by the member who wrote and her, and only they post there
         marked = p.get("channel_type") != "im"
         kin = self.household.allowed if marked else None
         told, namesakes = self.household.told_names(), self.household.namesakes()
         if more is not None:
-            more.readers, more.place, more.now = frozenset(ids), place, now
+            more.place, more.now = place, now
             more.told, more.namesakes, more.marked = told, namesakes, marked
         own = await self.slack.own_ids()
         try:
@@ -2145,6 +2117,7 @@ class Processor:
             place, named[p["user"]], vault.message_text(p.get("text"), p.get("files"), named), listed,
             vault.earlier(msgs, p["ts"], place, named, own, now, kin=kin, thread=limit, namesakes=namesakes),
             also=sorted({named[m["user"]] for m in batch} - {named[p["user"]]}), outside=outside,
+            unlisted=unlisted,
         )
 
     async def _look_up(self, want: set[str], shown: list[dict], turn: list[dict], own: frozenset[str], kin,
@@ -2173,17 +2146,12 @@ class Processor:
         want |= held.keys() | set(asked)
         return want, await self.slack.users(want), [u for u in others if u not in want]
 
-    async def _added_text(self, p: dict, more: Additions) -> str | None:
-        """A message added while the conversation's session works, as that
-        session is handed it, in the place its opening frame named. None
-        unless the message's own household check finds the readers that frame
-        named: someone joined or left, and a turn of its own frames who reads
-        it now."""
-        ids = await self._household_members(p)
-        if ids is None or frozenset(ids) != more.readers:
-            log.info("leaving %s in %s for the next turn: its readers are not its session's",
-                     p["ts"], p["channel"])
-            return None
+    async def _added_text(self, p: dict, more: Additions) -> str:
+        """A let-in member's message added while the conversation's session
+        works, as that session is handed it, in the place its opening frame
+        named, whoever reads the conversation by then: the session's one
+        answer reaches whoever reads it when it is posted, as any answer
+        does."""
         own = await self.slack.own_ids()
         # a member's message: every id it mentions is named
         want = ({p["user"]} | set(MENTION_RE.findall(p.get("text") or ""))) - more.told.keys()

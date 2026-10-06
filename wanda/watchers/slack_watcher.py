@@ -29,7 +29,8 @@ class SlackWatcher:
     message into one of four triggers:
 
       dm            — any message in a DM or group DM; no mention needed
-      task          — a message in a thread wanda owns (e.g. an email task)
+      task          — a message in a thread wanda owns (e.g. an email task, or
+                      one of her alerts in a channel)
       mention       — @wanda rooting its own thread in a channel
       mention_guest — @wanda inside a thread wanda does not own; it answers,
                       but later un-mentioned replies there are left alone
@@ -48,6 +49,9 @@ class SlackWatcher:
         self.bot_user_id: str | None = None
         self.bot_id: str | None = None
         self.client: SocketModeClient | None = None
+        # (user, conversation) already logged as not allowed: in a group DM
+        # every line of someone outside the household would be logged
+        self._ignored: set[tuple[str, str]] = set()
 
     def start(self) -> None:
         """Connects, once auth.test has named her bot user, and her bot id
@@ -123,7 +127,9 @@ class SlackWatcher:
             return
 
         if not self._allowed(user):
-            log.warning("ignoring %s from non-allowed user %s", kind, user)
+            if (user, channel) not in self._ignored:
+                self._ignored.add((user, channel))
+                log.warning("ignoring %s from non-allowed user %s in %s", kind, user, channel)
             return
 
         # Keyed on the MESSAGE, not the envelope: one @-mention in a thread

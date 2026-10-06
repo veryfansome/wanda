@@ -122,11 +122,44 @@ def test_bot_and_self_messages_ignored(store):
                         "channel_type": "im", "ts": "1.2", "text": "x"}) is None
 
 
-def test_owner_list_restricts_when_set(store):
+def test_owner_list_restricts_when_set(store, caplog):
     ev = {"type": "message", "user": "U_STRANGER", "channel": "C9", "channel_type": "channel",
           "ts": "1.1", "text": "<@UBOT> hi"}
     assert fire(store, ev, slack_owner_user_ids=["U_ME"]) is None
     assert fire(store, ev) is not None  # empty list = anyone
+    # a DM, a group DM's lines and a reply in her thread start nothing either,
+    # each logged once per person and conversation
+    store.create_task(None, "C9", "50.1", kind="mention")
+    caplog.clear()
+    w, q, loop = watcher(store, slack_owner_user_ids=["U_ME"])
+    for i, (channel, kind, thread) in enumerate((("D5", "im", None), ("G5", "mpim", None), ("G5", "mpim", None),
+                                                 ("C9", "channel", "50.1"))):
+        w._handle(w.client, FakeReq({"type": "message", "user": "U_STRANGER", "channel": channel,
+                                     "channel_type": kind, "ts": f"60.{i}", "text": "hi",
+                                     **({"thread_ts": thread} if thread else {})}))
+    loop.run_until_complete(asyncio.sleep(0))
+    loop.close()
+    assert q.empty()
+    assert [r.getMessage() for r in caplog.records if "non-allowed" in r.getMessage()] == [
+        "ignoring dm from non-allowed user U_STRANGER in D5", "ignoring dm from non-allowed user U_STRANGER in G5",
+        "ignoring task from non-allowed user U_STRANGER in C9"]
+
+
+def test_a_reply_under_an_alert_in_a_channel_is_hers(store, monkeypatch):
+    """The alert records its thread, so a reply there needs no @wanda."""
+    import wanda.actions.slack as actions
+
+    class Web:
+        def chat_postMessage(self, **kw):
+            return {"ok": True, "channel": "C_ALERTS", "ts": "70.1"}
+
+    monkeypatch.setattr(actions, "MIN_INTERVAL_S", 0)
+    sa = actions.SlackActions(cfg(alert_channel="C_ALERTS"), store)
+    sa.web = Web()
+    asyncio.run(sa.alert("a vault snapshot failed"))
+    ev = fire(store, {"type": "message", "user": "U1", "channel": "C_ALERTS", "channel_type": "group",
+                      "ts": "70.5", "thread_ts": "70.1", "text": "what does this mean?"})
+    assert ev is not None and ev.payload["kind"] == "task" and ev.payload["reply_thread"] == "70.1"
 
 
 def test_app_mention_twin_is_ignored(store):
@@ -514,10 +547,9 @@ def test_a_members_name_is_read_now_on_a_client_of_its_own(monkeypatch):
     assert sa.web.posted == ["Will do."]
 
 
-def test_the_workspace_is_read_each_time_and_a_conversation_has_its_type(monkeypatch):
+def test_the_workspace_is_read_each_time(monkeypatch):
     """Someone who joined the Slack a minute ago can open a public channel
-    now, so users.list is read each time it is asked; and conversations.info
-    names a conversation's type as message events do."""
+    now, so users.list is read each time it is asked."""
     import wanda.actions.slack as actions
 
     class Web:
@@ -528,10 +560,6 @@ def test_the_workspace_is_read_each_time_and_a_conversation_has_its_type(monkeyp
             self.lists += 1
             return {"members": list(self.people)}
 
-        def conversations_info(self, channel):
-            return {"channel": {"D1": {"is_im": True}, "G1": {"is_mpim": True, "is_private": True},
-                                "C1": {"is_private": True}, "C2": {}}[channel]}
-
     monkeypatch.setattr(actions, "MIN_INTERVAL_S", 0)
     sa = actions.SlackActions(cfg(), store=None)
     sa.web = Web()
@@ -540,11 +568,10 @@ def test_the_workspace_is_read_each_time_and_a_conversation_has_its_type(monkeyp
         before = [u["id"] for u in await sa.workspace()]
         sa.web.people.append({"id": "U3"})
         after = [u["id"] for u in await sa.workspace()]
-        return before, after, [await sa.channel_type(c) for c in ("D1", "G1", "C1", "C2")]
+        return before, after
 
-    before, after, types = asyncio.run(go())
+    before, after = asyncio.run(go())
     assert before == ["U1"] and after == ["U1", "U3"] and sa.web.lists == 2
-    assert types == ["im", "mpim", "group", "channel"]
 
 
 def test_alerts_and_failure_notes_carry_the_harness_marks(monkeypatch):
@@ -586,6 +613,30 @@ def test_alerts_and_failure_notes_carry_the_harness_marks(monkeypatch):
     assert post["channel"] == "U0FAN" and post["metadata"]["event_type"] == ALERT_EVENT
     assert note["metadata"]["event_type"] == NOTE_EVENT and "metadata" not in answer
     assert history["include_all_metadata"] is True and replies["include_all_metadata"] is True
+
+
+def test_every_post_in_her_name_is_rendered_harmless(monkeypatch):
+    """An answer or a note, an alert, and what a session posts itself: a
+    special inside another is rendered once, never into a ping."""
+    import wanda.actions.slack as actions
+    from wanda import slack_cli
+
+    class Web:
+        posted = []
+
+        def chat_postMessage(self, **kw):
+            self.posted.append(kw["text"])
+            return {"ok": True, "channel": kw["channel"], "ts": "1.1"}
+
+    monkeypatch.setattr(actions, "MIN_INTERVAL_S", 0)
+    sa = actions.SlackActions(cfg(alert_channel="U0FAN"), store=None)
+    sa.web = Web()
+    asyncio.run(sa.reply(None, "<!here|<!here>>", channel="D1"))
+    asyncio.run(sa.alert("<!here|<!here>>"))
+    monkeypatch.setattr(slack_cli, "_client", lambda cfg, user_token=False: Web())
+    assert slack_cli.run(cfg(), SimpleNamespace(verb="post", text="<!here|<!here>>", channel="C9", thread=None,
+                                                no_thread=False)) == 0
+    assert Web.posted == ["&lt;!here|@here&gt;", "⚠️ &lt;!here|@here&gt;", "&lt;!here|@here&gt;"]
 
 
 def test_a_deleted_message_is_passed_on(store):
