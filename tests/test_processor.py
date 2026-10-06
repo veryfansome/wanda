@@ -1065,6 +1065,10 @@ def answer(text):
     return {"recalled": ["person:aaaaaa"], "answer": text, "recorded": ["event:x"]}
 
 
+# a report filled with scaffolding, which is no report
+FILLER = {"recalled": ["test"], "answer": "test", "recorded": ["test"]}
+
+
 def test_each_turn_is_a_fresh_session_in_the_vault(tmp_path, monkeypatch):
     monkeypatch.setenv("WANDA_SLACK_BOT_TOKEN", "xoxb-not-for-sessions")
     runner = RecordingRunner()
@@ -1396,11 +1400,26 @@ def test_the_report_may_arrive_as_the_result_text(tmp_path, monkeypatch):
     assert slack.replies == ["Yes."]
 
 
-def test_a_placeholder_is_not_posted(tmp_path, monkeypatch):
+@pytest.mark.parametrize("said,posted", [
+    ({"recalled": [], "answer": "test", "recorded": []}, "test"),
+    (answer("TBD"), "TBD"),
+    ({"recalled": ["person:aaaaaa"], "answer": "The plumber comes at 5.", "recorded": ["placeholder"]},
+     "The plumber comes at 5."),
+    (FILLER, None),
+], ids=["one word", "beside a real report", "a placeholder recorded", "nothing but filler"])
+def test_a_one_word_answer_is_posted_and_filler_is_no_report(tmp_path, monkeypatch, said, posted):
+    """A placeholder answer is hers unless `recalled` or `recorded` holds one
+    too, when the session filled the schema with scaffolding and ended
+    without its report; any other answer is hers whatever they hold."""
     slack = ConversationSlack()
-    p, _, _ = memory_processor(tmp_path, slack, RecordingRunner(answer("test")), monkeypatch)
-    asyncio.run(p.handle_slack(dm(f"{AT:.1f}", "hello")))
-    assert slack.replies == []
+    p, store, _ = memory_processor(tmp_path, slack, RecordingRunner(said), monkeypatch)
+    asyncio.run(p.handle_slack(dm(f"{AT:.1f}", "say test if you're up")))
+    [run] = store._query("SELECT status, error FROM runs")
+    if posted:
+        assert slack.replies == [posted] and (run["status"], run["error"]) == ("ok", None)
+    else:
+        assert (run["status"], run["error"]) == ("error", "the session ended without its report")
+        assert slack.replies == ["⚠️ my run failed: the session ended without its report"]
 
 
 def test_an_answer_pings_no_group_and_hides_no_link(tmp_path, monkeypatch):
@@ -3101,6 +3120,18 @@ def test_a_names_session_whose_last_turn_says_nothing_posts_nothing(tmp_path, mo
     assert runs[0]["result_text"].startswith("one answer to 1: The person I have known in this Slack as fan")
     asyncio.run(p.deliver_pending())
     assert slack.replies == [] and len(snaps) == 1
+
+
+def test_a_names_session_that_reports_only_filler_failed(tmp_path, monkeypatch):
+    """Its run is an error, so its try failed and is made again, where an ok
+    run that left fan alone would keep his name."""
+    def filler(m, sid):
+        return RunResult(ok=True, structured=FILLER, result_text=json.dumps(FILLER), session_id=sid)
+    p, store, _ = names_processor(tmp_path, monkeypatch, Memory("fan"), filler)
+    hand(p, changed(p))
+    [run] = store._query("SELECT status, error FROM runs")
+    assert (run["status"], run["error"]) == ("error", "the session ended without its report")
+    assert tried(p)["error"] == "the session ended without its report" and p.household.rows["U1"]["kept"] is None
 
 
 def frame_name(p):

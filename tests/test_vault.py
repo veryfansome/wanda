@@ -1033,8 +1033,21 @@ def test_report_reads_structured_output_or_the_result_text():
     assert vault.report(None, "I filed it.") is None
     assert vault.report({"ok": True}, None) is None
     assert vault.answer({"answer": "  Will do.  "}) == "Will do."
-    assert vault.answer({"answer": "Test"}) == ""
+    assert vault.answer({"answer": "Test"}) == "Test"
     assert vault.answer({"answer": ""}) == ""
+
+
+def test_a_report_of_nothing_but_placeholders_is_none():
+    """A report is none only when its answer and its `recalled` or
+    `recorded` hold a placeholder, however it arrives; the answers a
+    session's results carry pass over it."""
+    filler = {"recalled": ["test"], "answer": "test", "recorded": ["test"]}
+    assert vault.report(filler, None) is None and vault.report(None, json.dumps(filler)) is None
+    assert vault.report({"recalled": [], "answer": " TBD.", "recorded": ["TODO"]}, None) is None
+    for kept in ({"recalled": [], "answer": "test", "recorded": []},
+                 {"recalled": ["Testing"], "answer": "The plumber comes at 5.", "recorded": ["placeholder"]}):
+        assert vault.report(kept, None) == kept
+    assert vault.answers([{"structured_output": filler}, {"result": json.dumps({"answer": "Test"})}]) == ["Test"]
 
 
 def test_settings_problem():

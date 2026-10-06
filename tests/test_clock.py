@@ -822,24 +822,26 @@ def test_a_timed_wake_whose_answer_delivery_gave_up_on_is_a_reminder_not_given(t
 
 
 class Turns:
-    """Stands in for claude: a session whose turns gave these answers, in
-    order, each kept in its transcript as Claude Code keeps a turn's
-    structured output, and whose last turn ended with its answer, or ran out
-    of time (`timed_out`)."""
+    """Stands in for claude: a session whose turns gave these answers, or
+    these whole reports, in order, each kept in its transcript as Claude
+    Code keeps a turn's structured output, and whose last turn ended with
+    its report, or ran out of time (`timed_out`)."""
 
     def __init__(self, answers, timed_out=False):
         self.agent_sem = asyncio.Semaphore(2)
-        self.answers, self.timed_out = answers, timed_out
+        self.reports = [a if isinstance(a, dict) else {"recalled": [], "answer": a, "recorded": []}
+                        for a in answers]
+        self.timed_out = timed_out
 
     async def run(self, prompt, *, session_id, cwd, **kw):
         tx = vault.transcripts_dir(Path(cwd))
         tx.mkdir(parents=True, exist_ok=True)
         (tx / f"{session_id}.jsonl").write_text("".join(
-            json.dumps({"type": "attachment", "attachment": {"type": "structured_output", "data": {
-                "recalled": [], "answer": a, "recorded": []}}}) + "\n" for a in self.answers))
+            json.dumps({"type": "attachment", "attachment": {"type": "structured_output", "data": out}}) + "\n"
+            for out in self.reports))
         if self.timed_out:
             return RunResult(ok=False, timed_out=True, error="claude ran past 420 s", session_id=session_id)
-        out = {"recalled": [], "answer": self.answers[-1], "recorded": []}
+        out = self.reports[-1]
         return RunResult(ok=True, structured=out, result_text=json.dumps(out), session_id=session_id)
 
 
@@ -854,6 +856,10 @@ class Posts(FakeSlack):
         self.posts.append((channel, text, note))
 
 
+# a report filled with scaffolding, which is no report
+FILLER = {"recalled": ["test"], "answer": "test", "recorded": ["test"]}
+
+
 @pytest.mark.parametrize("answers,timed_out,posted,outcome,alert", [
     # a turn begun after the answer, as by a background command's end, said nothing
     (["Morning. The plumber is at 5.", ""], False, "Morning. The plumber is at 5.", "spoke", None),
@@ -862,14 +868,20 @@ class Posts(FakeSlack):
      "a morning look on 2026-10-01 failed after it spoke; doctor says whose"),
     # no turn said anything, and the last ran out of time
     ([""], True, None, "failed", "a morning look on 2026-10-01 failed; doctor says whose"),
+    # a turn after the answer reported nothing but filler
+    (["Morning. The plumber is at 5.", FILLER], False, "Morning. The plumber is at 5.", "spoke, then failed",
+     "a morning look on 2026-10-01 failed after it spoke; doctor says whose"),
+    # the only turn reported nothing but filler
+    ([FILLER], False, None, "failed", "a morning look on 2026-10-01 failed; doctor says whose"),
 ])
 def test_a_clock_session_posts_the_last_answer_it_gave_that_says_something(tmp_path, monkeypatch, answers,
                                                                           timed_out, posted, outcome, alert):
     """Through the daemon's own `memory_turn`: Claude Code prints the last turn's
     result alone, and the transcript keeps every turn's answer. The last
     that says something is posted and the look spoke, though a later turn
-    said nothing or failed; the failure is alerted, as any clock session's
-    is, and doctor says whose. With none said, a failure posts nothing."""
+    said nothing or failed, as one that reported nothing but filler has; the
+    failure is alerted, as any clock session's is, and doctor says whose.
+    With none said, a failure posts nothing."""
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     slack = Posts()
     store = named(Store(tmp_path / "p.db"))
@@ -886,7 +898,8 @@ def test_a_clock_session_posts_the_last_answer_it_gave_that_says_something(tmp_p
                                                      NAMES.get)[0], now))
     assert slack.posts == ([("D-U1", posted, False)] if posted else [])
     run = store.run(1)
-    assert (run["status"], run["result_text"]) == (("ok", posted) if posted else ("timeout", ""))
+    assert (run["status"], run["result_text"]) == (
+        ("ok", posted) if posted else ("timeout" if timed_out else "error", ""))
     assert store.get_meta("clock:outcome:U1") == f"2026-10-01 08:00 {outcome}"
     assert clock.look_healthy(store.get_meta("clock:outcome:U1"), now, timedelta(minutes=30),
                               LOOKS["U1"]) is bool(posted)

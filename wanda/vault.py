@@ -792,7 +792,10 @@ def normalised(s: str) -> str:
 
 def report(structured, result_text: str | None) -> dict | None:
     """What the session reported. Claude Code puts it in structured_output;
-    the lab reads it from the result text, so both are read."""
+    the lab reads it from the result text, so both are read. A placeholder
+    answer beside a placeholder in `recalled` or `recorded` is the schema
+    filled with scaffolding, and no report; beside anything else it is her
+    answer, since a member may ask her to say just "test"."""
     for candidate in (structured, result_text):
         if isinstance(candidate, str):
             try:
@@ -800,18 +803,21 @@ def report(structured, result_text: str | None) -> dict | None:
             except ValueError:
                 continue
         if isinstance(candidate, dict) and isinstance(candidate.get("answer"), str):
-            return candidate
+            return None if _scaffolding(candidate) else candidate
     return None
+
+
+def _scaffolding(out: dict) -> bool:
+    def holds(field) -> bool:
+        return any(isinstance(v, str) and normalised(v) in PLACEHOLDER
+                   for v in (field if isinstance(field, list) else [field]))
+    return holds(out["answer"]) and (holds(out.get("recalled")) or holds(out.get("recorded")))
 
 
 def answer(out: dict) -> str:
     """The answer a report gives, rendered harmless, as it is posted: the
     answer the run store keeps is the one posted, at once or later."""
-    text = out["answer"].strip()
-    if text and normalised(text) in PLACEHOLDER:
-        log.warning("dropping a placeholder answer: %r", text)
-        return ""
-    return harmless(text)
+    return harmless(out["answer"].strip())
 
 
 def answers(results: list[dict]) -> list[str]:
