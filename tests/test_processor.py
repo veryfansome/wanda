@@ -1095,6 +1095,20 @@ def test_each_turn_is_a_fresh_session_in_the_vault(tmp_path, monkeypatch):
     assert snaps == [f"after {a['session_id']}", f"after {b['session_id']}"]
 
 
+def test_each_snapshot_is_followed_by_a_look_for_files_mem_cannot_read(tmp_path, monkeypatch):
+    """A node file a session or a hand damaged since is put back, or left
+    out and alerted, before the next session meets it."""
+    seen = []
+    runner = RecordingRunner()
+    p, _, _ = memory_processor(tmp_path, ConversationSlack(), runner, monkeypatch,
+                               snapshot=lambda cfg, message: seen.append(message))
+    monkeypatch.setattr("wanda.vault.put_back", lambda cfg: seen.append("look") or [])
+    asyncio.run(p.handle_slack(dm(f"{AT:.1f}", "the March one")))
+    asyncio.run(p.handle_slack(dm(f"{AT + 60:.1f}", "and is it paid?")))
+    (_, a), (_, b) = runner.calls
+    assert seen == [f"after {a['session_id']}", "look", f"after {b['session_id']}", "look"]
+
+
 def test_silence_posts_nothing_and_owes_nothing(tmp_path, monkeypatch):
     slack = ConversationSlack()
     p, store, _ = memory_processor(tmp_path, slack, RecordingRunner(answer("")), monkeypatch)

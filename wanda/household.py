@@ -145,7 +145,7 @@ class Found:
     said: str = ""  # what it found, in mem's words, for doctor
 
 
-def _unq(v: str) -> str:
+def unq(v: str) -> str:
     """A front matter value as fm::unq reads it: a double-quoted one exactly,
     an unquoted one as it is."""
     v = v.strip()
@@ -173,7 +173,7 @@ def found(code: int, out: str) -> Found:
             for line in rest[4:4 + rest[4:].index("\n---")].split("\n"):
                 key, sep, value = line.partition(": ")
                 if sep:
-                    meta[key] = _unq(value)
+                    meta[key] = unq(value)
         label = spelled(meta.get("name") or meta.get("summary"))
         return Found((first,), label, meta.get("made", ""), f"{first} ({label})")
     if code == 1 and AMBIGUOUS in first:

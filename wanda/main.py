@@ -177,6 +177,11 @@ def addressed_to_me(asker: str, text: str) -> str:
     return f"The message addressed to me, from {sanitize(asker)}:\n{sanitize(text)}"
 
 
+def left_out(store: Store) -> list[vault.Unreadable]:
+    """The node files `mem` cannot read that the last look left out."""
+    return [vault.Unreadable(**u) for u in json.loads(store.get_meta("memory_files") or "[]")]
+
+
 class Additions:
     """The messages added to a conversation while its session works, for that
     session to take into its one answer: taken off the conversation's waiting
@@ -1190,6 +1195,12 @@ class Processor:
         await self._flush_given_up()
         await self._flush_lost()
         await self._flush_names()
+        # a file left out for now, when snapshots.git or the vault did not
+        # answer, is looked at again each pass, so that it is back before
+        # most sessions meet it
+        if any(u.error for u in left_out(self.store)):
+            await self.put_back()
+        await self._flush_memory()
         for kind in ("breaker", "cap", "snapshot", "startup", "clock", "names"):
             await self._flush_alert(kind)
         await self._housekeep()
@@ -1479,6 +1490,50 @@ class Processor:
         named = {g["id"] for g in given_up}
         left = [g for g in json.loads(self.store.get_meta("given_up_runs") or "[]") if g["id"] not in named]
         self.store.set_meta("given_up_runs", json.dumps(left))
+
+    async def put_back(self) -> None:
+        """Each node file `mem` cannot read put back from the snapshots, or
+        left out (vault.put_back), each named in the `memory` alert, and named
+        again only when what became of it changes. A start looks before
+        anything writes the vault, and a turn after its snapshot."""
+        try:
+            found = await asyncio.to_thread(vault.put_back, self.cfg)
+        except OSError as e:
+            log.warning("memory: could not look for node files mem cannot read: %s", e)
+            return
+        before = {u.path: u for u in left_out(self.store)}
+        said = []
+        for u in found:
+            if u.put_back:
+                log.info("memory: put back %s from snapshot %s", u.path, u.commit)
+            if u.put_back or u.path not in before or before[u.path].why() != u.why():
+                said.append(f"memory: {u.said()}")
+        left = [u for u in found if not u.put_back]
+        if left:
+            log.warning("memory: %d file(s) mem cannot read left out: %s", len(left),
+                        ", ".join(f"{u.path} ({u.left_out()})" for u in left))
+        self.store.set_meta("memory_files", json.dumps([u._asdict() for u in left]))
+        if said:
+            listed = json.loads(self.store.get_meta("memory_alerts") or "[]")
+            self.store.set_meta("memory_alerts", json.dumps(listed + said))
+
+    async def _flush_memory(self) -> None:
+        """The `memory` alert, at most once a day as every other kind is,
+        written from its list when it is due, so that none is dropped at a
+        day's end."""
+        listed = json.loads(self.store.get_meta("memory_alerts") or "[]")
+        today = datetime.now(timezone.utc).date().isoformat()
+        if not listed or self.store.get_meta("memory_alert_date") == today:
+            return
+        try:
+            await self.slack.alert("\n".join(listed))
+        except Exception:
+            log.warning("memory alert undeliverable; will retry")
+            return
+        self.store.set_meta("memory_alert_date", today)
+        # what a look added while the alert went is named in the next
+        left = json.loads(self.store.get_meta("memory_alerts") or "[]")[len(listed):]
+        self.store.set_meta("memory_alerts", json.dumps(left))
 
     async def _housekeep(self) -> None:
         """The snapshots repository's housekeeping, once a local day, on the
@@ -1991,6 +2046,7 @@ class Processor:
         if said := await asyncio.to_thread(vault.snapshot, self.cfg, f"after {sid}"):
             log.warning("%s", said)
             await self._alert_once("snapshot", f"vault snapshots: {said}")
+        await self.put_back()
         return error
 
     async def _post_run(self, run_id: int, text: str, channel: str, reply_thread: str | None, *,
@@ -2286,6 +2342,9 @@ async def run_daemon(cfg: Config) -> None:
     runner = RunnerService(claude_bin, agent_sem=asyncio.Semaphore(cfg.memory_sessions))
     processor = Processor(cfg, store, queue, slack_actions, runner, slack_queue)
 
+    # before prepare's `mem entity`, which, where her own node cannot be read,
+    # makes her a second one
+    await processor.put_back()
     # before Slack connects: a vault `mem` cannot work in would turn every
     # message into a session that finds nothing and files nothing, silently.
     # A restart loop would be as silent, so the first failure of a day is posted.
@@ -2404,8 +2463,9 @@ async def run_doctor(cfg: Config, smoke: bool) -> int:
     clock_ok = not (problem or looks)
 
     print("memory:")
+    broken = None
     if problem is None:
-        problem = vault.check(cfg, datetime.now(cfg.zone))
+        problem, broken = vault.check(cfg, datetime.now(cfg.zone))
         report("vault", problem is None, problem or str(cfg.vault_dir))
 
     print("store:")
@@ -2442,6 +2502,21 @@ async def run_doctor(cfg: Config, smoke: bool) -> int:
         for r in given_up:
             print(f"      run {r['id']}, from {r['started_at']}: {r['slack_channel']}"
                   + (f", thread {r['reply_thread']}" if r["reply_thread"] else ""))
+        # each file the last look left out that still cannot be read, and
+        # any damaged since, which the next snapshot or start looks at
+        left = {u.path: u for u in left_out(store) if broken is None or u.path in broken}
+        unseen = [path for path in broken or () if path not in left]
+        report("memory files", not (left or unseen),
+               f"{len(left) + len(unseen)} that mem cannot read" if left or unseen else "none left out")
+        for u in left.values():
+            # the snapshot holding the readable copy, which the fold-in
+            # (README, State) checks out
+            print(f"      {u.path}, {vault.node_id(u.path)}: {u.left_out()}" + (
+                f"; a readable copy is in snapshot {u.commit}; README, State, says how to fold "
+                f"{' and '.join(u.made_since)} into {vault.node_id(u.path)}" if u.made_since else ""))
+        for path in unseen:
+            print(f"      {path}, {vault.node_id(path)}: not yet looked at; the next snapshot or start puts it "
+                  "back or leaves it out")
         # a look that failed, one a restart cut short and a day with none all
         # look, in Slack, like a look with nothing to say. A look runs its
         # session and posts, then takes its snapshot in its turn, behind

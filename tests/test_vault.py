@@ -4,6 +4,7 @@ parser reading every frame back, who may be in a conversation, the
 environment, the report, and the vault's setup, check and snapshots (against
 a stand-in `mem`)."""
 
+import asyncio
 import contextlib
 import json
 import logging
@@ -17,7 +18,7 @@ import subprocess
 import threading
 import time
 import unicodedata
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -1097,9 +1098,17 @@ here=$(cd "$(dirname "$0")" && pwd)
 echo "$*" >> "$here/calls"
 case "$1" in
   entity) { cat "$here/templates/root.md"; printf '\\n## What is here\\n'; } > "$MEM_VAULT/CLAUDE.md"
-          mkdir -p "$MEM_VAULT/people"; printf -- '---\\nname: "me"\\n---\\n' > "$MEM_VAULT/people/aaaaaa.md"
+          mkdir -p "$MEM_VAULT/people"
+          # her node, where none reads as hers: beside a file of hers it cannot read, a second
+          if ! grep -qsx 'name: "me"' "$MEM_VAULT"/people/*.md; then
+            id=aaaaaa; [ -e "$MEM_VAULT/people/$id.md" ] && id=ffffff
+            printf -- '---\\nname: "me"\\n---\\n' > "$MEM_VAULT/people/$id.md"
+          fi
           echo x > "$MEM_VAULT/.index.db"; echo "ok person:aaaaaa" ;;
-  recall) echo "expanded from 1: person:aaaaaa" ;;
+  recall) hers=$(grep -lsx 'name: "me"' "$MEM_VAULT"/people/*.md | wc -l)
+          if [ "$2" = me ] && [ $hers -eq 0 ]; then echo "(no node for 'me')"; exit 1; fi
+          if [ "$2" = me ] && [ $hers -gt 1 ]; then echo "('me' is more than one node. An id says which.)"; exit 1; fi
+          echo "expanded from 1: person:aaaaaa" ;;
 esac
 """
 # util-linux flock, which macOS lacks: drops the options and the lock file and
@@ -1509,16 +1518,23 @@ def test_stale_standing_texts_are_regenerated(tmp_path, stand_in):
 
 
 def test_check_names_what_is_wrong(tmp_path, stand_in, monkeypatch):
+    """A node file `mem` cannot read is named beside the verdict; it fails
+    the check only when no node file can be read, which leaves a session
+    nothing to find."""
     c = cfg(tmp_path)
-    assert "No such file" in vault.check(c, NOW)
+    assert "No such file" in vault.check(c, NOW)[0]
     c.vault_dir.mkdir(parents=True)
-    assert "CLAUDE.md" in vault.check(c, NOW)
+    assert "CLAUDE.md" in vault.check(c, NOW)[0]
     assert vault.prepare(c, NOW) is None and vault.snapshot(c, "startup") is None
     (c.vault_dir / "people" / "bbbbbb.md").write_text("---\nname: \"Le")
     (c.vault_dir / "events").mkdir()
     (c.vault_dir / "events" / "2026-10-01-cccccc.md").write_text('---\nsummary: "lunch"\n---\n\nbody\n')
-    problem = vault.check(c, NOW)
-    assert "1 node file(s)" in problem and "people/bbbbbb.md" in problem and "startup" in problem
+    assert vault.check(c, NOW) == (None, ["people/bbbbbb.md"])
+    for path in ("people/aaaaaa.md", "events/2026-10-01-cccccc.md"):
+        (c.vault_dir / path).write_text(DAMAGED)
+    problem, broken = vault.check(c, NOW)
+    assert "3 node file(s)" in problem and "people/bbbbbb.md" in problem and "startup" in problem
+    assert broken == ["people/aaaaaa.md", "people/bbbbbb.md", "events/2026-10-01-cccccc.md"]
     monkeypatch.setenv("PATH", "/usr/bin:/bin")
     assert vault.prepare(c, NOW) == "mem is not on PATH"
 
@@ -1531,12 +1547,12 @@ def test_check_reads_the_vault_under_its_lock_and_writes_under_it_alone(tmp_path
     fd = os.open(c.vault_dir, os.O_RDONLY)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)  # as a `mem` write holds it
-        assert vault.check(c, NOW) == f"reading {c.vault_dir}: the vault stayed locked for 0.3 s"
+        assert vault.check(c, NOW)[0] == f"reading {c.vault_dir}: the vault stayed locked for 0.3 s"
         fcntl.flock(fd, fcntl.LOCK_SH)  # as a `mem` read holds it: the reads go on, the write waits
-        assert vault.check(c, NOW) == f"writing to {c.vault_dir}: the vault stayed locked for 0.3 s"
+        assert vault.check(c, NOW)[0] == f"writing to {c.vault_dir}: the vault stayed locked for 0.3 s"
     finally:
         os.close(fd)
-    assert vault.check(c, NOW) is None
+    assert vault.check(c, NOW) == (None, [])
 
 
 def test_check_proves_the_vault_takes_a_write(tmp_path, stand_in):
@@ -1547,7 +1563,7 @@ def test_check_proves_the_vault_takes_a_write(tmp_path, stand_in):
     assert not (c.vault_dir / vault.WRITE_PROBE).exists()
     c.vault_dir.chmod(0o555)
     try:
-        problem = vault.check(c, NOW)
+        problem, _ = vault.check(c, NOW)
     finally:
         c.vault_dir.chmod(0o755)
     assert problem.startswith(f"writing to {c.vault_dir}: ") and "Permission denied" in problem
@@ -1559,7 +1575,7 @@ def test_a_mem_call_that_never_answers_is_reported_not_raised(tmp_path, stand_in
     (stand_in / "mem").write_text("#!/bin/sh\nexec sleep 5\n")
     run = vault._run
     monkeypatch.setattr(vault, "_run", lambda argv, cwd=None, env=None, timeout=120: run(argv, cwd, env, 0.5))
-    problem = vault.check(c, NOW)
+    problem, _ = vault.check(c, NOW)
     assert problem.startswith("mem recall me:") and "timed out" in problem
     (c.vault_dir / "CLAUDE.md").write_text("# an older text\n")
     problem = vault.prepare(c, NOW)
@@ -1573,6 +1589,368 @@ def test_a_write_mem_cannot_make_fails_the_setup(tmp_path, stand_in):
     (stand_in / "mem").write_text('#!/bin/sh\necho "(a write that could not be made)"; exit 1\n')
     problem = vault.prepare(c, NOW)
     assert problem.startswith("mem entity: exit 1:") and "(a write that could not be made)" in problem
+
+
+# --- a node file `mem` cannot read ---
+
+DAMAGED = "no front matter\n"
+
+
+def node(c: Config, path: str, name: str, *, before=(), body="") -> Path:
+    """A node file as `mem` writes one, its aliases every name it has had:
+    its name and `before`, the names a rename struck."""
+    f = c.vault_dir / path
+    f.parent.mkdir(parents=True, exist_ok=True)
+    aliases = ", ".join(json.dumps(n) for n in (name, *before))
+    struck = "".join(f"~~was named: {n}~~\n" for n in before)
+    f.write_text(f"---\nname: {json.dumps(name)}\naliases: [{aliases}]\n---\n\n{struck}{body}")
+    return f
+
+
+def kept(c: Config) -> dict[str, str]:
+    """The damaged files kept in the data directory, by path, with their text."""
+    d = c.expanded_data_dir / "damaged"
+    return {str(f.relative_to(d)): f.read_text() for f in sorted(d.rglob("*")) if f.is_file()}
+
+
+def head(c: Config) -> str:
+    return subprocess.run(["git", "--git-dir", str(c.snapshots_dir), "log", "-1", "--format=%h"],
+                          capture_output=True, text=True).stdout.strip()
+
+
+class Alerts:
+    """Slack as the daemon's alerts reach it, or are refused while it is down."""
+
+    def __init__(self):
+        self.alerts, self.up = [], True
+
+    async def alert(self, text):
+        if not self.up:
+            raise RuntimeError("slack down")
+        self.alerts.append(text)
+
+
+def processor(c: Config, slack=None):
+    from wanda.main import Processor
+    from wanda.runner import RunnerService
+    from wanda.store import Store
+    c.expanded_data_dir.mkdir(parents=True, exist_ok=True)
+    store = Store(c.db_path)
+    return Processor(c, store, asyncio.Queue(), slack or Alerts(), RunnerService("/bin/true")), store
+
+
+def test_a_file_mem_cannot_read_is_put_back_from_the_newest_snapshot_that_reads(tmp_path, stand_in):
+    """The newest snapshot holding the file can hold it damaged, committed
+    after the damage. The damaged file is kept in the data directory, and
+    the copy takes the node's path whole."""
+    c = cfg(tmp_path)
+    assert vault.prepare(c, NOW) is None
+    lena = node(c, "people/bbbbbb.md", "Lena", body="dentist on Tuesdays\n")
+    assert vault.snapshot(c, "after s1") is None
+    node(c, "people/bbbbbb.md", "Lena", body="dentist on Wednesdays now\n")
+    assert vault.snapshot(c, "after s2") is None
+    good, readable = head(c), lena.read_text()
+    lena.write_text(DAMAGED)
+    assert vault.snapshot(c, "after s3") is None
+    assert vault.put_back(c) == [vault.Unreadable("people/bbbbbb.md", good, put_back=True)]
+    assert lena.read_text() == readable and not list(lena.parent.glob(".*"))
+    assert list(kept(c).values()) == [DAMAGED] and next(iter(kept(c))).startswith("people/bbbbbb.md.")
+    assert vault.put_back(c) == []
+
+
+def test_a_start_puts_files_back_before_mem_makes_her_a_second_node(tmp_path, stand_in, monkeypatch):
+    """At a start whose standing texts are not current, as after an upgrade,
+    `mem entity` writes her node, and makes a second one beside a file of
+    hers it cannot read. Hers is put back first, and a friend's beside a
+    namesake that was in that snapshot too; the next pass alerts both, with
+    the snapshot."""
+    from wanda import main
+    from wanda.store import Store
+    c = cfg(tmp_path, slack_bot_token="xoxb-x", slack_app_token="xapp-x", alert_channel="C9",
+            slack_owner_user_ids="U1", email_triage=False, claude_bin="/bin/true")
+    assert vault.prepare(c, NOW) is None
+    node(c, "people/bbbbbb.md", "Alex", body="Belle's friend from school\n")
+    node(c, "people/cccccc.md", "Alex", body="the plumber\n")
+    assert vault.snapshot(c, "after s1") is None
+    commit = head(c)
+    readable = {path: (c.vault_dir / path).read_text() for path in ("people/aaaaaa.md", "people/bbbbbb.md")}
+    for path in readable:
+        (c.vault_dir / path).write_text(DAMAGED)
+    (c.vault_dir / "CLAUDE.md").write_text("# an older text\n")
+    store = Store(c.db_path)
+    store.set_meta("vault_since", "2026-09-01")
+    store.close()
+    posted = []
+
+    async def alert(self, text):
+        posted.append(text)
+
+    async def one_pass(self):
+        await self.drain_mail()
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    async def user_now(self, uid):
+        return {"id": uid, "profile": {"display_name": "fan"}}
+    monkeypatch.setattr("wanda.actions.slack.SlackActions.alert", alert)
+    monkeypatch.setattr("wanda.actions.slack.SlackActions.user_now", user_now)
+    monkeypatch.setattr("wanda.main.SlackWatcher.start", lambda self: None)
+    monkeypatch.setattr("wanda.main.SlackWatcher.stop", lambda self: None)
+    monkeypatch.setattr("wanda.main.Processor.loop", one_pass)
+    monkeypatch.setattr("wanda.main.acquire_lock", lambda path: None)
+    asyncio.run(main.run_daemon(c))
+    assert "entity --kind person --name me" in (stand_in / "calls").read_text().splitlines()
+    assert {path: (c.vault_dir / path).read_text() for path in readable} == readable
+    assert not (c.vault_dir / "people" / "ffffff.md").exists(), "no second node of hers"
+    assert sorted(path.split(".md.")[0] for path in kept(c)) == ["people/aaaaaa", "people/bbbbbb"]
+    assert [t for t in posted if t.startswith("memory: ")] == [
+        f"memory: people/aaaaaa.md could not be read; put back from snapshot {commit}, the damaged copy kept "
+        f"in damaged/ in the data directory\nmemory: people/bbbbbb.md could not be read; put back from snapshot "
+        f"{commit}, the damaged copy kept in damaged/ in the data directory"]
+
+
+def test_a_file_is_left_out_beside_a_node_made_since_that_carries_its_name(tmp_path, stand_in, capsys):
+    """Put back, the two would answer to one name, and `mem` would refuse
+    every command naming it: here a thing named, in other capitals, as the
+    damaged file's person was, by a session that could not see that person.
+    A file no snapshot holds readable is left out too. Doctor names each,
+    and both nodes of the first, with their kinds."""
+    from wanda.main import run_doctor
+    c = cfg(tmp_path, slack_owner_user_ids="U1", email_triage=False, claude_bin="/usr/bin/true")
+    assert vault.prepare(c, NOW) is None
+    lena = node(c, "people/bbbbbb.md", "Lena")
+    assert vault.snapshot(c, "after s1") is None
+    commit = head(c)
+    lena.write_text(DAMAGED)
+    node(c, "things/dddddd.md", "LENA")
+    node(c, "people/eeeeee.md", "Sam").write_text(DAMAGED)
+    p, store = processor(c)
+    asyncio.run(p.put_back())
+    assert lena.read_text() == DAMAGED and kept(c) == {}
+    assert json.loads(store.get_meta("memory_alerts")) == [
+        "memory: people/bbbbbb.md could not be read and is left out: thing:dddddd, made since, carries its name; "
+        "doctor names both (README, State)",
+        "memory: people/eeeeee.md could not be read and is left out: no snapshot holds a readable copy"]
+    store.close()
+    asyncio.run(run_doctor(c, smoke=False))
+    out = capsys.readouterr().out
+    assert "  ✗ memory files — 2 that mem cannot read\n" in out, out
+    assert (f"      people/bbbbbb.md, person:bbbbbb: left out: thing:dddddd, made since, carries its name; a "
+            f"readable copy is in snapshot {commit}; README, State, says how to fold thing:dddddd into "
+            "person:bbbbbb\n") in out, out
+    assert "      people/eeeeee.md, person:eeeeee: left out: no snapshot holds a readable copy\n" in out, out
+
+
+def test_a_node_renamed_into_the_name_since_the_snapshot_keeps_the_file_out(tmp_path, stand_in):
+    """A namesake whose file in that snapshot carried the name already was
+    there before the damage; one renamed into it since was not."""
+    c = cfg(tmp_path)
+    assert vault.prepare(c, NOW) is None
+    alex = node(c, "people/bbbbbb.md", "Alex", body="Belle's friend from school\n")
+    node(c, "people/cccccc.md", "Sam", body="the plumber\n")
+    assert vault.snapshot(c, "after s1") is None
+    commit = head(c)
+    alex.write_text(DAMAGED)
+    node(c, "people/cccccc.md", "Alex", before=("Sam",), body="the plumber\n")
+    assert vault.put_back(c) == [vault.Unreadable("people/bbbbbb.md", commit, made_since=("person:cccccc",))]
+    assert alex.read_text() == DAMAGED and kept(c) == {}
+
+
+def test_a_file_snapshots_git_did_not_answer_for_is_put_back_at_a_later_pass(tmp_path, stand_in, monkeypatch):
+    """A git that fails is no sign that no snapshot holds the file: nothing
+    is copied, it is not said to have no copy, the start goes on, and each
+    pass tries again until git answers. At a start whose standing texts are
+    current nothing makes her another node meanwhile, and she is put back
+    as the only one."""
+    c = cfg(tmp_path, email_triage=False)
+    assert vault.prepare(c, NOW) is None
+    node(c, "people/bbbbbb.md", "Lena")
+    assert vault.snapshot(c, "after s1") is None
+    commit = head(c)
+    hers = c.vault_dir / "people" / "aaaaaa.md"
+    readable = hers.read_text()
+    hers.write_text(DAMAGED)
+    looks = []
+    put_back = vault.put_back
+    monkeypatch.setattr(vault, "put_back", lambda c: looks.append(1) or put_back(c))
+    slack = Alerts()
+    p, store = processor(c, slack)
+    # the snapshots' housekeeping, which would alert its own failure, is done for the day
+    store.set_meta("snapshots_housekept", datetime.now(c.zone).date().isoformat())
+    calls = len((stand_in / "calls").read_text().splitlines())
+    c.snapshots_dir.chmod(0)
+    try:
+        asyncio.run(p.put_back())
+        assert vault.prepare(c, NOW) is None, "the start goes on"
+        asyncio.run(p.drain_mail())
+    finally:
+        c.snapshots_dir.chmod(0o755)
+    assert len(looks) == 2 and hers.read_text() == DAMAGED and kept(c) == {}
+    assert (stand_in / "calls").read_text().splitlines()[calls:] == ["recall person:bbbbbb"]
+    assert len(slack.alerts) == 1 and slack.alerts[0].startswith(
+        "memory: people/aaaaaa.md could not be read and is left out for now: snapshots.git did not answer "
+        "(git log: exit 128: fatal: not a git repository"), slack.alerts
+    asyncio.run(p.drain_mail())
+    assert len(looks) == 3 and hers.read_text() == readable and list(kept(c).values()) == [DAMAGED]
+    assert not (c.vault_dir / "people" / "ffffff.md").exists()
+    assert json.loads(store.get_meta("memory_alerts")) == [
+        f"memory: people/aaaaaa.md could not be read; put back from snapshot {commit}, the damaged copy kept "
+        "in damaged/ in the data directory"], "the next day's alert"
+    asyncio.run(p.drain_mail())
+    assert len(looks) == 3, "nothing left out for now, so no look until the next snapshot"
+
+
+class Died(BaseException):
+    """The daemon killed part way, which nothing it runs can catch."""
+
+
+def test_a_death_before_the_rename_leaves_the_damaged_file_for_the_next_look(tmp_path, stand_in, monkeypatch):
+    """The path holds the damaged file or the readable one, never one cut
+    short: the copy is written to a hidden file beside it first, which no
+    snapshot holds and `mem` never reads as a node. The next look puts the
+    file back, keeping the damaged file a second time."""
+    c = cfg(tmp_path)
+    assert vault.prepare(c, NOW) is None
+    lena = node(c, "people/bbbbbb.md", "Lena")
+    readable = lena.read_text()
+    assert vault.snapshot(c, "after s1") is None
+    lena.write_text(DAMAGED)
+    replace = os.replace
+
+    def dies(src, dst):
+        raise Died
+    monkeypatch.setattr(os, "replace", dies)
+    with pytest.raises(Died):
+        vault.put_back(c)
+    monkeypatch.setattr(os, "replace", replace)
+    part = lena.with_name(".bbbbbb.md.part")
+    assert lena.read_text() == DAMAGED and part.read_text() == readable and len(kept(c)) == 1
+    assert vault.broken_nodes(c.vault_dir) == ["people/bbbbbb.md"]
+    assert vault.snapshot(c, "after s2") is None and "people/.bbbbbb.md.part" not in tracked(c)
+    assert [u.put_back for u in vault.put_back(c)] == [True]
+    assert lena.read_text() == readable and not part.exists()
+    assert list(kept(c).values()) == [DAMAGED, DAMAGED]
+
+
+def test_a_file_put_right_or_forgotten_by_the_time_the_vault_is_held_is_left_alone(tmp_path, stand_in,
+                                                                                  monkeypatch):
+    """A `mem` write between the look and the hold put it right, and the
+    copy would write over that write; `mem forget` removed it, and the copy
+    would bring back a node that should never have existed."""
+    c = cfg(tmp_path)
+    assert vault.prepare(c, NOW) is None
+    lena = node(c, "people/bbbbbb.md", "Lena")
+    assert vault.snapshot(c, "after s1") is None
+    found, meanwhile = vault._readable_copy, []
+
+    def then(c, path):
+        copy = found(c, path)
+        meanwhile.pop()()
+        return copy
+    monkeypatch.setattr(vault, "_readable_copy", then)
+    lena.write_text(DAMAGED)
+    meanwhile.append(lambda: node(c, "people/bbbbbb.md", "Lena", body="moved to Leeds\n"))
+    assert vault.put_back(c) == []
+    assert lena.read_text().endswith("moved to Leeds\n") and kept(c) == {}
+    lena.write_text(DAMAGED)
+    meanwhile.append(lena.unlink)
+    assert vault.put_back(c) == []
+    assert not lena.exists() and kept(c) == {}
+
+
+def test_the_file_is_read_again_its_names_looked_for_and_the_copy_renamed_in_one_hold(tmp_path, stand_in,
+                                                                                    monkeypatch):
+    """Held exclusively, so that no `mem` call mints the name between the
+    look and the write; and one git at a time in snapshots.git, taking its
+    turn with the snapshots and the housekeeping."""
+    import fcntl
+    c = cfg(tmp_path)
+    assert vault.prepare(c, NOW) is None
+    lena = node(c, "people/bbbbbb.md", "Lena")
+    assert vault.snapshot(c, "after s1") is None
+    lena.write_text(DAMAGED)
+    seen = []
+    locked, made_since, read_bytes, replace = vault._locked, vault._made_since, Path.read_bytes, os.replace
+
+    @contextlib.contextmanager
+    def holding(v, how):
+        with locked(v, how):
+            seen.append(("hold", how))
+            yield
+            seen.append(("let go", how))
+
+    def taking_turns(what):
+        seen.append((what, vault._ONE_AT_A_TIME.locked()))
+    monkeypatch.setattr(vault, "_locked", holding)
+    monkeypatch.setattr(vault, "_made_since", lambda *a: taking_turns("names") or made_since(*a))
+    monkeypatch.setattr(Path, "read_bytes", lambda f: (f == lena and taking_turns("read")) or read_bytes(f))
+    monkeypatch.setattr(os, "replace", lambda a, b: taking_turns("rename") or replace(a, b))
+    assert [u.put_back for u in vault.put_back(c)] == [True]
+    assert seen[-5:] == [("hold", fcntl.LOCK_EX), ("read", True), ("names", True), ("rename", True),
+                         ("let go", fcntl.LOCK_EX)], seen
+
+
+def test_her_node_left_out_the_start_goes_on_and_two_of_hers_refuse_it(tmp_path, stand_in):
+    """With no copy of her node to put back and the standing texts current,
+    nothing makes her another: `mem` finds no one by her names, and the
+    check recalls a node it reads instead. Two nodes of hers would fail
+    every session naming her, and fail the start. With no node file
+    readable, a session would find nothing."""
+    c = cfg(tmp_path)
+    assert vault.prepare(c, NOW) is None
+    node(c, "people/bbbbbb.md", "Lena")
+    hers = c.vault_dir / "people" / "aaaaaa.md"
+    readable = hers.read_text()
+    hers.write_text(DAMAGED)
+    assert vault.put_back(c) == [vault.Unreadable("people/aaaaaa.md")], "snapshots.git has no commit yet"
+    calls = len((stand_in / "calls").read_text().splitlines())
+    assert vault.prepare(c, NOW) is None
+    assert (stand_in / "calls").read_text().splitlines()[calls:] == ["recall person:bbbbbb"]
+    hers.write_text(readable)
+    node(c, "people/ffffff.md", "me")
+    assert vault.prepare(c, NOW).startswith("mem recall me: exit 1: ('me' is more than one node.")
+    (c.vault_dir / "people" / "ffffff.md").unlink()
+    for f in (hers, c.vault_dir / "people" / "bbbbbb.md"):
+        f.write_text(DAMAGED)
+    assert [u.put_back for u in vault.put_back(c)] == [False, False]
+    assert vault.prepare(c, NOW).startswith("2 node file(s) mem cannot read, people/aaaaaa.md, people/bbbbbb.md;")
+
+
+class Tomorrow(datetime):
+    @classmethod
+    def now(cls, tz=None):
+        return datetime.now(tz) + timedelta(days=1)
+
+
+def test_the_memory_alert_names_each_file_once_and_keeps_it_until_slack_takes_it(tmp_path, monkeypatch):
+    """Named again only when what became of it changes, a failure's words
+    aside; listed past the day Slack refused the alert, and at most one
+    alert a day."""
+    c = cfg(tmp_path, email_triage=False)
+    looks = iter([
+        [vault.Unreadable("people/bbbbbb.md", error="snapshots.git did not answer (git log: exit 128: fatal)")],
+        [vault.Unreadable("people/bbbbbb.md", error="snapshots.git did not answer (git log: no answer in 120 s)")],
+        [vault.Unreadable("people/bbbbbb.md", "4e1b2c0", put_back=True)],
+        [vault.Unreadable("people/cccccc.md")],
+    ])
+    monkeypatch.setattr(vault, "put_back", lambda c: next(looks))
+    slack = Alerts()
+    slack.up = False
+    p, store = processor(c, slack)
+    asyncio.run(p.put_back())
+    for _ in range(3):
+        asyncio.run(p.drain_mail())  # the second look, then the third, then none
+    assert slack.alerts == [] and len(json.loads(store.get_meta("memory_alerts"))) == 2
+    monkeypatch.setattr("wanda.main.datetime", Tomorrow)
+    slack.up = True
+    asyncio.run(p.drain_mail())
+    assert slack.alerts == [
+        "memory: people/bbbbbb.md could not be read and is left out for now: snapshots.git did not answer "
+        "(git log: exit 128: fatal)\nmemory: people/bbbbbb.md could not be read; put back from snapshot 4e1b2c0, "
+        "the damaged copy kept in damaged/ in the data directory"]
+    asyncio.run(p.put_back())
+    asyncio.run(p.drain_mail())
+    assert len(slack.alerts) == 1 and json.loads(store.get_meta("memory_alerts")) == [
+        "memory: people/cccccc.md could not be read and is left out: no snapshot holds a readable copy"]
 
 
 # --- `mem` as the image's PATH finds it ---
@@ -1630,4 +2008,67 @@ def test_prepare_with_the_real_mem(tmp_path, monkeypatch):
     c = cfg(tmp_path)
     assert vault.prepare(c, NOW) is None
     assert (c.vault_dir / "CLAUDE.md").read_text().startswith("# My memory")
-    assert vault.check(c, NOW) is None
+    assert vault.check(c, NOW) == (None, [])
+
+
+@pytest.fixture
+def real_mem(tmp_path, monkeypatch):
+    """The `mem` TEST_MEM_BIN names on PATH, with the stand-in flock the
+    snapshots run under."""
+    mem = Path(os.environ["TEST_MEM_BIN"])
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin" / "flock").write_text(FLOCK)
+    (tmp_path / "bin" / "flock").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{mem.parent}:{tmp_path / 'bin'}:{os.environ['PATH']}")
+
+    def run(c: Config, sid: str, *args: str) -> subprocess.CompletedProcess:
+        return subprocess.run([str(mem), *args], cwd=c.vault_dir, env=vault.session_env(c, sid, NOW),
+                              capture_output=True, text=True)
+    return run
+
+
+def named(c: Config, name: str) -> list[str]:
+    return sorted(f.name for f in (c.vault_dir / "people").glob("*.md") if f'name: "{name}"\n' in f.read_text())
+
+
+@pytest.mark.skipif(not os.environ.get("TEST_MEM_BIN"), reason="TEST_MEM_BIN names a mem build with its templates")
+def test_her_node_unreadable_at_a_start_is_put_back_with_the_real_mem(tmp_path, real_mem):
+    """At a start after an upgrade, prepare's `mem entity` would make her a
+    second node beside a file of hers it cannot read: put back first, she is
+    one node, and a session naming her finds that one."""
+    c = cfg(tmp_path)
+    assert vault.prepare(c, NOW) is None
+    assert real_mem(c, "s-1", "entity", "--kind", "person", "--name", "Belle").returncode == 0
+    assert vault.snapshot(c, "after s-1") is None
+    [hers] = named(c, "me")
+    (c.vault_dir / "people" / hers).write_text(DAMAGED)
+    (c.vault_dir / "CLAUDE.md").write_text("# an older text\n")
+    assert [u.put_back for u in vault.put_back(c)] == [True]
+    assert vault.prepare(c, NOW) is None and named(c, "me") == [hers]
+    made = real_mem(c, "s-2", "trajectory", "--summary", "remind Belle about the dentist", "--expect",
+                    "Belle reminded", "--by", "2026-10-06T09:00", "--about", "me, Belle")
+    assert made.returncode == 0, made.stdout + made.stderr
+    tid = re.search(r"trajectory:(\w+)", made.stdout).group(1)
+    assert f'"[[{hers.removesuffix(".md")}]]"' in (c.vault_dir / "trajectories" / f"{tid}.md").read_text()
+    assert named(c, "me") == [hers]
+
+
+@pytest.mark.skipif(not os.environ.get("TEST_MEM_BIN"), reason="TEST_MEM_BIN names a mem build with its templates")
+def test_one_of_two_people_named_alex_damaged_after_a_snapshot_is_put_back_with_the_real_mem(tmp_path, real_mem):
+    """The other Alex was in that snapshot too: `mem` told them apart then,
+    and does again."""
+    c = cfg(tmp_path)
+    assert vault.prepare(c, NOW) is None
+    real_mem(c, "s-1", "entity", "--kind", "person", "--name", "Alex", "--summary", "Belle's friend from school")
+    real_mem(c, "s-1", "entity", "--kind", "person", "--name", "Alex", "--new", "--summary", "the plumber")
+    before = real_mem(c, "s-2", "recall", "Alex").stderr
+    assert "'Alex' is more than one node" in before, before
+    assert vault.snapshot(c, "after s-1") is None
+    [friend] = [f for f in (c.vault_dir / "people").glob("*.md")
+                if f.name != "CLAUDE.md" and "friend from school" in f.read_text()]
+    readable = friend.read_text()
+    friend.write_text(DAMAGED)
+    assert "'Alex' is more than one node" not in real_mem(c, "s-3", "recall", "Alex").stderr
+    assert [u.put_back for u in vault.put_back(c)] == [True]
+    assert friend.read_text() == readable
+    assert real_mem(c, "s-4", "recall", "Alex").stderr == before

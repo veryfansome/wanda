@@ -21,7 +21,7 @@ import subprocess
 import threading
 import time
 import unicodedata
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import NamedTuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -857,8 +857,11 @@ def last_said(given: list[str]) -> str:
 # period, and sessions read the vault's settings alone. root.md tells sessions
 # the transcripts are kept for a month.
 SETTINGS = '{"cleanupPeriodDays": 30}\n'
-# where `mem` keeps each kind of node (memory/src/fm.rs, KIND_DIR)
-KIND_DIRS = ("people", "places", "orgs", "groups", "things", "topics", "events", "prefs", "trajectories")
+# each directory `mem` keeps nodes in, and the kind of node it keeps there
+# (memory/src/fm.rs, KIND_DIR)
+KINDS = {"people": "person", "places": "place", "orgs": "org", "groups": "group", "things": "thing",
+         "topics": "topic", "events": "event", "prefs": "preference", "trajectories": "trajectory"}
+KIND_DIRS = tuple(KINDS)
 NAMED = re.compile(r'^(?:name|summary): *"?[^"\s]', re.MULTILINE)
 # How long the daemon waits for the vault's lock before giving up: a snapshot
 # is skipped, a startup fails.
@@ -1082,26 +1085,220 @@ def prepare(cfg: Config, now: datetime, known_since: str | None = None) -> str |
             return f"mem entity: {e}"
         if done.returncode != 0 or "panicked" in done.stderr:
             return f"mem entity: exit {done.returncode}: {(done.stdout + done.stderr)[-300:]}"
-    return check(cfg, now)
+    return check(cfg, now)[0]
+
+
+def _front(text: str) -> dict[str, str] | None:
+    """A node file's front matter, each field as written, or None for a file
+    `mem` passes over without a word: no closed front matter, or nothing to
+    call the node by."""
+    end = text.find("\n---", 4)
+    if not text.startswith("---\n") or end < 0 or not NAMED.search(text[4:end]):
+        return None
+    return {key: value for key, sep, value in (line.partition(": ") for line in text[4:end].split("\n")) if sep}
+
+
+def _read(f: Path) -> str:
+    try:
+        return f.read_text()
+    except (OSError, UnicodeDecodeError):
+        return ""
+
+
+def _decoded(b: bytes) -> str:
+    try:
+        return b.decode()
+    except UnicodeDecodeError:
+        return ""
+
+
+def _nodes(vault: Path) -> dict[str, dict[str, str] | None]:
+    """Every node file, by its path in the vault, with its front matter, or
+    None where `mem` cannot read it."""
+    return {str(f.relative_to(vault)): _front(_read(f))
+            for kind in KIND_DIRS for f in sorted((vault / kind).glob("*.md")) if f.name != "CLAUDE.md"}
 
 
 def broken_nodes(vault: Path) -> list[str]:
-    """Node files `mem` passes over without a word: no closed front matter,
-    or nothing to call the node by. A person `mem` cannot see is minted again
-    the next time someone names them."""
-    out = []
-    for kind in KIND_DIRS:
-        for f in sorted((vault / kind).glob("*.md")):
-            if f.name == "CLAUDE.md":
-                continue
+    """Node files `mem` passes over without a word. It does not see the node,
+    and what links to it reads without it; a person it cannot see is minted
+    again the next time someone names them."""
+    return [path for path, front in _nodes(vault).items() if front is None]
+
+
+def _names(front: dict[str, str]) -> set[str]:
+    """Every name `mem` finds a node by, in lower case: its name, and its
+    aliases, which `mem` writes from every name it has had."""
+    raw = front.get("aliases", "")
+    try:
+        aliases = json.loads(raw or "[]")
+    except ValueError:
+        aliases = raw.strip("[]").split(",")  # as written before every value was quoted
+    if not isinstance(aliases, list):
+        aliases = [aliases]
+    return {household.unq(str(n)).lower() for n in [front.get("name", ""), *aliases]} - {""}
+
+
+def node_id(path: str) -> str:
+    """`kind:id` for a node file's path in the vault."""
+    kind, _, name = path.partition("/")
+    return f"{KINDS[kind]}:{name.removesuffix('.md')}"
+
+
+class Unreadable(NamedTuple):
+    """A node file `mem` cannot read, and what became of it."""
+    path: str  # in the vault
+    commit: str = ""  # the newest snapshot holding a copy `mem` reads, if one does
+    put_back: bool = False
+    made_since: tuple[str, ...] = ()  # the nodes, by id, that keep it out
+    error: str = ""  # what stopped the look, which is made again at each pass
+
+    def why(self) -> tuple:
+        """What became of it, a failure's words aside: they can change from
+        one try to the next while the failure stays."""
+        return self.put_back, tuple(self.made_since), bool(self.error)
+
+    def left_out(self) -> str:
+        """Why it is left out, as the alert and doctor say it."""
+        if self.error:
+            return f"left out for now: {self.error}"
+        if self.made_since:
+            return (f"left out: {', '.join(self.made_since)}, made since, "
+                    f"{'carries' if len(self.made_since) == 1 else 'carry'} its name")
+        return "left out: no snapshot holds a readable copy"
+
+    def said(self) -> str:
+        """As the `memory` alert says it."""
+        if self.put_back:
+            return (f"{self.path} could not be read; put back from snapshot {self.commit}, the damaged copy "
+                    "kept in damaged/ in the data directory")
+        return (f"{self.path} could not be read and is {self.left_out()}"
+                + ("; doctor names both (README, State)" if self.made_since else ""))
+
+
+# how long a read of snapshots.git may take before the file waits for the next try
+SNAPSHOT_READ_S = 120
+
+
+def _in_snapshots(cfg: Config, *argv: str) -> bytes | None:
+    """What a read of snapshots.git printed, or None where it holds no such
+    path or no commit yet. Raises SubprocessError when git does not answer:
+    a repository that cannot say what it holds is not one that holds
+    nothing."""
+    try:
+        # in the C locale, so git's words for a path or a commit it does not
+        # have are the ones looked for below
+        done = subprocess.run(["git", "--git-dir", str(cfg.snapshots_dir), *argv], capture_output=True,
+                              env=os.environ | {"LC_ALL": "C"}, timeout=SNAPSHOT_READ_S)
+    except subprocess.TimeoutExpired:
+        raise subprocess.SubprocessError(f"git {argv[0]}: no answer in {SNAPSHOT_READ_S} s") from None
+    except OSError as e:
+        raise subprocess.SubprocessError(f"git {argv[0]}: {e}") from e
+    if done.returncode == 0:
+        return done.stdout
+    said = done.stderr.decode(errors="replace").strip()
+    if "does not exist in" in said or "does not have any commits yet" in said:
+        return None
+    raise subprocess.SubprocessError(f"git {argv[0]}: exit {done.returncode}: {said[:300]}")
+
+
+def _readable_copy(cfg: Config, path: str) -> tuple[str, bytes] | None:
+    """The newest snapshot holding a copy of `path` that `mem` reads, and the
+    copy. The newest that holds the file at all can hold it damaged."""
+    for commit in _decoded(_in_snapshots(cfg, "log", "--format=%h", "--", path) or b"").split():
+        copy = _in_snapshots(cfg, "show", f"{commit}:{path}")
+        if copy is not None and _front(_decoded(copy)) is not None:
+            return commit, copy
+    return None
+
+
+def _made_since(cfg: Config, nodes: dict[str, dict[str, str] | None], path: str, commit: str,
+                names: set[str]) -> list[str]:
+    """The readable nodes, by id, that carry one of `names` and whose file
+    did not carry it in snapshot `commit`: made or renamed since, while `mem`
+    could not see the node at `path`. Once that node read again `mem` would
+    refuse every command naming the name. One whose file carried it there was
+    its namesake before the damage, and is no bar."""
+    found = []
+    for other, front in nodes.items():
+        if front is None or other == path or not (shared := _names(front) & names):
+            continue
+        then = _in_snapshots(cfg, "show", f"{commit}:{other}")
+        before = _front(_decoded(then)) if then is not None else None
+        if before is None or shared - _names(before):
+            found.append(node_id(other))
+    return found
+
+
+def _write_whole(f: Path, text: bytes) -> None:
+    """As `mem` writes a node (memory/src/vault.rs, write_whole): to a hidden
+    file beside it, which then takes its name, so the path holds the old file
+    or the new one and never one cut short. The name does not end in `.md`,
+    and SNAPSHOT_SKIP leaves it out, so one left by a death part way is
+    neither read as a node nor snapshotted."""
+    part = f.with_name(f".{f.name}.part")
+    try:
+        part.write_bytes(text)
+        os.replace(part, f)
+    except OSError:
+        with contextlib.suppress(OSError):
+            part.unlink()
+        raise
+
+
+def _put_back_one(cfg: Config, path: str, commit: str, copy: bytes) -> Unreadable | None:
+    """The file at `path` written over with `copy`, the damaged file kept in
+    the data directory first, unless a node made since carries its name.
+    The file is read again, the names read and the copy written in one
+    exclusive hold of the vault, so that no `mem` call mints the name
+    between the look and the write. None when the file is no longer there
+    to put back or reads again: `mem forget` removed it, or a write or the
+    mount put it right."""
+    f = cfg.vault_dir / path
+    with _locked(cfg.vault_dir, fcntl.LOCK_EX):
+        try:
+            damaged = f.read_bytes()
+        except FileNotFoundError:
+            return None
+        if _front(_decoded(damaged)) is not None:
+            return None
+        nodes = _nodes(cfg.vault_dir)
+        if made := _made_since(cfg, nodes, path, commit, _names(_front(_decoded(copy)))):
+            return Unreadable(path, commit, made_since=tuple(made))
+        kept = cfg.expanded_data_dir / "damaged" / f"{path}.{datetime.now(timezone.utc):%Y%m%dT%H%M%S.%fZ}"
+        kept.parent.mkdir(parents=True, exist_ok=True)
+        kept.write_bytes(damaged)
+        _write_whole(f, copy)
+    return Unreadable(path, commit, put_back=True)
+
+
+def put_back(cfg: Config) -> list[Unreadable]:
+    """Each node file `mem` cannot read, put back as the newest snapshot
+    holding a copy it reads has it, or left out, with what became of it.
+    A file left out stays as it is: `mem` does not see the node, and the
+    start goes on (`check`). It takes its turn with the snapshots and the
+    housekeeping, one git at a time in snapshots.git, as they do. Raises
+    OSError when the vault cannot be read."""
+    vault = cfg.vault_dir
+    if not vault.is_dir():
+        return []
+    with _locked(vault, fcntl.LOCK_SH):
+        broken = broken_nodes(vault)
+    found = []
+    if not broken:
+        return found
+    with _ONE_AT_A_TIME:
+        for path in broken:
             try:
-                text = f.read_text()
-            except (OSError, UnicodeDecodeError):
-                text = ""
-            end = text.find("\n---", 4)
-            if not text.startswith("---\n") or end < 0 or not NAMED.search(text[4:end]):
-                out.append(str(f.relative_to(vault)))
-    return out
+                if (copy := _readable_copy(cfg, path)) is None:
+                    found.append(Unreadable(path))
+                elif (outcome := _put_back_one(cfg, path, *copy)) is not None:
+                    found.append(outcome)
+            except subprocess.SubprocessError as e:
+                found.append(Unreadable(path, error=f"snapshots.git did not answer ({e})"))
+            except OSError as e:
+                found.append(Unreadable(path, error=str(e)))
+    return found
 
 
 def last_snapshot(cfg: Config) -> str:
@@ -1122,48 +1319,57 @@ def last_snapshot(cfg: Config) -> str:
     raise OSError(f"git log: exit {done.returncode}: {done.stderr.strip()[:300]}")
 
 
-def check(cfg: Config, now: datetime) -> str | None:
-    """Whether a session would find its standing texts, nodes `mem` can read,
-    a vault that takes a write, and a `mem` that reads."""
+def check(cfg: Config, now: datetime) -> tuple[str | None, list[str]]:
+    """Whether a session would find its standing texts, a node `mem` can
+    read, a vault that takes a write, and a `mem` that reads; and the node
+    files `mem` cannot read, which `put_back` has put back or left out."""
     env = session_env(cfg, "", now)
     mem = shutil.which("mem", path=env.get("PATH"))
     if not mem:
-        return "mem is not on PATH"
+        return "mem is not on PATH", []
     try:
         root = (_templates(mem) / "root.md").read_text()
     except OSError as e:
-        return f"the templates beside mem: {e}"
+        return f"the templates beside mem: {e}", []
     try:
         # held shared, as the lock contract asks of anything that reads the
         # vault outside `mem`: the files are then read between `mem` commands
         with _locked(cfg.vault_dir, fcntl.LOCK_SH):
             standing = _standing(cfg.vault_dir, root)
-            broken = broken_nodes(cfg.vault_dir)
+            nodes = _nodes(cfg.vault_dir)
     except OSError as e:
-        return f"reading {cfg.vault_dir}: {e}"
+        return f"reading {cfg.vault_dir}: {e}", []
+    broken = [path for path, front in nodes.items() if front is None]
+    read = [path for path, front in nodes.items() if front is not None]
     if not standing:
-        return f"{cfg.vault_dir / 'CLAUDE.md'} does not carry the standing texts"
-    if broken:
+        return f"{cfg.vault_dir / 'CLAUDE.md'} does not carry the standing texts", broken
+    if broken and not read:
         try:
             last = last_snapshot(cfg)
         except OSError as e:
             last = f"unknown ({e})"
         return (f"{len(broken)} node file(s) mem cannot read, {', '.join(broken[:5])}; the last "
-                f"snapshot, {last}, holds the vault as it was (README, State)")
+                f"snapshot, {last}, holds the vault as it was (README, State)"), broken
     try:
         # held as anything other than `mem` that writes the live vault holds it
         with _locked(cfg.vault_dir, fcntl.LOCK_EX):
             (cfg.vault_dir / WRITE_PROBE).write_text("a write the vault takes\n")
             (cfg.vault_dir / WRITE_PROBE).unlink()
     except OSError as e:
-        return f"writing to {cfg.vault_dir}: {e}"
+        return f"writing to {cfg.vault_dir}: {e}", broken
+    # Where no file of hers reads, `mem` finds no one by her names, and a node
+    # it does read shows that it reads. Two of hers still fail the check, as
+    # they would fail every session naming her.
+    hers = [path for path in read if path.startswith("people/")
+            and household.unq(nodes[path].get("name") or nodes[path].get("summary", "")).lower() in household.SELF]
+    probe = "me" if hers or not read else node_id(read[0])
     try:
-        done = _run([mem, "recall", "me"], cwd=cfg.vault_dir, env=env)
+        done = _run([mem, "recall", probe], cwd=cfg.vault_dir, env=env)
     except (OSError, subprocess.SubprocessError) as e:
-        return f"mem recall me: {e}"
+        return f"mem recall {probe}: {e}", broken
     if done.returncode != 0:
-        return f"mem recall me: exit {done.returncode}: {(done.stdout + done.stderr)[-300:]}"
-    return None
+        return f"mem recall {probe}: exit {done.returncode}: {(done.stdout + done.stderr)[-300:]}", broken
+    return None, broken
 
 
 def _clear_git_locks(repo: Path) -> list[str]:
