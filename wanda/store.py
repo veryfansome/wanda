@@ -543,11 +543,13 @@ class Store:
             (task_id, task_id, limit),
         )
 
-    def mark_run_notified(self, run_id: int) -> None:
-        """A run posted: the messages it answers are no longer kept."""
+    def mark_run_notified(self, run_id: int) -> list[tuple[str, str]]:
+        """A run posted: the messages it answers are no longer kept. Returns
+        them, by (channel, ts)."""
         with self._transaction():
             self._db.execute("UPDATE runs SET notified=1 WHERE id=?", (run_id,))
-            self._db.execute("DELETE FROM unanswered WHERE run=? AND state='answered'", (run_id,))
+            return [tuple(r) for r in self._db.execute(
+                "DELETE FROM unanswered WHERE run=? AND state='answered' RETURNING channel, ts", (run_id,))]
 
     def owed_before(self, run_id: int) -> bool:
         """Whether a run recorded before this one in its task still owes its
@@ -649,12 +651,13 @@ class Store:
             self._db.executemany("UPDATE unanswered SET session=NULL, tries=MAX(tries-1, 0) WHERE channel=? "
                                  "AND ts=? AND state='due'", list(keys))
 
-    def forget(self, keys) -> None:
+    def forget(self, keys) -> list[tuple[str, str]]:
         """Kept messages that no run will answer: deleted, refused, or
-        answered with no run. One already answered stays, for its run."""
+        answered with no run. One already answered stays, for its run.
+        Returns those no longer kept."""
         with self._transaction():
-            self._db.executemany("DELETE FROM unanswered WHERE channel=? AND ts=? AND state <> 'answered'",
-                                 list(keys))
+            return [k for k in keys if self._db.execute(
+                "DELETE FROM unanswered WHERE channel=? AND ts=? AND state <> 'answered'", k).rowcount]
 
     # --- her running time ---
 

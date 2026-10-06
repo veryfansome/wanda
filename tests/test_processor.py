@@ -40,6 +40,9 @@ class FakeSlack:
         self.fail = fail
         self.tasks, self.digests, self.alerts, self.replies = [], [], [], []
         self.channels, self.threads = [], []
+        # each call putting her reaction on a message and taking it off, by
+        # (channel, ts), in order
+        self.reacted, self.unreacted = [], []
 
     async def post_task(self, row, v):
         if self.fail:
@@ -64,6 +67,12 @@ class FakeSlack:
         self.replies.append(text)
         self.channels.append(channel)
         self.threads.append(thread_ts)
+
+    async def react(self, channel, ts):
+        self.reacted.append((channel, ts))
+
+    async def unreact(self, channel, ts):
+        self.unreacted.append((channel, ts))
 
 
 def cfg(**kw) -> Config:
@@ -2919,9 +2928,10 @@ def test_an_answer_given_up_after_two_hours_is_followed_by_her_note_saying_so(tm
     """An answer to two of fan's messages, his third answered after it. Given
     up after two hours, her note after it dropped with it: GIVEN_UP, with
     the time of the first of the two, after the later answer there, holding
-    both, which go once it is posted. Given up at once, Slack would refuse a
-    note there too: nothing is posted, and the messages go. A note given up
-    is not replaced."""
+    both, which go, with her reaction, once it is posted. Given up at once,
+    Slack would refuse a note there too: nothing is posted, and the messages
+    go with their reaction left on, for good. A note given up is not
+    replaced."""
     group = "group" in given_up
     at_once = "at once" in given_up
     slack = RefusesSaying("Sorry" if given_up.startswith("her note") else "plumber",
@@ -2945,20 +2955,41 @@ def test_an_answer_given_up_after_two_hours_is_followed_by_her_note_saying_so(tm
         answered = store.record_run(**run, settled=Settled(answered=(first, second)))
     store.record_run(kind="agent", task_id=task, session_id="s2", started_at=utcnow(), exit_code=0, cost_usd=0.1,
                      status="ok", result_text="Yes.", notified=0, settled=Settled(answered=(third,)))
-    asyncio.run(p.drain_mail())
+    settle(p, p.drain_mail())
     if not at_once:
         assert slack.replies == [] and [r[0] for r in kept(store)] == [first[1], second[1], third[1]]
+        assert slack.unreacted == []
         fake_time.at += timedelta(minutes=122)
-        asyncio.run(p.drain_mail())
+        settle(p, p.drain_mail())
         assert [r[:2] for r in kept(store)] == [(first[1], "answered"), (second[1], "answered")]
-        asyncio.run(p.drain_mail())
+        assert slack.unreacted == [third]
+        settle(p, p.drain_mail())
         note = (main.GIVEN_UP_GROUP if group else main.GIVEN_UP).format(at="at 07:58")
         assert slack.replies == ["_(I wrote this at 08:00; it couldn't be sent until now.)_\nYes.", note]
+        assert sorted(slack.unreacted) == [first, second, third]
     else:
         assert slack.replies == ["Yes."]
+        settle(p, p.drain_mail())
+        assert slack.unreacted == [third]
     assert kept(store) == [] and store.pending_deliveries() == []
     then = "after two hours, a note asked for it again" if not at_once else "at once (is_archived), no note"
     assert f"run {answered}, from 08:00, {then}. " in slack.alerts[0]
+
+
+def test_her_note_given_up_after_two_hours_takes_her_reaction_off_its_message(tmp_path, fake_time):
+    """Not replaced, and its message goes with nothing said; Slack refused
+    that conversation for two hours, not for good."""
+    slack = RefusesSaying("Sorry", RuntimeError("ratelimited"))
+    p, store = make(tmp_path, slack, email_triage=False)
+    task = store.create_task(None, "D1", "conversation", kind="dm")
+    line = keep(store, dm(f"{fake_time.at.timestamp() - 60:.1f}", "is it paid?"))
+    store.record_run_and_note(main.FAILED, settled=Settled(answered=(line,)), kind="agent", task_id=task,
+                              session_id="s1", started_at=utcnow(), exit_code=1, cost_usd=0.1, status="error")
+    settle(p, p.drain_mail())
+    assert kept(store)[0][:2] == (line[1], "answered") and slack.unreacted == []
+    fake_time.at += timedelta(minutes=122)
+    settle(p, p.drain_mail())
+    assert slack.replies == [] and kept(store) == [] and slack.unreacted == [line]
 
 
 def test_a_stops_marker_from_before_is_posted_as_her_note_or_the_email_tasks(tmp_path):
@@ -3326,7 +3357,7 @@ def test_a_stop_lets_the_running_session_answer_record_and_snapshot_before_the_s
     posted and recorded and the vault snapshotted, and only then does the
     daemon shut down, stopping the watcher and writing when she last ran
     just before the store closes. What fan sent, never taken in, is left due
-    for the next start."""
+    for the next start, her reaction on it."""
     import logging
 
     events = []
@@ -3397,6 +3428,7 @@ def test_a_stop_lets_the_running_session_answer_record_and_snapshot_before_the_s
     assert "a pass" in events[at(stopping):at("shutting down")] and "a tick" not in events[at(stopping):]
     assert events[at("shutting down"):][-2:] == ["up_at", "the store closes"]
     assert slack.replies == ["Yes, on Monday."] and kept(store) == [(f"{AT + 60:.1f}", "due", 0, None)]
+    assert ("D1", f"{AT + 60:.1f}") in slack.reacted and ("D1", f"{AT + 60:.1f}") not in slack.unreacted
     assert [r["status"] for r in store._query("SELECT status FROM runs")] == ["ok"]
 
 
@@ -3404,7 +3436,8 @@ def test_a_stop_folds_a_message_into_the_running_session_and_starts_no_other(tmp
     """While fan's session works, mei's message waits for the one session's
     place; the stop cancels her turn and waits for his. What he adds
     meanwhile is taken into his session's one answer, and what she sends
-    starts nothing: both of hers are left due, untried, for the next start."""
+    starts nothing: both of hers are left due, untried, for the next start,
+    each still carrying her reaction, which his lose with the answer."""
     import logging
 
     p, store, _, slack = standin_processor(tmp_path, monkeypatch, steps=[1.0, 0.2])
@@ -3429,6 +3462,7 @@ def test_a_stop_folds_a_message_into_the_running_session_and_starts_no_other(tmp
         handled(added), handled(later)
         await asyncio.wait_for(stop, 10)
         await p.shutdown(grace_s=1)
+        await reactions_end(p)
         return waiting
     with caplog.at_level(logging.INFO, logger="wanda"):
         waiting = asyncio.run(go())
@@ -3437,6 +3471,8 @@ def test_a_stop_folds_a_message_into_the_running_session_and_starts_no_other(tmp
     assert slack.replies == ["one answer to 2: can you remind me at 5 | to call the plumber"]
     assert [r["status"] for r in store._query("SELECT status FROM runs")] == ["ok"]
     assert kept(store) == [(f"{AT + 10:.1f}", "due", 0, None), (f"{AT + 40:.1f}", "due", 0, None)]
+    fans, meis = [("D1", f"{AT:.1f}"), ("D1", f"{AT + 30:.1f}")], [("D2", f"{AT + 10:.1f}"), ("D2", f"{AT + 40:.1f}")]
+    assert sorted(slack.reacted) == fans + meis and sorted(slack.unreacted) == fans
 
 
 def test_a_stop_cancels_a_clock_wake_waiting_for_the_dm_a_session_works_in(tmp_path, monkeypatch):
@@ -3640,6 +3676,370 @@ def test_compose_lets_a_stop_wait_for_a_session_before_docker_kills_the_daemon()
     timeout = re.search(r'\n      WANDA_AGENT_TIMEOUT_S: "(\d+)"\n', compose)
     assert main.STOP_AFTER_TIMEOUT_S + main.SHUTDOWN_GRACE_S == 80
     assert int(grace[1]) * (60 if grace[2] == "m" else 1) > int(timeout[1]) + 80
+
+
+async def reactions_end(p):
+    """Until every call on her reaction set going so far has ended: one left
+    when a test's run ends would be cancelled with it."""
+    while p._reacting:
+        await asyncio.wait(set(p._reacting))
+
+
+def settle(p, coro):
+    """Runs `coro`, then lets each call on her reaction it set going end."""
+    async def go():
+        out = await coro
+        await reactions_end(p)
+        return out
+    return asyncio.run(go())
+
+
+def slack_error(error):
+    return SlackApiError("The request to the Slack API failed.", {"ok": False, "error": error})
+
+
+class Watched(ConversationSlack):
+    """Each post and each call on her reaction, in order, in `seen`."""
+
+    def __init__(self, **kw):
+        super().__init__(history=[], **kw)
+        self.seen = []
+
+    async def reply(self, thread_ts, text, channel=None):
+        await super().reply(thread_ts, text, channel)
+        self.seen.append(text)
+
+    async def react(self, channel, ts):
+        await super().react(channel, ts)
+        self.seen.append(("on", ts))
+
+    async def unreact(self, channel, ts):
+        await super().unreact(channel, ts)
+        self.seen.append(("off", ts))
+
+
+class Reacting(ConversationSlack):
+    """A Slack whose reactions stand as its calls left them, in `on`, each
+    add answered in turn by `adds` and each removal by `removals`: None
+    takes it, an error refuses it, "made" takes it and then times out, and
+    "hang" takes it once `gate` is set."""
+
+    def __init__(self, adds=(), removals=()):
+        super().__init__(history=[])
+        self.adds, self.removals = list(adds), list(removals)
+        self.on: set = set()
+        self.gate = asyncio.Event()
+
+    async def _answer(self, answers, key, put):
+        how = answers.pop(0) if answers else None
+        if how == "hang":
+            await self.gate.wait()
+            how = None
+        if how in (None, "made"):
+            (self.on.add if put else self.on.discard)(key)
+        if how == "made":
+            raise TimeoutError("The read operation timed out")
+        if how is not None:
+            raise how
+
+    async def react(self, channel, ts):
+        await super().react(channel, ts)
+        await self._answer(self.adds, (channel, ts), True)
+
+    async def unreact(self, channel, ts):
+        await super().unreact(channel, ts)
+        await self._answer(self.removals, (channel, ts), False)
+
+
+def test_her_reaction_goes_on_each_message_a_member_let_in_sends_while_it_waits(tmp_path, monkeypatch):
+    """Not waited for: fan's two lines carry it while his session works,
+    the second's waiting for the next turn, and each loses it once the turn
+    that took it has ended. mei, allowed and not let in, gets none: her line,
+    no longer kept, is only taken off, as any is whose row goes, since an
+    earlier start may have put it on."""
+    runner = Held(answer("Will do."))
+    slack = Watched()
+    p, store, _ = memory_processor(tmp_path, slack, runner, monkeypatch)
+    store._exec("DELETE FROM meta WHERE key='names:U2'")
+    p.household = Household.load(store, p.cfg.slack_owner_user_ids)
+    first, second = (f"{AT + i:.1f}" for i in (0, 10))
+    lines = [dm(first, "can you remind me"), dm(second, "to call the plumber"),
+             dm(f"{AT + 20:.1f}", "hi", channel="D2", user="U2")]
+    for ev in lines:
+        keep(store, ev)
+
+    async def go():
+        turns = [asyncio.create_task(p.handle_slack(ev)) for ev in lines]
+        await asyncio.sleep(0.05)
+        working = list(slack.reacted)
+        runner.release.set()
+        await asyncio.gather(*turns)
+        await reactions_end(p)
+        return working
+    assert asyncio.run(go()) == [("D1", first), ("D1", second)] == slack.reacted
+    assert slack.seen.index("Will do.") < slack.seen.index(("off", first))
+    assert sorted(slack.unreacted) == [("D1", first), ("D1", second), ("D2", f"{AT + 20:.1f}")]
+    assert kept(store) == []
+
+
+@pytest.mark.parametrize("ending", ["her answer", "a silence", "her note", "a deletion", "a budget refusal"])
+def test_her_reaction_comes_off_once_when_its_message_is_no_longer_kept(tmp_path, monkeypatch, ending):
+    """Whatever lets the message go: the post of her answer or of her note,
+    which answers it, a silence, its deletion while its session works, and,
+    until the cap holds what it turns away, the budget's reply. Once, after
+    anything posted to it, and not before."""
+    runner = Held(*{"her answer": [answer("Yes.")],
+                    "her note": [said_by_claude("API Error: 500")] * 2}.get(ending, [answer("")]))
+    slack = Watched()
+    p, store, _ = memory_processor(tmp_path, slack, runner, monkeypatch)
+    line = dm(f"{AT:.1f}", "is it paid?")
+    key = keep(store, line)
+    if ending == "a budget refusal":
+        store.record_run(kind="agent", task_id=None, session_id=None, started_at=utcnow(), exit_code=0,
+                         cost_usd=p.cfg.daily_cost_cap_usd, status="ok")
+
+    async def go():
+        turn = asyncio.create_task(p.handle_slack(line))
+        await asyncio.sleep(0.05)
+        await reactions_end(p)
+        working, deleted = list(slack.unreacted), None
+        if ending == "a deletion":
+            await p.handle_slack(Event(source="slack", dedupe_key="x", payload={
+                "kind": "deleted", "channel": "D1", "ts": key[1]}))
+            await reactions_end(p)
+            deleted = list(slack.unreacted)
+        runner.release.set()
+        await turn
+        await reactions_end(p)
+        return working, deleted
+    working, deleted = asyncio.run(go())
+    assert working == ([key] if ending == "a budget refusal" else [])
+    assert deleted == ([key] if ending == "a deletion" else None)
+    assert slack.reacted == [key] and slack.unreacted == [key] and kept(store) == []
+    assert slack.seen[-1] == ("off", key[1]) and slack.replies == {
+        "her answer": ["Yes."], "her note": [main.FAILED],
+        "a budget refusal": [BUDGET_REPLIES["breaker"]]}.get(ending, [])
+
+
+def test_her_reaction_stays_on_through_the_quiet_retry(tmp_path, monkeypatch):
+    """The first session ends without its report: the message is still hers
+    to answer while its second session works."""
+    slack = Watched()
+
+    class Twice(RecordingRunner):
+        async def run(self, prompt, **kw):
+            await reactions_end(p)
+            on.append(len(slack.reacted) - len(slack.unreacted))
+            return await super().run(prompt, **kw)
+    on = []
+    p, store, _ = memory_processor(tmp_path, slack, Twice("I filed it.", answer("Yes.")), monkeypatch)
+    line = dm(f"{AT:.1f}", "is it paid?")
+    key = keep(store, line)
+    settle(p, p.handle_slack(line))
+    assert on == [1, 1] and slack.seen == [("on", key[1]), "Yes.", ("off", key[1])]
+
+
+def test_her_reaction_stays_on_while_an_answer_slack_refuses_is_tried_again(tmp_path, monkeypatch, fake_time):
+    """Owed for close to two hours of her running, the answer is still to
+    come: the reaction comes off once Slack takes it."""
+    class Down(Watched):
+        down = True
+
+        async def reply(self, thread_ts, text, channel=None):
+            if self.down:
+                raise RuntimeError("ratelimited")
+            await super().reply(thread_ts, text, channel)
+    slack = Down()
+    p, store, _ = memory_processor(tmp_path, slack, RecordingRunner(answer("Yes.")), monkeypatch)
+    line = dm(f"{AT:.1f}", "is it paid?")
+    key = keep(store, line)
+    settle(p, p.handle_slack(line))
+    for _ in range(2):
+        fake_time.at += timedelta(minutes=55)
+        settle(p, p.drain_mail())
+    assert slack.reacted == [key] and slack.unreacted == [] and kept(store)[0][:2] == (key[1], "answered")
+    slack.down = False
+    fake_time.at += timedelta(minutes=5)
+    settle(p, p.drain_mail())
+    assert slack.unreacted == [key] and slack.seen[-1] == ("off", key[1]) and kept(store) == []
+
+
+def test_an_add_slack_did_not_take_is_tried_again_at_the_next_pass(tmp_path, monkeypatch):
+    """Once made it is not tried again, and it comes off with her answer."""
+    slack = Reacting(adds=[slack_error("ratelimited")])
+    runner = Held(answer("Yes."))
+    p, store, _ = memory_processor(tmp_path, slack, runner, monkeypatch)
+    line = dm(f"{AT:.1f}", "is it paid?")
+    key = keep(store, line)
+
+    async def go():
+        turn = asyncio.create_task(p.handle_slack(line))
+        await asyncio.sleep(0.05)
+        seen = [set(slack.on)]
+        for _ in range(2):
+            await p.drain_mail()
+            await reactions_end(p)
+            seen.append((set(slack.on), len(slack.reacted)))
+        runner.release.set()
+        await turn
+        await reactions_end(p)
+        return seen
+    assert asyncio.run(go()) == [set(), ({key}, 2), ({key}, 2)]
+    assert slack.on == set() and slack.unreacted == [key]
+
+
+def test_a_message_deleted_while_its_adds_retry_is_in_flight_ends_with_no_reaction(tmp_path, monkeypatch):
+    """The removal waits for the add in flight, a pass meanwhile starts no
+    second add, and none is tried once the removal is due. The silence after
+    the deletion takes nothing off again."""
+    slack = Reacting(adds=[slack_error("ratelimited"), "hang"])
+    runner = Held(answer(""))
+    p, store, _ = memory_processor(tmp_path, slack, runner, monkeypatch)
+    line = dm(f"{AT:.1f}", "is it paid?")
+    key = keep(store, line)
+
+    async def go():
+        turn = asyncio.create_task(p.handle_slack(line))
+        await asyncio.sleep(0.05)
+        await p.drain_mail()
+        await asyncio.sleep(0.05)
+        await p.drain_mail()
+        await p.handle_slack(Event(source="slack", dedupe_key="x", payload={
+            "kind": "deleted", "channel": "D1", "ts": key[1]}))
+        await asyncio.sleep(0.05)
+        waiting = list(slack.unreacted)
+        slack.gate.set()
+        await reactions_end(p)
+        await p.drain_mail()
+        runner.release.set()
+        await turn
+        await reactions_end(p)
+        return waiting
+    assert asyncio.run(go()) == []
+    assert slack.on == set() and len(slack.reacted) == 2 and slack.unreacted == [key] and kept(store) == []
+
+
+def test_an_add_that_timed_out_after_slack_made_it_comes_off_with_her_answer(tmp_path, monkeypatch):
+    """The add failed as far as she knows, while its session works: no
+    removal is skipped for that."""
+    slack = Reacting(adds=["made"])
+    runner = Held(answer("Yes."))
+    p, store, _ = memory_processor(tmp_path, slack, runner, monkeypatch)
+    line = dm(f"{AT:.1f}", "is it paid?")
+    key = keep(store, line)
+
+    async def go():
+        turn = asyncio.create_task(p.handle_slack(line))
+        await asyncio.sleep(0.05)
+        made = set(slack.on)
+        runner.release.set()
+        await turn
+        await reactions_end(p)
+        return made
+    assert asyncio.run(go()) == {key}
+    assert slack.replies == ["Yes."] and slack.reacted == slack.unreacted == [key] and slack.on == set()
+
+
+@pytest.mark.parametrize("error", ["not_reactable", "missing_scope"])
+def test_an_add_slack_will_never_take_is_dropped(tmp_path, monkeypatch, caplog, error):
+    """Not tried again. A token without reactions:write is said in the log
+    once, whatever it refuses, and a removal it refuses is not tried again
+    either: only a reinstall and a start give it the scope."""
+    import logging
+
+    scope = error == "missing_scope"
+    slack = Reacting(adds=[slack_error(error)] * 2, removals=[slack_error(error)] * 2 if scope else [])
+    runner = Held(answer(""), answer(""))
+    p, store, _ = memory_processor(tmp_path, slack, runner, monkeypatch)
+    lines = [dm(f"{AT:.1f}", "one"), dm(f"{AT + 60:.1f}", "two", channel="D2", user="U2")]
+    for ev in lines:
+        keep(store, ev)
+
+    async def go():
+        turns = [asyncio.create_task(p.handle_slack(ev)) for ev in lines]
+        await asyncio.sleep(0.05)
+        await p.drain_mail()
+        await reactions_end(p)
+        runner.release.set()
+        await asyncio.gather(*turns)
+        await reactions_end(p)
+        await p.drain_mail()
+        await reactions_end(p)
+    with caplog.at_level(logging.INFO, logger="wanda"):
+        asyncio.run(go())
+    assert len(slack.reacted) == 2 and len(slack.unreacted) == 2 and slack.on == set()
+    assert caplog.text.count("the bot token lacks reactions:write") == (1 if scope else 0)
+
+
+def test_a_removal_slack_did_not_take_is_tried_at_each_pass_for_a_day(tmp_path, monkeypatch, fake_time, caplog):
+    import logging
+
+    slack = Reacting(removals=[slack_error("ratelimited")] * 5)
+    p, store, _ = memory_processor(tmp_path, slack, RecordingRunner(answer("")), monkeypatch)
+    line = dm(f"{AT:.1f}", "is it paid?")
+    key = keep(store, line)
+    settle(p, p.handle_slack(line))
+    for _ in range(2):
+        fake_time.at += timedelta(minutes=1)
+        settle(p, p.drain_mail())
+    assert len(slack.unreacted) == 3 and slack.on == {key}
+    fake_time.at += timedelta(days=1)
+    with caplog.at_level(logging.WARNING, logger="wanda"):
+        for _ in range(2):
+            settle(p, p.drain_mail())
+    assert len(slack.unreacted) == 3 and "gave up trying to take off her reaction" in caplog.text
+
+
+def test_a_reaction_call_that_hangs_holds_up_no_post_and_no_wake(tmp_path, monkeypatch):
+    """Its task is no session's: the clock still starts a wake, and the
+    removal waits for it behind the post."""
+    slack = Reacting(adds=["hang"])
+    p, store, _ = memory_processor(tmp_path, slack, RecordingRunner(answer("Yes.")), monkeypatch)
+    woken = []
+
+    async def wake(w, now):
+        woken.append(w.key)
+    monkeypatch.setattr(p, "_clock_session", wake)
+    line = dm(f"{AT:.1f}", "is it paid?")
+    keep(store, line)
+
+    async def go():
+        await asyncio.wait_for(p.handle_slack(line), 5)
+        p._wake([SimpleNamespace(key="clock:due:aaaaaa")], datetime.now(p.cfg.zone))
+        await asyncio.sleep(0.05)
+        return len(p._reacting)
+    assert asyncio.run(go()) == 2
+    assert slack.replies == ["Yes."] and woken == ["clock:due:aaaaaa"]
+
+
+@pytest.mark.parametrize("header,scopes,line", [
+    ("x-oauth-scopes", "chat:write,reactions:write,users:read",
+     "✓ bot token — bot user UBOT in household; reactions:write\n"),
+    ("X-OAuth-Scopes", "chat:write, reactions:write",
+     "✓ bot token — bot user UBOT in household; reactions:write\n"),
+    ("x-oauth-scopes", "chat:write,users:read",
+     "✗ bot token — the token lacks reactions:write: update the app from slack/manifest.yaml and reinstall it "
+     "(README, Setup, step 3)\n")], ids=["with it", "its header's name in another case", "without it"])
+def test_doctor_says_whether_the_bot_token_can_put_her_reaction_on(tmp_path, capsys, monkeypatch, header, scopes,
+                                                                    line):
+    """By the scopes Slack sends with auth.test's answer."""
+    from slack_sdk.web.slack_response import SlackResponse
+
+    class Web:
+        def __init__(self, **kw):
+            pass
+
+        def auth_test(self):
+            return SlackResponse(client=None, http_verb="POST", api_url="auth.test", req_args={}, status_code=200,
+                                 data={"ok": True, "user_id": "UBOT", "team": "household"}, headers={header: scopes})
+
+        def apps_connections_open(self, app_token):
+            return {"ok": True}
+    monkeypatch.setattr("slack_sdk.WebClient", Web)
+    c = Config(_env_file=None, data_dir=tmp_path, claude_bin="/bin/true", email_triage=False,
+               slack_bot_token="xoxb-x", slack_app_token="xapp-y")
+    asyncio.run(main.run_doctor(c, smoke=False))
+    assert f"  {line}" in capsys.readouterr().out
 
 
 def opening_blocks(tmp_path):

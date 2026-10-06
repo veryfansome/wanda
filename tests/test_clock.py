@@ -332,9 +332,17 @@ class FakeSlack:
         self.fail_first = fail_first
         self.refuse = set(refuse)
         self.alerts = []
+        # each call putting her reaction on a message and taking it off
+        self.reacted, self.unreacted = [], []
 
     async def alert(self, text):
         self.alerts.append(text)
+
+    async def react(self, channel, ts):
+        self.reacted.append((channel, ts))
+
+    async def unreact(self, channel, ts):
+        self.unreacted.append((channel, ts))
 
     async def dm_channel(self, user):
         self.opened.append(user)

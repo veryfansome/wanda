@@ -587,6 +587,74 @@ def test_a_members_name_is_read_now_on_a_client_of_its_own(monkeypatch):
     assert sa.web.posted == ["Will do."]
 
 
+def test_her_reaction_is_put_on_and_taken_off_on_the_names_client(monkeypatch):
+    """`eyes`, outside the pacing lock posts wait on: a call that hangs holds
+    up no post. Slack's already_reacted is on; no_reaction, message_not_found
+    and channel_not_found on a removal are off; anything else raises."""
+    import threading
+
+    from slack_sdk.errors import SlackApiError
+
+    import wanda.actions.slack as actions
+
+    monkeypatch.setattr(actions, "MIN_INTERVAL_S", 0)
+    sa = actions.SlackActions(cfg(slack_bot_token="xoxb-x"), store=None)
+
+    class Names:
+        calls = []
+        error, hang = None, False
+        gate = threading.Event()
+
+        def reactions_add(self, **kw):
+            return self.answer("add", kw)
+
+        def reactions_remove(self, **kw):
+            return self.answer("remove", kw)
+
+        def answer(self, what, kw):
+            self.calls.append((what, kw))
+            if self.hang:
+                self.gate.wait(5)
+            if self.error:
+                raise SlackApiError("The request to the Slack API failed.", {"ok": False, "error": self.error})
+            return {"ok": True}
+
+    class Posts:
+        posted = []
+
+        def chat_postMessage(self, **kw):
+            self.posted.append(kw["text"])
+            return {"ok": True}
+
+    sa.names_web, sa.web = Names(), Posts()
+
+    async def go():
+        await sa.react("D1", "1.1")
+        await sa.unreact("D1", "1.1")
+        sa.names_web.error = "already_reacted"
+        await sa.react("D1", "1.1")
+        for error in ("no_reaction", "message_not_found", "channel_not_found"):
+            sa.names_web.error = error
+            await sa.unreact("D1", "1.1")
+        for error, call in (("ratelimited", sa.react), ("ratelimited", sa.unreact), ("message_not_found", sa.react),
+                            ("no_reaction", sa.react), ("already_reacted", sa.unreact)):
+            sa.names_web.error = error
+            with pytest.raises(SlackApiError):
+                await call("D1", "1.1")
+        sa.names_web.error, sa.names_web.hang = None, True
+        reacting = asyncio.create_task(sa.react("D1", "1.1"))
+        await asyncio.sleep(0.05)
+        await asyncio.wait_for(sa.reply(None, "Will do.", channel="D1"), 2)
+        assert not reacting.done()
+        sa.names_web.gate.set()
+        await reacting
+
+    asyncio.run(go())
+    assert sa.names_web.calls[:2] == [("add", {"channel": "D1", "timestamp": "1.1", "name": "eyes"}),
+                                      ("remove", {"channel": "D1", "timestamp": "1.1", "name": "eyes"})]
+    assert sa.web.posted == ["Will do."]
+
+
 def test_the_workspace_is_read_each_time(monkeypatch):
     """Someone who joined the Slack a minute ago can open a public channel
     now, so users.list is read each time it is asked."""

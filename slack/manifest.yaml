@@ -47,6 +47,10 @@ oauth_config:
       - mpim:history
       - mpim:read
       - mpim:write
+      # her reaction on a member's message from when she takes it until her
+      # answer is posted, which says she has it: she is otherwise silent
+      # until she has something to say
+      - reactions:write
       - users:read
 settings:
   event_subscriptions:

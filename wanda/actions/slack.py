@@ -28,6 +28,13 @@ MIN_INTERVAL_S = 1.0  # chat.postMessage is ~1/s/channel
 SNIPPET_LIMIT = 1500
 TEXT_LIMIT = 3500  # well under Slack's 40k text cap, and headers can be huge
 MISSING_THREAD_ERRORS = {"thread_not_found", "message_not_found", "channel_not_found"}
+# Her reaction on a member's message from when she takes it until her answer
+# or note to it is posted, or her session ends saying nothing: it says she has
+# it, where she is otherwise silent until she has something to say.
+WORKING = "eyes"
+# what Slack answers a removal with when there is nothing to take off: no
+# reaction there, or no such message or conversation
+NOT_THERE = {"no_reaction", "message_not_found", "channel_not_found"}
 # the most pages of 200 any one list is read in: a conversation's history or
 # a thread, a member list, the workspace
 MAX_CONTEXT_PAGES = 10
@@ -66,10 +73,12 @@ class SlackActions:
             ssl=ssl_context(),
             retry_handlers=default_retry_handlers() + [RateLimitErrorRetryHandler(max_retry_count=3)],
         )
-        # The household's names are read on a client of their own, outside
-        # the pacing lock: a Slack that hangs on one holds up no post. Ten
-        # seconds and no retry, where the SDK waits thirty and retries a
-        # connection error: the next round reads again.
+        # The household's names are read, and her reaction put on and taken
+        # off, on a client of their own, outside the pacing lock: a Slack that
+        # hangs on one holds up no post. Ten seconds and no retry, where the
+        # SDK waits thirty and retries a connection error: the next round or
+        # pass tries again. Slack limits each method on its own, so these
+        # take nothing from chat.postMessage's.
         self.names_web = WebClient(token=cfg.slack_bot_token, ssl=ssl_context(), timeout=10, retry_handlers=[])
         self._pace = asyncio.Lock()
         self._last_call = 0.0
@@ -144,6 +153,26 @@ class SlackActions:
             thread_ts=thread_ts,
             text=harmless(text)[:39000],
         )
+
+    # --- her reaction ---
+
+    async def react(self, channel: str, ts: str) -> None:
+        """Puts WORKING on a message, on the names' client; Slack saying it
+        is there already is success."""
+        try:
+            await asyncio.to_thread(self.names_web.reactions_add, channel=channel, timestamp=ts, name=WORKING)
+        except SlackApiError as e:
+            if (e.response or {}).get("error") != "already_reacted":
+                raise
+
+    async def unreact(self, channel: str, ts: str) -> None:
+        """Takes WORKING off a message, on the names' client; Slack saying
+        there is nothing to take off is success."""
+        try:
+            await asyncio.to_thread(self.names_web.reactions_remove, channel=channel, timestamp=ts, name=WORKING)
+        except SlackApiError as e:
+            if (e.response or {}).get("error") not in NOT_THERE:
+                raise
 
     # --- conversation context ---
 

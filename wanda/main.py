@@ -73,6 +73,14 @@ GIVE_UP_AFTER = timedelta(minutes=121)
 CLEARS = frozenset({"ratelimited", "rate_limited", "fatal_error", "internal_error", "service_unavailable",
                     "request_timeout", "message_limit_exceeded", "invalid_auth", "not_authed", "token_revoked",
                     "token_expired", "account_inactive"})
+# Her reaction on a member's message (SlackActions.react): an add or a removal
+# Slack did not take is tried again at each pass for this long.
+REACT_TRIED_FOR = timedelta(days=1)
+# What Slack says when her reaction cannot go on a message: the token lacks
+# the scope, until the app is reinstalled and the daemon started with its new
+# token, or the message or its conversation takes none.
+UNREACTABLE = frozenset({"missing_scope", "not_reactable", "too_many_reactions", "message_not_found",
+                         "channel_not_found", "is_archived"})
 # The first line of an answer posted this long or more after she wrote it,
 # saying when that was, in her words: whoever reads it then would otherwise
 # take it as said just now.
@@ -467,6 +475,18 @@ class Processor:
         # the tasks whose session has started, until they end, its post and
         # snapshot included: a stop lets these finish (let_finish)
         self._running: set[asyncio.Task] = set()
+        # Her reaction on members' messages: each add or removal a task of its
+        # own in `_reacting`, never in `_bg`, which reads as a session running
+        # and which a stop cancels. Per message, the last call made on it,
+        # which the next there waits for, so that a message has one add in
+        # flight at a time and its removal never goes before an add that
+        # would put the reaction back. The calls Slack did not take, by
+        # message: an add (True) or a removal, and when it first failed.
+        self._reacting: set[asyncio.Task] = set()
+        self._reaction: dict[tuple[str, str], asyncio.Task] = {}
+        self._react_again: dict[tuple[str, str], tuple[bool, datetime]] = {}
+        # whether the log has said that the token lacks reactions:write
+        self._scope_said = False
         # allowed ids already logged as not let in
         self._outside: set[str] = set()
         # the look at snapshots.git the housekeeping waits on (_housekeep)
@@ -1370,6 +1390,7 @@ class Processor:
         # Retry undelivered agent answers here too, not only at startup: a
         # Slack outage that outlives one run must not strand paid work.
         await self.deliver_pending()
+        self._retry_reactions()
         await self._flush_abandoned_alert()
         await self._flush_given_up()
         await self._flush_failed()
@@ -1809,7 +1830,7 @@ class Processor:
             if task is None:
                 # as a handler drops one: nothing deletes tasks
                 log.error("no task row for kept message %s in %s; dropped", r["ts"], r["channel"])
-                self.store.forget([kept_key(r)])
+                self._unreact(self.store.forget([kept_key(r)]))
                 continue
             if r["tries"] >= 2:
                 cut.setdefault(task["id"], (task, []))[1].append(r)
@@ -1901,7 +1922,7 @@ class Processor:
                 await self.slack.reply(reply_thread, text, channel=channel)
             except Exception as e:
                 return self._not_posted(run, channel, e, now)
-            self.store.mark_run_notified(run["id"])
+            self._unreact(self.store.mark_run_notified(run["id"]))
             return True
 
     def _not_posted(self, run, channel: str, e: Exception, now: datetime) -> bool:
@@ -1912,8 +1933,10 @@ class Processor:
         time. Her answer to members' messages given up after two hours is
         followed by her note saying so (GIVEN_UP), which then answers those
         messages; given up at once, there is no note, which Slack would
-        refuse there too. The first refusal and the give-up are logged.
-        Returns whether the run was given up."""
+        refuse there too. Messages given up with no note lose her reaction,
+        but where Slack refuses her for good: there it stays on, telling
+        whoever sent them that something is wrong. The first refusal and the
+        give-up are logged. Returns whether the run was given up."""
         error = e.response.get("error") if isinstance(e, SlackApiError) else None
         at_once = bool(error and error not in CLEARS)
         if at_once:
@@ -1932,6 +1955,9 @@ class Processor:
             note = (GIVEN_UP_GROUP if json.loads(oldest["payload"]).get("channel_type") == "mpim" else GIVEN_UP
                     ).format(at=written_at(datetime.fromtimestamp(float(oldest["ts"]), timezone.utc), now))
         notes, given = self.store.give_up(run["id"], MAX_DELIVERY_ATTEMPTS, note)
+        if given is None and not at_once:
+            # with no note they are no longer kept (Store.give_up)
+            self._unreact(kept_key(r) for r in answering)
         log.warning("gave up posting run %s in %s %s: %s%s%s", run["id"], channel, how, e,
                     f"; the note(s) after it, run(s) {', '.join(map(str, notes))}, dropped with it" if notes else "",
                     f"; her note saying so is run {given}" if given else "")
@@ -1943,6 +1969,75 @@ class Processor:
         given_up.append({"id": run["id"], "at": run["started_at"], "how": how + then})
         self.store.set_meta("given_up_runs", json.dumps(given_up))
         return True
+
+    # --- her reaction ---
+
+    def _react(self, key: tuple[str, str], on: bool = True) -> None:
+        """Puts her reaction on a kept message, by (channel, ts), or takes it
+        off, not awaited: once any call on it still in flight has ended."""
+        before = self._reaction.get(key)
+        t = asyncio.create_task(self._set_reaction(key, on, before if before and not before.done() else None))
+        self._reacting.add(t)
+        t.add_done_callback(self._reacting.discard)
+        self._reaction[key] = t
+        t.add_done_callback(lambda t: self._reaction.pop(key) if self._reaction.get(key) is t else None)
+
+    def _unreact(self, keys) -> None:
+        """Kept messages whose rows went: her reaction comes off each, whether
+        this start or an earlier one put it on."""
+        for key in keys:
+            self._react(key, on=False)
+
+    async def _set_reaction(self, key: tuple[str, str], on: bool, before: asyncio.Task | None) -> None:
+        """One add or removal, once `before`, the call made on the message
+        before it, has ended. What Slack did not take is kept to be tried
+        again (_retry_reactions), but for an add it will never take."""
+        if before is not None:
+            await asyncio.wait([before])
+        channel, ts = key
+        failed = None
+        try:
+            await (self.slack.react if on else self.slack.unreact)(channel, ts)
+        except Exception as e:
+            error = e.response.get("error") if isinstance(e, SlackApiError) else None
+            # the token lacks the scope for a removal as for an add, and only
+            # a reinstall and a start give it
+            if error == "missing_scope":
+                if not self._scope_said:
+                    self._scope_said = True
+                    log.warning("the bot token lacks reactions:write, so no message shows that she has it: update "
+                                "the app from slack/manifest.yaml and reinstall it (README, Setup, step 3)")
+            elif on and error in UNREACTABLE:
+                log.info("no reaction on %s in %s: %s", ts, channel, error)
+            else:
+                failed = error or str(e) or type(e).__name__
+        if failed is None:
+            self._react_again.pop(key, None)
+            return
+        tried = self._react_again.get(key)
+        if tried is None or tried[0] != on:
+            log.warning("could not %s her reaction on %s in %s: %s; tried again at each pass for a day",
+                        "put" if on else "take off", ts, channel, failed)
+            tried = (on, datetime.now(timezone.utc))
+        self._react_again[key] = tried
+
+    def _retry_reactions(self) -> None:
+        """Each add or removal of her reaction Slack did not take, tried again
+        at a pass, for a day from when it first failed; one in flight writes
+        its own outcome. Whatever lets a message go takes her reaction off,
+        and that removal's outcome replaces an add's: so an add is tried
+        again only while its message is kept, or once an answer given up at
+        once has left her reaction to stay on."""
+        now = datetime.now(timezone.utc)
+        for key, (on, since) in list(self._react_again.items()):
+            if key in self._reaction:
+                continue
+            if now - since > REACT_TRIED_FOR:
+                del self._react_again[key]
+                log.warning("gave up trying to %s her reaction on %s in %s after a day",
+                            "put" if on else "take off", key[1], key[0])
+            else:
+                self._react(key, on)
 
     # --- slack thread replies -> agentic sessions ---
 
@@ -1960,7 +2055,7 @@ class Processor:
                                        channel=ev.payload.get("channel"))
                 # answered by that note, if the store takes a write; if not,
                 # the next start runs it again
-                self.store.forget([kept_key(ev.payload)])
+                self._unreact(self.store.forget([kept_key(ev.payload)]))
 
     def _unhandled(self, p: dict) -> str:
         """What a message whose handling raised is told. A memory
@@ -2124,10 +2219,13 @@ class Processor:
         One that arrives while that session works is offered to it
         (Additions), so that its one answer takes it in; what it does not take
         waits for the next turn. Whatever raises before the turn's outcome is
-        recorded gets her note in its place."""
+        recorded gets her note in its place. From when its sender is let in
+        until it is no longer kept, the message carries her reaction, which
+        says she has it."""
         if not self._let_in(p):
             state["recorded"] = True  # nothing is said there, so nothing is owed
             return
+        self._react(kept_key(p))
         waiting = self._waiting.setdefault(task["id"], [])
         waiting.append(p)
         if more := self._additions.get(task["id"]):
@@ -2563,6 +2661,8 @@ class Processor:
         else:
             run_id = self.store.record_run(**run, settled=settled)
         state["recorded"] = True
+        if settled is not None:
+            self._unreact(settled.gone)
         # posted before the snapshot, which can wait its turn behind another;
         # _post_run keeps deliver_pending off the run from its first line
         if text and channel is not None:
@@ -2687,7 +2787,7 @@ class Processor:
         if (holding := self._in_turn.get(task["id"])) is not None:
             waiting = self._waiting.get(task["id"], [])
             keys = {*holding.rows} or {kept_key(m) for m in waiting}
-            self.store.forget(keys)
+            self._unreact(self.store.forget(keys))
             waiting[:] = [m for m in waiting if kept_key(m) not in keys]
 
     def _answered_before_the_stop(self, more: Additions, sid: str) -> Settled:
@@ -2710,7 +2810,10 @@ class Processor:
     def _withdraw(self, channel: str, ts: str) -> None:
         """A message deleted while it waited for its turn is not handed to a
         session, and is no longer kept unless an answer to it is."""
-        self.store.forget([(channel, ts)])
+        self._unreact(self.store.forget([(channel, ts)]))
+        # nor held by its turn: its row and its reaction are gone already
+        for holding in self._in_turn.values():
+            holding.rows.pop((channel, ts), None)
         for waiting in self._waiting.values():
             waiting[:] = [m for m in waiting if (m["channel"], m["ts"]) != (channel, ts)]
         # one a running session took and was never handed is not put back
@@ -2729,7 +2832,7 @@ class Processor:
             self._outside.add(p["user"])
             log.warning("not taking part in %s: %s is not let in until Slack gives a name for them (doctor)",
                         p["channel"], p["user"])
-        self.store.forget([kept_key(p)])
+        self._unreact(self.store.forget([kept_key(p)]))
         return False
 
     async def _readers(self, p: dict) -> list[str]:
@@ -3289,7 +3392,14 @@ async def run_doctor(cfg: Config, smoke: bool) -> int:
             from slack_sdk import WebClient
 
             auth = WebClient(token=cfg.slack_bot_token, ssl=ssl_context()).auth_test()
-            report("bot token", True, f"bot user {auth['user_id']} in {auth['team']}")
+            # the scopes the token was given, which Slack sends in a header
+            # with every answer, a header's name having no fixed case
+            scopes = next((v for k, v in auth.headers.items() if k.lower() == "x-oauth-scopes"), "")
+            if "reactions:write" in {s.strip() for s in scopes.split(",")}:
+                report("bot token", True, f"bot user {auth['user_id']} in {auth['team']}; reactions:write")
+            else:
+                report("bot token", False, "the token lacks reactions:write: update the app from "
+                                           "slack/manifest.yaml and reinstall it (README, Setup, step 3)")
         except Exception as e:
             report("bot token", False, str(e))
         try:
