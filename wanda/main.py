@@ -29,7 +29,7 @@ from wanda.config import Config, load_config
 from wanda.events import Event
 from wanda.household import NAMES_EVERY_S, SHUT, Found, Household, found, memory_said, same, settle, tries
 from wanda.runner import RunnerService, RunResult, refused
-from wanda.store import Store, utcnow
+from wanda.store import Settled, Store, utcnow
 from wanda.tls import ssl_context
 from wanda.transcript import MENTION_RE, is_mine
 from wanda.triage import (
@@ -127,6 +127,27 @@ FAILED_GROUP = "Sorry, I missed what was just said here. If any of it was for me
 FAILED_REST = "Sorry, I didn't get to what you added after that. Could you send it again?"
 FAILED_REST_GROUP = ("Sorry, I didn't get to what was said after that. If any of it was for me, could you send it "
                      "again?")
+# at a start, once in a conversation, in place of running a third time its
+# messages that two sessions took and two stops or crashes cut short: one that
+# brings her down each time it runs would otherwise do so at every start
+CUT_SHORT = "Sorry, I lost track of this while I was restarting. Could you send it again?"
+CUT_SHORT_GROUP = ("Sorry, I lost track of what was said here while I was restarting. If any of it was for me, "
+                   "could you send it again?")
+# in place of an answer delivery gave up on after two hours, {at} the time of
+# the oldest message it answered, as LATE_MARK says a time
+GIVEN_UP = ("Sorry, my answer to what you sent {at} didn't get through, and I've stopped trying. Could you send it "
+            "again?")
+GIVEN_UP_GROUP = ("Sorry, my answer to what was said here {at} didn't get through. If any of it was for me, could "
+                  "you send it again?")
+# A turn whose newest message is older than this when it is framed reaches its
+# session late, as after a stop: it is framed at the session's start and says
+# so (vault.LATE_TURN). Longer than a wait behind one other session
+# (WANDA_AGENT_TIMEOUT_S, 420 s in compose.wanda.yaml), which is not late.
+LATE_TURN_S = 600
+# An interval she was not running is named to a late turn (vault.DOWN) from
+# this long: a restart's seconds are no reason for the lateness, and its two
+# times would read as the same minute.
+DOWN_NAMED = timedelta(minutes=1)
 # the `failed` alert's classes of reason, each alerted at most once a UTC day
 FAILURE_CLASSES = ("timeout", "usage limit", "authentication", "other")
 
@@ -227,6 +248,49 @@ def left_out(store: Store) -> list[vault.Unreadable]:
     return [vault.Unreadable(**u) for u in json.loads(store.get_meta("memory_files") or "[]")]
 
 
+def kept_key(m: dict) -> tuple[str, str]:
+    """A message's key among those kept until answered (Store.first_time)."""
+    return m["channel"], m["ts"]
+
+
+class Holding:
+    """The kept messages a message's turn holds, from its frame until its
+    record writes what became of them (Store.Settled): those its frames take
+    and those its sessions are handed. Each session that takes them is
+    written to their rows as each of its turns begins, an added one as it is
+    written to the session's input. A try is counted once a turn, however
+    many sessions the turn runs, its quiet retry included, so a row's
+    `tries` count the turns begun for it that never recorded what became of
+    it."""
+
+    def __init__(self, store: Store):
+        self.store = store
+        self.rows: dict[tuple[str, str], dict] = {}
+        self.tried: set[tuple[str, str]] = set()
+
+    def take(self, batch: list[dict]) -> None:
+        self.rows |= {kept_key(m): m for m in batch}
+
+    def began(self, sid: str) -> None:
+        self._took(sid, list(self.rows))
+
+    def handed(self, sid: str, p: dict) -> None:
+        self.rows[kept_key(p)] = p
+        self._took(sid, [kept_key(p)])
+
+    def back(self, back: list[dict]) -> None:
+        # written to the session's input, never taken in
+        keys = [kept_key(m) for m in back]
+        for k in keys:
+            self.rows.pop(k, None)
+            self.tried.discard(k)
+        self.store.given_back(keys)
+
+    def _took(self, sid: str, keys: list[tuple[str, str]]) -> None:
+        self.store.took(sid, keys, {k for k in keys if k not in self.tried})
+        self.tried.update(keys)
+
+
 class Additions:
     """The messages added to a conversation while its session works, for that
     session to take into its one answer: taken off the conversation's waiting
@@ -236,11 +300,15 @@ class Additions:
     message that is not this session's to take. `give_back` puts what it was
     not handed back on the list, for the conversation's next turn, and
     `run_again` what began a turn of it that failed after an answer.
-    `results` holds the session's results as the runner reads them."""
+    `results` holds the session's results as the runner reads them. `holding`
+    is its turn's kept messages, which are told of the session `sid` as each
+    of its turns begins (`began()`) and as one is handed."""
 
-    def __init__(self, waiting: list[dict], frame):
+    def __init__(self, waiting: list[dict], frame, holding: Holding | None = None):
         self.waiting = waiting
         self.frame = frame
+        self.holding = holding
+        self.sid: str | None = None
         self.taken: list[tuple[dict, str]] = []
         self.closed = False
         self.started: float | None = None
@@ -273,6 +341,10 @@ class Additions:
         self.closed = True
         self.more.set()
 
+    def began(self) -> None:
+        if self.holding is not None:
+            self.holding.began(self.sid)
+
     async def next(self) -> str | None:
         if self.started is None:
             self.started = time.monotonic()
@@ -301,6 +373,8 @@ class Additions:
                 self._put_back(p)
                 break
             self.taken.append((p, text))
+            if self.holding is not None:
+                self.holding.handed(self.sid, p)
             return text
         self.closed = True
         return None
@@ -324,6 +398,8 @@ class Additions:
             else:
                 back.append(p)
         self.taken = kept
+        if self.holding is not None and back:
+            self.holding.back(back)
         self._put_first(back)
         return len(kept)
 
@@ -376,8 +452,8 @@ class Processor:
         self._waiting: dict[int, list[dict]] = {}
         # per conversation task, what its turn's session takes in while it works
         self._additions: dict[int, Additions] = {}
-        # conversations already given a restart notice in this shutdown
-        self._noticed: set[int] = set()
+        # per conversation task, the kept messages its running turn holds
+        self._in_turn: dict[int, Holding] = {}
         # allowed ids already logged as not let in
         self._outside: set[str] = set()
         # the look at snapshots.git the housekeeping waits on (_housekeep)
@@ -417,14 +493,17 @@ class Processor:
     async def shutdown(self, grace_s: float = 20.0) -> None:
         """Cancel in-flight agent runs and let them settle before the store
         closes — otherwise their claude subprocesses are orphaned and their
-        spend is never recorded."""
+        spend is never recorded. A member's message to her that a stop cuts
+        short, or that is still queued, is kept in the run store, and the
+        next start runs it again (`kept`)."""
         if self._bg:
             log.info("waiting on %d in-flight agent task(s)", len(self._bg))
             for t in self._bg:
                 t.cancel()
             await asyncio.wait(set(self._bg), timeout=grace_s)
         # Owner replies still queued were acked and deduped by Slack, so they
-        # can never be redelivered: leave each one a marker to answer on start.
+        # can never be redelivered: an email task's gets a marker to answer on
+        # start.
         while True:
             try:
                 ev = self.slack_queue.get_nowait()
@@ -433,19 +512,8 @@ class Processor:
             pl = ev.payload
             if pl.get("kind") == "deleted":
                 continue
-            if pl.get("kind") in CONVERSATION_KINDS:
-                # No task row yet (it is created during handling), so make one
-                # now — otherwise this acked, deduped trigger vanishes silently.
-                self.store.create_task(None, pl["channel"], pl["task_key"], kind=pl["kind"],
-                                       reply_thread=pl.get("reply_thread"))
             task = self.store.get_task_by_thread(pl["channel"], pl["task_key"])
-            if task is None:
-                continue
-            # a memory conversation gets one notice, wherever a let-in member's
-            # message waited
-            if task["kind"] != "email" and (
-                    pl.get("user") not in self.household.told_names() or not self._owes_notice(task["id"])):
-                log.info("dropped a message in %s at shutdown", pl["channel"])
+            if task is None or task["kind"] != "email":
                 continue
             log.info("recording dropped trigger in %s", pl["channel"])
             self.store.record_run(
@@ -774,8 +842,7 @@ class Processor:
         each look a crash cut short after it took its lock, settled at the
         next start, before Slack connects. A run recorded in its DM after
         the wake took the conversation's lock is the wake's own: it held the
-        lock until the process ended, nothing has run there since, and a stop
-        records a message it dropped as a run that is never recorded ok. One
+        lock until the process ended, and nothing has run there since. One
         recorded ok, with a report or an answer an earlier turn gave, was
         given, its answer, if not yet posted, followed as one Slack refused.
         One that posted nothing is released to be woken again while its time
@@ -1682,6 +1749,46 @@ class Processor:
             await self._alert_once("snapshot", f"vault snapshots: {problem}")
         self.store.set_meta("snapshots_housekept", today)
 
+    def kept(self) -> list[tuple]:
+        """What a start runs again of the members' messages kept from before
+        it, read before Slack connects, so that one kept as it connects is
+        dispatched once, from the queue. A conversation's first message, kept
+        before a handler made its task, gets the task made as a handler makes
+        it. Messages two sessions took and two stops or crashes cut short get
+        her note instead (CUT_SHORT), once in each conversation, before
+        anything there runs again. Returns the rest still due, by
+        conversation, as (task, keys), for `take_up` once her own ids are
+        known; one answered waits for delivery."""
+        due: dict[int, tuple] = {}
+        cut: dict[int, tuple] = {}
+        for r in self.store.kept():
+            if r["state"] == "answered":
+                continue
+            p = json.loads(r["payload"])
+            if p.get("kind") in CONVERSATION_KINDS:
+                self.store.create_task(None, p["channel"], p["task_key"], kind=p["kind"],
+                                       reply_thread=p.get("reply_thread"))
+            task = self.store.get_task_by_thread(r["channel"], r["task_key"])
+            if task is None:
+                # as a handler drops one: nothing deletes tasks
+                log.error("no task row for kept message %s in %s; dropped", r["ts"], r["channel"])
+                self.store.forget([kept_key(r)])
+                continue
+            if r["tries"] >= 2:
+                cut.setdefault(task["id"], (task, []))[1].append(r)
+            elif r["state"] == "due":
+                due.setdefault(task["id"], (task, []))[1].append(kept_key(r))
+        for task, rows in cut.values():
+            group = any(json.loads(r["payload"]).get("channel_type") == "mpim" for r in rows)
+            self.store.record_run(kind="note", task_id=task["id"], session_id=None, started_at=utcnow(),
+                                  exit_code=None, cost_usd=0.0, status="ok",
+                                  result_text=CUT_SHORT_GROUP if group else CUT_SHORT, notified=0,
+                                  settled=Settled(answered=tuple(kept_key(r) for r in rows)))
+        if due or cut:
+            log.info("run again after a stop: %d message(s) in %d conversation(s); %d cut short twice, given a note",
+                     sum(len(keys) for _, keys in due.values()), len(due), sum(len(rows) for _, rows in cut.values()))
+        return list(due.values())
+
     async def startup_recovery(self) -> None:
         # with triage off, mail rows from before stay as they are
         for row in self.store.fetch_by_status("acting", limit=200) if self.cfg.email_triage else ():
@@ -1710,9 +1817,15 @@ class Processor:
         for run in self.store.pending_deliveries(task_id):
             if run["task_id"] in held:
                 continue
-            # Cancelled runs carry no text; every other pending run does.
+            # Cancelled runs carry no text; every other pending run does. A
+            # memory conversation's is one an earlier version of the daemon
+            # recorded, for a message it did not keep, so no payload says
+            # whether it was a group DM's: Slack's ids begin with D for a 1:1
+            # DM alone
             text = run["result_text"] or (
-                "⏸ I restarted while working on this — reply again to retry."
+                "⏸ I restarted while working on this — reply again to retry." if run["task_kind"] == "email"
+                else CUT_SHORT_GROUP if run["task_kind"] == "dm" and not run["slack_channel"].startswith("D")
+                else CUT_SHORT
             )
             # only her answer in a memory conversation is marked late: her
             # note, the restart's notice and an email task's text are not
@@ -1759,10 +1872,14 @@ class Processor:
         failure Slack gave no error for) leaves the run owed, until a try
         fails after she has run GIVE_UP_AFTER since it was written; any other
         refusal gives it up at once, since Slack would refuse it there every
-        time. The first refusal and the give-up are logged. Returns whether
-        the run was given up."""
+        time. Her answer to members' messages given up after two hours is
+        followed by her note saying so (GIVEN_UP), which then answers those
+        messages; given up at once, there is no note, which Slack would
+        refuse there too. The first refusal and the give-up are logged.
+        Returns whether the run was given up."""
         error = e.response.get("error") if isinstance(e, SlackApiError) else None
-        if error and error not in CLEARS:
+        at_once = bool(error and error not in CLEARS)
+        if at_once:
             how = f"at once ({error})"
         elif self.store.ran(datetime.fromisoformat(run["ended_at"]), now) > GIVE_UP_AFTER:
             how = "after two hours"
@@ -1771,12 +1888,22 @@ class Processor:
                 log.warning("could not post run %s in %s yet: %s; tried again at every pass for two hours of "
                             "running", run["id"], channel, e)
             return False
-        notes = self.store.give_up(run["id"], MAX_DELIVERY_ATTEMPTS)
-        log.warning("gave up posting run %s in %s %s: %s%s", run["id"], channel, how, e,
-                    f"; the note(s) after it, run(s) {', '.join(map(str, notes))}, dropped with it" if notes else "")
+        answering = self.store.answering(run["id"])
+        note = None
+        if answering and run["kind"] != "note" and not at_once:
+            oldest = answering[0]
+            note = (GIVEN_UP_GROUP if json.loads(oldest["payload"]).get("channel_type") == "mpim" else GIVEN_UP
+                    ).format(at=written_at(datetime.fromtimestamp(float(oldest["ts"]), timezone.utc), now))
+        notes, given = self.store.give_up(run["id"], MAX_DELIVERY_ATTEMPTS, note)
+        log.warning("gave up posting run %s in %s %s: %s%s%s", run["id"], channel, how, e,
+                    f"; the note(s) after it, run(s) {', '.join(map(str, notes))}, dropped with it" if notes else "",
+                    f"; her note saying so is run {given}" if given else "")
         self.store.set_meta("abandoned_alert_pending", "1")
         given_up = json.loads(self.store.get_meta("given_up_runs") or "[]")
-        given_up.append({"id": run["id"], "at": run["started_at"], "how": how})
+        # whether a note asked for what it answered again, said only of an
+        # answer to members' messages
+        then = ", a note asked for it again" if given else ", no note" if answering else ""
+        given_up.append({"id": run["id"], "at": run["started_at"], "how": how + then})
         self.store.set_meta("given_up_runs", json.dumps(given_up))
         return True
 
@@ -1794,6 +1921,9 @@ class Processor:
             with contextlib.suppress(Exception):
                 await self.slack.reply(ev.payload.get("reply_thread"), self._unhandled(ev.payload),
                                        channel=ev.payload.get("channel"))
+                # answered by that note, if the store takes a write; if not,
+                # the next start runs it again
+                self.store.forget([kept_key(ev.payload)])
 
     def _unhandled(self, p: dict) -> str:
         """What a message whose handling raised is told. A memory
@@ -1835,13 +1965,10 @@ class Processor:
         except asyncio.CancelledError:
             # Cancelled anywhere — queued on the lock or semaphore, mid-run, or
             # while posting. The Slack event id is already committed, so Slack
-            # will never redeliver: leave a marker the next start can act on.
-            # a memory conversation owes one notice for all its waiting
-            # messages. Nothing awaits before the sender's check (_let_in),
-            # which marks a message it turns away recorded, so one cancelled
-            # unrecorded is a let-in member's.
-            memory = task["kind"] != "email"
-            if not state.get("recorded") and (not memory or self._owes_notice(task["id"])):
+            # will never redeliver: an email task's leaves a marker the next
+            # start can act on. A memory conversation's message is kept until
+            # it is answered, and the next start runs it again.
+            if not state.get("recorded") and task["kind"] == "email":
                 self.store.record_run(
                     kind="agent", task_id=task["id"], session_id=task["claude_session_id"],
                     started_at=utcnow(), exit_code=None, cost_usd=0.0,
@@ -1973,46 +2100,101 @@ class Processor:
                 # taken by the turn before, or deleted while it waited
                 state["recorded"] = True
                 return
-            took = False
-            first: list[dict] = []
-            more = None
+            await self._turn(task, p, state)
 
-            async def frame(again: str | None) -> tuple[str, datetime, Additions] | None:
-                # what waits, or for the retry of the session `again`, what
-                # that session took and what has waited since
-                nonlocal took, more
-                took = True
-                if again is None:
-                    batch = list(waiting)
-                    first[:] = batch
-                else:
-                    batch = [m for m in first + [m for m, _ in more.taken]
-                             if (m["channel"], m["ts"]) not in more.withdrawn] + waiting
-                waiting[:] = []
-                fresh = Additions(waiting, lambda m: self._added_text(m, fresh))
-                fresh.earlier = list(dict.fromkeys(
-                    [m["again"] for m in sorted(batch, key=lambda m: float(m["ts"])) if m.get("again")]
-                    + ([again] if again else [])))
-                fresh.rerun = any(m.get("again") for m in batch)
-                # what arrives from here on is offered to this session first
-                more = self._additions[task["id"]] = fresh
-                framed = await self._frame_turn(task, batch, state, fresh)
-                return None if framed is None else (*framed, fresh)
+    async def _turn(self, task, p: dict, state: dict) -> None:
+        """A turn of the conversation, its lock held, for every message
+        waiting there, `p` among them. The kept messages it takes are
+        written, before the lock is let go, by its record, or by her note
+        when something raises before that; a cancellation, as at a stop,
+        writes only what an answer already given answers, and leaves the
+        rest due for the next start."""
+        waiting = self._waiting.setdefault(task["id"], [])
+        holding = self._in_turn[task["id"]] = Holding(self.store)
+        took = False
+        first: list[dict] = []
+        more = None
 
-            try:
-                await self.memory_turn(task, None, None, channel=p["channel"], reply_thread=p.get("reply_thread"),
-                                       owed=True, state=state, frame=frame, group=p.get("channel_type") == "mpim")
-            except Exception as e:
-                log.exception("the turn for %s in %s failed", p["ts"], p["channel"])
-                if not state.get("recorded"):
-                    await self._note_failure(task, p, f"an internal error: {str(e) or type(e).__name__}", state,
-                                             rest=took and more is not None and more.rerun)
-            finally:
-                self._additions.pop(task["id"], None)
-            if not took:
-                # refused or failed before a session could start: the one
-                # reply answers every message waiting
-                waiting[:] = []
+        async def frame(again: str | None) -> tuple[str, datetime, Additions] | None:
+            # what waits, or for the retry of the session `again`, what
+            # that session took and what has waited since
+            nonlocal took, more
+            took = True
+            if again is None:
+                batch = list(waiting)
+                first[:] = batch
+            else:
+                batch = [m for m in first + [m for m, _ in more.taken]
+                         if (m["channel"], m["ts"]) not in more.withdrawn] + waiting
+            waiting[:] = []
+            holding.take(batch)
+            fresh = Additions(waiting, lambda m: self._added_text(m, fresh), holding)
+            # every earlier session that took one of them, oldest first: one
+            # whose later turn failed on it after an answer, the one a stop
+            # or a crash cut short, as its kept row names it, and the first
+            # try this retries
+            fresh.earlier = list(dict.fromkeys(
+                [s for m in sorted(batch, key=lambda m: float(m["ts"])) for s in (m.get("again"), m.get("session"))
+                 if s] + ([again] if again else [])))
+            fresh.rerun = any(m.get("again") for m in batch)
+            # what arrives from here on is offered to this session first
+            more = self._additions[task["id"]] = fresh
+            framed = await self._frame_turn(task, batch, state, fresh)
+            return None if framed is None else (*framed, fresh)
+
+        try:
+            await self.memory_turn(task, None, None, channel=p["channel"], reply_thread=p.get("reply_thread"),
+                                   owed=True, state=state, frame=frame, group=p.get("channel_type") == "mpim")
+        except Exception as e:
+            log.exception("the turn for %s in %s failed", p["ts"], p["channel"])
+            if not state.get("recorded"):
+                # what it holds, and before its frame every message waiting,
+                # which her note answers: one that comes while it is posted
+                # waits for a turn of its own
+                keys = [*holding.rows]
+                if not took:
+                    keys += [kept_key(m) for m in waiting]
+                    waiting[:] = []
+                await self._note_failure(task, p, f"an internal error: {str(e) or type(e).__name__}", state, keys,
+                                         rest=took and more is not None and more.rerun)
+        finally:
+            self._additions.pop(task["id"], None)
+            self._in_turn.pop(task["id"], None)
+
+    def take_up(self, task, keys) -> None:
+        """Runs again a conversation's kept messages `keys` that are still
+        due, as one turn, from a handler of its own in `_bg`, which `_wake`
+        reads as a session running: messages queued one event each would
+        reach their frames one by one. Once the handler holds the
+        conversation's lock it reads them again, so that one answered or
+        deleted meanwhile is not run, and puts each on the waiting list in
+        its place by time, behind the sender's check (`_let_in`); each is
+        framed with the session that last took it (vault.RETRIED)."""
+        t = asyncio.create_task(self._take_up(task, set(keys)))
+        self._bg.add(t)
+        t.add_done_callback(self._bg.discard)
+
+    async def _take_up(self, task, keys: set[tuple[str, str]]) -> None:
+        try:
+            async with self._task_locks.setdefault(task["id"], asyncio.Lock()):
+                waiting = self._waiting.setdefault(task["id"], [])
+                there = {kept_key(m) for m in waiting}
+                taken = []
+                for r in self.store.kept(task["slack_channel"], task["thread_ts"]):
+                    if r["state"] != "due" or kept_key(r) not in keys or kept_key(r) in there:
+                        continue
+                    m = json.loads(r["payload"]) | ({"session": r["session"]} if r["session"] else {})
+                    if self._let_in(m):
+                        taken.append(m)
+                if not taken:
+                    return
+                waiting[:] = sorted(waiting + taken, key=lambda m: float(m["ts"]))
+                await self._turn(task, taken[-1], {})
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # left as they are, for the next start
+            log.exception("could not run again what was kept in %s", task["slack_channel"])
 
     async def _frame_turn(self, task, batch: list[dict], state: dict,
                           more: Additions | None = None) -> tuple[str, datetime] | None:
@@ -2020,35 +2202,45 @@ class Processor:
         can take a whole session of another conversation: the turn's newest
         message framed with the others, with who is in the conversation now
         and with the earlier sessions that took its messages, and that
-        message's time in the household's zone. None when there is nothing to
-        run: every message withdrawn while it waited, or a frame that could
-        not be built, which posts her note."""
+        message's time in the household's zone. A turn whose newest message
+        is older than LATE_TURN_S, as one run again after a stop, takes the
+        session's start for its time instead, and says when the message was
+        sent and when she was not running since the turn's oldest one. None
+        when there is nothing to run: every message withdrawn while it
+        waited, or a frame that could not be built, which posts her note."""
         if not batch:
             return None
         p = max(batch, key=lambda m: float(m["ts"]))
         now = datetime.fromtimestamp(float(p["ts"]), self.cfg.zone)
+        late = None
+        if datetime.now(self.cfg.zone) - now > timedelta(seconds=LATE_TURN_S):
+            now = datetime.now(self.cfg.zone)
+            oldest = datetime.fromtimestamp(min(float(m["ts"]) for m in batch), timezone.utc)
+            late = [(a, b) for a, b in self.store.down() if b - a >= DOWN_NAMED and b > oldest]
         opening = tuple(vault.RETRIED.format(sid8=s[:8]) for s in (more.earlier if more is not None else ()))
         try:
-            arrival = await self._memory_arrival(p, batch, now, more, opening=opening)
+            arrival = await self._memory_arrival(p, batch, now, more, opening=opening, late=late)
         except Exception as e:
             log.exception("could not frame %s in %s", p["ts"], p["channel"])
             await self._note_failure(task, p, f"could not gather what was said here: {e}", state,
-                                     rest=more is not None and more.rerun)
+                                     [kept_key(m) for m in batch], rest=more is not None and more.rerun)
             return None
         return arrival, now
 
-    async def _note_failure(self, task, p: dict, error: str, state: dict, rest: bool = False) -> None:
+    async def _note_failure(self, task, p: dict, error: str, state: dict, keys: list[tuple[str, str]],
+                            rest: bool = False) -> None:
         """A message's turn that failed outside a session, its frame or the
         harness: a run that owes nothing, with the error, and her note in its
-        place; FAILED_REST when the turn ran again what a later turn failed
-        on after her answer (`rest`). A retry that failed so is named in the
-        `failed` alert by its first try, as one whose session failed is."""
+        place, which answers the kept messages `keys`; FAILED_REST when the
+        turn ran again what a later turn failed on after her answer (`rest`).
+        A retry that failed so is named in the `failed` alert by its first
+        try, as one whose session failed is."""
         group = p.get("channel_type") == "mpim"
         note = (FAILED_REST_GROUP if group else FAILED_REST) if rest else FAILED_GROUP if group else FAILED
         started = utcnow()
         run_id, note_id = self.store.record_run_and_note(
-            note, kind="agent", task_id=task["id"], session_id=None, started_at=started, exit_code=None,
-            cost_usd=0.0, status="error", error=truncate(error, 1000))
+            note, settled=Settled(answered=tuple(keys)), kind="agent", task_id=task["id"], session_id=None,
+            started_at=started, exit_code=None, cost_usd=0.0, status="error", error=truncate(error, 1000))
         state["recorded"] = True
         if first := state.get("first"):
             self._failed(*first[1:], "tried once more, a note asked for it again")
@@ -2080,7 +2272,9 @@ class Processor:
         answers that says something is the one posted, an answer it gave
         before a stop cut a later turn short is the run's, delivered at the
         next start, and what it was not handed is put back for the
-        conversation's next turn.
+        conversation's next turn. The kept messages the turn holds are
+        written with its run (`Holding`): answered by what it posts, gone after
+        a silence, or due again.
 
         A message's session that fails with no turn of a member's reported is
         tried once more, holding the slot, by a session `frame` is given the
@@ -2110,7 +2304,7 @@ class Processor:
         reserve = self.cfg.agent_expected_usd
         if (verdict := await self.check_budget(reserve_usd=reserve)) != "ok":
             if owed:
-                await self._refused(verdict, channel, reply_thread)
+                await self._refused(verdict, task, channel, reply_thread)
             state["recorded"] = True
             return verdict
         sid = sid or str(uuid.uuid4())
@@ -2131,7 +2325,7 @@ class Processor:
             while True:
                 if (verdict := await self.check_budget(reserve_usd=reserve)) != "ok":
                     if owed:
-                        await self._refused(verdict, channel, reply_thread)
+                        await self._refused(verdict, task, channel, reply_thread)
                     state["recorded"] = True
                     return verdict
                 more = None
@@ -2140,6 +2334,7 @@ class Processor:
                         state["recorded"] = True
                         return None
                     arrival, now, more = framed
+                    more.sid = sid
                 started = utcnow()
                 date = now.date().isoformat()
                 t0 = time.monotonic()
@@ -2170,9 +2365,15 @@ class Processor:
                         )
                 except asyncio.CancelledError:
                     # an answer the session gave before a later turn was cut
-                    # short is the run's, delivered at the next start; the
-                    # conversation's one restart notice is left for what was
-                    # added after it
+                    # short is the run's, delivered at the next start, and
+                    # answers what came before that turn; what began it, and
+                    # anything else not answered, is run again at that start.
+                    # What was written to its input and never taken in loses
+                    # the session and the try that write counted; the
+                    # transcript that says so is read here, not in a thread,
+                    # since a stop awaits nothing more
+                    if more is not None and more.taken:
+                        more.give_back(vault.handed(self.cfg.vault_dir, sid))
                     given = vault.last_said(vault.answers(more.results)) if owed and more is not None else ""
                     self.store.record_run(
                         kind="agent", task_id=task["id"], session_id=sid, started_at=started,
@@ -2182,8 +2383,8 @@ class Processor:
                             self.cfg.agent_expected_usd * max(1.0, (time.monotonic() - t0) / 60),
                         ),
                         status="ok" if given else "cancelled", error="daemon shut down mid-run",
-                        result_text=given or None,
-                        notified=0 if given or (owed and self._owes_notice(task["id"])) else 1,
+                        result_text=given or None, notified=0 if given else 1,
+                        settled=self._answered_before_the_stop(more, sid) if given else None,
                     )
                     state["recorded"] = True
                     raise
@@ -2263,6 +2464,13 @@ class Processor:
         if then in ("note", "rest"):
             note = ((FAILED_REST_GROUP if group else FAILED_REST) if then == "rest"
                     else FAILED_GROUP if group else FAILED)
+        # the kept messages of a message's turn: answered by what is posted,
+        # gone with a silence, but for any run again as the next turn
+        settled = None
+        if more is not None and more.holding is not None:
+            again = tuple((k, m) for k, m in more.holding.rows.items() if m.get("again") == sid)
+            rest = tuple(k for k in more.holding.rows if k not in dict(again))
+            settled = Settled(answered=rest, again=again) if text or note else Settled(gone=rest, again=again)
         # recorded before it is posted and before the snapshot: a restart
         # while either runs still finds the answer here and delivers it
         run = dict(
@@ -2280,9 +2488,9 @@ class Processor:
             notified=0 if text and channel is not None else 1,
         )
         if note:
-            run_id, note_id = self.store.record_run_and_note(note, **run)
+            run_id, note_id = self.store.record_run_and_note(note, settled=settled, **run)
         else:
-            run_id = self.store.record_run(**run)
+            run_id = self.store.record_run(**run, settled=settled)
         state["recorded"] = True
         # posted before the snapshot, which can wait its turn behind another;
         # _post_run keeps deliver_pending off the run from its first line
@@ -2392,24 +2600,41 @@ class Processor:
                  len((out or {}).get("recorded") or []),
                  outcome)
 
-    async def _refused(self, verdict: str, channel: str, reply_thread: str | None) -> None:
+    async def _refused(self, verdict: str, task, channel: str, reply_thread: str | None) -> None:
         try:
             await self.slack.reply(reply_thread, BUDGET_REPLIES[verdict], channel=channel)
         except Exception as e:
             # no run was recorded to deliver it from, and the refusal stands either way
             log.warning("could not post the budget's %s reply in %s: %s", verdict, channel, e)
+        # the reply answers what a message's turn holds, and, before its
+        # frame, every message waiting there, which no turn takes then
+        if (holding := self._in_turn.get(task["id"])) is not None:
+            waiting = self._waiting.get(task["id"], [])
+            keys = {*holding.rows} or {kept_key(m) for m in waiting}
+            self.store.forget(keys)
+            waiting[:] = [m for m in waiting if kept_key(m) not in keys]
 
-    def _owes_notice(self, task_id: int) -> bool:
-        """At most one restart notice per conversation: every message waiting
-        there is answered by the one "reply again"."""
-        if task_id in self._noticed:
-            return False
-        self._noticed.add(task_id)
-        return True
+    def _answered_before_the_stop(self, more: Additions, sid: str) -> Settled:
+        """The kept messages an answer the session `sid` gave before a stop
+        cut a later turn of it short answers: the turn's frame, and the
+        messages it was handed before the one that began the turn cut short.
+        That one and those after it stay due, as does every message handed
+        when the transcript cannot say which turn took it; what it was not
+        handed is given back already. The transcript is read here, not in a
+        thread, since a stop awaits nothing more."""
+        starts = vault.turn_starts(self.cfg.vault_dir, sid)
+        added = [kept_key(m) for m, _ in more.taken]
+        if starts is None:
+            cut = 0
+        else:
+            later = [t for turn in starts[len(more.results):] for t in turn.texts]
+            cut = next((i for i, (_, text) in enumerate(more.taken) if text in later), len(added))
+        return Settled(answered=tuple(k for k in more.holding.rows if k not in added) + tuple(added[:cut]))
 
     def _withdraw(self, channel: str, ts: str) -> None:
         """A message deleted while it waited for its turn is not handed to a
-        session."""
+        session, and is no longer kept unless an answer to it is."""
+        self.store.forget([(channel, ts)])
         for waiting in self._waiting.values():
             waiting[:] = [m for m in waiting if (m["channel"], m["ts"]) != (channel, ts)]
         # one a running session took and was never handed is not put back
@@ -2419,15 +2644,16 @@ class Processor:
     def _let_in(self, p: dict) -> bool:
         """Whether the sender of a message, whom the watcher found on the
         allowlist, starts a session: a member, with a name sessions are told,
-        which Slack gave. One without is not let in yet, and is logged once.
-        Asks Slack nothing: who else can read the conversation is the frame's
-        to say."""
+        which Slack gave. One without is not let in yet, and is logged once;
+        the message, which nothing answers, is no longer kept. Asks Slack
+        nothing: who else can read the conversation is the frame's to say."""
         if p["user"] in self.household.told_names():
             return True
         if p["user"] not in self._outside:
             self._outside.add(p["user"])
             log.warning("not taking part in %s: %s is not let in until Slack gives a name for them (doctor)",
                         p["channel"], p["user"])
+        self.store.forget([kept_key(p)])
         return False
 
     async def _readers(self, p: dict) -> list[str]:
@@ -2439,13 +2665,16 @@ class Processor:
         return await self.slack.members(p["channel"])
 
     async def _memory_arrival(self, p: dict, batch: list[dict], now: datetime,
-                              more: Additions | None = None, opening: tuple[str, ...] = ()) -> str:
+                              more: Additions | None = None, opening: tuple[str, ...] = (),
+                              late: list[tuple[datetime, datetime]] | None = None) -> str:
         """The newest message of a turn as its session is handed it: who said
         it, where, who reads the answer and which of them are outside the
-        household, and what came before, the turn's other messages and her
-        answers to the turns before included. When Slack will not say who
-        reads, the session is told so, and the turn's speakers are named.
-        `opening` is the further sentences of its opening line. `more` keeps
+        household, and what came before, the turn's other messages, however
+        many, and her answers to the turns before included. When Slack will
+        not say who reads, the session is told so, and the turn's speakers are
+        named. `opening` is the further sentences of its opening line, before
+        which, for a turn that reaches its session `late`, go when the
+        message was sent and each interval she was not running. `more` keeps
         the place, the time and the names it gives."""
         try:
             ids, unlisted = await self._readers(p), False
@@ -2462,10 +2691,13 @@ class Processor:
             more.place, more.now = place, now
             more.told, more.namesakes, more.marked = told, namesakes, marked
         own = await self.slack.own_ids()
+        # what came before goes back from the turn's oldest message, which a
+        # turn run late can have sent many hours before the session starts
+        turn = min(float(m["ts"]) for m in batch)
         try:
             msgs = await self.slack.fetch_context(
                 p["channel"], p["task_key"] if p.get("in_thread") else None,
-                now.timestamp() - vault.RECENT_HOURS * 3600, lambda m: vault.counts(m, p["ts"], own, kin))
+                turn - vault.RECENT_HOURS * 3600, lambda m: vault.counts(m, p["ts"], own, kin, turn))
         except Exception:
             # what came before is context; the message and its readers are not
             log.exception("could not load conversation context for %s", p["channel"])
@@ -2474,7 +2706,7 @@ class Processor:
         seen = {m.get("ts") for m in msgs}
         msgs = sorted(msgs + [m for m in batch if m["ts"] not in seen], key=lambda m: float(m.get("ts") or 0))
         limit = self.cfg.slack_context_limit
-        shown = vault.shown(msgs, p["ts"], place, own, now, kin=kin, thread=limit)
+        shown = vault.shown(msgs, p["ts"], place, own, now, kin=kin, thread=limit, turn=turn)
         # what the frame looks up: the readers it names, past NAMED_READERS
         # only the household's; the posters it shows; her user id, so that a
         # mention of her reads as her name
@@ -2497,9 +2729,14 @@ class Processor:
                 # anyone at all may be in this Slack
                 log.warning("could not read who is in this Slack for %s: %s", p["channel"], e)
                 outside = True
+        if late is not None:
+            opening = (vault.LATE_TURN.format(speaker=named[p["user"]], sent=vault.stamp(float(p["ts"]), now)),
+                       *(vault.DOWN.format(since=vault.stamp(a.timestamp(), now), until=vault.stamp(b.timestamp(), now))
+                         for a, b in late), *opening)
         return vault.arrival_text(
             place, named[p["user"]], vault.message_text(p.get("text"), p.get("files"), named), listed,
-            vault.earlier(msgs, p["ts"], place, named, own, now, kin=kin, thread=limit, namesakes=namesakes),
+            vault.earlier(msgs, p["ts"], place, named, own, now, kin=kin, thread=limit, namesakes=namesakes,
+                          turn=turn),
             also=sorted({named[m["user"]] for m in batch} - {named[p["user"]]}), outside=outside,
             unlisted=unlisted, opening=opening,
         )
@@ -2716,6 +2953,7 @@ async def run_daemon(cfg: Config) -> None:
     # before Slack connects, so that no session has run in a DM since the
     # timed wake a stop or a crash cut short there, or the look a crash did
     processor.settle_wakes(datetime.now(cfg.zone))
+    kept = processor.kept()
 
     slack_watcher = SlackWatcher(cfg, store, loop, slack_queue)
     try:
@@ -2740,6 +2978,10 @@ async def run_daemon(cfg: Config) -> None:
     store.came_up(utcnow())
     log.info("wanda running (enforcement=%s, email triage=%s, agent=%s)", cfg.enforcement,
              cfg.email_triage_model if cfg.email_triage else "off", cfg.agent_model)
+    # made before slack_loop's task, so that each holds its conversation's
+    # lock before a message from the queue there waits on it
+    for task, keys in kept:
+        processor.take_up(task, keys)
     # slack_loop starts first: recovery can take many paced Slack calls, and an
     # owner reply arriving during it must not sit undispatched in the queue.
     tasks = [asyncio.create_task(processor.slack_loop())]
@@ -2868,6 +3110,21 @@ async def run_doctor(cfg: Config, smoke: bool) -> int:
             last = store.get_meta(f"clock:outcome:{uid}")
             report(f"last look for {uid} ({household.told(uid) or 'not let in'})", clock.look_healthy(
                 last, datetime.now(cfg.zone), running, clock.first_start(at, quiet)), last or "none yet")
+        # a member's message kept and not yet answered, due longer than a
+        # look may run and two sessions more since it was sent, or since the
+        # last start, which runs again what a stop left: its turn did not
+        # come, or wrote nothing when it ended
+        taken = [r for r in store.kept() if r["state"] != "answered"]
+        since = store.get_meta("started_at")
+        overdue = [r for r in taken if r["state"] == "due" and datetime.now(timezone.utc) - max(
+            datetime.fromtimestamp(float(r["ts"]), timezone.utc),
+            datetime.fromisoformat(since) if since else datetime.min.replace(tzinfo=timezone.utc),
+        ) > running + timedelta(seconds=2 * cfg.agent_timeout_s)]
+        report("messages taken and not yet answered", not overdue, f"{len(taken)}" + (
+            f", {len(overdue)} due longer than a turn takes" if overdue else "") if taken else "none")
+        for r in overdue:
+            print(f"      {r['channel']}, the message of {datetime.fromtimestamp(float(r['ts']), zone):%Y-%m-%d %H:%M}"
+                  f" (ts {r['ts']}), taken by {r['tries']} session(s) that did not finish")
         # the timed reminders not given, with who asked and why, which their
         # alert leaves out. Its session may have closed the item, and the
         # clock wakes only for an open one, so the command reopens it too

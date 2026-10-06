@@ -347,10 +347,11 @@ async def moment(at, vault_dir):
 
 
 class Feed:
-    """What the runner reads a session's added messages from: next(), close()
-    and results, as the product's feed has them. Each text put on `waiting`
-    is handed over in turn, indented as the product frames a message, after
-    `frame_s`, until it is closed; `written` holds those it handed over."""
+    """What the runner reads a session's added messages from: next(), close(),
+    began() and results, as the product's feed has them. Each text put on
+    `waiting` is handed over in turn, indented as the product frames a
+    message, after `frame_s`, until it is closed; `written` holds those it
+    handed over, and `turns` how many turns began."""
 
     def __init__(self, frame_s=0.0):
         self.waiting: list[str] = []
@@ -359,9 +360,13 @@ class Feed:
         self.closed = False
         self.more = asyncio.Event()
         self.frame_s = frame_s
+        self.turns = 0
 
     def poke(self):
         self.more.set()
+
+    def began(self):
+        self.turns += 1
 
     def close(self):
         self.closed = True
@@ -416,6 +421,8 @@ def test_one_added_after_the_last_step_gets_a_further_turn_whose_result_is_the_s
     assert rr.structured["answer"] == "one answer to 2: first | and tell me too"
     # each result's figure is the session's so far, as the CLI's are
     assert rr.cost_usd == 0.02
+    # the feed is told as each turn begins
+    assert feed.turns == 2
 
 
 def opening_blocks(tmp_path):

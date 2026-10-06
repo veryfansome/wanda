@@ -134,8 +134,9 @@ class RunnerService:
         feed=None,
     ) -> RunResult:
         """`feed`, when given, keeps the session's input open while it works,
-        for the messages `feed.next()` hands it, and is handed each result as
-        it comes, in `feed.results` (see `_streamed`)."""
+        for the messages `feed.next()` hands it, is told as each of its turns
+        begins (`feed.began()`), and is handed each result as it comes, in
+        `feed.results` (see `_streamed`)."""
         argv = [
             self.claude_bin,
             "-p",
@@ -280,6 +281,7 @@ class RunnerService:
                     api_error = ev.get("error")
                 elif kind == "system" and ev.get("subtype") == "init":
                     began.set()
+                    feed.began()
                 elif ev.get("type") == "result":
                     results.append(ev)
                     feed.close()

@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import sqlite3
 from types import SimpleNamespace
 
 import pytest
@@ -175,6 +176,45 @@ def test_app_mention_twin_is_ignored(store):
     loop.run_until_complete(asyncio.sleep(0))
     loop.close()
     assert q.qsize() == 1, "one user message must produce exactly one trigger"
+
+
+def test_a_message_to_her_is_kept_until_it_is_answered(store):
+    """Every member's message to her, wherever it is, a DM's first included,
+    before its conversation has a task; not a reply in an email task's
+    thread, nor one starting nothing."""
+    store.create_task(None, "C_TRIAGE", "77.1", kind="email")
+    store.create_task(None, "C9", "50.1", kind="mention")
+    for i, event in enumerate(({"channel": "D5", "channel_type": "im", "text": "hi"},
+                               {"channel": "C9", "channel_type": "channel", "text": "<@UBOT> hi"},
+                               {"channel": "C9", "channel_type": "channel", "text": "<@UBOT> hi", "thread_ts": "8.8"},
+                               {"channel": "C9", "channel_type": "channel", "text": "and", "thread_ts": "50.1"},
+                               {"channel": "C_TRIAGE", "channel_type": "channel", "text": "do it", "thread_ts": "77.1"},
+                               {"channel": "C9", "channel_type": "channel", "text": "morning all"})):
+        fire(store, {"type": "message", "user": "U1", "ts": f"90.{i}", **event})
+    assert [(r["channel"], r["ts"], r["task_key"]) for r in store.kept()] == [
+        ("D5", "90.0", "conversation"), ("C9", "90.1", "90.1"), ("C9", "90.2", "8.8"), ("C9", "90.3", "50.1")]
+    assert store.get_task_by_thread("D5", "conversation") is None
+
+
+def test_the_envelope_is_acknowledged_once_the_message_is_kept(store, monkeypatch):
+    """Slack sends nothing again once it is acknowledged: a message lost to
+    a stop or a crash between the two would be lost for good. Acknowledged
+    too when keeping it raises."""
+    w, q, loop = watcher(store)
+    acked = []
+    w.client = SimpleNamespace(send_socket_mode_response=lambda r: acked.append(
+        (r.envelope_id, [x["ts"] for x in store.kept()])))
+    dm = {"type": "message", "user": "U1", "channel": "D5", "channel_type": "im", "text": "hi"}
+    w._handle(w.client, FakeReq({**dm, "ts": "1.1"}))
+    assert acked == [("env1", ["1.1"])]
+
+    def full(key, payload=None):
+        raise sqlite3.OperationalError("database or disk is full")
+    monkeypatch.setattr(store, "first_time", full)
+    with pytest.raises(sqlite3.OperationalError):
+        w._handle(w.client, FakeReq({**dm, "ts": "2.2"}))
+    loop.close()
+    assert acked == [("env1", ["1.1"]), ("env1", ["1.1"])]
 
 
 def test_dm_conversation_is_one_resumable_task(store):

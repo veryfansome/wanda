@@ -77,11 +77,19 @@ OUTSIDERS_READ = " Some who can read it are outside the household."
 UNLISTED = " I could not find out who else is in it."
 # on the opening line, after those, once for each earlier session that took
 # the turn's messages and ended without answering them, oldest first: the
-# session it retries, or the one whose later turn failed after an answer.
+# session it retries, the one whose later turn failed after an answer, or one
+# a stop or a crash cut short.
 # {sid8} is the session's first eight characters, which `mem session` takes
 # as a prefix of its id.
 RETRIED = ("An earlier session of mine for this, {sid8}, ended before I answered; what it wrote to memory is "
            "still there.")
+# on the opening line, before RETRIED's, when the turn's newest message
+# reaches its session late, as after a stop: the session is framed at its own
+# start, and told when the message was sent, and each interval she was not
+# running since the turn's oldest one, so that it answers knowing how long
+# ago it was asked
+LATE_TURN = "What {speaker} says below was sent at {sent} and reaches me only now."
+DOWN = "I was not running from {since} until {until}."
 ME = "me"
 # Who posted one of her alerts, as a frame shows it: an alert carries the
 # harness's words, so it is never shown as something she said.
@@ -401,12 +409,13 @@ def _showable(m: dict, ts: str, own: frozenset[str]) -> bool:
     return mine or _at(m) < float(ts)
 
 
-def counts(m: dict, ts: str, own: frozenset[str], kin=None) -> bool:
+def counts(m: dict, ts: str, own: frozenset[str], kin=None, turn: float | None = None) -> bool:
     """Whether a message read is one of the household's lines a frame can
     show before the message `ts`: a member's, an allowed id's or hers, not her
-    note or a join, and after the message hers alone. `shown` counts the
+    note or a join, and after the message hers alone; given `turn`, the time
+    of the turn's oldest message, only one before it. `shown` counts the
     household's window by it, and fetch_context stops reading by it."""
-    return _showable(m, ts, own) and not from_outside(m, own, kin)
+    return _showable(m, ts, own) and not from_outside(m, own, kin) and (turn is None or _at(m) < turn)
 
 
 def _newest(lines: list[dict], n: int) -> list[dict]:
@@ -415,7 +424,7 @@ def _newest(lines: list[dict], n: int) -> list[dict]:
 
 
 def shown(messages: list[dict], ts: str, place: str, own: frozenset[str], now: datetime, *,
-          kin=None, thread: int = 50) -> list[dict]:
+          kin=None, thread: int = 50, turn: float | None = None) -> list[dict]:
     """The messages a frame shows before the message `ts`, oldest first,
     picked before their posters are looked up. Outside a thread, the
     household's newest EARLIER of the last RECENT_HOURS, and of anyone else's
@@ -425,9 +434,12 @@ def shown(messages: list[dict], ts: str, place: str, own: frozenset[str], now: d
     `thread` - 1 each, in the same way. So no one else's lines push the
     household's out of view. `kin`, the allowed ids, is None in a 1:1 DM,
     where every poster is the household's. Her posts after the message are
-    kept, as `earlier` says."""
+    kept, as `earlier` says. Given `turn`, the time of the turn's oldest
+    message, the hours and the household's count go back from it, and every
+    household line from it on is shown besides: a turn that takes many
+    messages, sent over a night say, is framed whole however late it runs."""
     in_thread = place.endswith("thread")
-    since = now.timestamp() - RECENT_HOURS * 3600
+    since = (now.timestamp() if turn is None else turn) - RECENT_HOURS * 3600
     lines = [m for m in messages if _showable(m, ts, own) and (in_thread or _at(m) >= since)]
     first, ours_n, theirs_n = [], EARLIER, OUTSIDE_EARLIER
     if in_thread:
@@ -435,8 +447,10 @@ def shown(messages: list[dict], ts: str, place: str, own: frozenset[str], now: d
         # cannot be shown, as her failure note cannot, no reply takes its place
         first = [m for m in lines[:1] if m is messages[0]]
         lines, ours_n, theirs_n = lines[len(first):], thread - 1, thread - 1
-    ours = _newest([m for m in lines if counts(m, ts, own, kin)], ours_n)
+    ours = _newest([m for m in lines if counts(m, ts, own, kin, turn)], ours_n)
     start = _at(ours[0]) if ours and len(ours) == ours_n else float("-inf")
+    if turn is not None:
+        ours += [m for m in lines if counts(m, ts, own, kin) and _at(m) >= turn]
     theirs = _newest([m for m in lines if from_outside(m, own, kin) and _at(m) >= start], theirs_n)
     keep = {id(m) for m in ours + theirs}
     return first + [m for m in lines if id(m) in keep]
@@ -483,7 +497,8 @@ def _labelled(text: str, label: str, *, cut: int | None = None) -> tuple[str, in
 
 
 def earlier(messages: list[dict], ts: str, place: str, named: dict[str, str], own: frozenset[str],
-            now: datetime, *, kin=None, thread: int = 50, namesakes=()) -> list[tuple[str, str, str]]:
+            now: datetime, *, kin=None, thread: int = 50, namesakes=(),
+            turn: float | None = None) -> list[tuple[str, str, str]]:
     """The conversation before this message as a frame shows it (`shown`),
     oldest first, as (when, who, text). Her alert is shown as an alert posted
     in her name, every further line of it labelled so. A post marked outside
@@ -497,7 +512,7 @@ def earlier(messages: list[dict], ts: str, place: str, named: dict[str, str], ow
     framed under its conversation's lock, so they are what she said to the
     turns before, and a message sent while one of those ran would otherwise
     look unanswered."""
-    kept = shown(messages, ts, place, own, now, kin=kin, thread=thread)
+    kept = shown(messages, ts, place, own, now, kin=kin, thread=thread, turn=turn)
     head = kept[0] if place.endswith("thread") and kept and kept[0] is messages[0] else None
     out, room = [], OUTSIDE_CUT_AT
     # newest first, so that others' newest posts are the ones kept whole
@@ -540,8 +555,9 @@ def arrival_text(place: str, speaker: str, text: str, readers: list[str],
     can read, that some who can are outside the household; elsewhere the marks
     on its readers say so. `unlisted` says that Slack would not say who else
     is in the conversation. `opening` is the sentences that go after those on
-    the opening line, RETRIED's; a direct message with any takes the shape
-    every other frame has, since the lab's has no line to hold them."""
+    the opening line, LATE_TURN's, DOWN's and RETRIED's; a direct message
+    with any takes the shape every other frame has, since the lab's has no
+    line to hold them."""
     said = _indent(text, 4)
     after = f", after {' and '.join(also)}" if also else ""
     if place == "dm" and not earlier and not also and not opening:

@@ -95,6 +95,13 @@ def texts() -> list[tuple[str, str]]:
         found.append((f"memory frame, a retry, {place}", vault.arrival_text(
             place, "alice", "hi", ["alice"], [], unlisted=True,
             opening=tuple(vault.RETRIED.format(sid8=sid) for sid in ("3f9a1c2e", "7b20d4e1")))))
+    # a turn that reaches its session late, across a stop
+    for place in vault.PLACES:
+        found.append((f"memory frame, a late turn, {place}", vault.arrival_text(
+            place, "alice", "hi", ["alice"], [("Wed 2026-09-30 21:40", "alice", "earlier")], unlisted=True,
+            opening=(vault.LATE_TURN.format(speaker="alice", sent="Wed 2026-09-30 23:58"),
+                     vault.DOWN.format(since="Wed 2026-09-30 23:59", until="06:58"),
+                     vault.RETRIED.format(sid8="3f9a1c2e")))))
     for place in vault.PLACES:
         found.append((f"a message added while the session works, {place}",
                       vault.added_text(place, "alice", "hi", "09:06")))

@@ -169,6 +169,23 @@ def test_a_retry_is_read_back_as_the_message_it_retries(place, chan):
         "answered; what it wrote to memory is still there.\n\nfan says:\n\n    one line")
 
 
+@pytest.mark.parametrize("place,chan", [("dm", "dm"), ("group", "group dm"), ("channel", "channel"),
+                                        ("public", "public channel"), ("thread", "thread"),
+                                        ("public thread", "public thread")])
+def test_a_late_turn_is_read_back_as_the_message_it_frames(place, chan):
+    """When the message was sent, each interval she was not running and each
+    earlier session, after the sentences on who reads, a public frame's
+    included: read back as fan saying what he said."""
+    late = (vault.LATE_TURN.format(speaker="fan", sent="Wed 2026-09-30 23:58"),
+            vault.DOWN.format(since="Wed 2026-09-30 23:59", until="06:58"),
+            vault.DOWN.format(since="07:02", until="07:40"), vault.RETRIED.format(sid8="3f9a1c2e"))
+    for earlier in ([], [("09:00", "mei", "earlier")]):
+        arrival = vault.arrival_text(place, "fan", SAID, ["fan", "mei"], earlier, outside=place.startswith("public"),
+                                     unlisted=True, opening=late)
+        assert parser()(vault.prompt("2026-10-01", arrival)) == ("2026-10-01", chan, "fan", SAID)
+        assert f"I could not find out who else is in it. {' '.join(late)}\n\n" in arrival
+
+
 OWN = frozenset({"UBOT", "BBOT"})
 KIN = ["U1", "U2", "U5"]
 TOLD = {"U1": "fan", "U2": "mei"}

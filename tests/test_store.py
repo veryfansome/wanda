@@ -1,8 +1,11 @@
+import json
+import sqlite3
+import threading
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from wanda.store import Store
+from wanda.store import Settled, Store
 
 
 @pytest.fixture
@@ -57,8 +60,79 @@ def test_tasks(store):
 
 
 def test_slack_event_dedupe(store):
-    assert store.slack_event_first_time("ev1") is True
-    assert store.slack_event_first_time("ev1") is False
+    assert store.first_time("ev1") is True
+    assert store.first_time("ev1") is False
+
+
+def message(ts, channel="D1", task_key="conversation"):
+    """A member's message as the watcher hands it on."""
+    return {"kind": "dm", "channel": channel, "channel_type": "im", "task_key": task_key, "reply_thread": None,
+            "in_thread": False, "user": "U1", "text": f"line {ts}", "files": [], "ts": ts}
+
+
+def test_a_message_to_her_is_kept_as_it_is_seen(store):
+    """In the transaction that records it as seen, before its conversation
+    has a task; a redelivery keeps nothing again, and one that is not to
+    her keeps nothing."""
+    assert store.first_time("D1:1.1", message("1.1"))
+    assert store.get_task_by_thread("D1", "conversation") is None
+    assert not store.first_time("D1:1.1", message("1.1"))
+    assert store.first_time("C1:2.2")
+    [kept] = store.kept()
+    assert (kept["channel"], kept["ts"], kept["task_key"], kept["state"], kept["tries"], kept["session"]) == (
+        "D1", "1.1", "conversation", "due", 0, None)
+    assert json.loads(kept["payload"]) == message("1.1")
+    # one that cannot be kept is not marked seen either, so that Slack's
+    # sending it again is taken
+    store._db.execute("DROP TABLE unanswered")
+    with pytest.raises(sqlite3.OperationalError):
+        store.first_time("D1:3.3", message("3.3"))
+    store.set_meta("next", "write")
+    assert store._query("SELECT 1 FROM slack_events WHERE event_id='D1:3.3'") == []
+
+
+def test_a_run_and_what_it_answers_are_written_together_while_the_watcher_writes(store, monkeypatch):
+    """The watcher's thread commits on the same connection: the lock is held
+    across a run and its kept messages, so a commit of the watcher's never
+    keeps half of them, and one that fails leaves none."""
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    task = store.create_task(None, "D1", "conversation", kind="dm")
+    store.first_time("D1:1.1", message("1.1"))
+    settle, watcher, seen = store._settle, [], threading.Event()
+
+    def interrupted(settled, run_id):
+        settle(settled, run_id)
+        watcher.append(threading.Thread(target=lambda: store.first_time("D1:2.2", message("2.2")) and seen.set()))
+        watcher[0].start()
+        assert not seen.wait(0.3), "the watcher's write waits for the run's"
+        raise sqlite3.OperationalError("disk I/O error")
+    monkeypatch.setattr(store, "_settle", interrupted)
+    with pytest.raises(sqlite3.OperationalError):
+        store.record_run(kind="agent", task_id=task, session_id="s", started_at=now, exit_code=0, cost_usd=0.1,
+                         status="ok", result_text="Noted.", notified=0, settled=Settled(answered=(("D1", "1.1"),)))
+    watcher[0].join(5)
+    assert seen.is_set() and store._query("SELECT id FROM runs") == []
+    assert [(r["ts"], r["state"], r["run"]) for r in store.kept()] == [("1.1", "due", None), ("2.2", "due", None)]
+
+
+def test_what_a_run_answers_goes_when_it_is_posted(store):
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    task = store.create_task(None, "D1", "conversation", kind="dm")
+    for ts in ("1.1", "2.2", "3.3", "4.4"):
+        store.first_time(f"D1:{ts}", message(ts))
+    store.took("s1", [("D1", "1.1"), ("D1", "2.2"), ("D1", "3.3")], {("D1", "1.1"), ("D1", "3.3")})
+    run = store.record_run(kind="agent", task_id=task, session_id="s1", started_at=now, exit_code=0, cost_usd=0.1,
+                           status="ok", result_text="Noted.", notified=0, settled=Settled(
+                               answered=(("D1", "1.1"),), gone=(("D1", "2.2"),),
+                               again=((("D1", "3.3"), message("3.3") | {"again": "s1"}),)))
+    assert [(r["ts"], r["state"], r["run"], r["tries"], r["session"]) for r in store.kept()] == [
+        ("1.1", "answered", run, 1, "s1"), ("3.3", "due", None, 0, "s1"), ("4.4", "due", None, 0, None)]
+    assert json.loads(store.kept()[1]["payload"])["again"] == "s1"
+    # a deletion takes only what no run answers
+    store.forget([("D1", "1.1"), ("D1", "4.4")])
+    assert [r["ts"] for r in store.kept()] == ["1.1", "3.3"]
+    store.mark_run_notified(run)
+    assert [r["ts"] for r in store.kept()] == ["3.3"]
 
 
 def test_runs_accounting(store):

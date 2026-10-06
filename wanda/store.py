@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import sqlite3
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS imap_cursor (
@@ -71,6 +72,24 @@ CREATE TABLE IF NOT EXISTS slack_events (
   received_at TEXT NOT NULL
 );
 
+-- A member's message to her, kept from when it is seen until its answer is
+-- posted: `due` until a turn records what it came to, then `answered` by
+-- `run`, the run that posts her answer or note. Slack never sends a message
+-- again once it is acknowledged, so this is what a stop or a crash leaves to
+-- run again. `session` is the last session that took it, and `tries` how many
+-- turns a session began for it and did not finish.
+CREATE TABLE IF NOT EXISTS unanswered (
+  channel  TEXT NOT NULL,
+  ts       TEXT NOT NULL,
+  task_key TEXT NOT NULL,
+  payload  TEXT NOT NULL,
+  state    TEXT NOT NULL DEFAULT 'due',
+  tries    INTEGER NOT NULL DEFAULT 0,
+  session  TEXT,
+  run      INTEGER REFERENCES runs(id),
+  PRIMARY KEY (channel, ts)
+);
+
 CREATE TABLE IF NOT EXISTS digests (
   local_date TEXT PRIMARY KEY,
   channel    TEXT NOT NULL,
@@ -108,6 +127,16 @@ DOWN_KEPT = 5
 
 def utcnow() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+class Settled(NamedTuple):
+    """What a recorded run does to the kept messages of its turn, each by
+    (channel, ts): answered by the run that posts the turn's answer or note
+    (the note's, when there is one), gone after a silence, or kept due with
+    its payload, to run again as the conversation's next turn."""
+    answered: tuple = ()
+    gone: tuple = ()
+    again: tuple = ()  # of ((channel, ts), payload)
 
 
 class Store:
@@ -220,6 +249,20 @@ class Store:
     def _query(self, sql: str, params: tuple = ()) -> list[sqlite3.Row]:
         with self._lock:
             return self._db.execute(sql, params).fetchall()
+
+    @contextlib.contextmanager
+    def _transaction(self):
+        """Statements written together or not at all. The lock is held across
+        them, since the watcher's thread commits on this same connection, and
+        a commit among them would keep the half before it; one that raises
+        is rolled back, or the next write's commit would keep it."""
+        with self._lock:
+            try:
+                yield self._db
+            except BaseException:
+                self._db.rollback()
+                raise
+            self._db.commit()
 
     # --- imap cursor ---
 
@@ -397,31 +440,42 @@ class Store:
         error: str | None = None,
         result_text: str | None = None,
         notified: int = 1,
+        settled: Settled | None = None,
     ) -> int:
         """notified=0 marks a run whose outcome still owes the owner a Slack
-        message, so a restart can deliver it."""
-        with self._lock:
+        message, so a restart can deliver it. `settled` is what it does to
+        its turn's kept messages, written with it: a restart finds the run
+        and the messages it answers, or neither."""
+        with self._transaction():
             run_id = self._insert_run(kind, task_id, session_id, started_at, exit_code, cost_usd, status, error,
                                       result_text, notified)
-            self._db.commit()
+            self._settle(settled, run_id)
         return run_id
 
-    def record_run_and_note(self, note: str, **run) -> tuple[int, int]:
+    def record_run_and_note(self, note: str, settled: Settled | None = None, **run) -> tuple[int, int]:
         """A run, and her note in its conversation after it, a run of kind
         `note` owed to the same task under the same session, written in one
-        transaction: a restart finds both or neither, so a failure is never
-        left with nothing said for it. Returns both ids."""
-        with self._lock:
-            try:
-                run_id = self._insert_run(**run)
-                note_id = self._insert_run("note", run["task_id"], run["session_id"], run["started_at"], None, 0.0,
-                                           "ok", None, note, 0)
-            except BaseException:
-                # or the next write's commit would keep the run alone
-                self._db.rollback()
-                raise
-            self._db.commit()
+        transaction with what they do to the turn's kept messages: a restart
+        finds all of it or none, so a failure is never left with nothing said
+        for it. Returns both ids."""
+        with self._transaction():
+            run_id = self._insert_run(**run)
+            note_id = self._insert_run("note", run["task_id"], run["session_id"], run["started_at"], None, 0.0,
+                                       "ok", None, note, 0)
+            self._settle(settled, note_id)
         return run_id, note_id
+
+    def _settle(self, settled: Settled | None, run_id: int) -> None:
+        if settled is None:
+            return
+        self._db.executemany("UPDATE unanswered SET state='answered', run=? WHERE channel=? AND ts=?",
+                             [(run_id, *k) for k in settled.answered])
+        self._db.executemany("DELETE FROM unanswered WHERE channel=? AND ts=? AND state <> 'answered'",
+                             list(settled.gone))
+        # run again as a fresh turn, so the try of the turn that gave it back
+        # is not counted against it
+        self._db.executemany("UPDATE unanswered SET state='due', tries=0, payload=? WHERE channel=? AND ts=?",
+                             [(json.dumps(p), *k) for k, p in settled.again])
 
     def _insert_run(self, kind: str, task_id: int | None, session_id: str | None, started_at: str,
                     exit_code: int | None, cost_usd: float | None, status: str, error: str | None = None,
@@ -478,7 +532,10 @@ class Store:
         )
 
     def mark_run_notified(self, run_id: int) -> None:
-        self._exec("UPDATE runs SET notified=1 WHERE id=?", (run_id,))
+        """A run posted: the messages it answers are no longer kept."""
+        with self._transaction():
+            self._db.execute("UPDATE runs SET notified=1 WHERE id=?", (run_id,))
+            self._db.execute("DELETE FROM unanswered WHERE run=? AND state='answered'", (run_id,))
 
     def owed_before(self, run_id: int) -> bool:
         """Whether a run recorded before this one in its task still owes its
@@ -506,24 +563,86 @@ class Store:
         return self._exec("UPDATE runs SET deliver_attempts = 1 WHERE id=? AND deliver_attempts = 0",
                           (run_id,)).rowcount > 0
 
-    def give_up(self, run_id: int, attempts: int) -> list[int]:
+    def _notes_after(self, run_id: int) -> list[int]:
+        # her notes owed after the run in its task under its session
+        return [r["id"] for r in self._db.execute(
+            "SELECT n.id FROM runs r JOIN runs n ON n.task_id = r.task_id AND n.session_id = r.session_id "
+            "AND n.id > r.id WHERE r.id = ? AND n.kind = 'note' AND n.notified = 0", (run_id,))]
+
+    def answering(self, run_id: int) -> list[sqlite3.Row]:
+        """The kept messages a run answers, and those of the notes giving it
+        up would drop with it, oldest first."""
+        with self._lock:
+            runs = [run_id, *self._notes_after(run_id)]
+            return self._db.execute(
+                f"SELECT * FROM unanswered WHERE state='answered' AND run IN ({','.join('?' * len(runs))}) "
+                "ORDER BY CAST(ts AS REAL)", runs).fetchall()
+
+    def give_up(self, run_id: int, attempts: int, note: str | None = None) -> tuple[list[int], int | None]:
         """Delivery gives a run up, so that it blocks nothing after it: marked
         notified with `attempts` as its count, by which a run given up is told
         from one posted. Her notes owed after it in its task under its
         session go with it, since each follows that answer and means nothing
-        without it. Returns the notes' ids."""
-        with self._lock:
-            try:
-                self._db.execute("UPDATE runs SET notified=1, deliver_attempts=? WHERE id=?", (attempts, run_id))
-                notes = [r["id"] for r in self._db.execute(
-                    "SELECT n.id FROM runs r JOIN runs n ON n.task_id = r.task_id AND n.session_id = r.session_id "
-                    "AND n.id > r.id WHERE r.id = ? AND n.kind = 'note' AND n.notified = 0", (run_id,))]
-                self._db.executemany("UPDATE runs SET notified=1 WHERE id=?", [(n,) for n in notes])
-            except BaseException:
-                self._db.rollback()
-                raise
-            self._db.commit()
-        return notes
+        without it. The messages they answered are no longer kept, or, given
+        a `note`, are answered by that note instead, a run of hers with no
+        session, recorded after them in the same task. Returns the notes' ids
+        and the new note's."""
+        with self._transaction():
+            self._db.execute("UPDATE runs SET notified=1, deliver_attempts=? WHERE id=?", (attempts, run_id))
+            notes = self._notes_after(run_id)
+            self._db.executemany("UPDATE runs SET notified=1 WHERE id=?", [(n,) for n in notes])
+            runs = [run_id, *notes]
+            which = f"state='answered' AND run IN ({','.join('?' * len(runs))})"
+            given = None
+            if note is not None:
+                task = self._db.execute("SELECT task_id FROM runs WHERE id=?", (run_id,)).fetchone()["task_id"]
+                given = self._insert_run("note", task, None, utcnow(), None, 0.0, "ok", None, note, 0)
+                self._db.execute(f"UPDATE unanswered SET run=? WHERE {which}", (given, *runs))
+            else:
+                self._db.execute(f"DELETE FROM unanswered WHERE {which}", runs)
+        return notes, given
+
+    # --- the messages kept until they are answered ---
+
+    def first_time(self, key: str, payload: dict | None = None) -> bool:
+        """Whether a Slack message is seen for the first time, by its
+        `channel:ts` key. A member's message to her (`payload`, as the
+        watcher hands it on) is kept due in the same transaction, so that
+        once it is seen nothing loses it before it is answered."""
+        with self._transaction():
+            first = self._db.execute("INSERT OR IGNORE INTO slack_events(event_id, received_at) VALUES(?,?)",
+                                     (key, utcnow())).rowcount > 0
+            if first and payload is not None:
+                self._db.execute("INSERT OR IGNORE INTO unanswered(channel, ts, task_key, payload) VALUES(?,?,?,?)",
+                                 (payload["channel"], payload["ts"], payload["task_key"], json.dumps(payload)))
+        return first
+
+    def kept(self, channel: str | None = None, task_key: str | None = None) -> list[sqlite3.Row]:
+        """The messages kept, in one conversation when it is given, oldest
+        first."""
+        return self._query("SELECT * FROM unanswered WHERE ? IS NULL OR (channel=? AND task_key=?) "
+                           "ORDER BY CAST(ts AS REAL)", (channel, channel, task_key))
+
+    def took(self, sid: str, keys, counted) -> None:
+        """The session `sid` has taken these kept messages, by (channel, ts):
+        a try is counted for each in `counted`."""
+        with self._transaction():
+            self._db.executemany("UPDATE unanswered SET session=?, tries=tries+? WHERE channel=? AND ts=? "
+                                 "AND state='due'", [(sid, int(k in counted), *k) for k in keys])
+
+    def given_back(self, keys) -> None:
+        """Kept messages written to a session that never took them in: the
+        session and the try that write counted go."""
+        with self._transaction():
+            self._db.executemany("UPDATE unanswered SET session=NULL, tries=MAX(tries-1, 0) WHERE channel=? "
+                                 "AND ts=? AND state='due'", list(keys))
+
+    def forget(self, keys) -> None:
+        """Kept messages that no run will answer: deleted, refused, or
+        answered with no run. One already answered stays, for its run."""
+        with self._transaction():
+            self._db.executemany("DELETE FROM unanswered WHERE channel=? AND ts=? AND state <> 'answered'",
+                                 list(keys))
 
     # --- her running time ---
 
@@ -541,12 +660,17 @@ class Store:
             down.pop()
         self.set_meta("down", json.dumps((down + [[up, at]])[-DOWN_KEPT:]))
 
+    def down(self) -> list[tuple[datetime, datetime]]:
+        """The intervals she was not running, oldest first, as many as are
+        kept."""
+        return [(datetime.fromisoformat(start), datetime.fromisoformat(end))
+                for start, end in json.loads(self.get_meta("down") or "[]")]
+
     def ran(self, since: datetime, now: datetime) -> timedelta:
         """How long she has been running between `since` and `now`: the time
         between, less what of it falls in the intervals she was not."""
         ran = now - since
-        for start, end in json.loads(self.get_meta("down") or "[]"):
-            start, end = datetime.fromisoformat(start), datetime.fromisoformat(end)
+        for start, end in self.down():
             ran -= max(timedelta(0), min(end, now) - max(start, since))
         return ran
 
@@ -555,13 +679,6 @@ class Store:
         return self.runs_since(midnight_utc)
 
     # --- slack event dedupe ---
-
-    def slack_event_first_time(self, event_id: str) -> bool:
-        cur = self._exec(
-            "INSERT OR IGNORE INTO slack_events(event_id, received_at) VALUES(?,?)",
-            (event_id, utcnow()),
-        )
-        return cur.rowcount > 0
 
     def prune_slack_events(self, older_than_days: int = 7) -> None:
         cutoff = datetime.now(timezone.utc) - timedelta(days=older_than_days)

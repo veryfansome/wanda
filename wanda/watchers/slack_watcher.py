@@ -23,10 +23,11 @@ DM_TASK_KEY = "conversation"
 
 
 class SlackWatcher:
-    """Socket Mode listener. Acks every envelope immediately (Slack retries
-    past ~3s), passes deletions on (kind `deleted`), so that a message still
-    waiting for its turn can be withdrawn, and classifies every other
-    message into one of four triggers:
+    """Socket Mode listener. Acks every envelope once what it brings is
+    written down (Slack retries past ~3s, and never sends a message again
+    once it is acknowledged), passes deletions on (kind `deleted`), so that a
+    message still waiting for its turn can be withdrawn, and classifies
+    every other message into one of four triggers:
 
       dm            — any message in a DM or group DM; no mention needed
       task          — a message in a thread wanda owns (e.g. an email task, or
@@ -77,7 +78,17 @@ class SlackWatcher:
         return not self.cfg.slack_owner_user_ids or user in self.cfg.slack_owner_user_ids
 
     def _handle(self, client: SocketModeClient, req: SocketModeRequest) -> None:
-        client.send_socket_mode_response(SocketModeResponse(envelope_id=req.envelope_id))
+        try:
+            self._take(req)
+        finally:
+            # after a member's message is kept (Store.first_time): one
+            # acknowledged first and lost to a stop or a crash before it was
+            # written would be lost for good. Acknowledged too when the write
+            # raises, as on a full disk, which Slack's sending it again would
+            # meet the same way
+            client.send_socket_mode_response(SocketModeResponse(envelope_id=req.envelope_id))
+
+    def _take(self, req: SocketModeRequest) -> None:
         if req.type != "events_api":
             return
         event = req.payload.get("event", {})
@@ -132,12 +143,6 @@ class SlackWatcher:
                 log.warning("ignoring %s from non-allowed user %s in %s", kind, user, channel)
             return
 
-        # Keyed on the MESSAGE, not the envelope: one @-mention in a thread
-        # arrives as both app_mention and message.*, with different event_ids,
-        # and would otherwise run the agent twice. Same key also absorbs
-        # Slack's redeliveries.
-        if not self.store.slack_event_first_time(f"{channel}:{ts}"):
-            return
         if kind == "dm" and not thread_ts:  # noqa: SIM108 — kept explicit
             # A DM is one conversation: every top-level message maps to one
             # task, so its turns run one at a time, each a fresh session.
@@ -146,20 +151,26 @@ class SlackWatcher:
             task_key, reply_thread = DM_TASK_KEY, None
         else:
             task_key = reply_thread = thread_ts or ts
-        ev = Event(
-            source="slack",
-            dedupe_key=f"{channel}:{ts}",
-            payload={
-                "kind": kind,
-                "channel": channel,
-                "channel_type": channel_type,
-                "task_key": task_key,          # identifies the task and session
-                "reply_thread": reply_thread,  # where answers get posted
-                "in_thread": bool(thread_ts),
-                "user": user,
-                "text": event.get("text", ""),
-                "files": [f.get("name") or "file" for f in event.get("files") or []],
-                "ts": ts,
-            },
-        )
-        self.loop.call_soon_threadsafe(self.queue.put_nowait, ev)
+        payload = {
+            "kind": kind,
+            "channel": channel,
+            "channel_type": channel_type,
+            "task_key": task_key,          # identifies the task and session
+            "reply_thread": reply_thread,  # where answers get posted
+            "in_thread": bool(thread_ts),
+            "user": user,
+            "text": event.get("text", ""),
+            "files": [f.get("name") or "file" for f in event.get("files") or []],
+            "ts": ts,
+        }
+        # Keyed on the MESSAGE, not the envelope: one @-mention in a thread
+        # arrives as both app_mention and message.*, with different event_ids,
+        # and would otherwise run the agent twice. Same key also absorbs
+        # Slack's redeliveries. A message to her is kept until it is answered,
+        # but for a reply in an email task's thread, whose path leaves its own
+        # marker at a stop (Processor.shutdown)
+        memory = kind != "task" or existing["kind"] != "email"
+        if not self.store.first_time(f"{channel}:{ts}", payload if memory else None):
+            return
+        self.loop.call_soon_threadsafe(self.queue.put_nowait, Event(source="slack", dedupe_key=f"{channel}:{ts}",
+                                                                    payload=payload))
