@@ -150,6 +150,9 @@ def texts() -> list[tuple[str, str]]:
         ("the news of a change of name", vault.RENAMED.format(old="fan", new="Fan Zhu")),
         ("the news of a change of name, unrendered", vault.RENAMED),
         ("the frame of a session that reaches no one", vault.NOBODY.format(text="(the news)")),
+        # written into a message's session after an empty first answer to a
+        # message said to her
+        ("the line after an empty answer", vault.NOTHING_SENT.format(whom="fan and mei")),
         # the note doctor's command leaves on a reminder it reopens, which the
         # session woken for it reads among the item's notes
         ("doctor's note on a reminder reopened", REOPENED),

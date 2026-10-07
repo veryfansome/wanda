@@ -1,20 +1,22 @@
 """What the product's memory sessions did with messages added while they
 worked, the reading that tells whether FOLD_LIMIT and FOLD_FOR_S in
-wanda/main.py fit how the household's sessions take added messages,
-read from their transcripts alone, which outlive a rebuild where the
-daemon's log does not: per session, the messages it was handed after its
-opening one in the product's frame (ADDED_RE, read from the parser
-`mem session` reads them with), how many further turns it ran (later user
-entries holding text that no background command's notice began), how many
-of those opened with more than one message, which Claude Code takes as one
-when they wait for the same turn, and how long they took, from the first
-further turn's first entry to the session's last. A line that cannot be
-read, as the last of a transcript still being written can be, is passed
-over.
+wanda/main.py fit how the household's sessions take added messages, read
+from their transcripts alone, which outlive a rebuild where the daemon's
+log does not: per session, the messages it was handed after its opening
+one in the product's frame (ADDED_RE, read from the parser `mem session`
+reads them with), how many further turns it ran (later user entries
+holding text that neither a background command's notice nor the
+harness's line after an empty first answer, NOTHING_SENT_OPENS in
+wanda/vault.py, began), how many of those opened with more than one
+message, which Claude Code takes as one when they wait for the same
+turn, and how long they took, from the first further turn's first entry
+to the session's last. A line that cannot be read, as the last of a
+transcript still being written can be, is passed over.
 
     python3 lab/fold_counts.py <directory of transcripts> [<memory/src/transcript.rs>]
 
-The parser is this repository's unless another is named."""
+The parser is this repository's unless another is named; the line's
+opening words are always read from this repository's harness."""
 import json, re, sys
 from datetime import datetime
 from pathlib import Path
@@ -31,6 +33,13 @@ if found is None:
     sys.exit(f"no ADDED_RE in {parser}: that parser does not read messages added while a session works")
 body = found.group(1)
 ADDED = re.compile("".join(re.findall(r'r"(.*?)"', body, re.DOTALL)))
+# the opening words of the line the harness writes into a session whose
+# first answer to a direct message or a mention was empty
+harness = Path(__file__).resolve().parent.parent / "wanda" / "vault.py"
+opens = re.search(r'^NOTHING_SENT_OPENS = "(.*?)"$', harness.read_text(), re.MULTILINE)
+if opens is None:
+    sys.exit(f"no NOTHING_SENT_OPENS in {harness}: the harness's line after an empty answer cannot be told")
+NOTHING_SENT = opens.group(1)
 
 
 def texts(c):
@@ -65,7 +74,7 @@ for path in sorted(Path(sys.argv[1]).glob("*.jsonl")):
         elif e.get("type") == "user" and not e.get("isMeta"):
             said = texts((e.get("message") or {}).get("content"))
             if not said or (e.get("origin") or {}).get("kind") == "task-notification" \
-                    or said[0].lstrip().startswith("<task-notification>"):
+                    or said[0].lstrip().startswith(("<task-notification>", NOTHING_SENT)):
                 continue
             if opened:
                 turn_starts.append(e)

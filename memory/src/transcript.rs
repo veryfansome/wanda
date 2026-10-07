@@ -843,6 +843,32 @@ mod tests {
         assert!(!shown.contains("(aside)") && !shown.contains("(nothing)") && ex.answer == "At 5.", "{shown}");
     }
 
+    // the harness's line after an empty first answer to a direct message
+    // (NOTHING_SENT in wanda/vault.py) begins a turn that is no one's
+    // message: what was said, then her answer to the line
+    #[test]
+    fn the_line_after_an_empty_answer_is_no_ones_and_her_answer_to_it_is_hers() {
+        use serde_json::json;
+        let line = "My answer is empty, so nothing will be sent, and nothing in this session has been said \
+                    back to fan.";
+        let ex = exchange_of("told-nothing", &[
+            entry(json!({"type": "user", "timestamp": "2026-10-01T23:42:00Z", "message": {"role": "user",
+                        "content": [{"type": "text", "text": prompt("In a direct message that fan and I \
+                                     read.\n\nfan says:\n\n    the dentist moved to the 14th")}]}})),
+            entry(json!({"type": "attachment", "timestamp": "2026-10-01T23:42:10Z", "attachment": {
+                        "type": "structured_output", "data": {"answer": ""}}})),
+            entry(json!({"type": "user", "timestamp": "2026-10-01T23:42:11Z", "message": {"role": "user",
+                        "content": [{"type": "text", "text": line}]}})),
+            entry(json!({"type": "attachment", "timestamp": "2026-10-01T23:42:20Z", "attachment": {
+                        "type": "structured_output", "data": {"answer": "Got it: Wednesday the 14th."}}})),
+        ]);
+        let shown = render(&ex, false, false);
+        assert!(one_speaker(&ex) && ex.answer == "Got it: Wednesday the 14th.", "{shown}");
+        assert!(shown.contains("23:42:00  fan said: the dentist moved to the 14th\n23:42:20  I said: Got it: \
+                                Wednesday the 14th."), "{shown}");
+        assert!(!shown.contains("added") && !shown.contains("nothing will be sent"), "{shown}");
+    }
+
     #[test]
     fn an_addition_reads_back_under_either_closing() {
         use serde_json::json;

@@ -450,12 +450,16 @@ class Additions:
     `hold_back` keeps out what began one Claude Code refused to run.
     `results` holds the session's results as the runner reads them. `holding`
     is its turn's kept messages, which are told of the session `sid` as each
-    of its turns begins (`began()`) and as one is handed."""
+    of its turns begins (`began()`) and as one is handed. At the session's
+    first result `nothing_sent` gives the line the runner writes when that
+    answer is empty though a message said to her began it, and `line_turn`
+    reads, from the session's transcript in `vault_dir`, which turn took it."""
 
-    def __init__(self, waiting: list[dict], frame, holding: Holding | None = None):
+    def __init__(self, waiting: list[dict], frame, holding: Holding | None = None, vault_dir: Path | None = None):
         self.waiting = waiting
         self.frame = frame
         self.holding = holding
+        self.vault_dir = vault_dir
         self.sid: str | None = None
         self.taken: list[tuple[dict, str]] = []
         self.closed = False
@@ -490,6 +494,13 @@ class Additions:
         # and still stands, which her note after that answer asks for again
         # (FAILED_REST) and holds in the answer's place (`ask`)
         self.asked: set[tuple[str, str]] = set()
+        # the line written after an empty first answer (vault.NOTHING_SENT),
+        # the index of the result its turn gave, once that is known, and
+        # whether the runner took that index with the transcript showing no
+        # turn for the line
+        self.line: str | None = None
+        self.nudge_result: int | None = None
+        self.line_guessed = False
 
     def poke(self) -> None:
         self.more.set()
@@ -535,6 +546,34 @@ class Additions:
             return text
         self.closed = True
         return None
+
+    def nothing_sent(self, result: dict, ran_s: float, timeout_s: float) -> str | None:
+        """The line to write into the session after its first result, kept in
+        `line`, or None: when that result reported an empty answer, a 1:1 DM
+        or a message mentioning her that was not deleted is among the turn's,
+        nothing was written to the session after its prompt, and it has run
+        no more than half its time, as a retry's rule has it. Those are the
+        cases the harness can tell were said to her; a line in a group DM or
+        a thread that does not name her is hers to judge."""
+        if self.holding is None or self.taken or ran_s > timeout_s / 2:
+            return None
+        if turn_failure(result) is not None or vault.answers([result]) != [""]:
+            return None
+        to_her = [m for m in sorted(self.holding.rows.values(), key=lambda m: float(m["ts"]))
+                  if m.get("channel_type") == "im" or m.get("kind") in ("mention", "mention_guest")
+                  or m.get("mentioned") is True]
+        whom = list(dict.fromkeys(self.told[m["user"]] for m in to_her if m.get("user") in self.told))
+        if not whom:
+            return None
+        self.line = vault.NOTHING_SENT.format(whom=" and ".join(whom))
+        return self.line
+
+    def line_turn(self) -> int | bool | None:
+        """Which turn took `line` (vault.line_turn), None when it cannot be
+        read."""
+        if self.line is None or self.vault_dir is None or self.sid is None:
+            return None
+        return vault.line_turn(self.vault_dir, self.sid, self.line)
 
     def _put_back(self, p: dict) -> None:
         # unless it was deleted while it was framed
@@ -3089,7 +3128,7 @@ class Processor:
                 if tried := m.pop("first_try", None):
                     state["first"] = tuple(tried)
             holding.take(batch)
-            fresh = Additions(waiting, lambda m: self._added_text(m, fresh), holding)
+            fresh = Additions(waiting, lambda m: self._added_text(m, fresh), holding, self.cfg.vault_dir)
             # every earlier session that took one of them, oldest first: one
             # whose later turn failed on it after an answer, the one a stop
             # or a crash cut short, as its kept row names it, and the first
@@ -3357,9 +3396,14 @@ class Processor:
         Claude Code refused to run holds its messages, or after an answer
         those that began the turn it refused, until a session runs again
         (_claude_refused), named by this session once a turn of it has given
-        a result. Each such failure is kept for the `failed` alert, with
-        Claude Code's reason, and so is a member's turn that failed before
-        the answer posted, which a later turn gave.
+        a result. A session whose first answer to a 1:1 DM or a mention of
+        her was empty is told so once (vault.NOTHING_SENT, Additions), and
+        its answer to that stands, empty or not; when the turn that took it
+        fails, or the session ends before it, with nothing to post, she says
+        FAILED wherever the conversation is, or the messages are held when
+        Claude Code refused it. Each such failure is kept for the `failed`
+        alert, with Claude Code's reason, and so is a member's turn that
+        failed before the answer posted, which a later turn gave.
 
         `owed` is whether someone is waiting: if not, as for the clock, a
         refusal, a failure or a restart posts nothing, except that an answer
@@ -3500,6 +3544,16 @@ class Processor:
                 added = 0
                 if more and more.taken:
                     added = more.give_back(await asyncio.to_thread(vault.handed, self.cfg.vault_dir, sid))
+                # the line written after an empty first answer: a session that
+                # ended with its input still open, its transcript trailing its
+                # output, or whose input the runner closed on a guess at the
+                # line's result, is read once more for the turn that took it,
+                # which, if it gave a result, gave the line's
+                nudge = more is not None and more.line is not None
+                if nudge and (more.nudge_result is None or more.line_guessed):
+                    turn = await asyncio.to_thread(more.line_turn)
+                    if turn is not None and turn is not False and turn < len(rr.results):
+                        more.nudge_result = turn
                 out = vault.report(rr.structured, rr.result_text) if rr.ok else None
                 final = vault.answer(out) if out is not None else ""
                 # an answer a turn before the last gave stands unless a later
@@ -3543,6 +3597,11 @@ class Processor:
                 else:
                     error, text = rr.error or "the session ended without its report", kept
                     claude = rr.error is not None and bool((rr.envelope or {}).get("is_error"))
+                if nudge and not text and error is None and more.nudge_result is None:
+                    # told nothing would be sent, the session ended before the
+                    # turn that took that line gave a result, and nothing is to
+                    # be posted: a failure, which her note answers
+                    error, claude = "the session ended before answering what it was told", False
                 # which turn a member's message began, read once: for what
                 # follows a failure, and for a member's turn that failed
                 # before the answer posted or said nothing after it
@@ -3596,7 +3655,12 @@ class Processor:
                 sid, waited = str(uuid.uuid4()), 0.0
         note = ""
         if then in ("note", "rest"):
-            note = ((FAILED_REST_GROUP if group else FAILED_REST) if then == "rest"
+            # where the turn after the line failed with nothing to post, her
+            # note is for a message said to her, whatever the conversation:
+            # FAILED_GROUP hedges about whether it was, and FAILED_REST speaks
+            # of an added message
+            note = (FAILED if nudge and then == "note" else
+                    (FAILED_REST_GROUP if group else FAILED_REST) if then == "rest"
                     else FAILED_GROUP if group else FAILED)
         # the kept messages of a message's turn: answered by what is posted,
         # gone with a silence, but for any run again as the next turn or held
@@ -3732,6 +3796,8 @@ class Processor:
             # still give back
             deleted = len(more.holding.deleted)
             outcome += f", {deleted} of its {deleted + len(more.holding.rows)} messages deleted"
+        if nudge:
+            outcome += "; told nothing would be sent"
         self._log_session(sid, channel, waited, ran, added, rr, more, out, outcome, looks)
         await self._snapshot(sid)
         return error
@@ -3754,7 +3820,10 @@ class Processor:
         result whose failure decides it, read for a refusal or a spent budget:
         that of the first member's turn that failed after the last report and
         after the answer posted (`answered_at`), where there is one, and
-        otherwise `at`, None being the session's own end."""
+        otherwise `at`, None being the session's own end. Where the session
+        was told nothing would be sent (`more.line`) and nothing is to be
+        posted, it is the result of the turn that took that line, or the
+        session's end when that turn gave none."""
         # each turn's report, None for one that failed; a session that gave
         # no result is read as one turn, by its outcome
         reports = [None if ev.get("is_error") else vault.report(ev.get("structured_output"), ev.get("result"))
@@ -3774,6 +3843,17 @@ class Processor:
                     and ran <= self.cfg.agent_timeout_s / 2):
                 return "retry", False, "", at
             return told, False, "", at
+        # told nothing would be sent, with nothing to post: the turn that
+        # took that line failed, or the session ended before it gave a result
+        nudged = more.nudge_result
+        if more.line is not None and not text and starts is None and nudged is not None:
+            # with no transcript the line's turn is taken to be the next to
+            # give a result, which a notice's turn before it may have given:
+            # the first failure from there on is read as the line's turn's,
+            # and with none, the session's own end
+            nudged = next((i for i in range(nudged, len(rr.results)) if turn_failure(rr.results[i])), None)
+        if more.line is not None and not text and (nudged is None or turn_failure(rr.results[nudged])):
+            return "held" if refused(rr, nudged) else "note", False, "", nudged
         # a member's turn that failed before the posted answer's turn had its
         # message in view of that answer: only those failing after both it and
         # the last report are answered or told

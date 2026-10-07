@@ -179,6 +179,14 @@ AFTER_DATE = (
 # morning look on, it promises less than she can do, the safe side.
 NO_WAKE = ("Nothing wakes me on a day by itself, and nothing shows me what has come due on one; "
            "what I say in this session reaches only the conversation I am answering in.")
+# Written into a message's session as a further turn when its first answer is
+# empty though a direct message or a mention of her began it, the two cases
+# the harness can tell were said to her: stated as fact, her answer to it
+# standing, empty or not. {whom} is the told names of those whose message it
+# was. A turn it begins is no one's message (turn_starts), read by its fixed
+# opening words, which lab/fold_counts.py reads from here too.
+NOTHING_SENT_OPENS = "My answer is empty, so nothing will be sent"
+NOTHING_SENT = NOTHING_SENT_OPENS + ", and nothing in this session has been said back to {whom}."
 
 TOOLS = "Read,Glob,Grep,Bash,Skill"
 SCHEMA = {
@@ -686,8 +694,44 @@ def handed(vault: Path, sid: str) -> list[str] | None:
     return out
 
 
+def line_turn(vault: Path, sid: str, line: str) -> int | bool | None:
+    """Which turn of a session took `line`, written to its input after its
+    first result, as an index into its results, counting turns as
+    turn_starts does: the one whose opening entry holds it, or, when Claude
+    Code handed it at a step of a turn already running, as one a background
+    command's notice began, the turn open then. False while the transcript
+    shows neither, as before Claude Code has written the entry; None when the
+    transcript cannot be read."""
+    try:
+        lines = (transcripts_dir(vault) / f"{sid}.jsonl").read_text(errors="replace").splitlines()
+    except OSError:
+        return None
+    turn = -1
+    for x in lines:
+        try:
+            e = json.loads(x)
+        except ValueError:
+            continue
+        if not isinstance(e, dict):
+            continue
+        a = e.get("attachment") if isinstance(e.get("attachment"), dict) else {}
+        if e.get("type") == "attachment" and a.get("type") == "queued_command":
+            if any(line in t for t in _texts(a.get("prompt"))):
+                # written after the first result, so a turn after the
+                # prompt's took it: the next to open, when none has yet
+                return max(turn, 1)
+        elif e.get("type") == "user" and not e.get("isMeta"):
+            texts = _texts((e.get("message") or {}).get("content"))
+            if _notice(e) or texts:
+                turn += 1
+                if any(line in t for t in texts):
+                    return turn
+    return False
+
+
 class Turn(NamedTuple):
-    # begun by a message, not by a background command's notice of its end
+    # begun by a member's message, not by a background command's notice of
+    # its end or the harness's line after an empty answer (NOTHING_SENT)
     member: bool
     # the messages that began it, as `handed` gives them: the first turn's
     # without the prompt
@@ -696,9 +740,10 @@ class Turn(NamedTuple):
 
 def turn_starts(vault: Path, sid: str) -> list[Turn] | None:
     """Each turn of a session, in order, as its transcript records the
-    message or the notice that began it. Claude Code gives each turn a
-    result, in the same order, so a turn past the session's last result
-    failed. None when the transcript cannot be read."""
+    message, the notice, or the harness's line that began it. Claude Code
+    gives each turn a result, in the same order, so a turn past the
+    session's last result failed. None when the transcript cannot be
+    read."""
     try:
         lines = (transcripts_dir(vault) / f"{sid}.jsonl").read_text(errors="replace").splitlines()
     except OSError:
@@ -711,9 +756,11 @@ def turn_starts(vault: Path, sid: str) -> list[Turn] | None:
             continue
         if not isinstance(e, dict) or e.get("type") != "user" or e.get("isMeta"):
             continue
-        if _notice(e):
+        texts = _texts((e.get("message") or {}).get("content"))
+        if _notice(e) or texts and texts[0].lstrip().startswith(NOTHING_SENT_OPENS):
+            # a notice's, or the harness's own line after an empty answer
             out.append(Turn(False, []))
-        elif texts := _texts((e.get("message") or {}).get("content")):
+        elif texts:
             out.append(Turn(True, texts if opened else texts[1:]))
             opened = True
     return out

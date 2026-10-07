@@ -133,3 +133,51 @@ def test_a_message_that_is_not_framed_waits_for_the_next_turn(not_framed):
         return await more.next(), waiting, more.closed
     got, waiting, closed = run(go())
     assert got is None and closed and [m["text"] for m in waiting] == ["m"]
+
+
+def said(ts, user="U1", **payload):
+    """A kept message's payload, as the watcher builds it."""
+    return {"channel": "D1", "ts": ts, "user": user, "text": "the dentist moved to the 14th", **payload}
+
+
+EMPTY = {"type": "result", "subtype": "success", "is_error": False, "result": "{}",
+         "structured_output": {"recalled": [], "answer": "", "recorded": []}}
+
+
+@pytest.mark.parametrize("rows, whom", [
+    ([said("1", kind="dm", channel_type="im", mentioned=False)], "fan"),
+    ([said("1", kind="mention", channel_type="channel", mentioned=True)], "fan"),
+    ([said("1", kind="mention_guest", channel_type="channel", mentioned=True)], "fan"),
+    ([said("1", kind="dm", channel_type="mpim", mentioned=True)], "fan"),
+    ([said("1", kind="task", channel_type="channel", mentioned=True)], "fan"),
+    # whoever's message it was, each named once, in the order they spoke,
+    # whatever the order the turn holds them in
+    ([said("4", kind="dm", channel_type="mpim", mentioned=True),
+      said("3", user="U2", kind="dm", channel_type="mpim", mentioned=True),
+      said("2", kind="dm", channel_type="mpim", mentioned=False),
+      said("1", user="U2", kind="dm", channel_type="mpim", mentioned=True)], "mei and fan"),
+    ([said("1", kind="dm", channel_type="mpim", mentioned=False)], None),
+    ([said("1", kind="task", channel_type="channel", mentioned=False)], None),
+    # kept before the payload carried it
+    ([said("1", kind="dm", channel_type="mpim")], None),
+    ([said("1", kind="task", channel_type="channel")], None),
+], ids=["a 1:1 DM", "a channel mention", "a mention in another's thread", "a group DM line naming her",
+        "a reply in her thread naming her", "several speakers", "a group DM line", "a reply in her thread",
+        "a group DM line kept before", "a reply kept before"])
+def test_the_line_after_an_empty_answer_is_for_what_was_said_to_her(rows, whom):
+    more = Additions([], None, main.Holding(None))
+    more.holding.take(rows)
+    more.told = {"U1": "fan", "U2": "mei"}
+    line = more.nothing_sent(EMPTY, 10, 420)
+    assert line == (None if whom is None else vault.NOTHING_SENT.format(whom=whom)) and more.line == line
+
+
+def test_no_line_once_every_message_said_to_her_was_deleted():
+    more = Additions([], None, main.Holding(None))
+    more.holding.take([said("1", kind="dm", channel_type="im", mentioned=False),
+                       said("2", kind="dm", channel_type="im", mentioned=False)])
+    more.told = {"U1": "fan"}
+    for k in list(more.holding.rows):
+        more.holding.rows.pop(k)
+        more.holding.deleted.add(k)
+    assert more.nothing_sent(EMPTY, 10, 420) is None and more.line is None

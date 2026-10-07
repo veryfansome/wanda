@@ -6508,6 +6508,302 @@ def test_a_stop_during_a_further_turn_leaves_an_answer_to_two_messages_deleted_m
     assert slack.replies == ["The dentist, noted."] and kept(store) == []
 
 
+# --- a direct message or a mention whose first answer was empty: the session
+# is told nothing would be sent, once, and its answer to that stands ---
+
+def told_nothing(whom="fan"):
+    return vault.NOTHING_SENT.format(whom=whom)
+
+
+def answered_with(*said):
+    """The stand-in's answer to the turns it was handed, in order."""
+    return "one answer to {}: {}".format(len(said), " | ".join(said))
+
+
+@pytest.mark.parametrize("late", [False, True], ids=["its entry at once", "its entry written late"])
+def test_an_empty_first_answer_to_a_dm_is_told_and_its_next_answer_posted(tmp_path, monkeypatch, caplog, late):
+    """Her answer to the line is posted, with no note; with the line's turn's
+    opening entry written after its result, the input still closes at that
+    result, by the read between results, not at the session's timeout."""
+    import logging
+
+    p, store, _, slack = standin_processor(tmp_path, monkeypatch, steps=[0.2], silent="first", late_entry=late)
+    monkeypatch.setattr(p.cfg, "agent_timeout_s", 20)
+    line = dm(f"{AT:.1f}", "the dentist moved to the 14th")
+    keep(store, line)
+    start = time.monotonic()
+    with caplog.at_level(logging.INFO, logger="wanda"):
+        conversation(p, (0, line))
+    reply = answered_with("the dentist moved to the 14th", told_nothing())
+    assert slack.replies == [reply] and time.monotonic() - start < 10
+    assert failed_runs(store) == [("agent", "ok", None)] and kept(store) == []
+    assert store.get_meta("failed_runs") is None
+    [said] = session_lines(caplog)
+    assert said.endswith(f", {len(reply)} characters to post; told nothing would be sent")
+
+
+def test_the_line_answered_with_nothing_stands(tmp_path, monkeypatch, caplog):
+    """Her silence after it is hers: no note follows. Its entry written late,
+    the input closes at its result by the read between results."""
+    import logging
+
+    p, store, _, slack = standin_processor(tmp_path, monkeypatch, steps=[0.2], silent="all", late_entry=True)
+    monkeypatch.setattr(p.cfg, "agent_timeout_s", 20)
+    line = dm(f"{AT:.1f}", "the dentist moved to the 14th")
+    keep(store, line)
+    start = time.monotonic()
+    with caplog.at_level(logging.INFO, logger="wanda"):
+        conversation(p, (0, line))
+    assert slack.replies == [] and time.monotonic() - start < 10 and kept(store) == []
+    assert failed_runs(store) == [("agent", "ok", None)] and store.get_meta("failed_runs") is None
+    [said] = session_lines(caplog)
+    assert said.endswith(", silent; told nothing would be sent")
+
+
+@pytest.mark.parametrize("where", ["a DM", "a group DM", "a rerun turn"])
+def test_the_lines_turn_failing_with_nothing_to_post_gets_her_note(tmp_path, monkeypatch, caplog, where):
+    """FAILED wherever it is, since the message was said to her: one entry
+    for the alert, and no second session."""
+    import logging
+
+    slack = ConversationSlack(members=["U1", "U2", "UBOT"], history=[])
+    nudged = {"steps": [0.2], "silent": "first", "fail": 1}
+    sessions = [{"steps": [0.2], "reply_s": 1.5, "fail": "later"}, nudged] if where == "a rerun turn" else [nudged]
+    p, store, _, slack = standin_processor(tmp_path, monkeypatch, slack=slack, sessions=sessions)
+    monkeypatch.setattr(p.cfg, "agent_timeout_s", 20)
+    first = dm(f"{AT:.1f}", "can you remind me at 5", channel_type="mpim" if where == "a group DM" else "im")
+    if where == "a group DM":
+        first.payload["mentioned"] = True
+    with caplog.at_level(logging.INFO, logger="wanda"):
+        if where == "a rerun turn":
+            conversation(p, (0, first), (("tool_result", 1, 0.2), dm(f"{AT + 30:.1f}", "to call the plumber")))
+        else:
+            conversation(p, (0, first))
+    assert slack.replies == ([answered_with("can you remind me at 5")] if where == "a rerun turn" else []) + [
+        main.FAILED]
+    assert len(list(vault.transcripts_dir(tmp_path / "vault").glob("*.jsonl"))) == len(sessions)
+    *_, entry = json.loads(store.get_meta("failed_runs"))
+    assert entry["then"] == "not tried again, a note asked for it again"
+    assert len(json.loads(store.get_meta("failed_runs"))) == len(sessions)
+    said = session_lines(caplog)[-1]
+    assert said.endswith(": error_during_execution; a note asks for it again; told nothing would be sent")
+
+
+@pytest.mark.parametrize("notify, after", [("after", False), ({"after": 1}, False), ({"after": 1}, True)],
+                         ids=["a notice's turn before the line", "a notice's turn after it",
+                              "a notice's turn after it, the line's entry written late"])
+def test_the_lines_turn_failing_beside_a_notices_turn_that_says_nothing_gets_her_note(tmp_path, monkeypatch,
+                                                                                    notify, after):
+    """The line's result is the one its turn gave, however the notice's turn
+    falls beside it."""
+    p, store, _, slack = standin_processor(tmp_path, monkeypatch, steps=[0.2], silent="first", notify=notify,
+                                           fail=2 if notify == "after" else 1, late_entry=after)
+    monkeypatch.setattr(p.cfg, "agent_timeout_s", 20)
+    keep(store, line := dm(f"{AT:.1f}", "the dentist moved to the 14th"))
+    conversation(p, (0, line))
+    assert slack.replies == [main.FAILED] and kept(store) == []
+
+
+def test_a_notices_turn_that_answers_after_the_lines_failed_one_is_posted(tmp_path, monkeypatch):
+    """What she said there is posted, and her note would contradict it."""
+    p, store, _, slack = standin_processor(tmp_path, monkeypatch, steps=[0.2], silent="first",
+                                           notify={"after": 1, "says": True}, fail=1)
+    monkeypatch.setattr(p.cfg, "agent_timeout_s", 20)
+    keep(store, line := dm(f"{AT:.1f}", "the dentist moved to the 14th"))
+    conversation(p, (0, line))
+    assert slack.replies == [answered_with("the dentist moved to the 14th", told_nothing())]
+    assert main.FAILED not in slack.replies
+
+
+def test_a_notices_turn_that_answers_before_the_lines_failed_one_is_posted(tmp_path, monkeypatch):
+    """A notice's turn between the empty first answer and the line says
+    something, and the line's turn then fails, the session's last: her
+    answer is posted, and no note contradicts it."""
+    p, store, _, slack = standin_processor(tmp_path, monkeypatch, steps=[0.2], silent="first",
+                                           notify={"after": 0, "says": True}, fail=2)
+    monkeypatch.setattr(p.cfg, "agent_timeout_s", 20)
+    keep(store, line := dm(f"{AT:.1f}", "the dentist moved to the 14th"))
+    conversation(p, (0, line))
+    assert slack.replies == [answered_with("the dentist moved to the 14th")]
+
+
+def test_with_the_transcript_unreadable_the_lines_turn_failing_after_a_notices_gets_her_note(tmp_path,
+                                                                                            monkeypatch):
+    """The result taken as the line's turn's, the next after it, is a
+    notice's turn's that said nothing: the failure after it is read as the
+    line's turn's, and her note follows."""
+    p, store, _, slack = standin_processor(tmp_path, monkeypatch, steps=[0.2], silent="first",
+                                           notify={"after": 0}, fail=2)
+    monkeypatch.setattr(p.cfg, "agent_timeout_s", 20)
+    monkeypatch.setattr("wanda.vault.transcripts_dir", lambda v: tmp_path / "nowhere")
+    keep(store, line := dm(f"{AT:.1f}", "the dentist moved to the 14th"))
+    conversation(p, (0, line))
+    assert slack.replies == [main.FAILED] and kept(store) == []
+
+
+def test_with_the_transcript_unreadable_a_silence_to_the_line_then_a_notices_failed_turn_gets_her_note(
+        tmp_path, monkeypatch, caplog):
+    """The line's turn says nothing, and a notice's turn after it fails: with
+    no transcript that reads as a notice's silence and the line's turn
+    failing, and her note follows, so that no message said to her is left
+    with nothing, though here she chose to say nothing."""
+    import logging
+
+    p, store, _, slack = standin_processor(tmp_path, monkeypatch, steps=[0.2], silent="all",
+                                           notify={"after": 1}, fail=2)
+    monkeypatch.setattr(p.cfg, "agent_timeout_s", 20)
+    monkeypatch.setattr("wanda.vault.transcripts_dir", lambda v: tmp_path / "nowhere")
+    keep(store, line := dm(f"{AT:.1f}", "the dentist moved to the 14th"))
+    with caplog.at_level(logging.INFO, logger="wanda"):
+        conversation(p, (0, line))
+    assert slack.replies == [main.FAILED] and kept(store) == []
+    [said] = session_lines(caplog)
+    assert said.endswith(", failed: error_during_execution; a note asks for it again; told nothing would be sent")
+
+
+def test_a_guess_at_the_lines_turn_gives_way_to_the_transcript_once_the_session_has_ended(tmp_path, monkeypatch,
+                                                                                          caplog):
+    """The line's turn fails, a notice's turn reports after it, and the
+    transcript shows nothing for the line while the session runs: once the
+    session sits between turns, the input is closed with the notice's result
+    taken as the line's, but the transcript read once the session has ended
+    names the line's own result, which failed, and her note follows."""
+    import logging
+
+    from wanda import runner
+
+    monkeypatch.setattr(runner, "LINE_SHOWN_WITHIN_S", 1.0)
+    p, store, _, slack = standin_processor(tmp_path, monkeypatch, steps=[0.2], silent="first",
+                                           notify={"after": 1}, fail=1)
+    monkeypatch.setattr(p.cfg, "agent_timeout_s", 20)
+    ended, shown, run = [], vault.line_turn, p.runner.run
+    monkeypatch.setattr(vault, "line_turn", lambda v, sid, line: shown(v, sid, line) if ended else False)
+
+    async def run_to_its_end(*a, **kw):
+        try:
+            return await run(*a, **kw)
+        finally:
+            ended.append(True)
+    monkeypatch.setattr(p.runner, "run", run_to_its_end)
+    keep(store, line := dm(f"{AT:.1f}", "the dentist moved to the 14th"))
+    with caplog.at_level(logging.INFO, logger="wanda"):
+        conversation(p, (0, line))
+    assert "its last result is taken as that turn's" in caplog.text
+    assert slack.replies == [main.FAILED] and kept(store) == []
+    said = session_lines(caplog)[-1]
+    assert said.endswith(", failed: error_during_execution; a note asks for it again; told nothing would be sent")
+
+
+def test_the_lines_turn_running_out_of_time_in_a_quiet_step_gets_her_note(tmp_path, monkeypatch, caplog):
+    """A notice's turn reports after the empty answer, and the line's turn,
+    its entry written after its result, runs a step longer than
+    LINE_SHOWN_WITHIN_S and the session's time: a turn under way is never
+    taken for the session's quiet, so nothing is guessed, the session ended
+    before the line's turn gave a result, and her note follows."""
+    import logging
+
+    from wanda import runner
+
+    monkeypatch.setattr(runner, "LINE_SHOWN_WITHIN_S", 1.0)
+    p, store, _, slack = standin_processor(tmp_path, monkeypatch, steps=[0.2], silent="first",
+                                           notify={"after": 0}, late_entry=True, steps_later=[30.0])
+    monkeypatch.setattr(p.cfg, "agent_timeout_s", 6)
+    keep(store, line := dm(f"{AT:.1f}", "the dentist moved to the 14th"))
+    with caplog.at_level(logging.INFO, logger="wanda"):
+        conversation(p, (0, line))
+    assert "its last result is taken as that turn's" not in caplog.text
+    assert slack.replies == [main.FAILED] and kept(store) == []
+    said = session_lines(caplog)[-1]
+    assert said.endswith(", failed: timed out after 6s; a note asks for it again; told nothing would be sent"), said
+
+
+def test_the_lines_turn_refused_holds_the_message_naming_the_session(tmp_path, monkeypatch, caplog):
+    """No note: held while Claude Code refuses, every row naming the session,
+    which ran a turn and may have written to memory, so that the session that
+    takes it up is told of it."""
+    import logging
+
+    p, store, _, slack = standin_processor(tmp_path, monkeypatch, sessions=[
+        {"steps": [0.2], "silent": "first", "notify": "after",
+         "refuse": {"turn": 2, "error": "rate_limit", "said": "You've hit your limit · resets 5pm"}},
+        {"steps": [0.2]}])
+    monkeypatch.setattr(p.cfg, "agent_timeout_s", 20)
+    keep(store, line := dm(f"{AT:.1f}", "the dentist moved to the 14th"))
+    with caplog.at_level(logging.INFO, logger="wanda"):
+        conversation(p, (0, line))
+    assert slack.replies == [] and failed_runs(store) == [("agent", "refused", "You've hit your limit · resets 5pm")]
+    [sid] = [r["session_id"] for r in store._query("SELECT session_id FROM runs")]
+    assert [(r[1], r[3]) for r in kept(store)] == [("held", sid)]
+    assert session_lines(caplog)[-1].endswith("; held; told nothing would be sent")
+    store.end_hold()
+    a_pass(p)
+    assert slack.replies == [answered_with("the dentist moved to the 14th")] and kept(store) == []
+    assert vault.RETRIED.format(sid8=sid[:8]) in opening_text(tmp_path, -1)
+
+
+def test_the_lines_turn_refused_before_a_notices_report_holds_the_message(tmp_path, monkeypatch):
+    """The refusal is read from the line's turn's own result, not from the
+    session's last, a notice's turn's report: held, naming the session, the
+    hold begun, and alerted as Claude Code's usage limit."""
+    monkeypatch.setattr("wanda.vault.line_turn", lambda v, sid, line: 1)
+    monkeypatch.setattr("wanda.vault.turn_starts", lambda v, sid: [
+        vault.Turn(True, []), vault.Turn(False, []), vault.Turn(False, [])])
+    runner = Told([turn_result(answer("")), turn_result(said="You've hit your limit · resets 5pm"),
+                   turn_result(answer(""))], [None, "rate_limit", None])
+    p, store, _ = memory_processor(tmp_path, ConversationSlack(history=[]), runner, monkeypatch)
+    keep(store, line := dm(f"{AT:.1f}", "the dentist moved to the 14th"))
+    asyncio.run(p.handle_slack(line))
+    sid = runner.calls[0][1]["session_id"]
+    assert p.slack.replies == [] and kept(store) == [(f"{AT:.1f}", "held", 0, sid)]
+    assert store.get_meta("held_since") is not None
+    [failed] = json.loads(store.get_meta("failed_runs"))
+    assert failed["why"] == "usage limit"
+
+
+def test_a_dm_deleted_while_the_lines_turn_runs_gets_no_note_when_it_fails(tmp_path, monkeypatch):
+    """A DM deleted while the line's turn runs, which then fails: no note, as
+    for any turn whose messages were all deleted."""
+    p, store, _, slack = standin_processor(tmp_path, monkeypatch, steps=[0.2], steps_later=[1.0], silent="first",
+                                           fail=1)
+    monkeypatch.setattr(p.cfg, "agent_timeout_s", 20)
+    keep(store, line := dm(f"{AT:.1f}", "the dentist moved to the 14th"))
+    conversation(p, (0, line), (("tool_use", 2, 0.1), deletion(f"{AT:.1f}")))
+    assert slack.replies == [] and kept(store) == [] and store.pending_deliveries() == []
+
+
+class Told(RecordingRunner):
+    """A session that writes the line after its first result, as the runner
+    would, and gives `results`; it runs no reader, so which turn took the
+    line is read only once it has ended."""
+
+    def __init__(self, results, api_errors=None):
+        super().__init__(ended(results, api_errors))
+        self.results = results
+
+    async def run(self, prompt, **kw):
+        kw["feed"].nothing_sent(self.results[0], 0, kw["timeout_s"])
+        return await super().run(prompt, **kw)
+
+
+@pytest.mark.parametrize("given, note", [(2, []), (1, [main.FAILED])], ids=["its result given", "none given"])
+def test_the_lines_turn_is_read_once_the_session_has_ended(tmp_path, monkeypatch, caplog, given, note):
+    """A session that ended with its input still open after the line: the
+    transcript names the turn that took it, and a result that turn gave is
+    the line's, her silence there standing; with none, the session ended
+    before answering it."""
+    import logging
+
+    monkeypatch.setattr("wanda.vault.line_turn", lambda v, sid, line: 1)
+    runner = Told([turn_result(answer(""))] * given)
+    p, store, _ = memory_processor(tmp_path, ConversationSlack(history=[]), runner, monkeypatch)
+    with caplog.at_level(logging.INFO, logger="wanda"):
+        asyncio.run(p.handle_slack(dm(f"{AT:.1f}", "the dentist moved to the 14th")))
+    assert len(runner.calls) == 1 and p.slack.replies == note
+    [said] = session_lines(caplog)
+    assert said.endswith("silent; told nothing would be sent" if given == 2 else
+                         "; a note asks for it again; told nothing would be sent")
+
+
 def test_a_clock_run_with_no_kept_messages_is_posted_later_as_ever(tmp_path, monkeypatch):
     """Nothing it answers can be deleted."""
     p, store, _ = memory_processor(tmp_path, Refusing(history=[]), RecordingRunner(answer("Time to call the plumber.")),

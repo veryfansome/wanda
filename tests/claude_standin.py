@@ -33,27 +33,36 @@ each of a list of them, one for each session in the order they start under
 the same home, the last for every one after:
 `startup_s`, `steps` (seconds each tool call of the first turn takes),
 `reply_s` (time from the last tool call to the result), `steps_later` (the
-tool calls of a later turn), `fail` ("first" or "later": that turn's result
-is an error, of the subtype `fail_subtype`, error_during_execution unless
-set), `no_report` ("first" or "later": that turn ends as a success
-carrying the model's text and no structured output, as the first turns of
-two of those sessions did), `crash` ("later": the process exits 1
-in a later turn, before its result, as a crash or a kill from outside would
-end it), `silent_later` (a later turn's answer is empty), `notify` ("mid":
-a background command's notice of its end handed at the first step, in mode
-"task-notification", as 2.1.268's code reads; "after": one that starts a
-turn of its own after the first result, which answers nothing), `on_eof`,
-`hang` (never answer; "later": only in a later turn), `big` (a tool result
-this long, in characters),
+tool calls of a later turn), `fail` ("first", "later" or a turn's index:
+that turn's result is an error, of the subtype `fail_subtype`,
+error_during_execution unless set), `no_report` ("first" or "later": that
+turn ends as a success carrying the model's text and no structured output,
+as the first turns of two of those sessions did), `crash` ("later": the
+process exits 1 in a later turn, before its result, as a crash or a kill
+from outside would end it), `silent_later` (a later turn's answer is
+empty), `silent` ("first", a turn's index, or "all": that turn's answer, or
+every one, is empty), `notify` ("mid": a background command's notice of its
+end handed at the first step, in mode "task-notification", as 2.1.268's
+code reads; `{"after": <index>, "says": <bool>}`: one that starts a turn of
+its own after that turn's result, which answers nothing unless `says`;
+"after" is `{"after": 0}`; "with": one waiting beside the message that
+starts the turn after the first, taken into that turn with it as one
+message, its first block), `notify_steps` (the tool calls of a notice's
+turn, at which a message written meanwhile is handed), `late_entry` (a
+later turn's opening entry is written to the transcript only after its
+result, as no session has been seen to do but nothing rules out),
+`on_eof`, `hang` (never answer; "later": only in a later turn), `big` (a
+tool result this long, in characters),
 `stderr` (characters written to stderr first), `leave` (start a process that
 outlives it, its pid written to ~/left.pid), `answer_new` (a later turn
 answers only what it was handed since the turn before), `event` (an event
 written after the first tool call), `result_without` (a field every result
-leaves out), `refuse` (`turn`, "first" or "later": that turn is refused
-before any step, Claude Code saying `said` in an assistant message whose
-`error` is `error`, one of the list its output schema gives that field, or
-none when `error` is null, and in a result that is an error; no session has
-shown this result's shape, which follows the error results above).
+leaves out), `refuse` (`turn`, "first", "later" or a turn's index: that
+turn is refused before any step, Claude Code saying `said` in an assistant
+message whose `error` is `error`, one of the list its output schema gives
+that field, or none when `error` is null, and in a result that is an error;
+no session has shown this result's shape, which follows the error results
+above).
 
 Its answer says how many messages it was handed, and which, so a test can
 tell what the one answer covered."""
@@ -208,17 +217,50 @@ def main():
             record({"type": "queue-operation", "operation": "remove", "timestamp": now(),
                     "sessionId": sid, "reason": "absorbed_mid_turn"})
 
-    def turn(msg, steps, fail, notice=False):
-        nonlocal cost, index, answered
+    def names(which, i):
+        """Whether a knob's "first", "later", index or "all" names turn `i`."""
+        return which is not None and not isinstance(which, bool) and which in (
+            "all", i, "later" if i else "first")
+
+    def this_turn(which):
+        return names(which, index)
+
+    def silent(i):
+        return names(cfg.get("silent"), i)
+
+    def notified():
+        """The notice's turn after a turn's result, as `notify` sets it."""
+        n = cfg.get("notify")
+        return {"after": 0} if n == "after" else n if isinstance(n, dict) else None
+
+    def turn(msg, steps, notice=False):
         record({"type": "queue-operation", "operation": "dequeue", "timestamp": now(), "sessionId": sid})
-        record({"type": "user", "message": {"role": "user", "content": msg["message"]["content"]},
-                "promptSource": "sdk", "timestamp": now(), "sessionId": sid, "uuid": str(uuid.uuid4()),
-                **({"origin": {"kind": "task-notification"}} if notice else {})})
+        opening = {"type": "user", "message": {"role": "user", "content": msg["message"]["content"]},
+                   "promptSource": "sdk", "timestamp": now(), "sessionId": sid, "uuid": str(uuid.uuid4()),
+                   **({"origin": {"kind": "task-notification"}} if notice else {})}
+        late = cfg.get("late_entry") and index > 0 and not notice
+        if not late:
+            record(opening)
+        try:
+            ran(msg, steps, notice)
+        finally:
+            if late:
+                # written this long after the result, so that a reader looking
+                # only at results finds it no sooner than the next one
+                time.sleep(0.3)
+                record(opening)
+        if not notice and (n := notified()) and n.get("after") == index - 1:
+            turn({"type": "user", "message": {"role": "user", "content": NOTICE}}, cfg.get("notify_steps", []),
+                 notice=True)
+
+    def ran(msg, steps, notice):
+        nonlocal cost, index, answered
+        fail = this_turn(cfg.get("fail"))
         emit({"type": "system", "subtype": "init", "session_id": sid, "cwd": os.getcwd(),
               "claude_code_version": "2.1.268", "uuid": str(uuid.uuid4())})
         if not notice:
             handed.extend(texts(msg))
-        if (refuse := cfg.get("refuse")) and refuse["turn"] == ("later" if index else "first"):
+        if (refuse := cfg.get("refuse")) and this_turn(refuse["turn"]):
             words = {"type": "text", "text": refuse["said"]}
             emit({"type": "assistant", "message": {"role": "assistant", "content": [words]},
                   "parent_tool_use_id": None, "session_id": sid, "uuid": str(uuid.uuid4()),
@@ -271,7 +313,8 @@ def main():
                   "total_cost_usd": round(cost, 4), "result_index": index_now, "queued_turn_count": 0,
                   "stop_reason": "end_turn", "uuid": str(uuid.uuid4())})
             return
-        quiet = notice or (index_now > 0 and cfg.get("silent_later"))
+        says = (notified() or {}).get("says")
+        quiet = notice and not says or (index_now > 0 and cfg.get("silent_later")) or silent(index_now)
         report = {"recalled": [], "answer": "" if quiet else f"one answer to {len(covered)}: " + " | ".join(
             said(t) for t in covered), "recorded": []}
         record({"type": "attachment", "timestamp": now(), "sessionId": sid,
@@ -281,10 +324,13 @@ def main():
               "total_cost_usd": round(cost, 4), "result_index": index_now, "queued_turn_count": 0,
               "stop_reason": "tool_use", "uuid": str(uuid.uuid4())})
 
-    turn(first, cfg.get("steps", [0.2]), cfg.get("fail") == "first")
-    if cfg.get("notify") == "after":
-        turn({"type": "user", "message": {"role": "user", "content": NOTICE}}, [], cfg.get("fail") == "later",
-             notice=True)
+    turn(first, cfg.get("steps", [0.2]))
+    if cfg.get("notify") == "with":
+        # what arrives within this time waits beside the notice
+        time.sleep(0.5)
+        line = waiting_now()
+        blocks = [{"type": "text", "text": NOTICE}] + ((line["message"]["content"] if line else []))
+        turn({"type": "user", "message": {"role": "user", "content": blocks}}, cfg.get("steps_later", []))
     while True:
         # a message read after the turn's last step starts a further turn; at
         # the end of input whatever is still queued is run first
@@ -295,7 +341,7 @@ def main():
                 return 0
             time.sleep(0.05)
             continue
-        turn(msg, cfg.get("steps_later", []), cfg.get("fail") == "later")
+        turn(msg, cfg.get("steps_later", []))
 
 
 if __name__ == "__main__":

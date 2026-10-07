@@ -36,6 +36,21 @@ STREAM_EVENTS = frozenset({
     "command_lifecycle", "transcript_mirror", "active_goal", "autocompact_state", "control_request",
     "control_response", "control_cancel_request", "keep_alive",
 })
+# How often, once a result has come after the line written after an empty
+# first answer, the session's transcript is read for the turn that took it
+# between results: Claude Code can write that turn's opening entry after the
+# turn's result, and the input stays open until the entry shows.
+LINE_READ_EVERY_S = 0.25
+# How long the session may then sit between turns, writing nothing, while its
+# transcript shows no turn for the line, before its last result is taken as
+# that turn's and the input closed, as when the transcript cannot be read: a
+# transcript that never shows the line would otherwise hold the input open,
+# and the session's slot, to its timeout. A turn under way is never cut, so a
+# quiet step of the line's own turn is not taken for the end of it. The guess
+# is marked (`feed.line_guessed`), and what the transcript shows once the
+# session has ended stands over it. No session has been seen to write that
+# entry after its result; the stand-in's late entry trails it by 0.3 s.
+LINE_SHOWN_WITHIN_S = 5.0
 # what a result must carry for the harness to read it: its outcome and cost,
 # and a successful one its text
 RESULT_FIELDS = (("subtype", str), ("is_error", bool), ("total_cost_usd", (int, float)))
@@ -147,8 +162,11 @@ class RunnerService:
     ) -> RunResult:
         """`feed`, when given, keeps the session's input open while it works,
         for the messages `feed.next()` hands it, is told as each of its turns
-        begins (`feed.began()`), and is handed each result as it comes, in
-        `feed.results` (see `_streamed`)."""
+        begins (`feed.began()`), is handed each result as it comes, in
+        `feed.results`, gives at the first result the line to write after it,
+        if any (`feed.nothing_sent`), and says which turn took that line
+        (`feed.line_turn`), whose result's index the runner keeps in
+        `feed.nudge_result` (see `_streamed`)."""
         argv = [
             self.claude_bin,
             "-p",
@@ -238,15 +256,30 @@ class RunnerService:
                         max_budget_usd: float, t0: float, mark: str | None) -> RunResult:
         """A session whose input stays open while it works. The prompt is its
         first message; each one `feed.next()` hands over is written as it
-        comes, from the start of the first turn until the session's first
-        result, which closes `feed` and the input. Claude Code hands a message
-        written while a turn runs to that turn at its next step, and one
-        written after the turn's last step to a further turn of the same
-        session, which gives a result of its own: the session's outcome is
-        its last result, read once its output has ended, and `results` holds
-        them all. Which messages it was handed, its transcript says. What it
-        leaves running is ended as `run` ends it. An event it does not know
-        fails the session, as an output it cannot read does."""
+        comes, from the start of the first turn until `feed` ends or the
+        session's first result closes it. Claude Code hands a message written
+        while a turn runs to that turn at its next step, and one written after
+        the turn's last step to a further turn of the same session, which
+        gives a result of its own: the session's outcome is its last result,
+        read once its output has ended, and `results` holds them all. Which
+        messages it was handed, its transcript says. What it leaves running is
+        ended as `run` ends it. An event it does not know fails the session,
+        as an output it cannot read does.
+
+        The input is closed here alone, at the first result, once the writer
+        is stopped, unless `feed.nothing_sent` then gives a line: that is
+        written, or `feed.line` cleared when it cannot be, and the input
+        closes at the result of the turn that took it, which `feed.line_turn`
+        reads from the transcript at each result after it and every
+        LINE_READ_EVERY_S between them until it shows that turn, its index
+        kept in `feed.nudge_result`; when the transcript cannot be read, at
+        the next result, taken as the line's, and so too once the session has
+        sat between turns, writing nothing, for LINE_SHOWN_WITHIN_S after a
+        result with the transcript still showing no turn for the line, at the
+        last result, which `feed.line_guessed` marks as a guess.
+        Claude Code gives each turn one result, in order, so a notice's turn
+        that ran before the line's is never taken for it. An exit of any other
+        kind closes it too."""
         # the feed's own list: a shutdown that cancels this still leaves the
         # caller every answer the session gave
         results: list[dict] = feed.results
@@ -257,7 +290,19 @@ class RunnerService:
         api_errors: list[str | None] = []
         turn_error: str | None = None
 
+        # set once the line is written, until the input closes after its turn
+        nudged = False
+        between: asyncio.Task | None = None
+        # the index of the line's turn among the results, once the transcript
+        # shows it, when the session last wrote anything, and whether a turn
+        # is under way
+        known: int | None = None
+        heard = time.monotonic()
+        stirring = False
+
         async def write_input() -> None:
+            # the feed's end stops what is written, not the input: the first
+            # result may still be followed by the line
             try:
                 proc.stdin.write(user_line(prompt))
                 await proc.stdin.drain()
@@ -271,13 +316,56 @@ class RunnerService:
                     await proc.stdin.drain()
             except (BrokenPipeError, ConnectionResetError):
                 pass  # it has ended; its transcript says what it was handed
-            finally:
-                with contextlib.suppress(Exception):
-                    proc.stdin.close()
+
+        def close_input() -> None:
+            nonlocal nudged
+            nudged = False
+            with contextlib.suppress(Exception):
+                proc.stdin.close()
+
+        async def line_taken(at_result: bool) -> None:
+            # closes the input once a result already read is the line's
+            # turn's; at a result, with no transcript, at that one. The
+            # transcript is read until it shows that turn
+            nonlocal known
+            if known is None:
+                turn = await asyncio.to_thread(feed.line_turn)
+                if not nudged:
+                    return
+                if turn is None:
+                    if at_result:
+                        feed.nudge_result = len(results) - 1
+                        close_input()
+                    return
+                if turn is False:
+                    return
+                known = turn
+            if nudged and len(results) - 1 >= known:
+                feed.nudge_result = known
+                close_input()
+
+        async def read_between() -> None:
+            # Claude Code can write the line's turn's opening entry after that
+            # turn's result: read again until it shows, or until the session
+            # has sat between turns, writing nothing, for LINE_SHOWN_WITHIN_S
+            while nudged and known is None:
+                await asyncio.sleep(LINE_READ_EVERY_S)
+                if not (nudged and known is None and len(results) > 1):
+                    continue
+                await line_taken(False)
+                if nudged and known is None and not stirring and time.monotonic() - heard >= LINE_SHOWN_WITHIN_S:
+                    log.warning("%s: its transcript showed no turn for the line written after its empty answer, "
+                                "and it sat between turns, writing nothing, for %ss; "
+                                "its last result is taken as that turn's",
+                                mark or "a session", LINE_SHOWN_WITHIN_S)
+                    feed.nudge_result = len(results) - 1
+                    feed.line_guessed = True
+                    close_input()
 
         async def read_output() -> None:
-            nonlocal api_error, turn_error
+            nonlocal api_error, turn_error, heard, stirring
             async for line in proc.stdout:
+                heard = time.monotonic()
                 if not line.strip():
                     continue
                 try:
@@ -287,6 +375,12 @@ class RunnerService:
                 kind = ev.get("type") if isinstance(ev, dict) else None
                 if kind not in STREAM_EVENTS:
                     raise ValueError(f"an event of a type this runner does not know: {kind!r}")
+                # a turn under way, until its result: the quiet the bound
+                # waits for is the session's between turns
+                if kind in ("assistant", "user") or (kind == "system" and ev.get("subtype") == "init"):
+                    stirring = True
+                elif kind == "result":
+                    stirring = False
                 if kind == "result":
                     missing = [k for k, t in RESULT_FIELDS if not isinstance(ev.get(k), t)]
                     if ev.get("subtype") == "success" and not isinstance(ev.get("result"), str):
@@ -302,11 +396,32 @@ class RunnerService:
                     results.append(ev)
                     api_errors.append(turn_error)
                     turn_error = None
-                    feed.close()
-                    # the input closes now, not once a message being framed
-                    # is ready: that one goes back on its list
-                    writer.cancel()
+                    if len(results) == 1:
+                        feed.close()
+                        # the writer stops now, not once a message being
+                        # framed is ready: that one goes back on its list
+                        writer.cancel()
+                        await asyncio.gather(writer, return_exceptions=True)
+                        if (said := feed.nothing_sent(ev, time.monotonic() - t0, timeout_s)) is None:
+                            close_input()
+                        else:
+                            await write_line(said)
+                    elif nudged:
+                        await line_taken(True)
             await proc.wait()
+
+        async def write_line(said: str) -> None:
+            nonlocal nudged, between
+            try:
+                proc.stdin.write(user_line(said))
+                await proc.stdin.drain()
+            except (BrokenPipeError, ConnectionResetError):
+                # it has ended, and was told nothing
+                feed.line = None
+                close_input()
+                return
+            nudged = True
+            between = asyncio.create_task(read_between())
 
         writer = asyncio.create_task(write_input())
         errors = asyncio.create_task(proc.stderr.read())
@@ -333,10 +448,12 @@ class RunnerService:
                                  left_running=left)
             finally:
                 feed.close()
-                for t in (writer, errors):
+                close_input()
+                tasks = [t for t in (writer, errors, between) if t is not None]
+                for t in tasks:
                     if not t.done():
                         t.cancel()
-                await asyncio.gather(writer, errors, return_exceptions=True)
+                await asyncio.gather(*tasks, return_exceptions=True)
             left = await self._end_left_behind(proc.pid, mark)
         except asyncio.CancelledError:
             if mark:

@@ -241,6 +241,10 @@ class SlackWatcher:
             "text": event.get("text", ""),
             "files": [f.get("name") or "file" for f in event.get("files") or []],
             "ts": ts,
+            # whether it names her, which its kind does not show for a DM, a
+            # group DM or a reply in her thread: a message that names her was
+            # said to her
+            "mentioned": mentioned,
         }
         # A message to her is kept until it is answered, but for a reply in
         # an email task's thread, whose path leaves its own marker at a stop

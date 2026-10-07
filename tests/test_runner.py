@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from wanda import vault
+from wanda import main, vault
 from wanda.runner import RunnerService, RunResult, refused
 
 
@@ -348,10 +348,11 @@ async def moment(at, vault_dir):
 
 class Feed:
     """What the runner reads a session's added messages from: next(), close(),
-    began() and results, as the product's feed has them. Each text put on
-    `waiting` is handed over in turn, indented as the product frames a
-    message, after `frame_s`, until it is closed; `written` holds those it
-    handed over, and `turns` how many turns began."""
+    began(), results, nothing_sent() and line_turn(), as the product's feed
+    has them, but that it gives no line to write after the first result.
+    Each text put on `waiting` is handed over in turn, indented as the
+    product frames a message, after `frame_s`, until it is closed; `written`
+    holds those it handed over, and `turns` how many turns began."""
 
     def __init__(self, frame_s=0.0):
         self.waiting: list[str] = []
@@ -361,6 +362,14 @@ class Feed:
         self.more = asyncio.Event()
         self.frame_s = frame_s
         self.turns = 0
+        self.line = None
+        self.nudge_result = None
+
+    def nothing_sent(self, result, ran_s, timeout_s):
+        return None
+
+    def line_turn(self):
+        return None
 
     def poke(self):
         self.more.set()
@@ -631,3 +640,242 @@ def test_what_claude_code_says_when_it_will_not_run_is_read_where_no_error_is_gi
     """A session run with --output-format json, as the clock's are, prints no
     assistant event: its error's words are read, in any case."""
     assert refused(RunResult(ok=False, error=said)) == why
+
+
+class Held:
+    """A turn's kept messages as the product's feed reads them: one 1:1 DM
+    of fan's, and each one handed since."""
+
+    def __init__(self):
+        self.rows = {("D1", "1.0"): {"channel": "D1", "ts": "1.0", "channel_type": "im", "kind": "dm",
+                                     "user": "U1", "text": "the dentist moved to the 14th"}}
+
+    def began(self, sid):
+        pass
+
+    def handed(self, sid, p):
+        self.rows[(p["channel"], p["ts"])] = p
+
+    def back(self, back):
+        pass
+
+
+class Watched(main.Additions):
+    """The product's feed, which also keeps how many results had come when
+    the runner closed the input on finding the line's turn."""
+
+    closed_at = None
+
+    @property
+    def nudge_result(self):
+        return self.__dict__.get("_nudge_result")
+
+    @nudge_result.setter
+    def nudge_result(self, i):
+        self.__dict__["_nudge_result"] = i
+        if i is not None:
+            self.closed_at = len(self.results) - 1
+
+
+LINE = vault.NOTHING_SENT.format(whom="fan")
+
+
+def nudged(tmp_path, fake, added=(), timeout_s=20, frame_s=0.0):
+    """One session of fan's 1:1 DM started with "    first", through the
+    product's feed, each (moment, text) of `added` put on its conversation's
+    waiting list at that moment and framed in `frame_s`: the result, the
+    feed, how long it took, and what was left waiting."""
+    vault_dir = tmp_path / "vault"
+    vault_dir.mkdir(exist_ok=True)
+    waiting = []
+
+    async def frame(p):
+        await asyncio.sleep(frame_s)
+        return "    " + p["text"]
+
+    async def go():
+        more = Watched(waiting, frame, Held(), vault_dir)
+        more.sid, more.told = "s1", {"U1": "fan"}
+
+        async def arrive():
+            for at, text in added:
+                await moment(at, vault_dir)
+                waiting.append({"ts": f"{time.time():.6f}", "channel": "D1", "text": text})
+                more.poke()
+        arriving = asyncio.create_task(arrive())
+        rr = await RunnerService(fake).run("    first", model="m", max_budget_usd=2, timeout_s=timeout_s,
+                                          session_id="s1", cwd=str(vault_dir), feed=more)
+        await arriving
+        return rr, more
+    start = time.monotonic()
+    rr, more = run(go())
+    return rr, more, time.monotonic() - start, [m["text"] for m in waiting]
+
+
+def opened_by(tmp_path, n):
+    """The text blocks that opened the session's turn `n`, as its transcript
+    records them."""
+    f = vault.transcripts_dir(tmp_path / "vault") / "s1.jsonl"
+    entries = [json.loads(x) for x in f.read_text().splitlines()]
+    opening = [e["message"]["content"] for e in entries if e.get("type") == "user" and vault._texts(
+        e["message"]["content"])]
+    return vault._texts(opening[n])
+
+
+def test_an_empty_first_answer_is_told_alone_what_was_not_sent(tmp_path, monkeypatch):
+    """A message being framed when the first answer comes goes back on its
+    list, and the line is written alone, as the next turn."""
+    fake = standin(tmp_path, monkeypatch, steps=[0.3], reply_s=0.5, silent="first")
+    rr, more, took, back = nudged(tmp_path, fake, [(("tool_use", 1, 0), "framed too slowly")], frame_s=15)
+    assert more.line == LINE and more.taken == [] and back == ["framed too slowly"]
+    assert rr.ok and len(rr.results) == 2 and more.nudge_result == 1 and not rr.timed_out
+    assert opened_by(tmp_path, 1) == [LINE]
+    assert rr.structured["answer"] == f"one answer to 2: first | {LINE}"
+
+
+def test_the_line_is_written_when_the_feed_ended_before_the_first_answer(tmp_path, monkeypatch):
+    """The feed's end stops what is written, not the input, which the first
+    result still finds open."""
+    monkeypatch.setattr(main, "FOLD_FOR_S", 0.3)
+    fake = standin(tmp_path, monkeypatch, steps=[1.5], silent="first")
+    rr, more, took, _ = nudged(tmp_path, fake)
+    assert more.line == LINE and rr.ok and len(rr.results) == 2 and more.nudge_result == 1
+    assert rr.structured["answer"] == f"one answer to 2: first | {LINE}"
+
+
+@pytest.mark.parametrize("behaviour, line_turn", [
+    # a notice's turn, of no step, after the first result: the line's own
+    # turn is the one after it, whenever the notice's result is read
+    ({"notify": "after"}, 2),
+    ({"notify": "after", "reply_s": 0.5}, 2),
+    # a notice's turn that takes the line at a step
+    ({"notify": "after", "notify_steps": [1.0]}, 1),
+    # no notice
+    ({}, 1),
+    # the line and a notice taken as one turn
+    ({"notify": "with"}, 1),
+    # the line's opening entry written after its result, found by a read
+    # between results
+    ({"late_entry": True}, 1),
+], ids=["a notice's turn first", "a notice's turn first, 0.5 s to its result", "a notice's turn takes it",
+        "no notice", "taken with a notice", "its entry written late"])
+def test_the_input_closes_at_the_result_of_the_turn_that_took_the_line(tmp_path, monkeypatch, behaviour,
+                                                                        line_turn):
+    fake = standin(tmp_path, monkeypatch, steps=[0.2], silent="first", **behaviour)
+    rr, more, took, _ = nudged(tmp_path, fake)
+    assert more.line == LINE and not rr.timed_out and took < 10
+    assert more.nudge_result == more.closed_at == line_turn and len(rr.results) == line_turn + 1
+
+
+def test_with_the_transcript_unreadable_the_next_result_is_the_lines(tmp_path, monkeypatch):
+    monkeypatch.setattr(vault, "line_turn", lambda vault_dir, sid, line: None)
+    fake = standin(tmp_path, monkeypatch, steps=[0.2], silent="first")
+    rr, more, took, _ = nudged(tmp_path, fake)
+    assert more.line == LINE and not rr.timed_out and more.nudge_result == more.closed_at == 1
+
+
+def test_a_late_entry_before_a_notices_turn_is_still_the_lines(tmp_path, monkeypatch):
+    """The line's turn, its entry written after its result, then a notice's
+    turn: the line's result is the second, whichever result the input
+    closed at."""
+    fake = standin(tmp_path, monkeypatch, steps=[0.2], silent="first", late_entry=True, notify={"after": 1})
+    rr, more, took, _ = nudged(tmp_path, fake)
+    assert more.nudge_result == 1 and more.closed_at in (1, 2) and not rr.timed_out
+
+
+@pytest.mark.parametrize("behaviour, added, timeout_s", [
+    # an answer
+    ({"steps": [0.2]}, (), 20),
+    # an error
+    ({"steps": [0.2], "fail": "first", "silent": "first"}, (), 20),
+    # past half its time
+    ({"steps": [1.5], "silent": "first"}, (), 2.5),
+    # a message written to it after the prompt
+    ({"steps": [1.0, 0.1], "silent": "first"}, [(("tool_use", 1, 0.1), "and tell me too")], 20),
+], ids=["an answer", "an error", "half the time", "a message written after the prompt"])
+def test_no_line_is_written(tmp_path, monkeypatch, behaviour, added, timeout_s):
+    fake = standin(tmp_path, monkeypatch, **behaviour)
+    rr, more, took, _ = nudged(tmp_path, fake, added, timeout_s=timeout_s)
+    assert more.line is None and len(rr.results) == 1 and not rr.timed_out
+    assert all(LINE not in t for n in range(len(rr.results)) for t in opened_by(tmp_path, n))
+
+
+def test_a_transcript_that_never_shows_the_line_closes_the_input_once_the_session_is_quiet(tmp_path, monkeypatch,
+                                                                                         caplog):
+    """Read as one that cannot be read, once a result has come after the line
+    and the session has written nothing for LINE_SHOWN_WITHIN_S: its last
+    result is the line's, logged so, and the session's slot is not held to
+    its timeout."""
+    import logging
+
+    from wanda import runner
+
+    monkeypatch.setattr(vault, "line_turn", lambda vault_dir, sid, line: False)
+    monkeypatch.setattr(runner, "LINE_SHOWN_WITHIN_S", 1.0)
+    fake = standin(tmp_path, monkeypatch, steps=[0.2], silent="first")
+    with caplog.at_level(logging.WARNING, logger="wanda.runner"):
+        rr, more, took, _ = nudged(tmp_path, fake)
+    assert more.line == LINE and not rr.timed_out and took < 10
+    assert more.nudge_result == more.closed_at == 1 and len(rr.results) == 2 and more.line_guessed
+    assert "its last result is taken as that turn's" in caplog.text
+
+
+def test_a_session_still_writing_is_not_taken_for_quiet(tmp_path, monkeypatch):
+    """The transcript shows no turn for the line for 2.5 s, while a notice's
+    turn has reported and the line's turn writes a step every 0.4 s: the
+    input is not closed at the notice's result, but at the line's."""
+    from wanda import runner
+
+    real = vault.line_turn
+    t0 = time.monotonic()
+
+    def slow(vault_dir, sid, line):
+        return False if time.monotonic() - t0 < 2.5 else real(vault_dir, sid, line)
+    monkeypatch.setattr(vault, "line_turn", slow)
+    monkeypatch.setattr(runner, "LINE_SHOWN_WITHIN_S", 1.0)
+    fake = standin(tmp_path, monkeypatch, steps=[0.2], silent="first", notify={"after": 0},
+                   steps_later=[0.4] * 7)
+    rr, more, took, _ = nudged(tmp_path, fake)
+    assert more.nudge_result == more.closed_at == 2 and not rr.timed_out and not more.line_guessed
+
+
+def test_once_the_lines_turn_is_known_the_transcript_is_not_read_while_it_runs(tmp_path, monkeypatch):
+    """A notice's turn reports first, and the line's turn then takes three
+    seconds of steps: its result closes the input, with no read between."""
+    reads = []
+    line_turn = vault.line_turn
+
+    def read(vault_dir, sid, line):
+        reads.append(line_turn(vault_dir, sid, line))
+        return reads[-1]
+    monkeypatch.setattr(vault, "line_turn", read)
+    fake = standin(tmp_path, monkeypatch, steps=[0.2], silent="first", notify={"after": 0}, steps_later=[1.5, 1.5])
+    rr, more, took, _ = nudged(tmp_path, fake)
+    assert more.nudge_result == more.closed_at == 2 and not rr.timed_out
+    known = next(i for i, turn in enumerate(reads) if turn is not False)
+    # a read already under way when the turn became known may still finish
+    assert len(reads) - known - 1 <= 1
+
+
+# A claude that takes its prompt, closes its input, and gives an empty
+# answer: the line after it meets a closed pipe.
+CLOSES_ITS_INPUT = """import json, os, sys, time
+sys.stdin.readline()
+os.close(0)
+report = {"recalled": [], "answer": "", "recorded": []}
+for ev in ({"type": "system", "subtype": "init", "session_id": "s1"},
+           {"type": "result", "subtype": "success", "is_error": False, "result": json.dumps(report),
+            "structured_output": report, "session_id": "s1", "total_cost_usd": 0.01}):
+    print(json.dumps(ev), flush=True)
+time.sleep(0.5)
+"""
+
+
+def test_a_line_that_cannot_be_written_is_not_kept(tmp_path):
+    """The session has closed its input: it was told nothing, so nothing
+    follows as though it had been."""
+    script = tmp_path / "closes.py"
+    script.write_text(CLOSES_ITS_INPUT)
+    fake = make_fake_claude(tmp_path, f'exec "{sys.executable}" "{script}"')
+    rr, more, took, _ = nudged(tmp_path, fake)
+    assert more.line is None and len(rr.results) == 1 and rr.ok and not rr.timed_out

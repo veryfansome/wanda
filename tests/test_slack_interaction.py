@@ -1,6 +1,7 @@
 """Mention/DM triggering, context rendering, and task anchoring."""
 
 import asyncio
+import json
 import os
 import sqlite3
 from types import SimpleNamespace
@@ -821,6 +822,32 @@ def test_owned_thread_replies_work_without_a_mention(store):
     ev = fire(store, {"type": "message", "user": "U1", "channel": "C9", "channel_type": "channel",
                       "ts": "100.5", "thread_ts": "100.1", "text": "and the other one?"})
     assert ev is not None and ev.payload["kind"] == "task"
+
+
+@pytest.mark.parametrize("where, text, mentioned", [
+    ("group", "<@UBOT> the plumber comes Tuesday", True),
+    ("group", "<@UBOT|wanda> the plumber comes Tuesday", True),
+    ("group", "the plumber comes Tuesday", False),
+    ("her thread", "<@UBOT> and the other one?", True),
+    ("her thread", "and the other one?", False),
+    ("dm", "hi", False),
+    ("channel", "<@UBOT> hi", True),
+], ids=["a group DM line naming her", "naming her in the labelled form", "a group DM line",
+        "a reply in her thread naming her", "a reply in her thread", "a 1:1 DM", "a channel mention"])
+def test_whether_a_message_names_her_rides_its_payload(store, where, text, mentioned):
+    """A group DM line and a reply in her thread take a kind that does not
+    show a mention; the payload says whether the message named her, which is
+    kept with it."""
+    if where == "her thread":
+        store.create_task(None, "C9", "100.1", kind="mention")
+    event = {"group": {"channel": "G5", "channel_type": "mpim"},
+             "her thread": {"channel": "C9", "channel_type": "channel", "thread_ts": "100.1"},
+             "dm": {"channel": "D5", "channel_type": "im"},
+             "channel": {"channel": "C9", "channel_type": "channel"}}[where]
+    ev = fire(store, {"type": "message", "user": "U1", "ts": "100.5", "text": text, **event})
+    assert ev.payload["mentioned"] is mentioned
+    [row] = store.kept()
+    assert json.loads(row["payload"])["mentioned"] is mentioned
 
 
 # --- one classification for the live watcher and a read back from Slack ---

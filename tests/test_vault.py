@@ -391,6 +391,48 @@ def test_what_a_session_was_handed_is_read_from_its_transcript(tmp_path, monkeyp
     assert vault.turn_starts(v, "s2") is None
 
 
+def test_the_line_after_an_empty_answer_begins_no_members_turn_and_its_turn_is_found(tmp_path, monkeypatch):
+    """The harness's own line, written when a first answer to a message said
+    to her was empty: a turn it begins is no one's message, and which turn
+    took it is read by its words, alone, with a notice, or handed at a step
+    of a notice's turn."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    v = tmp_path / "vault"
+    v.mkdir()
+    d = vault.transcripts_dir(v)
+    d.mkdir(parents=True)
+    line = vault.NOTHING_SENT.format(whom="fan and mei")
+    notice = "<task-notification>\n<task-id>b1</task-id>\n</task-notification>"
+
+    def user(*texts, **more):
+        return {"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": t} for t in texts]},
+                **more}
+    prompt = user("the prompt")
+    answered = {"type": "attachment", "attachment": {"type": "structured_output", "data": {"answer": ""}}}
+    notices = {"type": "user", "origin": {"kind": "task-notification"},
+               "message": {"role": "user", "content": notice}}
+    step = {"type": "user", "message": {"role": "user", "content": [
+        {"tool_use_id": "t1", "type": "tool_result", "content": "ok"}]}}
+    queued = {"type": "attachment", "attachment": {"type": "queued_command", "commandMode": "prompt",
+                                                   "prompt": [{"type": "text", "text": line}]}}
+    shapes = {
+        "alone": ([prompt, answered, user(line)], 1),
+        "after a notice's turn": ([prompt, answered, notices, answered, user(line)], 2),
+        "taken with a notice": ([prompt, answered, user(notice, line)], 1),
+        "at a step of a notice's turn": ([prompt, answered, notices, step, queued], 1),
+        # never the prompt's, which ended before the line was written
+        "at a step of a notice's turn whose entry comes later": ([prompt, answered, queued, notices], 1),
+        "not yet": ([prompt, answered, notices], False),
+    }
+    for name, (rows, turn) in shapes.items():
+        (d / f"{name}.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+        assert vault.line_turn(v, name, line) is turn, name
+    assert vault.line_turn(v, "none", line) is None
+    # the turn it began is not a member's, nor one it was taken into with a notice
+    assert vault.turn_starts(v, "alone") == [(True, []), (False, [])]
+    assert vault.turn_starts(v, "taken with a notice") == [(True, []), (False, [])]
+
+
 def test_frames_name_who_reads_and_what_came_before():
     assert vault.arrival_text("group", "fan", "hi", ["fan", "mei"], []) == (
         "In a group direct message that fan, mei and I read. Everyone in it sees what I say "
