@@ -5327,6 +5327,21 @@ def test_a_follow_up_that_needs_no_answer_leaves_the_first_answer(tmp_path, monk
     assert store._query("SELECT status FROM runs")[0]["status"] == "ok"
 
 
+def test_a_further_turn_that_answers_only_its_own_line_is_what_is_posted(tmp_path, monkeypatch):
+    """Only the last answer that says something is posted, so a further turn
+    begun by "thanks!" that answers the thanks alone leaves the question
+    unanswered. The added message's frame says which answer is sent and that
+    it has to answer everything; nothing in the harness posts the question's
+    answer instead."""
+    p, store, _, slack = standin_processor(tmp_path, monkeypatch, steps=[0.2], reply_s=1.5, answer_new=True)
+    conversation(p, (0, dm(f"{AT:.1f}", "can you remind me at 5 to call the plumber?")),
+                 (("tool_result", 1, 0.2), dm(f"{AT + 30:.1f}", "thanks!")))
+    assert slack.replies == ["one answer to 1: thanks!"]
+    assert handed_texts(tmp_path) == [[vault.added_text("dm", "fan", "thanks!", "16:40")]]
+    assert "so that answer has to answer everything in this session that was said to me" in handed_texts(tmp_path)[0][0]
+    assert store._query("SELECT status FROM runs")[0]["status"] == "ok"
+
+
 def test_a_failed_last_turn_after_an_answer_posts_the_answer_then_answers_the_rest(tmp_path, monkeypatch):
     """The message that began the failed turn is run again as the
     conversation's next turn, by a session told of the one that failed."""

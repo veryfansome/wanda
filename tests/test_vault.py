@@ -344,8 +344,9 @@ def test_an_added_message_says_who_where_when_and_what_is_sent():
     assert vault.added_text("group", "mei", "and tell me too", "16:42") == (
         "mei adds this in the same group direct message at 16:42, before anything I say back "
         "has been sent:\n\n    and tell me too\n\n"
-        "Nothing I have said back in this session has been sent yet. The last answer I give in this session "
-        "that says something is the one sent, so that is where anything said here gets its answer.")
+        "Nothing I have said back in this session has been sent yet. Only the last answer I give in this session "
+        "that says something is sent, and nothing before it, so that answer has to answer everything in this "
+        "session that was said to me.")
     assert "in the same Slack thread in a public channel at" in vault.added_text(
         "public thread", "fan", "x", "09:00")
 

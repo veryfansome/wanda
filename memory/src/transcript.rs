@@ -63,7 +63,9 @@ static NOBODY_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
 
 // a message added to the conversation while its session worked, as the product
 // hands it to that session (wanda/vault.py, ADDED). Every line of the message
-// is indented, so the closing sentence, which is not, ends it.
+// is indented, so the closing, which is not, ends it. Only the closing's first
+// sentence is matched, so a frame whose later sentences have since changed
+// still reads back.
 static ADDED_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(concat!(
     r"(?s)^(?P<speaker>[^\n]+?) adds this in the same [^\n]+? at [^\n]+?, ",
     r"before anything I say back has been sent:\n\n(?P<text>.*?)\n\n",
@@ -718,11 +720,22 @@ mod tests {
         format!("{v}\n")
     }
 
-    fn addition(speaker: &str, text: &str) -> String {
+    // the closing of an added message's frame, and the one it had before, which
+    // transcripts kept for a month still hold
+    const CLOSING: &str = "Nothing I have said back in this session has been sent yet. Only the last \
+                           answer I give in this session that says something is sent, and nothing before \
+                           it, so that answer has to answer everything in this session that was said to me.";
+    const EARLIER_CLOSING: &str = "Nothing I have said back in this session has been sent yet. The last \
+                                   answer I give in this session that says something is the one sent, so \
+                                   that is where anything said here gets its answer.";
+
+    fn added_with(speaker: &str, text: &str, closing: &str) -> String {
         format!("{speaker} adds this in the same group direct message at 16:42, before anything I say \
-                 back has been sent:\n\n    {text}\n\nNothing I have said back in this session has been \
-                 sent yet. The last answer I give in this session that says something is the one sent, so \
-                 that is where anything said here gets its answer.")
+                 back has been sent:\n\n    {text}\n\n{closing}")
+    }
+
+    fn addition(speaker: &str, text: &str) -> String {
+        added_with(speaker, text, CLOSING)
     }
 
     fn exchange_of(name: &str, lines: &[String]) -> Exchange {
@@ -828,6 +841,21 @@ mod tests {
         ]);
         let shown = render(&ex, false, false);
         assert!(!shown.contains("(aside)") && !shown.contains("(nothing)") && ex.answer == "At 5.", "{shown}");
+    }
+
+    #[test]
+    fn an_addition_reads_back_under_either_closing() {
+        use serde_json::json;
+        for closing in [CLOSING, EARLIER_CLOSING] {
+            let added = added_with("mei", "and tell me too\n    and fan", closing);
+            assert_eq!(parse_added(&added), Some(("mei".into(), "and tell me too\nand fan".into())), "{closing}");
+            let ex = exchange_of("closings", &[
+                entry(json!({"type": "user", "timestamp": "2026-10-01T23:42:00Z", "message": {"role": "user",
+                            "content": [{"type": "text", "text": opening()}, {"type": "text", "text": added}]}})),
+            ]);
+            assert_eq!(ex.speaker, "fan (then mei)", "{closing}");
+            assert!(render(&ex, false, false).contains("23:42:00  mei added: and tell me too\nand fan"), "{closing}");
+        }
     }
 
     // a message Claude Code took into the opening turn with the prompt is a

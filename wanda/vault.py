@@ -596,8 +596,9 @@ def prompt(date: str, arrival: str) -> str:
 # message.
 ADDED = ("{speaker} adds this in the same {room} at {when}, before anything I say back has been sent:"
          "\n\n    {text}\n\n"
-         "Nothing I have said back in this session has been sent yet. The last answer I give in this session "
-         "that says something is the one sent, so that is where anything said here gets its answer.")
+         "Nothing I have said back in this session has been sent yet. Only the last answer I give in this "
+         "session that says something is sent, and nothing before it, so that answer has to answer everything "
+         "in this session that was said to me.")
 
 
 def added_text(place: str, speaker: str, text: str, when: str) -> str:
