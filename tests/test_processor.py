@@ -3056,6 +3056,83 @@ class RefusesSaying(FakeSlack):
         await super().reply(thread_ts, text, channel)
 
 
+@pytest.mark.parametrize("note", ["the cap's", "a hold's"])
+def test_her_note_on_the_cap_or_a_hold_given_up_leaves_her_reaction_on_what_it_tells_of(tmp_path, fake_time, note):
+    """Her note that she will come back to it, refused for two hours of her
+    running: given up, with no note of its own, and what it told of stays
+    kept, her reaction on. The alert says when, and nothing of a note,
+    which is said of an answer to members' messages."""
+    slack = RefusesSaying("come back", RuntimeError("ratelimited"))
+    p, store = make(tmp_path, slack, email_triage=False)
+    task = store.create_task(None, "D1", "conversation", kind="dm")
+    line = keep(store, dm(f"{fake_time.at.timestamp() - 60:.1f}", "is it paid?"))
+    kept_as = Settled(capped=(line,)) if note == "the cap's" else Settled(held=((line, "s1"),))
+    store.set_meta("held_since", (fake_time.at - timedelta(minutes=5)).isoformat())
+    store.record_run(kind="note", task_id=task, session_id=None, started_at=utcnow(), exit_code=None, cost_usd=0.0,
+                     status="ok", notified=0, settled=kept_as,
+                     result_text=main.CAPPED_NOTE if note == "the cap's" else main.HELD)
+    settle(p, p.deliver_pending())
+    fake_time.at += timedelta(minutes=122)
+    settle(p, p.deliver_pending())
+    assert slack.replies == [] and not store.pending_deliveries(task) and slack.unreacted == []
+    assert [r[1] for r in kept(store)] == ["capped" if note == "the cap's" else "held"]
+    assert [g["how"] for g in json.loads(store.get_meta("given_up_runs"))] == ["after two hours"]
+
+
+def test_her_note_after_an_answer_given_up_names_the_first_message_that_stands(tmp_path, fake_time):
+    """An answer to three messages, the first deleted after the record,
+    given up after two hours: her note stands for the second and the third,
+    and names the second's time (GIVEN_UP)."""
+    slack = RefusesSaying("plumber", RuntimeError("ratelimited"))
+    p, store = make(tmp_path, slack, email_triage=False)
+    task = store.create_task(None, "D1", "conversation", kind="dm")
+    at = fake_time.at.timestamp()
+    first = keep(store, dm(f"{at - 600:.1f}", "when is the plumber?"))
+    second = keep(store, dm(f"{at - 300:.1f}", "and is it paid?"))
+    third = keep(store, dm(f"{at - 60:.1f}", "and the gate code?"))
+    store.record_run(kind="agent", task_id=task, session_id="s1", started_at=utcnow(), exit_code=0, cost_usd=0.1,
+                     status="ok", result_text="The plumber is at 5.", notified=0,
+                     settled=Settled(answered=(first, second, third)))
+    settle(p, p.drain_mail())
+
+    async def gone():
+        p._withdraw(*first)
+    settle(p, gone())
+    fake_time.at += timedelta(minutes=122)
+    settle(p, p.drain_mail())
+    settle(p, p.drain_mail())
+    assert slack.replies == [main.GIVEN_UP.format(at=main.written_at(
+        datetime.fromtimestamp(at - 300, timezone.utc), fake_time.at.astimezone(p.cfg.zone)))]
+
+
+def test_an_answer_whose_messages_are_all_deleted_while_slack_refuses_it_is_given_up_quietly(tmp_path, fake_time):
+    """An answer to two messages, both deleted while the post that fails at
+    two hours is in flight: given up, its note recorded for the first and
+    then not posted, as nothing it tells of stands."""
+    at = fake_time.at.timestamp()
+
+    class Deletes(RefusesSaying):
+        async def reply(self, thread_ts, text, channel=None):
+            if self.word in text and fake_time.at.timestamp() - at > 7200:
+                for k in self.keys:
+                    p._withdraw(*k)
+            await super().reply(thread_ts, text, channel)
+    slack = Deletes("plumber", RuntimeError("ratelimited"))
+    p, store = make(tmp_path, slack, email_triage=False)
+    task = store.create_task(None, "D1", "conversation", kind="dm")
+    first = keep(store, dm(f"{at - 600:.1f}", "when is the plumber?"))
+    second = keep(store, dm(f"{at - 60:.1f}", "and is it paid?"))
+    slack.keys = [first, second]
+    store.record_run(kind="agent", task_id=task, session_id="s1", started_at=utcnow(), exit_code=0, cost_usd=0.1,
+                     status="ok", result_text="The plumber is at 5.", notified=0,
+                     settled=Settled(answered=(first, second)))
+    settle(p, p.drain_mail())
+    fake_time.at += timedelta(minutes=122)
+    settle(p, p.drain_mail())
+    settle(p, p.drain_mail())
+    assert slack.replies == [] and not store.pending_deliveries(task) and kept(store) == []
+
+
 ARCHIVED = SlackApiError("The request to the Slack API failed.", {"ok": False, "error": "is_archived"})
 
 
@@ -3085,7 +3162,7 @@ def test_an_answer_given_up_after_two_hours_is_followed_by_her_note_saying_so(tm
         run |= {"status": "error", "result_text": None, "notified": 1}
     if "note" in given_up:
         answered, noted = store.record_run_and_note(main.FAILED_REST if "after it" in given_up else main.FAILED,
-                                                    settled=Settled(answered=(first, second)), **run)
+                                                    noted=Settled(answered=(first, second)), **run)
         if given_up.startswith("her note"):
             answered = noted
     else:
@@ -3120,7 +3197,7 @@ def test_her_note_given_up_after_two_hours_takes_her_reaction_off_its_message(tm
     p, store = make(tmp_path, slack, email_triage=False)
     task = store.create_task(None, "D1", "conversation", kind="dm")
     line = keep(store, dm(f"{fake_time.at.timestamp() - 60:.1f}", "is it paid?"))
-    store.record_run_and_note(main.FAILED, settled=Settled(answered=(line,)), kind="agent", task_id=task,
+    store.record_run_and_note(main.FAILED, noted=Settled(answered=(line,)), kind="agent", task_id=task,
                               session_id="s1", started_at=utcnow(), exit_code=1, cost_usd=0.1, status="error")
     settle(p, p.drain_mail())
     assert kept(store)[0][:2] == (line[1], "answered") and slack.unreacted == []
@@ -4374,6 +4451,356 @@ def test_sessions_claude_code_refused_count_nothing_and_a_message_then_is_held(t
     assert [r[1] for r in kept(store)] == ["held"]
 
 
+class RefusesOnce(ConversationSlack):
+    """A Slack that refuses her posts, as one rate limiting does, until
+    `refuse` is cleared."""
+
+    def __init__(self):
+        super().__init__(members=["U1", "U2", "UBOT"], history=[])
+        self.refuse = True
+
+    async def reply(self, thread_ts, text, channel=None):
+        if self.refuse:
+            raise RuntimeError("ratelimited")
+        await super().reply(thread_ts, text, channel)
+
+
+@pytest.mark.parametrize("note", ["the cap's", "a hold's"])
+@pytest.mark.parametrize("deleted", ["its one message", "its one message, in a group DM",
+                                     "one of two, the other sent before", "one of two, the other sent after"])
+def test_her_note_on_the_cap_or_a_hold_is_posted_only_while_a_message_it_tells_of_stands(
+        tmp_path, monkeypatch, fake_time, note, deleted):
+    """Her note that she will come back to it (CAPPED_NOTE, HELD, and in a
+    group DM CAPPED_GROUP, HELD_GROUP), refused by Slack, and the message it
+    was recorded for deleted before the next pass: with nothing the cap or
+    the hold keeps left there, nothing is posted and the day's mark goes
+    with it, so that a message kept there later that day is told; with
+    another kept there, sent before the deletion or after it while the note
+    was owed, the note tells of that one and is posted, once."""
+    slack = RefusesOnce()
+    p, store, _ = memory_processor(tmp_path, slack, RecordingRunner(answer("never")), monkeypatch)
+    at = fake_time.at.timestamp()
+    group = "group" in deleted
+    channel = "G1" if group else "D1"
+
+    def line(ts, text):
+        return dm(ts, text, channel_type="mpim" if group else "im", channel=channel)
+    first, other = line(f"{at - 60:.1f}", "is it paid?"), line(f"{at - 30:.1f}", "and the plumber?")
+    if note == "the cap's":
+        text, state = main.CAPPED_GROUP if group else main.CAPPED_NOTE, "capped"
+    else:
+        text, state = main.HELD_GROUP if group else main.HELD, "held"
+    task = store.create_task(None, channel, "conversation", kind="dm")
+    if note == "the cap's":
+        monkeypatch.setattr(p.cfg, "daily_run_cap", 1)
+        store.record_run(kind="agent", task_id=None, session_id=None, started_at=utcnow(), exit_code=0,
+                         cost_usd=0.1, status="ok")
+    else:
+        store.set_meta("held_since", (fake_time.at - timedelta(minutes=5)).isoformat())
+
+    def kept_back(ev):
+        # kept by the cap or the hold, as a turn or the hold's confirmation keeps it
+        keep(store, ev)
+        if note == "the cap's":
+            settle(p, p.handle_slack(ev))
+        else:
+            store._exec("UPDATE unanswered SET state='held' WHERE state='due'")
+            settle(p, p._claude_refused(store.get_task_by_thread(channel, "conversation")))
+    kept_back(first)
+    if deleted == "one of two, the other sent before":
+        kept_back(other)
+    assert slack.replies == [] and len(store.pending_deliveries(task)) == 1
+
+    async def gone():
+        p._withdraw(channel, first.payload["ts"])
+    settle(p, gone())
+    if deleted == "one of two, the other sent after":
+        kept_back(other)
+    slack.refuse = False
+    settle(p, p.deliver_pending())
+    if deleted.startswith("one of two"):
+        assert slack.replies == [text] and kept(store) == [(other.payload["ts"], state, 0, None)]
+        return
+    assert slack.replies == [] and kept(store) == [] and not store.pending_deliveries(task)
+    kept_back(line(f"{at:.1f}", "and the plumber?"))
+    assert slack.replies == [text] and [r[0] for r in kept(store)] == [f"{at:.1f}"]
+
+
+@pytest.mark.parametrize("note", ["the cap's", "a hold's"])
+def test_her_note_of_the_day_before_not_posted_leaves_the_mark_of_today(tmp_path, monkeypatch, fake_time, note):
+    """Her note on the cap or a hold recorded the day before and owed since,
+    the hold lasting since, with nothing it could tell of kept there now:
+    not posted, and the mark a note said there today left stays, so that
+    nothing more is said there today."""
+    slack = ConversationSlack(members=["U1", "U2", "UBOT"], history=[])
+    p, store, _ = memory_processor(tmp_path, slack, RecordingRunner(answer("never")), monkeypatch)
+    task = store.create_task(None, "D1", "conversation", kind="dm")
+    today = fake_time.at.astimezone(p.cfg.zone).date().isoformat()
+    mark = ("cap_noted" if note == "the cap's" else "held_noted") + f":{task}"
+    if note == "a hold's":
+        store.set_meta("held_since", (fake_time.at - timedelta(days=1, minutes=5)).isoformat())
+    store.record_run(kind="note", task_id=task, session_id=None,
+                     started_at=(fake_time.at - timedelta(days=1)).isoformat(timespec="seconds"), exit_code=None,
+                     cost_usd=0.0, status="ok", notified=0,
+                     result_text=main.CAPPED_NOTE if note == "the cap's" else main.HELD)
+    store.set_meta(mark, today)
+    settle(p, p.deliver_pending())
+    assert slack.replies == [] and not store.pending_deliveries(task) and store.get_meta(mark) == today
+
+
+@pytest.mark.parametrize("since", ["deleted", "taken up since"])
+def test_her_note_on_the_cap_with_nothing_capped_left_says_why_in_the_log(tmp_path, fake_time, caplog, since):
+    """Her note on the cap owed the day it was said, with nothing capped
+    left in its conversation: not posted, and its day's mark goes. When a
+    take-up that day, the cap having been only busy, answered what it
+    kept, which is then still kept there, answered, the log says so, and
+    the answer follows alone; with nothing kept there, its messages were
+    deleted."""
+    import logging
+    slack = ConversationSlack(history=[])
+    p, store = make(tmp_path, slack, email_triage=False)
+    task = store.create_task(None, "D1", "conversation", kind="dm")
+    note = store.record_run(kind="note", task_id=task, session_id=None, started_at=utcnow(), exit_code=None,
+                            cost_usd=0.0, status="ok", notified=0, result_text=main.CAPPED_NOTE)
+    mark = f"cap_noted:{task}"
+    store.set_meta(mark, fake_time.at.astimezone(p.cfg.zone).date().isoformat())
+    if since == "taken up since":
+        line = keep(store, dm(f"{fake_time.at.timestamp() - 60:.1f}", "is it paid?"))
+        store.record_run(kind="agent", task_id=task, session_id="s1", started_at=utcnow(), exit_code=0,
+                         cost_usd=0.1, status="ok", result_text="Yes, paid.", notified=0,
+                         settled=Settled(answered=(line,)))
+    with caplog.at_level(logging.INFO, logger="wanda"):
+        settle(p, p.deliver_pending())
+    assert slack.replies == ([] if since == "deleted" else ["Yes, paid."]) and kept(store) == []
+    assert f"run {note} not posted: its messages were {since}" in caplog.messages
+    assert store.get_meta(mark) is None
+
+
+def _owed_note(store, task, line, note, started_at=None):
+    # her note on the cap or a hold, owed as when Slack refused it, said for
+    # the kept message `line`
+    kept_as = Settled(capped=(line,)) if note == "the cap's" else Settled(held=((line, "s1"),))
+    return store.record_run(kind="note", task_id=task, session_id=None, started_at=started_at or utcnow(),
+                            exit_code=None, cost_usd=0.0, status="ok", notified=0, settled=kept_as,
+                            result_text=main.CAPPED_NOTE if note == "the cap's" else main.HELD)
+
+
+@pytest.mark.parametrize("note", ["the cap's", "a hold's"])
+@pytest.mark.parametrize("new", ["waiting for its turn", "answered since"])
+def test_her_note_whose_message_was_deleted_is_not_posted_for_a_new_one_there(tmp_path, fake_time, caplog, note,
+                                                                               new):
+    """Her note on the cap or a hold owed, the hold lasting, its message
+    deleted, and a new message sent there after it, which neither the cap
+    nor the hold keeps, waiting for its turn or answered by a session whose
+    answer comes after the note: not posted, its day's mark goes, and the
+    log says its messages were deleted."""
+    import logging
+    slack = ConversationSlack(history=[])
+    p, store = make(tmp_path, slack, email_triage=False)
+    task = store.create_task(None, "D1", "conversation", kind="dm")
+    at = fake_time.at.timestamp()
+    store.set_meta("held_since", (fake_time.at - timedelta(minutes=10)).isoformat())
+    line = keep(store, dm(f"{at - 360:.1f}", "is it paid?"))
+    run = _owed_note(store, task, line, note, started_at=(fake_time.at - timedelta(minutes=5)).isoformat())
+    mark = ("cap_noted" if note == "the cap's" else "held_noted") + f":{task}"
+    store.set_meta(mark, fake_time.at.astimezone(p.cfg.zone).date().isoformat())
+
+    async def withdraw():
+        p._withdraw(*line)
+    settle(p, withdraw())
+    again = keep(store, dm(f"{at - 60:.1f}", "is it paid? (the plumber)"))
+    if new == "answered since":
+        store.record_run(kind="agent", task_id=task, session_id="s1", started_at=utcnow(), exit_code=0,
+                         cost_usd=0.1, status="ok", result_text="Yes, paid.", notified=0,
+                         settled=Settled(answered=(again,)))
+    with caplog.at_level(logging.INFO, logger="wanda"):
+        settle(p, p.deliver_pending())
+    assert slack.replies == ([] if new == "waiting for its turn" else ["Yes, paid."])
+    assert not store.pending_deliveries(task) and store.get_meta(mark) is None
+    assert f"run {run} not posted: its messages were deleted" in caplog.messages
+
+
+@pytest.mark.parametrize("note", ["the cap's", "a hold's"])
+def test_her_note_said_late_in_the_evening_takes_the_mark_of_its_local_day(tmp_path, fake_time, note):
+    """Her note on the cap or a hold said at 23:30 in Los Angeles, already
+    the next day in UTC, and its message deleted: the mark of the local day
+    it was said goes."""
+    fake_time.at = datetime(2026, 10, 2, 6, 30, tzinfo=timezone.utc)
+    slack = ConversationSlack(history=[])
+    p, store = make(tmp_path, slack, email_triage=False)
+    task = store.create_task(None, "D1", "conversation", kind="dm")
+    store.set_meta("held_since", (fake_time.at - timedelta(minutes=5)).isoformat())
+    line = keep(store, dm(f"{fake_time.at.timestamp() - 60:.1f}", "is it paid?"))
+    mark = ("cap_noted" if note == "the cap's" else "held_noted") + f":{task}"
+    _owed_note(store, task, line, note)
+    store.set_meta(mark, "2026-10-01")
+
+    async def withdraw():
+        p._withdraw(*line)
+    settle(p, withdraw())
+    settle(p, p.deliver_pending())
+    assert slack.replies == [] and store.get_meta(mark) is None
+
+
+@pytest.mark.parametrize("note", ["the cap's", "a hold's"])
+@pytest.mark.parametrize("beside", ["another DM", "a thread in the same DM"])
+def test_her_note_is_kept_up_only_by_what_stands_in_its_own_conversation(tmp_path, fake_time, note, beside):
+    """The cap and the hold reach every conversation at once: two, each
+    owed her note, fan's DM and mei's, or a DM and a thread in it. The
+    first one's message deleted: only the second's note is posted."""
+    slack = ConversationSlack(history=[])
+    p, store = make(tmp_path, slack, email_triage=False)
+    at = fake_time.at.timestamp()
+    store.set_meta("held_since", (fake_time.at - timedelta(minutes=5)).isoformat())
+    top = f"{at - 600:.1f}"
+    d1 = store.create_task(None, "D1", "conversation", kind="dm")
+    gone = keep(store, dm(f"{at - 60:.1f}", "is it paid?"))
+    if beside == "another DM":
+        other = store.create_task(None, "D2", "conversation", kind="dm")
+        stands = keep(store, dm(f"{at - 30:.1f}", "and the plumber?", channel="D2", user="U2"))
+    else:
+        other = store.create_task(None, "D1", top, kind="dm", reply_thread=top)
+        stands = keep(store, dm(f"{at - 30:.1f}", "and the plumber?", thread=top))
+    _owed_note(store, d1, gone, note)
+    _owed_note(store, other, stands, note)
+
+    async def withdraw():
+        p._withdraw(*gone)
+    settle(p, withdraw())
+    settle(p, p.deliver_pending())
+    assert slack.replies == [main.CAPPED_NOTE if note == "the cap's" else main.HELD]
+    assert slack.channels == ["D2"] if beside == "another DM" else slack.threads == [top]
+    assert [r[0] for r in kept(store)] == [stands[1]]
+
+
+@pytest.mark.parametrize("wait", ["the cap's, midnight come", "the cap's, said at 23:30, midnight come",
+                                  "a hold's, the hold ended", "a hold's, a later hold"])
+def test_her_note_on_the_cap_or_a_hold_past_what_it_said_she_would_wait_for_is_not_posted(
+        tmp_path, fake_time, caplog, wait):
+    """Her note on the cap said the day before, or at 23:30 in Los Angeles
+    and checked at 00:30, both the same day in UTC, or on a hold that has
+    ended since, with a later hold or none in place now, what it kept still
+    kept there: not posted, since that is taken up now and her answer comes
+    alone. The log says so, and a mark said there since stays."""
+    import logging
+    if "23:30" in wait:
+        fake_time.at = datetime(2026, 10, 2, 7, 30, tzinfo=timezone.utc)  # 00:30 in Los Angeles
+    slack = ConversationSlack(history=[])
+    p, store = make(tmp_path, slack, email_triage=False)
+    task = store.create_task(None, "D1", "conversation", kind="dm")
+    note = "the cap's" if wait.startswith("the cap's") else "a hold's"
+    line = keep(store, dm(f"{fake_time.at.timestamp() - 3600:.1f}", "is it paid?"))
+    said = fake_time.at - (timedelta(hours=1) if "23:30" in wait else timedelta(days=1) if note == "the cap's"
+                           else timedelta(minutes=30))
+    run = _owed_note(store, task, line, note, started_at=said.isoformat())
+    if wait == "a hold's, a later hold":
+        store.set_meta("held_since", (fake_time.at - timedelta(minutes=5)).isoformat())
+    mark = ("cap_noted" if note == "the cap's" else "held_noted") + f":{task}"
+    today = fake_time.at.astimezone(p.cfg.zone).date().isoformat()
+    store.set_meta(mark, today)
+    with caplog.at_level(logging.INFO, logger="wanda"):
+        settle(p, p.deliver_pending())
+    assert slack.replies == [] and not store.pending_deliveries(task) and store.get_meta(mark) == today
+    assert [r[1] for r in kept(store)] == ["capped" if note == "the cap's" else "held"]
+    assert f"run {run} not posted: its messages were taken up since" in caplog.messages
+
+
+def test_her_note_on_the_cap_owed_at_midnight_is_not_posted_before_her_answer(tmp_path, monkeypatch, fake_time):
+    """Her note on the cap, refused by Slack before midnight and owed past
+    it: the first pass after midnight takes up what the cap kept, and her
+    answer comes alone."""
+    fake_time.at = datetime.fromtimestamp(AT + 30, timezone.utc)
+    slack = RefusesOnce()
+    p, store, _ = memory_processor(tmp_path, slack, RecordingRunner(answer("Yes, paid.")), monkeypatch)
+    monkeypatch.setattr(p.cfg, "daily_run_cap", 1)
+    store.record_run(kind="agent", task_id=None, session_id=None, started_at=utcnow(), exit_code=0,
+                     cost_usd=0.1, status="ok")
+    ev = dm(f"{AT:.1f}", "is it paid?")
+    keep(store, ev)
+    settle(p, p.handle_slack(ev))
+    assert slack.replies == [] and [r[1] for r in kept(store)] == ["capped"]
+    fake_time.at = datetime(2026, 10, 2, 7, 1, tzinfo=timezone.utc)  # 00:01 in Los Angeles
+    slack.refuse = False
+    a_pass(p)
+    assert slack.replies == ["Yes, paid."] and kept(store) == []
+
+
+def test_her_note_on_a_hold_owed_when_the_hold_ends_is_not_posted_before_her_answer(tmp_path, monkeypatch,
+                                                                                     fake_time):
+    """Her note on a hold, refused by Slack and owed when a session
+    elsewhere ends the hold: the hold's end takes up what it held, and her
+    answer comes alone."""
+    fake_time.at = datetime.fromtimestamp(AT, timezone.utc)
+    runner = Limited(answer("Yes, paid."))
+    slack = RefusesOnce()
+    p, store, _ = memory_processor(tmp_path, slack, runner, monkeypatch)
+    ev = dm(f"{AT:.1f}", "is it paid?")
+    keep(store, ev)
+    settle(p, p.handle_slack(ev))
+    fake_time.at += timedelta(minutes=1)
+    a_pass(p)  # the hold's try, refused again, confirms it: her note, refused by Slack
+    assert slack.replies == [] and len(store.pending_deliveries()) == 1
+
+    async def ended():
+        # a session elsewhere ran: the hold ends, its take-up is started,
+        # and a pass comes while it waits for its turn
+        p._claude_ran(datetime.now(timezone.utc))
+        await p.drain_mail()
+        await until(lambda: not p._bg, "every turn ended")
+        await reactions_end(p)
+    runner.back = True
+    slack.refuse = False
+    fake_time.at += timedelta(seconds=10)
+    asyncio.run(ended())
+    assert store.get_meta("held_since") is None
+    assert slack.replies == ["Yes, paid."] and kept(store) == []
+
+
+def test_a_message_deleted_and_sent_again_during_a_hold_is_told(tmp_path, monkeypatch, fake_time, caplog):
+    """The hold confirmed and her note on it refused by Slack; mei's message
+    deleted and sent again, as a correction is. Its turn finds the note
+    with nothing held there and does not post it, logging its message
+    deleted, and its mark goes; the turn is refused and holds the new
+    message, which is told."""
+    import logging
+    slack = RefusesOnce()
+    p, store, _ = memory_processor(tmp_path, slack, Limited(), monkeypatch)
+    at = fake_time.at.timestamp()
+    task = store.create_task(None, "D1", "conversation", kind="dm")
+    first = dm(f"{at - 60:.1f}", "is it paid?")
+    keep(store, first)
+    store._exec("UPDATE unanswered SET state='held'")
+    store.set_meta("held_since", (fake_time.at - timedelta(minutes=5)).isoformat())
+    settle(p, p._claude_refused(store.get_task_by_thread("D1", "conversation")))
+    assert slack.replies == [] and len(store.pending_deliveries(task)) == 1
+    [note] = [r["id"] for r in store.pending_deliveries(task)]
+
+    async def withdraw():
+        p._withdraw("D1", first.payload["ts"])
+    settle(p, withdraw())
+    slack.refuse = False
+    again = dm(f"{at - 10:.1f}", "is it paid yet?")
+    keep(store, again)
+    with caplog.at_level(logging.INFO, logger="wanda"):
+        settle(p, p.handle_slack(again))
+    assert f"run {note} not posted: its messages were deleted" in caplog.messages
+    assert slack.replies == [main.HELD] and [(r[0], r[1]) for r in kept(store)] == [(again.payload["ts"], "held")]
+
+
+def test_an_answer_in_the_words_of_her_note_on_a_hold_is_posted_though_nothing_is_held(tmp_path, fake_time):
+    """A session's answer is checked as an answer is, by the messages it
+    answers, whatever its words: only her own note on the cap or a hold is
+    checked against what the cap or the hold keeps there."""
+    slack = ConversationSlack(history=[])
+    p, store = make(tmp_path, slack, email_triage=False)
+    task = store.create_task(None, "D1", "conversation", kind="dm")
+    line = keep(store, dm(f"{fake_time.at.timestamp() - 60:.1f}", "can you get to anything right now?"))
+    store.record_run(kind="agent", task_id=task, session_id="s1", started_at=utcnow(), exit_code=0, cost_usd=0.1,
+                     status="ok", result_text=main.HELD, notified=0, settled=Settled(answered=(line,)))
+    settle(p, p.deliver_pending())
+    assert slack.replies == [main.HELD] and kept(store) == []
+
+
 @pytest.mark.parametrize("then", ["refused again", "running again"])
 def test_a_usage_limit_says_nothing_until_a_try_a_minute_on_confirms_it(tmp_path, monkeypatch, fake_time, then):
     """fan's DM and a group DM meet Claude Code's usage limit: each message
@@ -5188,6 +5615,613 @@ def test_a_message_deleted_while_it_is_framed_is_not_answered(tmp_path, monkeypa
                  (("tool_use", 1, 0.1), dm(f"{AT + 30:.1f}", "that was meant for mei")), (0.3, deleted))
     assert slack.replies == ["one answer to 1: can you remind me at 5"]
     assert len(store._query("SELECT * FROM runs")) == 1 and handed_texts(tmp_path) == [[]]
+
+
+# --- what is said for a message deleted before it is posted ---
+
+def deletion(ts, channel="D1"):
+    return Event(source="slack", dedupe_key=f"{channel}:del:{ts}", payload={"kind": "deleted", "channel": channel,
+                                                                             "ts": ts})
+
+
+def session_lines(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.getMessage().startswith("memory session ")]
+
+
+def test_an_answer_to_a_message_deleted_while_its_session_works_is_not_posted(tmp_path, monkeypatch, caplog):
+    """Recorded as an answer posted nowhere is, and owed to no one."""
+    import logging
+
+    p, store, _, slack = standin_processor(tmp_path, monkeypatch, steps=[1.0])
+    line = dm(f"{AT:.1f}", "the dentist moved to the 14th")
+    keep(store, line)
+    with caplog.at_level(logging.INFO, logger="wanda"):
+        conversation(p, (0, line), (("tool_use", 1, 0.1), deletion(f"{AT:.1f}")))
+    assert slack.replies == [] and store.pending_deliveries() == [] and kept(store) == []
+    answered = "one answer to 1: the dentist moved to the 14th"
+    assert [dict(r) for r in store._query("SELECT kind, status, result_text, notified FROM runs")] == [
+        {"kind": "agent", "status": "ok", "result_text": answered, "notified": 1}]
+    [said] = session_lines(caplog)
+    assert said.endswith(f", {len(answered)} characters, not posted: its messages were deleted")
+
+
+def test_one_of_two_deleted_while_their_session_works_leaves_the_answer_posted(tmp_path, monkeypatch, caplog):
+    """The answer is for the rest; the session line says how many were taken
+    back."""
+    import logging
+
+    p, store, _, slack = standin_processor(tmp_path, monkeypatch, steps=[1.0, 0.2])
+    first, added = dm(f"{AT:.1f}", "the dentist moved to the 14th"), dm(f"{AT + 30:.1f}", "and Joan's swim is off")
+    keep(store, first), keep(store, added)
+    with caplog.at_level(logging.INFO, logger="wanda"):
+        conversation(p, (0, first), (("tool_use", 1, 0.1), added), (0.3, deletion(f"{AT:.1f}")))
+    answered = "one answer to 2: the dentist moved to the 14th | and Joan's swim is off"
+    assert slack.replies == [answered] and store.pending_deliveries() == [] and kept(store) == []
+    [said] = session_lines(caplog)
+    assert said.endswith(f", {len(answered)} characters to post, 1 of its 2 messages deleted")
+
+
+def test_a_failed_session_whose_one_message_was_deleted_gets_no_note(tmp_path, monkeypatch, caplog):
+    """Nor a second session: nothing is left to answer."""
+    import logging
+
+    p, store, _, slack = standin_processor(tmp_path, monkeypatch, steps=[1.0], fail="first")
+    line = dm(f"{AT:.1f}", "is it paid?")
+    keep(store, line)
+    with caplog.at_level(logging.INFO, logger="wanda"):
+        conversation(p, (0, line), (("tool_use", 1, 0.1), deletion(f"{AT:.1f}")))
+    assert slack.replies == [] and store.pending_deliveries() == [] and kept(store) == []
+    assert failed_runs(store) == [("agent", "error", "error_during_execution")]
+    assert len(handed_texts(tmp_path)) == 1
+    [said] = session_lines(caplog)
+    assert said.endswith(", failed: error_during_execution, not posted: its messages were deleted")
+    asyncio.run(p._flush_failed())
+    assert slack.alerts[-1].endswith(", Claude Code said: error_during_execution, not tried again, no note")
+
+
+def test_a_refused_session_whose_one_message_was_deleted_holds_nothing(tmp_path, monkeypatch, caplog):
+    """With a hold confirmed, a message newly held there would be told so
+    (HELD): one deleted while its session was refused is not held, and
+    nothing is said there. The refusal still holds sessions."""
+    import logging
+
+    p, store, _, slack = standin_processor(tmp_path, monkeypatch, startup_s=1.0, refuse={
+        "turn": "first", "error": "rate_limit", "said": "You've hit your limit · resets 5pm"})
+    since = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
+    store.set_meta("held_since", since)
+    store.set_meta("held_confirmed", since)
+    line = dm(f"{AT:.1f}", "is it paid?")
+    keep(store, line)
+    with caplog.at_level(logging.INFO, logger="wanda"):
+        conversation(p, (0, line), (0.5, deletion(f"{AT:.1f}")))
+    assert slack.replies == [] and kept(store) == [] and store.get_meta("held_since") == since
+    assert failed_runs(store) == [("agent", "refused", "You've hit your limit · resets 5pm")]
+    [said] = session_lines(caplog)
+    assert not said.endswith("; held")
+    assert said.endswith(", failed: You've hit your limit · resets 5pm, not posted: its messages were deleted")
+    asyncio.run(p._flush_failed())
+    assert slack.alerts[-1].endswith(", not tried again, no note")
+
+
+def test_a_later_turn_that_failed_on_a_message_deleted_since_runs_nothing_again(tmp_path, monkeypatch, caplog):
+    """Her answer to the first is posted; the added message its later turn
+    failed on was taken back while that turn ran, so it is neither run again
+    nor asked for again (FAILED_REST)."""
+    import logging
+
+    p, store, _, slack = standin_processor(tmp_path, monkeypatch, steps=[0.2], reply_s=1.5, steps_later=[1.0],
+                                           fail="later")
+    asked, added = dm(f"{AT:.1f}", "can you remind me at 5"), dm(f"{AT + 30:.1f}", "to call the plumber")
+    keep(store, asked), keep(store, added)
+    with caplog.at_level(logging.INFO, logger="wanda"):
+        conversation(p, (0, asked), (("tool_result", 1, 0.2), added),
+                     (("tool_use", 2, 0.2), deletion(f"{AT + 30:.1f}")))
+    answered = "one answer to 1: can you remind me at 5"
+    assert slack.replies == [answered] and store.pending_deliveries() == [] and kept(store) == []
+    assert failed_runs(store) == [("agent", "ok", "error_during_execution")]
+    assert len(handed_texts(tmp_path)) == 1
+    [said] = session_lines(caplog)
+    assert said.endswith(f", {len(answered)} characters to post, then failed: error_during_execution, "
+                         "1 of its 2 messages deleted")
+    asyncio.run(p._flush_failed())
+    assert slack.alerts[-1].endswith(", Claude Code said: error_during_execution, not tried again, no note")
+
+
+@pytest.mark.parametrize("later", [
+    {"refuse": {"turn": "later", "error": "rate_limit", "said": "You've hit your limit · resets 5pm"}},
+    {"fail": "later", "fail_subtype": "error_max_budget_usd"},
+], ids=["refused", "out of budget"])
+def test_with_the_transcript_unreadable_a_later_turn_on_a_message_deleted_since_asks_nothing(tmp_path, monkeypatch,
+                                                                                              later):
+    """Which turn took what cannot be read, and every message the session
+    was handed was taken back: no note asks for it again, though a second
+    session would meet the same refusal or budget."""
+    monkeypatch.setattr("wanda.vault.turn_starts", lambda v, sid: None)
+    monkeypatch.setattr("wanda.vault.handed", lambda v, sid: None)
+    p, store, _, slack = standin_processor(tmp_path, monkeypatch, steps=[0.2], reply_s=1.5, **later)
+    asked, added = dm(f"{AT:.1f}", "can you remind me at 5"), dm(f"{AT + 30:.1f}", "to call the plumber")
+    keep(store, asked), keep(store, added)
+    conversation(p, (0, asked), (("tool_result", 1, 0.2), added), (("tool_result", 1, 0.6), deletion(f"{AT + 30:.1f}")))
+    assert slack.replies == ["one answer to 1: can you remind me at 5"]
+    assert store.pending_deliveries() == [] and kept(store) == [] and len(handed_texts(tmp_path)) == 1
+    asyncio.run(p._flush_failed())
+    assert slack.alerts[-1].endswith(", not tried again, no note")
+
+
+@pytest.mark.parametrize("later", [
+    {"fail": "later", "fail_subtype": "error_max_budget_usd"},
+    {"refuse": {"turn": "later", "error": "rate_limit", "said": "You've hit your limit · resets 5pm"}},
+], ids=["out of budget", "refused"])
+def test_with_the_transcript_unreadable_a_later_failed_turn_is_run_again_not_asked_for(tmp_path, monkeypatch,
+                                                                                       later):
+    """What the session was handed is back on the waiting list already, and
+    the conversation's next turn answers it: no note asks for it again
+    first, whether the later turn's budget ran out or Claude Code refused
+    it."""
+    monkeypatch.setattr("wanda.vault.turn_starts", lambda v, sid: None)
+    monkeypatch.setattr("wanda.vault.handed", lambda v, sid: None)
+    p, store, _, slack = standin_processor(tmp_path, monkeypatch, steps=[0.2], reply_s=1.5, **later)
+    asked, added = dm(f"{AT:.1f}", "can you remind me at 5"), dm(f"{AT + 30:.1f}", "to call the plumber")
+    keep(store, asked), keep(store, added)
+    conversation(p, (0, asked), (("tool_result", 1, 0.2), added))
+    assert slack.replies == ["one answer to 1: can you remind me at 5", "one answer to 1: to call the plumber"]
+    assert store.pending_deliveries() == [] and kept(store) == []
+
+
+def test_a_frame_that_fails_after_its_one_message_was_deleted_gets_no_note(tmp_path, monkeypatch):
+    """The turn's failure outside its session is the alert's alone."""
+    p, store, _ = memory_processor(tmp_path, ConversationSlack(history=[]), RecordingRunner(), monkeypatch)
+    line = dm(f"{AT:.1f}", "is it paid?")
+    keep(store, line)
+
+    async def gathered(self, *args, **kw):
+        await self.handle_slack(deletion(f"{AT:.1f}"))
+        raise RuntimeError("boom")
+    monkeypatch.setattr(Processor, "_memory_arrival", gathered)
+    settle(p, p.handle_slack(line))
+    assert p.runner.calls == [] and p.slack.replies == [] and kept(store) == []
+    assert failed_runs(store) == [("agent", "error", "could not gather what was said here: boom")]
+    assert store.pending_deliveries() == []
+    asyncio.run(p._flush_failed())
+    assert p.slack.alerts[-1].endswith(", could not gather what was said here: boom, not tried again, no note")
+
+
+def test_a_retrys_frame_that_fails_after_its_one_message_was_deleted_gets_no_note(tmp_path, monkeypatch):
+    """The turn is the next start's retry of a first try a stop left: the
+    alert names that first try, tried once more, and nothing is posted."""
+    p, store, _ = memory_processor(tmp_path, ConversationSlack(history=[]), RecordingRunner(), monkeypatch)
+    store.create_task(None, "D1", "conversation", kind="dm")
+    line = dm(f"{AT:.1f}", "is it paid?")
+    key = keep(store, line)
+    tried = ["s0", 7, utcnow(), "error_during_execution", True, "other"]
+    store.settle(Settled(first_try=((key, line.payload | {"first_try": tried}),)))
+
+    async def gathered(self, *args, **kw):
+        await self.handle_slack(deletion(f"{AT:.1f}"))
+        raise RuntimeError("boom")
+    monkeypatch.setattr(Processor, "_memory_arrival", gathered)
+    q = started_again(p, RecordingRunner())
+    assert q.runner.calls == [] and q.slack.replies == [] and kept(store) == []
+    assert store.pending_deliveries() == []
+    [failed] = json.loads(store.get_meta("failed_runs"))
+    assert (failed["id"], failed["then"]) == (7, "tried once more, no note")
+
+
+def test_a_first_try_a_stop_left_whose_message_is_deleted_before_it_is_framed_is_alerted(tmp_path, monkeypatch):
+    """The next start's take-up finds nothing left to run: the first try's
+    failure is alerted as one nothing followed, and nothing is posted."""
+    p, store, _ = memory_processor(tmp_path, ConversationSlack(history=[]), RecordingRunner(), monkeypatch)
+    store.create_task(None, "D1", "conversation", kind="dm")
+    line = dm(f"{AT:.1f}", "is it paid?")
+    key = keep(store, line)
+    tried = ["s0", 7, utcnow(), "error_during_execution", True, "other"]
+    store.settle(Settled(first_try=((key, line.payload | {"first_try": tried}),)))
+    late = Processor._late_answered
+
+    async def deleted_first(self, keys):
+        await self.handle_slack(deletion(f"{AT:.1f}"))
+        return await late(self, keys)
+    monkeypatch.setattr(Processor, "_late_answered", deleted_first)
+    q = started_again(p, RecordingRunner())
+    assert q.runner.calls == [] and q.slack.replies == [] and kept(store) == []
+    assert store.pending_deliveries() == []
+    [failed] = json.loads(store.get_meta("failed_runs"))
+    assert (failed["id"], failed["then"]) == (7, "not tried again, no note")
+
+
+def test_a_message_deleted_before_its_retry_is_framed_leaves_the_first_trys_failure_alerted(tmp_path, monkeypatch):
+    """Nothing is left for the retry to run, and nothing is posted; the first
+    try's failure is alerted all the same."""
+    p, store, _ = memory_processor(tmp_path, ConversationSlack(history=[]), RecordingRunner(ok=False), monkeypatch)
+    line = dm(f"{AT:.1f}", "is it paid?")
+    keep(store, line)
+    budget, checked = p.check_budget, []
+
+    async def checking(**kw):
+        # the third check is the retry's, after the first try was recorded
+        checked.append(kw)
+        if len(checked) == 3:
+            await p.handle_slack(deletion(f"{AT:.1f}"))
+        return await budget(**kw)
+    monkeypatch.setattr(p, "check_budget", checking)
+    settle(p, p.handle_slack(line))
+    assert len(p.runner.calls) == 1 and p.slack.replies == [] and kept(store) == []
+    assert store.pending_deliveries() == []
+    [failed] = json.loads(store.get_meta("failed_runs"))
+    assert (failed["said"], failed["then"]) == ("claude reported an error", "not tried again, no note")
+
+
+def test_a_retrys_frame_that_fails_names_the_first_try_once(tmp_path, monkeypatch):
+    """The first try fails, and the retry's frame cannot be built: her note
+    is posted, and the first try is named once in the alert, by the note."""
+    p, store, _ = memory_processor(tmp_path, ConversationSlack(history=[]), RecordingRunner(ok=False), monkeypatch)
+    line = dm(f"{AT:.1f}", "is it paid?")
+    keep(store, line)
+    arrival, calls = Processor._memory_arrival, []
+
+    async def second_fails(self, *args, **kw):
+        calls.append(1)
+        if len(calls) == 2:
+            raise RuntimeError("boom")
+        return await arrival(self, *args, **kw)
+    monkeypatch.setattr(Processor, "_memory_arrival", second_fails)
+    settle(p, p.handle_slack(line))
+    assert len(p.runner.calls) == 1 and p.slack.replies == [main.FAILED]
+    failed = json.loads(store.get_meta("failed_runs"))
+    assert [f["then"] for f in failed] == ["tried once more, a note asked for it again"]
+
+
+def test_an_answer_slack_refused_whose_message_is_then_deleted_is_not_posted(tmp_path, monkeypatch, caplog):
+    """At the next pass the run is owed no longer, and nothing is posted."""
+    import logging
+
+    slack = Refusing(history=[])
+    p, store, _ = memory_processor(tmp_path, slack, RecordingRunner(answer("On Wednesday the 14th, then.")),
+                                   monkeypatch)
+    line = dm(f"{AT:.1f}", "the dentist moved to the 14th")
+    key = keep(store, line)
+    settle(p, p.handle_slack(line))
+    assert slack.refused == ["On Wednesday the 14th, then."] and [r[1] for r in kept(store)] == ["answered"]
+    settle(p, p.handle_slack(deletion(key[1])))
+    assert [r["deleted"] for r in store.kept()] == [1]
+    p.slack = ConversationSlack(history=[])
+    with caplog.at_level(logging.INFO, logger="wanda"):
+        a_pass(p)
+    assert p.slack.replies == [] and store.pending_deliveries() == [] and kept(store) == []
+    [run] = store._query("SELECT id, session_id, notified FROM runs")
+    assert run["notified"] == 1
+    assert f"run {run['id']} of session {run['session_id']} not posted: its messages were deleted" in caplog.text
+
+
+def test_a_message_deleted_as_its_answer_is_posted_reads_not_posted(tmp_path, monkeypatch, caplog):
+    """The session ended with its message standing, which is deleted before
+    the answer reaches Slack: the answer is not posted, and the session line
+    says so."""
+    import logging
+
+    p, store, _ = memory_processor(tmp_path, ConversationSlack(history=[]), RecordingRunner(answer("At 5, then.")),
+                                   monkeypatch)
+    line = dm(f"{AT:.1f}", "can you remind me at 5")
+    keep(store, line)
+    post = p._post
+
+    async def deleted_first(run, *a, **kw):
+        await p.handle_slack(deletion(f"{AT:.1f}"))
+        return await post(run, *a, **kw)
+    monkeypatch.setattr(p, "_post", deleted_first)
+    with caplog.at_level(logging.INFO, logger="wanda"):
+        settle(p, p.handle_slack(line))
+    assert p.slack.replies == []
+    [said] = session_lines(caplog)
+    assert said.endswith(", 11 characters, not posted: its messages were deleted"), said
+
+
+@pytest.mark.parametrize("deleted,posted", [("both", []), ("the first", [main.FAILED_REST]),
+                                            ("the second", ["At 5, then."])])
+def test_an_answer_and_her_note_after_it_are_each_posted_only_while_a_message_of_its_own_stands(
+        tmp_path, monkeypatch, deleted, posted):
+    """Her answer holds the first message and her note the second, which it
+    asks for again: each is posted while its own stands, in their order."""
+    p, store, _ = memory_processor(tmp_path, ConversationSlack(history=[]), RecordingRunner(), monkeypatch)
+    keys = (keep(store, dm(f"{AT:.1f}", "can you remind me at 5")),
+            keep(store, dm(f"{AT + 30:.1f}", "to call the plumber")))
+    tid = store.create_task(None, "D1", "conversation", kind="dm")
+    store.record_run_and_note(
+        main.FAILED_REST, settled=Settled(answered=keys[:1]), noted=Settled(answered=keys[1:]), kind="agent",
+        task_id=tid, session_id="s1", started_at=utcnow(), exit_code=0, cost_usd=0.4, status="ok",
+        error="error_during_execution", result_text="At 5, then.", notified=0)
+    for key in {"both": keys, "the first": keys[:1], "the second": keys[1:]}[deleted]:
+        settle(p, p.handle_slack(deletion(key[1])))
+    asyncio.run(p.deliver_pending())
+    assert p.slack.replies == posted
+    assert store.pending_deliveries() == [] and kept(store) == []
+
+
+@pytest.mark.parametrize("deleted,posted", [("both", []), ("the second", ["At 5, then.", main.FAILED_REST])])
+def test_an_answer_whose_messages_are_kept_on_her_note_is_checked_by_the_notes(tmp_path, monkeypatch, caplog,
+                                                                               deleted, posted):
+    """An answer and her note recorded with every message on the note, as
+    when the note can name none of what it asks for again, still waiting:
+    the answer has none of its own, and is posted while one of the note's
+    stands."""
+    import logging
+
+    p, store, _ = memory_processor(tmp_path, ConversationSlack(history=[]), RecordingRunner(), monkeypatch)
+    keys = (keep(store, dm(f"{AT:.1f}", "can you remind me at 5")),
+            keep(store, dm(f"{AT + 30:.1f}", "to call the plumber")))
+    tid = store.create_task(None, "D1", "conversation", kind="dm")
+    run_id, note_id = store.record_run_and_note(
+        main.FAILED_REST, noted=Settled(answered=keys), kind="agent", task_id=tid, session_id="s1",
+        started_at=utcnow(), exit_code=0, cost_usd=0.4, status="ok", error="error_during_execution",
+        result_text="At 5, then.", notified=0)
+    for key in keys if deleted == "both" else keys[1:]:
+        settle(p, p.handle_slack(deletion(key[1])))
+    with caplog.at_level(logging.INFO, logger="wanda"):
+        asyncio.run(p.deliver_pending())
+    assert p.slack.replies == posted
+    assert store.pending_deliveries() == [] and kept(store) == []
+    if deleted == "both":
+        for run in (run_id, note_id):
+            assert f"run {run} of session s1 not posted: its messages were deleted" in caplog.text
+
+
+def test_her_note_for_a_turn_that_failed_outside_its_session_logs_no_session_when_not_posted(tmp_path,
+                                                                                            monkeypatch, caplog):
+    """A note recorded for a turn whose frame failed has no session: once its
+    message is deleted, delivery's line names none."""
+    import logging
+
+    p, store, _ = memory_processor(tmp_path, ConversationSlack(history=[]), RecordingRunner(), monkeypatch)
+    key = keep(store, dm(f"{AT:.1f}", "is it paid?"))
+    tid = store.create_task(None, "D1", "conversation", kind="dm")
+    _, note_id = store.record_run_and_note(
+        main.FAILED, noted=Settled(answered=(key,)), kind="agent", task_id=tid, session_id=None,
+        started_at=utcnow(), exit_code=None, cost_usd=0.0, status="error", error="could not gather what was said")
+    settle(p, p.handle_slack(deletion(key[1])))
+    with caplog.at_level(logging.INFO, logger="wanda"):
+        asyncio.run(p.deliver_pending())
+    assert p.slack.replies == [] and store.pending_deliveries() == []
+    assert f"run {note_id} not posted: its messages were deleted" in caplog.text
+
+
+@pytest.mark.parametrize("deleted,posted", [(0, [main.FAILED_REST]), (1, ["one answer to 1: can you remind me at 5"])],
+                         ids=["the one answered", "the one asked for again"])
+def test_an_answer_and_her_note_slack_refused_are_posted_for_what_still_stands(tmp_path, monkeypatch, deleted,
+                                                                                posted):
+    """Her answer to the first message and her note asking again for the one
+    added after it, whose turn ran out of budget, both wait while Slack
+    refuses them; once one of the two messages is deleted, the next pass
+    posts only what answers the other."""
+    p, store, _, slack = standin_processor(tmp_path, monkeypatch, slack=Refusing(history=[]), steps=[0.2],
+                                           reply_s=1.5, fail="later", fail_subtype="error_max_budget_usd")
+    lines = (dm(f"{AT:.1f}", "can you remind me at 5"), dm(f"{AT + 30:.1f}", "to call the plumber"))
+    for line in lines:
+        keep(store, line)
+    conversation(p, (0, lines[0]), (("tool_result", 1, 0.2), lines[1]))
+    assert slack.refused == ["one answer to 1: can you remind me at 5"] and len(store.pending_deliveries()) == 2
+    settle(p, p.handle_slack(deletion(lines[deleted].payload["ts"])))
+    p.slack = ConversationSlack(history=[])
+    a_pass(p)
+    assert p.slack.replies == posted and store.pending_deliveries() == [] and kept(store) == []
+
+
+@pytest.mark.parametrize("later,posted,line,held", [
+    ({"fail": "later", "fail_subtype": "error_max_budget_usd"}, [main.FAILED_REST],
+     "error_max_budget_usd; a note asks for it again", []),
+    ({"fail": "later"}, ["one answer to 1: to call the plumber"],
+     "error_during_execution; run again as the next turn", []),
+    ({"refuse": {"turn": "later", "error": "rate_limit", "said": "You've hit your limit · resets 5pm"}}, [],
+     "You've hit your limit · resets 5pm; held", ["held"]),
+], ids=["out of budget", "another failure", "refused"])
+def test_an_answer_whose_one_message_is_deleted_while_she_works_is_not_posted_beside_what_follows(
+        tmp_path, monkeypatch, caplog, later, posted, line, held):
+    """The first message is deleted while she works, before her answer to it,
+    and the turn the added one began fails after that answer: it is kept as
+    one whose every message was deleted, and only what follows for the added
+    one goes on, her note asking for it again, its run again or its hold."""
+    import logging
+
+    p, store, _, slack = standin_processor(tmp_path, monkeypatch, steps=[0.2], reply_s=1.5, steps_later=[1.0],
+                                           **later)
+    asked, added = dm(f"{AT:.1f}", "can you remind me at 5"), dm(f"{AT + 30:.1f}", "to call the plumber")
+    keep(store, asked), keep(store, added)
+    with caplog.at_level(logging.INFO, logger="wanda"):
+        conversation(p, (0, asked), (("tool_result", 1, 0.2), added), (0.3, deletion(f"{AT:.1f}")))
+    assert slack.replies == posted and store.pending_deliveries() == []
+    assert [r[1] for r in kept(store)] == held
+    answered = "one answer to 1: can you remind me at 5"
+    [run] = store._query("SELECT notified FROM runs WHERE kind='agent' AND result_text=?", (answered,))
+    assert run["notified"] == 1
+    said = session_lines(caplog)[0]
+    assert said.endswith(f", {len(answered)} characters, not posted: its messages were deleted, then failed: {line}")
+
+
+def test_an_answer_beside_a_note_that_names_none_of_what_it_asks_for_is_posted_while_one_stands(tmp_path,
+                                                                                               monkeypatch):
+    """Two messages framed together, the second deleted while she works; her
+    answer covers both, and a turn the transcript does not show then runs out
+    of budget, so her note can name none of what it asks for and holds them
+    all: the answer is posted, the first standing, and the note after it."""
+    def result(out=None):
+        return ({"type": "result", "subtype": "success", "is_error": False, "result": json.dumps(out),
+                 "structured_output": out} if out else
+                {"type": "result", "subtype": "error_max_budget_usd", "is_error": True})
+    results = [result(answer("Yes, at 5.")), result()]
+    monkeypatch.setattr("wanda.vault.turn_starts", lambda v, sid: [vault.Turn(True, [])])
+    runner = RecordingRunner(RunResult(ok=False, envelope=results[-1], error="error_max_budget_usd",
+                                       results=results))
+    p, store, _ = memory_processor(tmp_path, ConversationSlack(history=[]), runner, monkeypatch)
+    keep(store, dm(f"{AT:.1f}", "is the plumber coming?"))
+    keep(store, dm(f"{AT + 10:.1f}", "and when?"))
+    run = runner.run
+
+    async def deleted_while_it_runs(prompt, **kw):
+        await p.handle_slack(deletion(f"{AT + 10:.1f}"))
+        return await run(prompt, **kw)
+    monkeypatch.setattr(runner, "run", deleted_while_it_runs)
+
+    async def go():
+        for task, keys in p.kept():
+            p.take_up(task, keys)
+        while p._bg:
+            await asyncio.sleep(0.01)
+    asyncio.run(go())
+    assert len(runner.calls) == 1 and p.slack.replies == ["Yes, at 5.", main.FAILED_REST]
+
+
+def test_a_refused_session_with_one_of_its_two_messages_deleted_holds_the_other(tmp_path, monkeypatch, caplog):
+    """Nothing said, and Claude Code refusing the session: the message that
+    stands is held, so the line names the one deleted and not the turn's as
+    posted nowhere."""
+    import logging
+
+    p, store, _, slack = standin_processor(tmp_path, monkeypatch, startup_s=1.0, refuse={
+        "turn": "first", "error": "rate_limit", "said": "You've hit your limit · resets 5pm"})
+    first, second = dm(f"{AT:.1f}", "is the plumber coming?"), dm(f"{AT + 10:.1f}", "and when?")
+    keep(store, first), keep(store, second)
+
+    async def go():
+        for task, keys in p.kept():
+            p.take_up(task, keys)
+        await asyncio.sleep(0.5)
+        await p.handle_slack(deletion(f"{AT + 10:.1f}"))
+        while p._bg:
+            await asyncio.sleep(0.01)
+    with caplog.at_level(logging.INFO, logger="wanda"):
+        asyncio.run(go())
+    assert [r[:2] for r in kept(store)] == [(f"{AT:.1f}", "held")]
+    [said] = session_lines(caplog)
+    assert said.endswith(", failed: You've hit your limit · resets 5pm; held, 1 of its 2 messages deleted"), said
+
+
+def test_a_silent_session_whose_every_message_was_deleted_says_so(tmp_path, monkeypatch, caplog):
+    """The line reads `silent, 1 of its 1 messages deleted`, not a bare
+    `silent`, which would read as a DM left unanswered."""
+    import logging
+
+    runner = RecordingRunner(answer(""))
+    p, store, _ = memory_processor(tmp_path, ConversationSlack(history=[]), runner, monkeypatch)
+    line = dm(f"{AT:.1f}", "the dentist moved to the 14th")
+    keep(store, line)
+    run = runner.run
+
+    async def deleted_while_it_runs(prompt, **kw):
+        await p.handle_slack(deletion(f"{AT:.1f}"))
+        return await run(prompt, **kw)
+    monkeypatch.setattr(runner, "run", deleted_while_it_runs)
+    with caplog.at_level(logging.INFO, logger="wanda"):
+        settle(p, p.handle_slack(line))
+    assert p.slack.replies == [] and kept(store) == []
+    [said] = session_lines(caplog)
+    assert said.endswith(", silent, 1 of its 1 messages deleted")
+
+
+def test_a_framed_session_whose_turn_holds_no_message_posts_its_answer(tmp_path, monkeypatch):
+    """Nothing it answers was deleted: a frame whose turn holds no message
+    still posts what she says."""
+    runner = RecordingRunner(answer("Time to call the plumber."))
+    p, store, _ = memory_processor(tmp_path, ConversationSlack(history=[]), runner, monkeypatch)
+    store.create_task(None, "D1", "conversation", kind="dm")
+    task = store.get_task_by_thread("D1", "conversation")
+    now = datetime.fromtimestamp(AT, p.cfg.zone)
+
+    async def frame(again):
+        return "an arrival", now, Additions([], lambda m: None, main.Holding(store))
+    asyncio.run(p.memory_turn(task, None, None, channel="D1", reply_thread=None, owed=False, frame=frame))
+    assert p.slack.replies == ["Time to call the plumber."]
+
+
+def test_a_stop_after_an_answer_to_a_message_then_deleted_leaves_nothing_owed(tmp_path, monkeypatch):
+    """The answer the session gave before the stop cut a later turn short is
+    the run's, and with its one message deleted is owed to no one: the next
+    start posts nothing."""
+    p, store, _, slack = standin_processor(tmp_path, monkeypatch, steps=[0.2], notify="after", hang="later")
+    line = dm(f"{AT:.1f}", "can you remind me at 5")
+    keep(store, line)
+
+    async def go():
+        t = asyncio.create_task(p.handle_slack(line))
+        p._bg.add(t)
+        await moment(("structured_output", 1, 0.2), p.cfg.vault_dir)
+        await p.handle_slack(deletion(f"{AT:.1f}"))
+        await p.shutdown(grace_s=1)
+    asyncio.run(go())
+    [run] = [dict(r) for r in store._query("SELECT status, notified, result_text FROM runs")]
+    assert run == {"status": "ok", "notified": 1, "result_text": "one answer to 1: can you remind me at 5"}
+    assert kept(store) == [] and store.pending_deliveries() == []
+    again = RecordingRunner()
+    q = started_again(p, again, slack)
+    asyncio.run(q.deliver_pending())
+    assert again.calls == [] and slack.replies == []
+
+
+def test_a_stop_during_a_further_turn_leaves_an_answer_to_a_message_deleted_meanwhile_owed_to_no_one(tmp_path,
+                                                                                                      monkeypatch):
+    """The first message is answered, a follow-up runs a further turn, and the
+    first is deleted while that turn runs, before the stop: the answer
+    answers the deleted message alone, so it is owed to no one, and the next
+    start posts only the follow-up's answer."""
+    p, store, _, slack = standin_processor(tmp_path, monkeypatch, steps=[0.2], reply_s=1.0, steps_later=[30])
+
+    async def go():
+        for at, ev in ((0, dm(f"{AT:.1f}", "can you remind me at 5")),
+                       (("tool_result", 1, 0.2), dm(f"{AT + 30:.1f}", "to call the plumber"))):
+            await moment(at, p.cfg.vault_dir)
+            keep(store, ev)
+            t = asyncio.create_task(p.handle_slack(ev))
+            p._bg.add(t)
+        await moment(("tool_use", 2, 0.2), p.cfg.vault_dir)
+        await p.handle_slack(deletion(f"{AT:.1f}"))
+        await p.shutdown(grace_s=5)
+    asyncio.run(go())
+    [run] = [dict(r) for r in store._query("SELECT status, notified, result_text FROM runs")]
+    assert run == {"status": "ok", "notified": 1, "result_text": "one answer to 1: can you remind me at 5"}
+    assert [r[:2] for r in kept(store)] == [(f"{AT + 30:.1f}", "due")]
+    started_again(p, RecordingRunner(answer("At 5, then.")), slack)
+    assert slack.replies == ["At 5, then."] and kept(store) == []
+
+
+def test_a_stop_during_a_further_turn_leaves_an_answer_to_two_messages_deleted_meanwhile_owed_to_no_one(
+        tmp_path, monkeypatch):
+    """The first message and one handed into the first turn are answered
+    together, a third runs a further turn, and both are deleted while it
+    runs, before the stop: the answer answers nothing that stands, and the
+    next start posts only the third's answer."""
+    p, store, _, slack = standin_processor(tmp_path, monkeypatch, steps=[1.0, 0.2], reply_s=1.0, steps_later=[30])
+
+    async def go():
+        for at, ev in ((0, dm(f"{AT:.1f}", "can you remind me at 5")),
+                       (("tool_use", 1, 0.1), dm(f"{AT + 10:.1f}", "to call the plumber")),
+                       (("tool_result", 2, 0.2), dm(f"{AT + 30:.1f}", "and the dentist"))):
+            await moment(at, p.cfg.vault_dir)
+            keep(store, ev)
+            t = asyncio.create_task(p.handle_slack(ev))
+            p._bg.add(t)
+        await moment(("tool_use", 3, 0.2), p.cfg.vault_dir)
+        await p.handle_slack(deletion(f"{AT:.1f}"))
+        await p.handle_slack(deletion(f"{AT + 10:.1f}"))
+        await p.shutdown(grace_s=5)
+    asyncio.run(go())
+    [run] = [dict(r) for r in store._query("SELECT status, notified, result_text FROM runs")]
+    assert run == {"status": "ok", "notified": 1,
+                   "result_text": "one answer to 2: can you remind me at 5 | to call the plumber"}
+    assert [r[:2] for r in kept(store)] == [(f"{AT + 30:.1f}", "due")]
+    started_again(p, RecordingRunner(answer("The dentist, noted.")), slack)
+    assert slack.replies == ["The dentist, noted."] and kept(store) == []
+
+
+def test_a_clock_run_with_no_kept_messages_is_posted_later_as_ever(tmp_path, monkeypatch):
+    """Nothing it answers can be deleted."""
+    p, store, _ = memory_processor(tmp_path, Refusing(history=[]), RecordingRunner(answer("Time to call the plumber.")),
+                                   monkeypatch)
+    store.create_task(None, "D1", "conversation", kind="dm")
+    task = store.get_task_by_thread("D1", "conversation")
+    asyncio.run(p.memory_turn(task, "It is 17:00, as asked:\n\n    call the plumber",
+                              datetime.fromtimestamp(AT, p.cfg.zone), channel="D1", reply_thread=None, owed=False))
+    assert len(store.pending_deliveries()) == 1
+    p.slack = ConversationSlack(history=[])
+    asyncio.run(p.deliver_pending())
+    assert p.slack.replies == ["Time to call the plumber."] and store.pending_deliveries() == []
 
 
 class ChangingSlack(ConversationSlack):

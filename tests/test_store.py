@@ -138,6 +138,25 @@ def test_what_a_run_answers_goes_when_it_is_posted(store):
     assert [r["ts"] for r in store.kept()] == ["3.3"]
 
 
+def test_a_deletion_marks_an_answered_message_and_still_forgets_a_due_one(store):
+    """The answered one stays for its run, marked, which a post reads; one
+    forgotten for any other reason is not marked."""
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    task = store.create_task(None, "D1", "conversation", kind="dm")
+    for ts in ("1.1", "2.2", "3.3"):
+        store.first_time(f"D1:{ts}", message(ts))
+    run = store.record_run(kind="agent", task_id=task, session_id="s1", started_at=now, exit_code=0, cost_usd=0.1,
+                           status="ok", result_text="Noted.", notified=0,
+                           settled=Settled(answered=(("D1", "1.1"), ("D1", "3.3"))))
+    assert store.forget([("D1", "3.3")]) == []
+    assert store.forget([("D1", "1.1"), ("D1", "2.2")], deleted=True) == [("D1", "2.2")]
+    assert [(r["ts"], r["state"], r["deleted"]) for r in store.kept()] == [("1.1", "answered", 1),
+                                                                           ("3.3", "answered", 0)]
+    assert [r["ts"] for r in store.answering(run)] == ["1.1", "3.3"]
+    store.mark_run_notified(run)
+    assert store.kept() == []
+
+
 def test_runs_accounting(store):
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     store.record_run(kind="triage", task_id=None, session_id=None, started_at=now,

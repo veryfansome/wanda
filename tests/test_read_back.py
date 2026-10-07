@@ -17,7 +17,7 @@ from wanda import main, vault
 from wanda.actions.slack import CallFailed
 from wanda.events import Event
 from wanda.main import Gate, Processor
-from wanda.store import Store, utcnow
+from wanda.store import Settled, Store, utcnow
 from wanda.watchers.slack_watcher import SlackWatcher
 
 from test_processor import (  # noqa: F401
@@ -1430,6 +1430,119 @@ def test_a_kept_row_slack_says_is_gone_is_withdrawn_and_runs_nothing(tmp_path, m
     runner = RecordingRunner()
     starting(tmp_path, monkeypatch, runner, slack)
     assert runner.calls == [] and kept(store) == [] and slack.replies == []
+
+
+@pytest.mark.parametrize("owed", ["an answer a stop left", "her note Slack refused", "two stops cut it short",
+                                  "her note on the cap", "her note on a hold"])
+def test_a_kept_row_an_owed_run_answers_slack_says_is_gone_gets_nothing_posted(tmp_path, monkeypatch, owed):
+    """Answered before the stop, or given her note at the start, and deleted
+    while she was down: her reaction, put on again and late, meets
+    message_not_found before the run is posted, and nothing is."""
+    t = float(int(time.time()))
+    store = store_down_an_hour(tmp_path, t)
+    line = keep(store, dm(f"{t - 3000:.1f}", "sent to the wrong person"))
+    task = store.create_task(None, "D1", "conversation", kind="dm")
+    if owed == "an answer a stop left":
+        store.record_run(kind="agent", task_id=task, session_id="s1", started_at=utcnow(), exit_code=None,
+                         cost_usd=0.0, status="ok", result_text="Noted, the 14th.", notified=0,
+                         settled=Settled(answered=(line,)))
+    elif owed == "her note Slack refused":
+        store.record_run_and_note(main.FAILED, noted=Settled(answered=(line,)), kind="agent", task_id=task,
+                                  session_id="s1", started_at=utcnow(), exit_code=1, cost_usd=0.0, status="error")
+    elif owed == "two stops cut it short":
+        store.took("s1", [line], {line})
+        store.took("s2", [line], {line})
+    else:
+        kept_as = (Settled(capped=(line,)) if owed == "her note on the cap" else Settled(held=((line, "s1"),)))
+        store.record_run(kind="note", task_id=task, session_id=None, started_at=utcnow(), exit_code=None,
+                         cost_usd=0.0, status="ok", notified=0, settled=kept_as,
+                         result_text=main.CAPPED_NOTE if owed == "her note on the cap" else main.HELD)
+    slack = Slack()
+    slack.react_errors[line] = slack_error("message_not_found")
+    runner = RecordingRunner()
+    starting(tmp_path, monkeypatch, runner, slack)
+    assert runner.calls == [] and slack.replies == [] and kept(store) == [] and store.pending_deliveries() == []
+
+
+def test_a_hold_confirmed_after_a_start_tells_no_conversation_whose_held_messages_were_deleted(
+        tmp_path, monkeypatch, fake_time):
+    """Two conversations held across a stop, the hold not yet confirmed; one
+    message deleted while she was down. The hold's try a pass makes is
+    refused again, which confirms the hold: her note goes where a held
+    message stands, and her reaction, put on again and late, meets
+    message_not_found where none does, so nothing is posted there."""
+    from test_processor import Limited
+    p, store, slack, runner = running(tmp_path, monkeypatch, fake_time, runner=Limited(), late_adds=True)
+    stands = keep(store, dm(f"{NOW - 8 * 3600:.1f}", "is it paid?"))
+    gone = keep(store, dm(f"{NOW - 7 * 3600:.1f}", "sent to the wrong person", channel="D2", user="U2"))
+    store.create_task(None, "D1", "conversation", kind="dm")
+    store.create_task(None, "D2", "conversation", kind="dm")
+    store._exec("UPDATE unanswered SET state='held'")
+    store.set_meta("held_since", iso(NOW - 300))
+    slack.react_errors[gone] = slack_error("message_not_found")
+
+    async def go():
+        await p.drain_mail()
+    with_loop(p, go)
+    assert len(runner.calls) == 1 and slack.replies == [main.HELD] and slack.channels == ["D1"]
+    assert [(r["ts"], r["state"]) for r in store.kept()] == [(stands[1], "held")]
+
+
+def test_an_owed_answer_to_two_messages_both_gone_while_she_was_down_is_not_posted(tmp_path, monkeypatch):
+    """Her reaction goes on again on each message the answer answers, and
+    Slack saying each is gone leaves nothing to post."""
+    t = float(int(time.time()))
+    store = store_down_an_hour(tmp_path, t)
+    first = keep(store, dm(f"{t - 3100:.1f}", "remind me at 5"))
+    second = keep(store, dm(f"{t - 3000:.1f}", "and the dentist"))
+    task = store.create_task(None, "D1", "conversation", kind="dm")
+    store.record_run(kind="agent", task_id=task, session_id="s1", started_at=utcnow(), exit_code=None,
+                     cost_usd=0.0, status="ok", result_text="Both noted.", notified=0,
+                     settled=Settled(answered=(first, second)))
+    slack = Slack()
+    slack.react_errors[first] = slack.react_errors[second] = slack_error("message_not_found")
+    runner = RecordingRunner()
+    starting(tmp_path, monkeypatch, runner, slack)
+    assert runner.calls == [] and slack.replies == [] and kept(store) == [] and store.pending_deliveries() == []
+
+
+def test_an_owed_answer_with_none_of_its_own_is_checked_by_her_note_after_it_at_a_start(tmp_path, monkeypatch):
+    """The answer's own message was deleted while she worked, and her note
+    after it asks for the one added since, which is deleted while she is
+    down: neither is posted."""
+    t = float(int(time.time()))
+    store = store_down_an_hour(tmp_path, t)
+    first = keep(store, dm(f"{t - 3100:.1f}", "remind me at 5"))
+    added = keep(store, dm(f"{t - 3000:.1f}", "and the dentist"))
+    task = store.create_task(None, "D1", "conversation", kind="dm")
+    store.forget([first], deleted=True)
+    store.record_run_and_note(main.FAILED_REST, settled=Settled(answered=()), noted=Settled(answered=(added,)),
+                              kind="agent", task_id=task, session_id="s1", started_at=utcnow(), exit_code=1,
+                              cost_usd=0.0, status="ok", result_text="At 5, then.", notified=0)
+    slack = Slack()
+    slack.react_errors[added] = slack_error("message_not_found")
+    runner = RecordingRunner()
+    starting(tmp_path, monkeypatch, runner, slack)
+    assert runner.calls == [] and slack.replies == [] and kept(store) == [] and store.pending_deliveries() == []
+
+
+def test_an_owed_answer_asks_slack_again_only_about_its_messages_not_known_deleted(tmp_path, monkeypatch):
+    """One of the answer's two messages was deleted before the stop, so she
+    already knows it is gone: her reaction goes on again on the other alone,
+    and the answer is posted for it."""
+    t = float(int(time.time()))
+    store = store_down_an_hour(tmp_path, t)
+    first = keep(store, dm(f"{t - 3100:.1f}", "remind me at 5"))
+    second = keep(store, dm(f"{t - 3000:.1f}", "and the dentist"))
+    task = store.create_task(None, "D1", "conversation", kind="dm")
+    store.record_run(kind="agent", task_id=task, session_id="s1", started_at=utcnow(), exit_code=None,
+                     cost_usd=0.0, status="ok", result_text="Both noted.", notified=0,
+                     settled=Settled(answered=(first, second)))
+    store.forget([first], deleted=True)
+    slack = Slack()
+    runner = RecordingRunner()
+    starting(tmp_path, monkeypatch, runner, slack)
+    assert slack.replies == ["Both noted."] and [k for k, _ in slack.react_times] == [second]
 
 
 def test_an_edited_message_is_taken_as_it_stands(tmp_path, monkeypatch):

@@ -34,7 +34,8 @@ the same home, the last for every one after:
 `startup_s`, `steps` (seconds each tool call of the first turn takes),
 `reply_s` (time from the last tool call to the result), `steps_later` (the
 tool calls of a later turn), `fail` ("first" or "later": that turn's result
-is an error), `no_report` ("first" or "later": that turn ends as a success
+is an error, of the subtype `fail_subtype`, error_during_execution unless
+set), `no_report` ("first" or "later": that turn ends as a success
 carrying the model's text and no structured output, as the first turns of
 two of those sessions did), `crash` ("later": the process exits 1
 in a later turn, before its result, as a crash or a kill from outside would
@@ -259,7 +260,8 @@ def main():
         covered = handed[answered:] if index_now > 0 and cfg.get("answer_new") else handed
         answered = len(handed)
         if fail:
-            emit({"type": "result", "subtype": "error_during_execution", "is_error": True, "num_turns": 1,
+            emit({"type": "result", "subtype": cfg.get("fail_subtype", "error_during_execution"), "is_error": True,
+                  "num_turns": 1,
                   "session_id": sid, "total_cost_usd": round(cost, 4), "result_index": index_now,
                   "queued_turn_count": 0, "errors": ["stand-in failure"], "uuid": str(uuid.uuid4())})
             return

@@ -120,6 +120,9 @@ MIGRATIONS = (
     # and for a DM holds a sentinel that is not a Slack timestamp.
     ("tasks", "reply_thread", "TEXT"),
     ("runs", "deliver_attempts", "INTEGER NOT NULL DEFAULT 0"),
+    # A kept message deleted after a run answered it: the row stays, for
+    # that run, and a run whose every message is so marked is not posted.
+    ("unanswered", "deleted", "INTEGER NOT NULL DEFAULT 0"),
 )
 
 # How many of the intervals she was not running are kept, the newest; a
@@ -473,17 +476,20 @@ class Store:
                                  "value=excluded.value", meta)
         return run_id
 
-    def record_run_and_note(self, note: str, settled: Settled | None = None, **run) -> tuple[int, int]:
+    def record_run_and_note(self, note: str, settled: Settled | None = None, noted: Settled | None = None,
+                            **run) -> tuple[int, int]:
         """A run, and her note in its conversation after it, a run of kind
         `note` owed to the same task under the same session, written in one
-        transaction with what they do to the turn's kept messages: a restart
-        finds all of it or none, so a failure is never left with nothing said
-        for it. Returns both ids."""
+        transaction with what they do to the turn's kept messages, `settled`
+        the run's and `noted` the note's: a restart finds all of it or none,
+        so a failure is never left with nothing said for it. Returns both
+        ids."""
         with self._transaction():
             run_id = self._insert_run(**run)
             note_id = self._insert_run("note", run["task_id"], run["session_id"], run["started_at"], None, 0.0,
                                        "ok", None, note, 0)
-            self._settle(settled, note_id)
+            self._settle(settled, run_id)
+            self._settle(noted, note_id)
         return run_id, note_id
 
     def settle(self, settled: Settled) -> None:
@@ -607,11 +613,11 @@ class Store:
             "SELECT n.id FROM runs r JOIN runs n ON n.task_id = r.task_id AND n.session_id = r.session_id "
             "AND n.id > r.id WHERE r.id = ? AND n.kind = 'note' AND n.notified = 0", (run_id,))]
 
-    def answering(self, run_id: int) -> list[sqlite3.Row]:
-        """The kept messages a run answers, and those of the notes giving it
-        up would drop with it, oldest first."""
+    def answering(self, run_id: int, own: bool = False) -> list[sqlite3.Row]:
+        """The kept messages a run answers, and, unless `own`, those of the
+        notes giving it up would drop with it, oldest first."""
         with self._lock:
-            runs = [run_id, *self._notes_after(run_id)]
+            runs = [run_id] if own else [run_id, *self._notes_after(run_id)]
             return self._db.execute(
                 f"SELECT * FROM unanswered WHERE state='answered' AND run IN ({','.join('?' * len(runs))}) "
                 "ORDER BY CAST(ts AS REAL)", runs).fetchall()
@@ -664,6 +670,11 @@ class Store:
                            "ON e.event_id = u.channel || ':' || u.ts WHERE ? IS NULL OR (u.channel=? AND u.task_key=?) "
                            "ORDER BY CAST(u.ts AS REAL)", (channel, channel, task_key))
 
+    def kept_in(self, task_id: int) -> list[sqlite3.Row]:
+        """The messages kept in a task's conversation, oldest first."""
+        return self._query("SELECT u.* FROM unanswered u JOIN tasks t ON u.channel = t.slack_channel "
+                           "AND u.task_key = t.thread_ts WHERE t.id=? ORDER BY CAST(u.ts AS REAL)", (task_id,))
+
     def took(self, sid: str, keys, counted) -> None:
         """The session `sid` has taken these kept messages, by (channel, ts):
         a try is counted for each in `counted`. One capped or held stays so
@@ -679,11 +690,15 @@ class Store:
             self._db.executemany("UPDATE unanswered SET session=NULL, tries=MAX(tries-1, 0) WHERE channel=? "
                                  "AND ts=? AND state='due'", list(keys))
 
-    def forget(self, keys) -> list[tuple[str, str]]:
+    def forget(self, keys, deleted: bool = False) -> list[tuple[str, str]]:
         """Kept messages that no run will answer: deleted, refused, or
-        answered with no run. One already answered stays, for its run.
-        Returns those no longer kept."""
+        answered with no run. One already answered stays, for its run, and
+        when it was `deleted` is marked so. Returns those no longer kept."""
+        keys = list(keys)
         with self._transaction():
+            if deleted:
+                self._db.executemany("UPDATE unanswered SET deleted=1 WHERE channel=? AND ts=? "
+                                     "AND state='answered'", keys)
             return [k for k in keys if self._db.execute(
                 "DELETE FROM unanswered WHERE channel=? AND ts=? AND state <> 'answered'", k).rowcount]
 
@@ -789,3 +804,7 @@ class Store:
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (key, value),
         )
+
+    def unmark(self, key: str, value: str) -> None:
+        """Deletes a meta key while it holds `value`."""
+        self._exec("DELETE FROM meta WHERE key=? AND value=?", (key, value))
