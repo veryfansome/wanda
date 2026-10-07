@@ -954,6 +954,43 @@ def test_a_clock_session_posts_the_last_answer_it_gave_that_says_something(tmp_p
     assert p._listed("U1", task) == ("2026-10-01" if posted else None)
 
 
+class Told(Turns):
+    """Turns that keep what each session was started with."""
+
+    def __init__(self, answers):
+        super().__init__(answers)
+        self.calls = []
+
+    async def run(self, prompt, **kw):
+        self.calls.append(kw)
+        return await super().run(prompt, **kw)
+
+
+@pytest.mark.parametrize("wake", ["morning", "timed"])
+def test_a_clock_session_is_not_told_that_nothing_wakes_her(tmp_path, monkeypatch, wake):
+    """Something did: its system prompt ends with its date paragraph."""
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    store = named(Store(tmp_path / "p.db"))
+    p = Processor(settings(tmp_path, email_triage=False), store, asyncio.Queue(), Posts(),
+                  RunnerService("/bin/true"))
+    p.runner = Told(["Morning."])
+    monkeypatch.setattr("wanda.vault.snapshot", lambda cfg, message: None)
+
+    async def mem(now, *args):
+        return ""
+    p._mem = mem
+    if wake == "morning":
+        now = datetime(2026, 10, 1, 8, 0, tzinfo=LA)
+        w = clock.morning_wakes(now, {"U1": LOOKS["U1"]}, QUIET, lambda q: None, NAMES.get)[0]
+    else:
+        now = datetime(2026, 10, 1, 19, 3, tzinfo=LA)
+        w = due_at(now, {"clock:due:a24e0d:2026-10-01T17:00:mei"})[0]
+    asyncio.run(p._clock_session(w, now))
+    [kw] = p.runner.calls
+    assert kw["append_system_prompt"].endswith(vault.date_paragraph(now))
+    assert vault.NO_WAKE not in kw["append_system_prompt"]
+
+
 @pytest.mark.parametrize("posted", [True, False], ids=["posted", "post refused"])
 def test_a_timed_wake_that_gave_its_reminder_and_then_failed_gave_it(tmp_path, monkeypatch, posted):
     """The reminder is posted, not kept as one not given, and the failure is

@@ -3003,7 +3003,8 @@ class Processor:
             for m in waiting + kept_there:
                 self._eyes(kept_key(m))
             await self.memory_turn(task, None, None, channel=p["channel"], reply_thread=p.get("reply_thread"),
-                                   owed=True, state=state, frame=frame, group=p.get("channel_type") == "mpim")
+                                   owed=True, state=state, frame=frame, group=p.get("channel_type") == "mpim",
+                                   no_wake=True)
         except Exception as e:
             log.exception("the turn for %s in %s failed", p["ts"], p["channel"])
             if not state.get("recorded"):
@@ -3186,7 +3187,8 @@ class Processor:
     async def memory_turn(self, task, arrival: str | None, now: datetime | None, *, channel: str | None,
                           reply_thread: str | None, owed: bool, state: dict | None = None,
                           frame: Callable[[str | None], Awaitable[tuple[str, datetime, Additions] | None]]
-                          | None = None, sid: str | None = None, group: bool = False) -> str | None:
+                          | None = None, sid: str | None = None, group: bool = False,
+                          no_wake: bool = False) -> str | None:
         """One memory session for an arrival, at `now` in the household's zone:
         a fresh `claude -p` with the lab's prompt, tools, schema and
         environment, and its answer, if it has one, posted once. Messages and
@@ -3232,7 +3234,9 @@ class Processor:
         (settle_wakes). With no `channel`, as for a change of name handed to
         memory, nothing is posted at all, and the run is recorded as owing
         nothing. `sid` is the session's id, made here unless the caller made
-        it, to find the run by. Returns what went wrong, or None. A post Slack
+        it, to find the run by. `no_wake`, which a message's turn passes, adds
+        vault.NO_WAKE after the date paragraph, for its retry too; a session
+        the clock woke is not told it. Returns what went wrong, or None. A post Slack
         refuses is not something that went wrong: the run stays owed and is
         posted later, or is given up (_not_posted)."""
         state = {} if state is None else state
@@ -3297,7 +3301,8 @@ class Processor:
                             # the transcript Claude Code keeps under this id is
                             # what `mem session` reads, and `made:` names it
                             session_id=sid,
-                            append_system_prompt=f"{ANCHOR}\n\n{vault.date_paragraph(now)}",
+                            append_system_prompt=f"{ANCHOR}\n\n{vault.date_paragraph(now)}"
+                            + (f"\n\n{vault.NO_WAKE}" if no_wake else ""),
                             tools=vault.TOOLS,
                             allowed_tools=vault.TOOLS,
                             permission_mode="dontAsk",

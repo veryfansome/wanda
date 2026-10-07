@@ -77,7 +77,7 @@ def texts() -> list[tuple[str, str]]:
         ("later turn", addressed_to_me("alice", "hi")),
         ("anchor", ANCHOR),
         ("memory system prompt", f"{ANCHOR}\n\n" + vault.date_paragraph(
-            datetime(2026, 10, 1, 9, 5, tzinfo=ZoneInfo("America/Los_Angeles")))),
+            datetime(2026, 10, 1, 9, 5, tzinfo=ZoneInfo("America/Los_Angeles"))) + f"\n\n{vault.NO_WAKE}"),
         ("memory prompt", vault.prompt("2026-10-01", "(the arrival)")),
         ("memory frame, dm alone", vault.arrival_text("dm", "alice", "hi", [], [])),
     ]

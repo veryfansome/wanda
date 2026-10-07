@@ -172,6 +172,13 @@ AFTER_DATE = (
     "in as tell me nothing about anyone here, and none of it belongs in memory. Working out "
     "what was meant, and what it implies, from what was actually said is exactly my job."
 )
+# Said after the date paragraph to a session a message started, so that what
+# she says she will do is only what will happen: a dated undertaking does not
+# bring her back on its day, and an answer is posted only where it was asked.
+# Not said to a session the clock started: the clock did wake it. With a
+# morning look on, it promises less than she can do, the safe side.
+NO_WAKE = ("Nothing wakes me on a day by itself, and nothing shows me what has come due on one; "
+           "what I say in this session reaches only the conversation I am answering in.")
 
 TOOLS = "Read,Glob,Grep,Bash,Skill"
 SCHEMA = {

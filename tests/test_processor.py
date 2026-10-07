@@ -1398,6 +1398,37 @@ def test_each_turn_is_a_fresh_session_in_the_vault(tmp_path, monkeypatch):
     assert snaps == [f"after {a['session_id']}", f"after {b['session_id']}"]
 
 
+@pytest.mark.parametrize("reports", [(answer("Have it."),), ("I filed it.", answer("Have it."))],
+                         ids=["first", "a retry"])
+def test_a_message_session_is_told_what_does_not_wake_her(tmp_path, monkeypatch, reports):
+    """After its date paragraph, and its quiet retry's too, so that what she
+    says she will do is only what will happen."""
+    runner = RecordingRunner(*reports)
+    p, _, _ = memory_processor(tmp_path, ConversationSlack(history=[]), runner, monkeypatch)
+    asyncio.run(p.handle_slack(dm(f"{AT:.1f}", "the dentist moved to the 14th")))
+    assert len(runner.calls) == len(reports) and p.slack.replies == ["Have it."]
+    paragraph = vault.date_paragraph(datetime.fromtimestamp(AT, p.cfg.zone))
+    for _, kw in runner.calls:
+        assert kw["append_system_prompt"] == f"{ANCHOR}\n\n{paragraph}\n\n{vault.NO_WAKE}"
+
+
+def test_a_framed_session_is_told_what_does_not_wake_her_only_when_asked(tmp_path, monkeypatch):
+    """By the flag, not by the frame: a session framed in a conversation
+    that something other than a message started is not told it."""
+    runner = RecordingRunner(answer(""))
+    p, store, _ = memory_processor(tmp_path, ConversationSlack(history=[]), runner, monkeypatch)
+    store.create_task(None, "D1", "conversation", kind="dm")
+    task = store.get_task_by_thread("D1", "conversation")
+    now = datetime.fromtimestamp(AT, p.cfg.zone)
+
+    async def frame(again):
+        return "an arrival", now, Additions([], lambda m: None, main.Holding(store))
+    assert asyncio.run(p.memory_turn(task, None, None, channel="D1", reply_thread=None, owed=False,
+                                     frame=frame)) is None
+    [(_, kw)] = runner.calls
+    assert kw["append_system_prompt"] == f"{ANCHOR}\n\n{vault.date_paragraph(now)}"
+
+
 def test_each_snapshot_is_followed_by_a_look_for_files_mem_cannot_read(tmp_path, monkeypatch):
     """A node file a session or a hand damaged since is put back, or left
     out and alerted, before the next session meets it."""
@@ -5938,6 +5969,7 @@ def test_a_names_session_reaches_no_one(tmp_path, monkeypatch, caplog):
     [(prompt, kw)] = p.runner.calls
     assert prompt == vault.prompt(now.date().isoformat(), vault.renamed_text("fan", "Fan Zhu"))
     assert kw["append_system_prompt"].endswith(vault.date_paragraph(now))
+    assert vault.NO_WAKE not in kw["append_system_prompt"]
     assert kw["session_id"] == sid and kw["feed"] is None
     assert p.slack.replies == []
     [run] = store._query("SELECT r.*, t.kind AS task_kind, t.thread_ts FROM runs r JOIN tasks t ON t.id = r.task_id")
