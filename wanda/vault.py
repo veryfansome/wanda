@@ -83,11 +83,11 @@ UNLISTED = " I could not find out who else is in it."
 # as a prefix of its id.
 RETRIED = ("An earlier session of mine for this, {sid8}, ended before I answered; what it wrote to memory is "
            "still there.")
-# on the opening line, before RETRIED's, when the turn's newest message
+# on the opening line, before RETRIED's, when the turn's first message
 # reaches its session late, as after a stop: the session is framed at its own
-# start, and told when the message was sent, and each interval she was not
-# running since the turn's oldest one, so that it answers knowing how long
-# ago it was asked
+# start, and told when the message it answers was sent, or the first when
+# that one is new, and each interval she was not running since the first, so
+# that it answers knowing how long ago it was asked
 LATE_TURN = "What {speaker} says below was sent at {sent} and reaches me only now."
 DOWN = "I was not running from {since} until {until}."
 ME = "me"

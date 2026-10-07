@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable
 
 from slack_sdk import WebClient
 from slack_sdk.socket_mode import SocketModeClient
@@ -22,12 +23,35 @@ DM_TYPES = ("im", "mpim")
 DM_TASK_KEY = "conversation"
 
 
+class Connections(SocketModeClient):
+    """The SDK's client, which says when a new connection replaces one:
+    every connection goes through `connect`, the start's, the monitor's
+    after a connection closed or went stale, and a refresh's, which Slack
+    asks for and which opens the new connection before closing the old.
+    `heard` is told the new connection's session id and whether one was
+    still open, which is so only on a refresh; the start's connection, with
+    none before it, and a try that opened nothing tell it nothing."""
+
+    def __init__(self, *, heard: Callable[[str, bool], None], **kw):
+        super().__init__(**kw)
+        self.heard = heard
+
+    def connect(self) -> None:
+        replaced, open_before = self.current_session is not None, self.is_connected()
+        super().connect()
+        if replaced and self.is_connected():
+            self.heard(self.current_session.session_id, open_before)
+
+
 class SlackWatcher:
     """Socket Mode listener. Acks every envelope once what it brings is
     written down (Slack retries past ~3s, and never sends a message again
     once it is acknowledged), passes deletions on (kind `deleted`), so that a
-    message still waiting for its turn can be withdrawn, and classifies
-    every other message into one of four triggers:
+    message still waiting for its turn can be withdrawn, says when a new
+    connection replaces one (kind `heard`) or when what an envelope brought
+    could not be written down (kind `owed`), so that what she may have missed
+    is read back from Slack, and classifies every other message, live or
+    read back (`trigger`), into one of four triggers:
 
       dm            — any message in a DM or group DM; no mention needed
       task          — a message in a thread wanda owns (e.g. an email task, or
@@ -63,7 +87,7 @@ class SlackWatcher:
         self.bot_user_id, self.bot_id = auth.get("user_id"), auth.get("bot_id")
         if not self.bot_user_id:
             raise RuntimeError("auth.test named no bot user")
-        self.client = SocketModeClient(app_token=self.cfg.slack_app_token, web_client=web)
+        self.client = Connections(app_token=self.cfg.slack_app_token, web_client=web, heard=self._heard)
         self.client.socket_mode_request_listeners.append(self._handle)
         self.client.connect()
         log.info("slack socket mode connected (bot user %s)", self.bot_user_id)
@@ -71,6 +95,25 @@ class SlackWatcher:
     def stop(self) -> None:
         if self.client:
             self.client.close()
+
+    def _heard(self, session: str, refresh: bool) -> None:
+        # from the SDK's thread, as a message is handed on: what arrives on a
+        # refreshed connection queues behind it, and after a reconnection in
+        # practice too, a message taking several thread hops; one that came
+        # first would only be answered first
+        self.loop.call_soon_threadsafe(self.queue.put_nowait, Event(
+            source="slack", dedupe_key=f"heard:{session}",
+            payload={"kind": "heard", "session": session, "refresh": refresh}))
+
+    def last_heard(self) -> tuple[str, float | None] | None:
+        """The open connection's session id and the time its last pong
+        carried, None before the first: frames on one socket arrive in
+        order, so every event Slack sent before that pong has reached her.
+        None with no connection open."""
+        if self.client is None or not self.client.is_connected():
+            return None
+        session = self.client.current_session
+        return session.session_id, session.last_ping_pong_time
 
     def _allowed(self, user: str) -> bool:
         """Whether `user` may start a session. An empty list would let anyone
@@ -80,6 +123,15 @@ class SlackWatcher:
     def _handle(self, client: SocketModeClient, req: SocketModeRequest) -> None:
         try:
             self._take(req)
+        except Exception:
+            # what it brought may be lost, as when the store takes no write
+            # on a full disk. The envelope is acknowledged all the same
+            # (below), so Slack does not send it again, and what it brought
+            # is read back from Slack once the store takes a write. Raised
+            # on, for the SDK's log
+            self.loop.call_soon_threadsafe(self.queue.put_nowait, Event(
+                source="slack", dedupe_key=f"owed:{req.envelope_id}", payload={"kind": "owed"}))
+            raise
         finally:
             # after a member's message is kept (Store.first_time): one
             # acknowledged first and lost to a stop or a crash before it was
@@ -99,17 +151,44 @@ class SlackWatcher:
         if event.get("type") != "message":
             return
         if event.get("subtype") == "message_deleted" and event.get("deleted_ts"):
+            # seen, so that a read back of Slack, or Slack sending it again,
+            # does not take it as new once it is gone
+            try:
+                self.store.first_time(f"{event.get('channel')}:{event['deleted_ts']}")
+            except Exception as e:
+                log.warning("could not record %s in %s as deleted: %s", event["deleted_ts"], event.get("channel"), e)
             # a deleted message still waiting for its conversation's turn is
             # withdrawn from it
             self.loop.call_soon_threadsafe(self.queue.put_nowait, Event(
                 source="slack", dedupe_key=f"{event.get('channel')}:{event['deleted_ts']}:deleted",
                 payload={"kind": "deleted", "channel": event.get("channel"), "ts": event["deleted_ts"]}))
             return
-        if event.get("bot_id") or event.get("subtype") not in HUMAN_SUBTYPES:
+        taken = self.trigger(event)
+        if taken is None:
             return
+        payload, memory = taken
+        channel, ts = payload["channel"], payload["ts"]
+        # Keyed on the MESSAGE, not the envelope: one @-mention in a thread
+        # arrives as both app_mention and message.*, with different event_ids,
+        # and would otherwise run the agent twice. Same key also absorbs
+        # Slack's redeliveries.
+        if not self.store.first_time(f"{channel}:{ts}", payload if memory else None):
+            return
+        self.loop.call_soon_threadsafe(self.queue.put_nowait, Event(source="slack", dedupe_key=f"{channel}:{ts}",
+                                                                    payload=payload))
+
+    def trigger(self, event: dict) -> tuple[dict, bool] | None:
+        """What a message event starts, as the payload handed on, and whether
+        it is kept until it is answered; None for one that starts nothing.
+        Both a live event and a message read back from Slack come through
+        here, so that each is taken by the same rules."""
+        if event.get("type") != "message":
+            return None
+        if event.get("bot_id") or event.get("subtype") not in HUMAN_SUBTYPES:
+            return None
         user = event.get("user")
         if not user or user == self.bot_user_id:
-            return
+            return None
 
         channel = event.get("channel")
         channel_type = event.get("channel_type")
@@ -135,13 +214,13 @@ class SlackWatcher:
         else:
             # Ordinary chatter, including plain replies in a guest thread —
             # otherwise one @wanda would capture a human conversation forever.
-            return
+            return None
 
         if not self._allowed(user):
             if (user, channel) not in self._ignored:
                 self._ignored.add((user, channel))
                 log.warning("ignoring %s from non-allowed user %s in %s", kind, user, channel)
-            return
+            return None
 
         if kind == "dm" and not thread_ts:  # noqa: SIM108 — kept explicit
             # A DM is one conversation: every top-level message maps to one
@@ -163,14 +242,7 @@ class SlackWatcher:
             "files": [f.get("name") or "file" for f in event.get("files") or []],
             "ts": ts,
         }
-        # Keyed on the MESSAGE, not the envelope: one @-mention in a thread
-        # arrives as both app_mention and message.*, with different event_ids,
-        # and would otherwise run the agent twice. Same key also absorbs
-        # Slack's redeliveries. A message to her is kept until it is answered,
-        # but for a reply in an email task's thread, whose path leaves its own
-        # marker at a stop (Processor.shutdown)
-        memory = kind != "task" or existing["kind"] != "email"
-        if not self.store.first_time(f"{channel}:{ts}", payload if memory else None):
-            return
-        self.loop.call_soon_threadsafe(self.queue.put_nowait, Event(source="slack", dedupe_key=f"{channel}:{ts}",
-                                                                    payload=payload))
+        # A message to her is kept until it is answered, but for a reply in
+        # an email task's thread, whose path leaves its own marker at a stop
+        # (Processor.shutdown)
+        return payload, kind != "task" or existing["kind"] != "email"

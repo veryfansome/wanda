@@ -125,6 +125,9 @@ MIGRATIONS = (
 # How many of the intervals she was not running are kept, the newest; a
 # restart loop leaves one (Store.came_up).
 DOWN_KEPT = 5
+# A thread of hers that a session ran in this recently is read back from
+# Slack whatever the age of its first message (Store.threads).
+THREADS_READ_FOR = timedelta(days=30)
 
 
 def utcnow() -> str:
@@ -654,9 +657,12 @@ class Store:
 
     def kept(self, channel: str | None = None, task_key: str | None = None) -> list[sqlite3.Row]:
         """The messages kept, in one conversation when it is given, oldest
-        first."""
-        return self._query("SELECT * FROM unanswered WHERE ? IS NULL OR (channel=? AND task_key=?) "
-                           "ORDER BY CAST(ts AS REAL)", (channel, channel, task_key))
+        first, each with when it was seen (`received_at`), or None once a
+        start has pruned that record: a message stays kept until it is
+        answered, however long."""
+        return self._query("SELECT u.*, e.received_at FROM unanswered u LEFT JOIN slack_events e "
+                           "ON e.event_id = u.channel || ':' || u.ts WHERE ? IS NULL OR (u.channel=? AND u.task_key=?) "
+                           "ORDER BY CAST(u.ts AS REAL)", (channel, channel, task_key))
 
     def took(self, sid: str, keys, counted) -> None:
         """The session `sid` has taken these kept messages, by (channel, ts):
@@ -680,6 +686,17 @@ class Store:
         with self._transaction():
             return [k for k in keys if self._db.execute(
                 "DELETE FROM unanswered WHERE channel=? AND ts=? AND state <> 'answered'", k).rowcount]
+
+    def threads(self, now: datetime) -> list[tuple[str, str]]:
+        """The threads a session of hers ran in within THREADS_READ_FOR of
+        `now`, as (channel, thread ts): a mention's, a guest's and a DM's
+        thread, not an email task's, nor a DM's one conversation, whose task
+        key is no thread."""
+        since = (now - THREADS_READ_FOR).astimezone(timezone.utc).isoformat(timespec="seconds")
+        return [(r["slack_channel"], r["thread_ts"]) for r in self._query(
+            "SELECT DISTINCT t.slack_channel, t.thread_ts FROM tasks t JOIN runs r ON r.task_id = t.id "
+            "WHERE r.kind <> 'note' AND r.started_at >= ? AND (t.kind IN ('mention', 'mention_guest') "
+            "OR (t.kind = 'dm' AND t.reply_thread IS NOT NULL)) ORDER BY t.slack_channel, t.thread_ts", (since,))]
 
     # --- her running time ---
 

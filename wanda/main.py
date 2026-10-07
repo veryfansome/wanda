@@ -18,13 +18,13 @@ import uuid
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import IO
+from typing import IO, NamedTuple
 
 from slack_sdk.errors import SlackApiError
 
 from wanda import clock, slack_cli, vault
 from wanda.actions.mailbox import MOVED, move_to_trash
-from wanda.actions.slack import SlackActions
+from wanda.actions.slack import MAX_CONTEXT_PAGES, READ_EVERY_S, CallFailed, SlackActions
 from wanda.config import Config, load_config
 from wanda.events import Event
 from wanda.household import NAMES_EVERY_S, SHUT, Found, Household, found, memory_said, same, settle, tries
@@ -48,7 +48,7 @@ from wanda.watchers.imap_watcher import (
     fetch_parsed,
     resolve_trash_folder,
 )
-from wanda.watchers.slack_watcher import DM_TASK_KEY, SlackWatcher
+from wanda.watchers.slack_watcher import DM_TASK_KEY, DM_TYPES, SlackWatcher
 
 log = logging.getLogger("wanda")
 
@@ -166,15 +166,66 @@ HELD_GROUP = ("I can't get to anything right now. If any of this was for me, I'l
 # that meets it again then confirms it, which her note says (HELD): one that
 # clears within it says nothing.
 HOLD_TRIED_AFTER = timedelta(minutes=1)
-# A turn whose newest message is older than this when it is framed reaches its
-# session late, as after a stop: it is framed at the session's start and says
-# so (vault.LATE_TURN). Longer than a wait behind one other session
-# (WANDA_AGENT_TIMEOUT_S, 420 s in compose.wanda.yaml), which is not late.
+# A turn whose first message is older than this when it is framed reaches its
+# session late, as after a stop or read back from Slack: it is framed at the
+# session's start and says so (vault.LATE_TURN). Longer than a wait behind one
+# other session (WANDA_AGENT_TIMEOUT_S, 420 s in compose.wanda.yaml), which is
+# not late.
 LATE_TURN_S = 600
 # An interval she was not running is named to a late turn (vault.DOWN) from
 # this long: a restart's seconds are no reason for the lateness, and its two
 # times would read as the same minute.
 DOWN_NAMED = timedelta(minutes=1)
+# What was sent while she could not hear Slack, stopped or with her connection
+# down, is read back from Slack (Processor.read_back) from `heard_from`, the
+# time before which everything sent reached her live or was read back: her
+# connection's last pong less HEARD_MARGIN, for a container clock ahead of
+# Slack's and for Slack sending an event late. Never from further back than
+# READ_BACK_DAYS: what says whether she has seen a message (slack_events) is
+# kept seven days.
+HEARD_MARGIN = timedelta(minutes=10)
+READ_BACK_DAYS = 6
+# A member's line in a conversation a read has not yet finished waits at a
+# gate, her reaction already on, so that what was missed there comes first and
+# both are one turn: at a start until the start's own step, after a lost
+# connection until its conversation is read, at most READ_WAIT_S either way. At
+# a start the gate opens GATE_SLACK_S later than that, so never before the
+# step, which opens it.
+READ_WAIT_S = 30
+GATE_SLACK_S = 5
+# A message deleted while she runs is remembered this long, well past any
+# line's wait at the gate, for its line to drop when it comes past
+GONE_KEPT_S = 3600
+# A read that fails is tried again a minute on, then two, four, and every five
+# minutes until one succeeds; failing for READ_FAILING_ALERTED, it is alerted.
+READ_RETRY_S = 60
+READ_RETRY_MAX_S = 300
+READ_FAILING_ALERTED = timedelta(minutes=10)
+# well past a read of this household's conversations, about 20 calls at one
+# every READ_EVERY_S (some 400 fit): one held in a call, or waiting for a
+# thread to call in, ends as a failure
+READ_TIMEOUT_S = 600
+# what Slack answers for a conversation or thread a read can never read: it is
+# read as having nothing
+NOT_READABLE = frozenset({"channel_not_found", "not_in_channel", "thread_not_found", "is_archived"})
+# her own joining of a channel, before which nothing there reached her live
+JOINED = ("channel_join", "group_join")
+# Her reaction on a message, put on this long or more after it was sent, is
+# late: on a message read back, sent again by Slack or kept across a stop,
+# any of which can have been deleted unseen. A late add waits its turn to be
+# made, one every READ_EVERY_S, and Slack answering it with message_not_found
+# withdraws the message; a frame waits for its messages' late adds, each at
+# most LATE_ADD_WAIT_S from when it was made.
+LATE_ADD_S = 60
+LATE_ADD_WAIT_S = 10
+# What is owed in a conversation is posted by its next turn while that turn
+# holds a session's place, waited for at most this long: a post Slack is slow
+# to take holds every other conversation and the clock meanwhile. One still
+# posting then goes on outside the place, its run owed until it ends, and the
+# turn's answer waits behind it; it is not cancelled, since a post already
+# handed to the client's thread may still reach Slack, and the pass would
+# post it again.
+OWED_IN_SLOT_S = 15
 # the `failed` alert's classes of reason, each alerted at most once a UTC day
 FAILURE_CLASSES = ("timeout", "usage limit", "authentication", "other")
 # A planned stop waits for the sessions running to finish for up to their
@@ -285,6 +336,32 @@ def left_out(store: Store) -> list[vault.Unreadable]:
 def kept_key(m: dict) -> tuple[str, str]:
     """A message's key among those kept until answered (Store.first_time)."""
     return m["channel"], m["ts"]
+
+
+class ReadFailing(NamedTuple):
+    """Reads back from Slack failing: since when, from what time the last
+    one read, its error, how many have failed, and when the next is tried
+    (time.monotonic)."""
+    since: datetime
+    bound: datetime | None
+    error: str
+    tries: int
+    next_try: float
+
+
+def conversation_type(c: dict) -> str:
+    """A conversation's type as a message event gives it, from what
+    users.conversations says of it."""
+    return "im" if c.get("is_im") else "mpim" if c.get("is_mpim") else "group" if c.get("is_private") else "channel"
+
+
+def why(e: BaseException) -> str:
+    """What made a read back fail, in a word where Slack gives one."""
+    if isinstance(e, SlackApiError):
+        return (e.response or {}).get("error") or str(e)
+    if isinstance(e, TimeoutError):
+        return f"it took longer than {READ_TIMEOUT_S} s"
+    return str(e) or type(e).__name__
 
 
 class Holding:
@@ -492,6 +569,52 @@ class Additions:
                                       key=lambda m: float(m["ts"]))
 
 
+class Gate:
+    """Where a member's line waits while what was missed in its conversation
+    is read. Closing it arms one timer that opens it for every conversation;
+    opening it for all cancels the timer, and so does a later close, which
+    arms its own while the lines waiting go on waiting. A conversation opens
+    as its read finishes it."""
+
+    def __init__(self) -> None:
+        self.closed = False
+        self._opened: set[str] = set()
+        # per conversation, what its lines wait on: woken only by its own
+        # opening, so that they go on in the order they began to wait
+        self._opening: dict[str, asyncio.Event] = {}
+        self._timer: asyncio.TimerHandle | None = None
+
+    def close(self, after: float) -> None:
+        if self._timer is not None:
+            self._timer.cancel()
+        self.closed, self._opened = True, set()
+        self._timer = asyncio.get_running_loop().call_later(after, self.open_all)
+
+    def open(self, channel: str) -> None:
+        self._opened.add(channel)
+        if (opening := self._opening.pop(channel, None)) is not None:
+            opening.set()
+
+    def open_all(self) -> None:
+        if self._timer is not None:
+            self._timer.cancel()
+            self._timer = None
+        self.closed = False
+        opening, self._opening = self._opening, {}
+        for e in opening.values():
+            e.set()
+
+    def is_open(self, channel: str) -> bool:
+        return not self.closed or channel in self._opened
+
+    async def wait(self, channel: str) -> None:
+        # woken once, though the gate may have closed again since: a close is
+        # a new connection's read, and what it finds missing came after this
+        # line; waiting for it would let a later line here go on first
+        if not self.is_open(channel):
+            await self._opening.setdefault(channel, asyncio.Event()).wait()
+
+
 class Processor:
     """Drains the message state machine and handles owner thread replies.
     At-least-once semantics everywhere: every side effect is idempotent or
@@ -513,6 +636,9 @@ class Processor:
         # the runs being posted, each with an event set once its post ends
         # (_claim)
         self._delivering: dict[int, asyncio.Event] = {}
+        # what is owed in a conversation, posted by its turn and still
+        # posting once the turn went on without it (OWED_IN_SLOT_S)
+        self._owed_posts: set[asyncio.Task] = set()
         # per conversation task, the messages waiting for its next turn
         self._waiting: dict[int, list[dict]] = {}
         # per conversation task, what its turn's session takes in while it works
@@ -540,6 +666,19 @@ class Processor:
         self._reacting: set[asyncio.Task] = set()
         self._reaction: dict[tuple[str, str], asyncio.Task] = {}
         self._react_again: dict[tuple[str, str], tuple[bool, datetime]] = {}
+        # each add in flight, with when it was made (loop time), which a
+        # frame waits for when it is late; and the messages `_eyes` has put
+        # her reaction on in this run, each until its row goes
+        self._adding: dict[tuple[str, str], tuple[asyncio.Task, float]] = {}
+        self._eyed: set[tuple[str, str]] = set()
+        # late adds made one at a time, each READ_EVERY_S after the last
+        self._late_pace = asyncio.Lock()
+        self._last_late = float("-inf")
+        # messages deleted, or found gone by Slack, while she runs, each with
+        # when (loop time): a line past the gate whose message is among them
+        # owes nothing, and drops it; a pass drops what is GONE_KEPT_S old,
+        # since most never meet a line
+        self._gone: dict[tuple[str, str], float] = {}
         # whether the log has said that the token lacks reactions:write
         self._scope_said = False
         # allowed ids already logged as not let in
@@ -557,6 +696,30 @@ class Processor:
         # memory, from before its try is written until its outcome is: the
         # re-look leaves them to it
         self._naming: set[str] = set()
+        # reading back from Slack what was sent while she could not hear it
+        # (read_back): the watcher it classifies with, the gate a member's
+        # line waits at meanwhile, the connection whose last pong `heard_from`
+        # moves to, the read running, whether one is needed, and since when
+        # reads have failed, with the error and when the next is tried. None
+        # of it is written to the store, so that a store that takes no write
+        # can neither lose it nor let `heard_from` move past it.
+        self.watcher: SlackWatcher | None = None
+        self.gate = Gate()
+        self._heard_session: str | None = None
+        self._reading: asyncio.Task | None = None
+        self._read_needed = False
+        self._read_failing: ReadFailing | None = None
+        # the time the running or the last read reads from
+        self._read_bound: datetime | None = None
+        # The messages a read kept and has not handed on, by key, each with
+        # its payload, and those of them whose task is made. Until a start's
+        # step, the start's read hands nothing on (`_collecting`), and what
+        # it kept is taken up with what the stop left.
+        self._unhanded: dict[tuple[str, str], dict] = {}
+        self._marked: set[tuple[str, str]] = set()
+        self._collecting = False
+        # the messages whose handling raised in a read, each logged once
+        self._read_faults: set[str] = set()
 
     async def loop(self) -> None:
         """Mail pipeline only. Owner commands are consumed by slack_loop on a
@@ -572,11 +735,26 @@ class Processor:
     async def slack_loop(self) -> None:
         while True:
             ev = await self.slack_queue.get()
+            kind = ev.payload.get("kind")
+            if kind in ("heard", "owed"):
+                # nothing here touches the store, and nothing ends the loop: a
+                # read needed is started by the pass, whatever fails here
+                if not self.stopping:
+                    try:
+                        self._read_needed = True
+                        if kind == "heard":
+                            self._heard(ev.payload)
+                    except Exception:
+                        log.exception("taking %s failed; the next pass reads back from Slack", ev.dedupe_key)
+                continue
             # Agent runs take minutes; never serialize owner commands behind
             # each other or behind mail triage.
-            t = asyncio.create_task(self.handle_slack(ev))
-            self._bg.add(t)
-            t.add_done_callback(self._bg.discard)
+            self._handler(ev)
+
+    def _handler(self, ev: Event, handed: bool = False) -> None:
+        t = asyncio.create_task(self.handle_slack(ev, handed=handed))
+        self._bg.add(t)
+        t.add_done_callback(self._bg.discard)
 
     async def let_finish(self, wait_s: float) -> None:
         """The start of a planned stop: no session starts from here on, and
@@ -591,6 +769,9 @@ class Processor:
         log.info("stopping: letting %d session(s) finish, for up to %d s", len(running), wait_s)
         for t in self._bg - running:
             t.cancel()
+        # it owes nothing: the next start reads from where this one did
+        if self._reading is not None:
+            self._reading.cancel()
         if running:
             await asyncio.wait(running, timeout=wait_s)
 
@@ -601,11 +782,19 @@ class Processor:
         member's message to her that a stop cuts short, or that is still
         queued, is kept in the run store, and the next start runs it again
         (`kept`)."""
+        if self._reading is not None:
+            self._reading.cancel()
+            await asyncio.wait({self._reading}, timeout=grace_s)
         if self._bg:
             log.info("waiting on %d in-flight agent task(s)", len(self._bg))
             for t in self._bg:
                 t.cancel()
-            await asyncio.wait(set(self._bg), timeout=grace_s)
+        # what is owed is not cancelled: a post already handed to the client's
+        # thread may still reach Slack, and its run would stay owed and be
+        # posted again. One wait for both, so that what is left settles within
+        # grace_s
+        if settling := set(self._bg) | set(self._owed_posts):
+            await asyncio.wait(settling, timeout=grace_s)
         # Owner replies still queued were acked and deduped by Slack, so they
         # can never be redelivered: an email task's gets a marker to answer on
         # start.
@@ -615,7 +804,9 @@ class Processor:
             except asyncio.QueueEmpty:
                 break
             pl = ev.payload
-            if pl.get("kind") == "deleted":
+            # neither a new connection nor a line the watcher could not keep
+            # is in a conversation: the next start reads back from Slack
+            if pl.get("kind") in ("deleted", "heard", "owed"):
                 continue
             task = self.store.get_task_by_thread(pl["channel"], pl["task_key"])
             if task is None or task["kind"] != "email":
@@ -1472,6 +1663,8 @@ class Processor:
         # Slack outage that outlives one run must not strand paid work.
         await self.deliver_pending()
         self._retry_reactions()
+        since = asyncio.get_running_loop().time() - GONE_KEPT_S
+        self._gone = {k: at for k, at in self._gone.items() if at > since}
         await self._flush_abandoned_alert()
         await self._flush_given_up()
         await self._flush_failed()
@@ -1483,11 +1676,28 @@ class Processor:
         if any(u.error for u in left_out(self.store)):
             await self.put_back()
         await self._flush_memory()
-        for kind in ("breaker", "cap", "snapshot", "startup", "clock", "names"):
+        self._read_failing_alert()
+        for kind in ("breaker", "cap", "snapshot", "startup", "clock", "names", "slack_read", "slack_passed",
+                     "slack_cut"):
             await self._flush_alert(kind)
         # she is running: a start counts her down from the last of these
         # marks (Store.came_up)
         self.store.set_meta("up_at", utcnow())
+        # beside `up_at`, so that a later step that raises at every pass
+        # holds neither; not while stopping, since a read the stop cancelled
+        # may have left conversations unread
+        if not self.stopping:
+            # each apart, so that one that raises at every pass, as on a
+            # `heard_from` that cannot be read, holds neither the other nor
+            # the steps after
+            try:
+                self._read_if_needed()
+            except Exception:
+                log.exception("could not start the read back from Slack")
+            try:
+                self._move_heard()
+            except Exception:
+                log.exception("could not move the time she last heard Slack")
         if self.stopping:
             # while a stop waits for the sessions running, a pass delivers and
             # alerts alone: the housekeeping would hold up their snapshots,
@@ -1728,14 +1938,20 @@ class Processor:
     async def _alert_once(self, kind: str, text: str) -> None:
         """At most one alert of each kind per UTC day — but only counted once
         it has actually been delivered, so a Slack outage can't silence it."""
+        if self._alert_due(kind, text):
+            await self._flush_alert(kind)
+
+    def _alert_due(self, kind: str, text: str) -> bool:
+        """Writes an alert of `kind` to be posted, unless one went today, for
+        the next flush; whether it did."""
         today = datetime.now(timezone.utc).date().isoformat()
         if self.store.get_meta(f"{kind}_alert_date") == today:
-            return
+            return False
         # The day it describes is stored with it: an alert that goes stale
         # overnight must be dropped, not posted as a false alarm that also
         # consumes the new day's slot.
         self.store.set_meta(f"{kind}_alert_pending", json.dumps({"date": today, "text": text}))
-        await self._flush_alert(kind)
+        return True
 
     async def _flush_alert(self, kind: str) -> None:
         raw = self.store.get_meta(f"{kind}_alert_pending")
@@ -1977,6 +2193,34 @@ class Processor:
             if not await self._post(run, run["slack_channel"], run["reply_thread"], text, answer):
                 held.add(run["task_id"])
 
+    async def _post_owed(self, task_id: int, channel: str | None) -> None:
+        """What is owed in a conversation, posted by its turn, waited for at
+        most OWED_IN_SLOT_S; past that it goes on posting on its own. With
+        nothing owed it does not wait, so the turn keeps its place in the
+        loop's step."""
+        if not self.store.pending_deliveries(task_id):
+            return
+        posting = asyncio.create_task(self.deliver_pending(task_id))
+        self._owed_posts.add(posting)
+        try:
+            await asyncio.wait({posting}, timeout=OWED_IN_SLOT_S)
+        finally:
+            if posting.done():
+                self._owed_posts.discard(posting)
+            else:
+                posting.add_done_callback(self._owed_posted)
+        if posting.done():
+            posting.result()
+        else:
+            log.warning("posting what is owed in %s took over %g s; the session goes on, its answer after it",
+                        channel, OWED_IN_SLOT_S)
+
+    def _owed_posted(self, t: asyncio.Task) -> None:
+        """The end of a post of what is owed that its turn went on without."""
+        self._owed_posts.discard(t)
+        if not t.cancelled() and (e := t.exception()) is not None:
+            log.error("could not post what was owed: %s", why(e))
+
     @contextlib.asynccontextmanager
     async def _claim(self, run_id: int):
         """Holds a run while one poster posts it: the pass, a turn's try
@@ -2060,26 +2304,54 @@ class Processor:
 
     def _react(self, key: tuple[str, str], on: bool = True) -> None:
         """Puts her reaction on a kept message, by (channel, ts), or takes it
-        off, not awaited: once any call on it still in flight has ended."""
+        off, not awaited: once any call on it still in flight has ended. When
+        an add is made is kept with it, for the frame that waits for it."""
         before = self._reaction.get(key)
         t = asyncio.create_task(self._set_reaction(key, on, before if before and not before.done() else None))
         self._reacting.add(t)
         t.add_done_callback(self._reacting.discard)
         self._reaction[key] = t
         t.add_done_callback(lambda t: self._reaction.pop(key) if self._reaction.get(key) is t else None)
+        if on:
+            self._adding[key] = (t, asyncio.get_running_loop().time())
+            t.add_done_callback(lambda t: self._adding.pop(key) if self._adding.get(key, (None,))[0] is t else None)
+
+    def _eyes(self, key: tuple[str, str]) -> None:
+        """Her reaction on a member's message, once in this run: from the
+        handler that takes it, or the turn that takes it up."""
+        if key not in self._eyed:
+            self._eyed.add(key)
+            self._react(key)
+
+    @staticmethod
+    def _late(key: tuple[str, str]) -> bool:
+        """Whether her reaction, put on now, is late (LATE_ADD_S)."""
+        return datetime.now(timezone.utc).timestamp() - float(key[1]) >= LATE_ADD_S
 
     def _unreact(self, keys) -> None:
         """Kept messages whose rows went: her reaction comes off each, whether
         this start or an earlier one put it on."""
         for key in keys:
+            self._eyed.discard(key)
             self._react(key, on=False)
 
     async def _set_reaction(self, key: tuple[str, str], on: bool, before: asyncio.Task | None) -> None:
         """One add or removal, once `before`, the call made on the message
         before it, has ended. What Slack did not take is kept to be tried
-        again (_retry_reactions), but for an add it will never take."""
+        again (_retry_reactions), but for an add it will never take. A late
+        add waits its turn (LATE_ADD_S), and Slack answering it with
+        message_not_found withdraws the message, which can only have been
+        deleted; on a message under LATE_ADD_S old, that answer is not known
+        to mean so, and the message is answered."""
         if before is not None:
             await asyncio.wait([before])
+        late = on and self._late(key)
+        if late:
+            async with self._late_pace:
+                wait = READ_EVERY_S - (time.monotonic() - self._last_late)
+                if wait > 0:
+                    await asyncio.sleep(wait)
+                self._last_late = time.monotonic()
         channel, ts = key
         failed = None
         try:
@@ -2093,6 +2365,16 @@ class Processor:
                     self._scope_said = True
                     log.warning("the bot token lacks reactions:write, so no message shows that she has it: update "
                                 "the app from slack/manifest.yaml and reinstall it (README, Setup, step 3)")
+            elif late and error == "message_not_found":
+                log.info("%s in %s is gone from Slack; withdrawn", ts, channel)
+                self._react_again.pop(key, None)
+                try:
+                    self._withdraw(channel, ts)
+                except Exception:
+                    # its row stays due, and the next start's late add
+                    # meets message_not_found again
+                    log.exception("could not forget %s in %s, gone from Slack", ts, channel)
+                return
             elif on and error in UNREACTABLE:
                 log.info("no reaction on %s in %s: %s", ts, channel, error)
             else:
@@ -2106,6 +2388,21 @@ class Processor:
                         "put" if on else "take off", ts, channel, failed)
             tried = (on, datetime.now(timezone.utc))
         self._react_again[key] = tried
+
+    async def _late_answered(self, keys) -> None:
+        """Waits for Slack to answer the late adds of her reaction on these
+        messages, by key, each at most LATE_ADD_WAIT_S from when it was made,
+        so that one Slack says is gone is withdrawn before it is framed.
+        `keys` gives them, and is called again as it waits, for a message
+        that joins meanwhile."""
+        loop = asyncio.get_running_loop()
+        while True:
+            flying = [(t, made) for k in keys() if (adding := self._adding.get(k)) is not None and self._late(k)
+                      for t, made in [adding] if not t.done() and loop.time() - made < LATE_ADD_WAIT_S]
+            if not flying:
+                return
+            left = min(made for _, made in flying) + LATE_ADD_WAIT_S - loop.time()
+            await asyncio.wait([t for t, _ in flying], timeout=max(left, 0), return_when=asyncio.FIRST_COMPLETED)
 
     def _retry_reactions(self) -> None:
         """Each add or removal of her reaction Slack did not take, tried again
@@ -2125,11 +2422,301 @@ class Processor:
             else:
                 self._react(key, on)
 
+    # --- reading back from Slack what was sent while she could not hear it ---
+
+    def read_at_start(self, watcher: SlackWatcher) -> asyncio.Task:
+        """The start's read back from Slack (read_back), begun once Slack has
+        connected, in one step: every conversation's line waits at the gate
+        until the start's step (collected) or READ_WAIT_S and GATE_SLACK_S
+        have passed; `heard_from` moves with the connection open now; and the
+        read hands nothing on until that step. Made before slack_loop's task,
+        so that a new connection already queued is taken as a later one's."""
+        self.watcher = watcher
+        self.gate.close(READ_WAIT_S + GATE_SLACK_S)
+        heard = watcher.last_heard()
+        self._heard_session = heard[0] if heard else None
+        self._collecting = True
+        return self._start_read()
+
+    def collected(self, kept: list[tuple]) -> list[tuple]:
+        """The start's step: what the start's read kept and has not handed
+        on joins what a stop left (`kept`, as `kept()` gives it), each still
+        kept, a conversation's first message getting the task the read could
+        not make, as `kept()` makes one; and the read hands on from here.
+        Returns each conversation as (task, keys), the one whose message has
+        waited longest first."""
+        found, self._unhanded, self._marked, self._collecting = self._unhanded, {}, set(), False
+        conversations = {task["id"]: (task, list(keys)) for task, keys in kept}
+        for channel, key in dict.fromkeys((p["channel"], p["task_key"]) for p in found.values()):
+            p = next(p for p in found.values() if (p["channel"], p["task_key"]) == (channel, key))
+            if p["kind"] in CONVERSATION_KINDS:
+                self.store.create_task(None, channel, key, kind=p["kind"], reply_thread=p.get("reply_thread"))
+            task = self.store.get_task_by_thread(channel, key)
+            if task is None:
+                continue
+            still = {kept_key(r) for r in self.store.kept(channel, key) if r["state"] == "due"}
+            _, keys = conversations.setdefault(task["id"], (task, []))
+            keys += [k for k in found if k in still and k not in keys]
+        return sorted((c for c in conversations.values() if c[1]), key=lambda c: min(float(ts) for _, ts in c[1]))
+
+    def _heard(self, heard: dict) -> None:
+        """A new connection to Slack, its read already needed: `heard_from`
+        moves with it from now, and it is read at once unless a read runs.
+        After one that closed, every line waits at the gate for its
+        conversation's read. Slack's refresh of a connection holds nothing
+        back: the new connection opens before the old one closes, so nothing
+        is known to be lost."""
+        self._heard_session = heard["session"]
+        if self._reading is None:
+            self._start_read(close=not heard.get("refresh"))
+
+    def _start_read(self, close: bool = False) -> asyncio.Task:
+        """The read, as a task of its own, kept out of `_bg`, which the clock
+        and the names round read as a session running; recorded as running
+        and taking the need for one, the gate closed first when `close`."""
+        if close:
+            self.gate.close(READ_WAIT_S)
+        self._read_bound = None
+        t = asyncio.create_task(self._read_for_at_most())
+        self._reading = t
+        t.add_done_callback(self._read_done)
+        self._read_needed = False
+        return t
+
+    async def _read_for_at_most(self) -> None:
+        async with asyncio.timeout(READ_TIMEOUT_S):
+            await self.read_back()
+
+    def _read_if_needed(self) -> None:
+        """At a pass: the read needed, unless one runs, at once or, while
+        reads fail, once the next try has come."""
+        if not self._read_needed or self._reading is not None or self.watcher is None:
+            return
+        if self._read_failing is not None and time.monotonic() < self._read_failing.next_try:
+            return
+        self._start_read()
+
+    def _move_heard(self) -> None:
+        """At a pass: `heard_from` on to the last pong of the connection
+        whose `heard` she has taken, less HEARD_MARGIN, never back. Not while
+        a read is needed or runs, nor while the open connection is not the one
+        taken, as while a new connection's `heard` is still queued. After a
+        sleep, until the SDK finds the old connection dead, the pass moves it
+        to that connection's last pong from before the sleep, which is before
+        the gap."""
+        if self._read_needed or self._reading is not None or self.watcher is None:
+            return
+        heard = self.watcher.last_heard()
+        if heard is None or heard[0] != self._heard_session or heard[1] is None:
+            return
+        at = datetime.fromtimestamp(heard[1], timezone.utc) - HEARD_MARGIN
+        was = self.store.get_meta("heard_from")
+        if was is None or at > datetime.fromisoformat(was):
+            self.store.set_meta("heard_from", at.isoformat(timespec="seconds"))
+
+    def _read_failing_alert(self) -> None:
+        failing = self._read_failing
+        if failing is not None and datetime.now(timezone.utc) - failing.since >= READ_FAILING_ALERTED:
+            self._alert_due("slack_read", f"could not read back from Slack what was sent since "
+                                          f"{self._when(failing.bound)}: {failing.error}; tried again every few "
+                                          "minutes until it can")
+
+    def _when(self, at: datetime | None) -> str:
+        # a read that failed before it knew from when it read
+        if at is None:
+            return "when she last heard it"
+        return vault.stamp(at.timestamp(), datetime.now(self.cfg.zone))
+
+    def _read_done(self, t: asyncio.Task) -> None:
+        """A read's end. Cancelled, by a stop alone, it owes nothing; raised,
+        a read is needed and reads are failing; returned, they are not. One
+        that hands on then hands on every message whose task it made, still
+        kept, and opens the gate for every conversation: those whose task
+        write raised wait for the next read, which makes it first."""
+        try:
+            if not t.cancelled():
+                if (e := t.exception()) is None:
+                    self._read_failing = None
+                else:
+                    self._read_needed = True
+                    failing = self._read_failing
+                    tries = failing.tries + 1 if failing is not None else 1
+                    wait = min(READ_RETRY_S * 2 ** (min(tries, 4) - 1), READ_RETRY_MAX_S)
+                    log.warning("could not read back from Slack what was sent since %s: %s; tried again in %d min",
+                                self._when(self._read_bound), why(e), wait // 60)
+                    self._read_failing = ReadFailing(failing.since if failing is not None else datetime.now(
+                        timezone.utc), self._read_bound, why(e), tries, time.monotonic() + wait)
+            if not self._collecting:
+                try:
+                    self._hand_on(only=self._marked)
+                except Exception:
+                    log.exception("could not hand on what the read kept; the next read hands it on")
+                self.gate.open_all()
+        finally:
+            self._reading = None
+
+    async def read_back(self) -> None:
+        """What was sent to her since `heard_from`, at most READ_BACK_DAYS
+        back, read from Slack, kept and handed on as the watcher keeps and
+        hands on a message: in every conversation she is in, DMs first, then
+        group DMs, then channels, each oldest first, its history before its
+        threads. A thread is read whose latest reply is after that time,
+        whatever its first message's age within READ_BACK_DAYS and the pages
+        read, and so is a thread of hers a session ran in within 30 days. Each
+        conversation is handed on, and its gate opened, once its history and
+        threads are read, or passed over: one Slack refuses with an error that
+        is the conversation's own, but for one it can never be read with
+        (NOT_READABLE), read as having nothing, or whose page the read cannot
+        handle, is logged and alerted, and the read goes on. Slack's trouble
+        or limits, a token it no longer takes, the network, the store and any
+        error listing the conversations end the read, to be tried again."""
+        now = datetime.now(timezone.utc)
+        heard = self.store.get_meta("heard_from")
+        heard_from = datetime.fromisoformat(heard) if heard else now
+        back = now - timedelta(days=READ_BACK_DAYS)
+        bound = self._read_bound = max(heard_from, back)
+        if heard_from < back:
+            cut = (f"she did not hear Slack from {self._when(heard_from)}: what was sent to her before "
+                   f"{self._when(back)} was not read back")
+            log.warning("%s", cut)
+            self._alert_due("slack_cut", cut)
+        if not self._collecting:
+            # what an earlier read kept and could not make the task of
+            for k, p in self._unhanded.items():
+                if p["kind"] in CONVERSATION_KINDS:
+                    self.store.create_task(None, k[0], p["task_key"], kind=p["kind"],
+                                           reply_thread=p.get("reply_thread"))
+                self._marked.add(k)
+            self._hand_on()
+        calls = self.slack.read_calls
+        listed = await self.slack.conversations()
+        ran: dict[str, list[str]] = {}
+        for channel, ts in self.store.threads(now):
+            ran.setdefault(channel, []).append(ts)
+        found: list[tuple[str, str]] = []
+        passed: list[tuple[str, str]] = []
+        for c in sorted(listed, key=lambda c: ("im", "mpim").index(t) if (t := conversation_type(c)) in DM_TYPES
+                        else 2):
+            channel = c["id"]
+            try:
+                await self._read_conversation(channel, conversation_type(c), bound, back, ran.get(channel, []), found)
+            except (CallFailed, sqlite3.Error, OSError):
+                raise
+            except Exception as e:
+                if isinstance(e, SlackApiError) and why(e) in CLEARS:
+                    raise
+                log.warning("could not read back from %s what was sent there since %s: %s; some of it may not have "
+                            "been read back", channel, self._when(bound), why(e))
+                passed.append((channel, why(e)))
+            if not self._collecting:
+                self._hand_on(channel, only=self._marked)
+                self.gate.open(channel)
+        log.info("read back from Slack since %s: %d message(s) to her in %d conversation(s), %d calls",
+                 self._when(bound), len(found), len({k[0] for k in found}), self.slack.read_calls - calls)
+        if passed:
+            self._alert_due("slack_passed", f"{len(passed)} conversation(s) could not be read back from Slack in "
+                                            f"full: {passed[0][1]}; some of what was sent there while she could not "
+                                            "hear Slack may not have been read back (the log names them)")
+
+    async def _read_conversation(self, channel: str, kind: str, bound: datetime, back: datetime, ran: list[str],
+                                 found: list[tuple[str, str]]) -> None:
+        """One conversation of a read: its history from `back`, every page
+        reaching after `bound` and older ones up to MAX_CONTEXT_PAGES in all,
+        then the threads that history names with a reply after `bound`, and
+        those of `ran` whose first message it did not read. What it keeps is
+        added to `found`."""
+        after = bound.timestamp()
+        history: list[dict] = []
+        n = 0
+        try:
+            async with contextlib.aclosing(self.slack.read_history(channel, back.timestamp())) as pages:
+                async for page, more in pages:
+                    history.extend(page)
+                    n += 1
+                    if more and n >= MAX_CONTEXT_PAGES and not any(float(m["ts"]) > after for m in page):
+                        log.info("read back %s from %s only: a reply under an older message there is not read back",
+                                 channel, self._when(datetime.fromtimestamp(min(float(m["ts"]) for m in history),
+                                                                            timezone.utc)))
+                        break
+        except SlackApiError as e:
+            if why(e) in NOT_READABLE:
+                return
+            raise
+        # nothing before her latest joining of a channel reached her live
+        joined = max((float(m["ts"]) for m in history if kind not in DM_TYPES and m.get("subtype") in JOINED
+                      and m.get("user") == self.watcher.bot_user_id), default=0.0)
+        floor = max(after, joined)
+        threads = [m["ts"] for m in history if float(m.get("latest_reply") or 0) > after]
+        read = {m.get("ts") for m in history}
+        threads += [ts for ts in ran if ts not in read and ts not in threads]
+        self._keep_read(channel, kind, history, floor, found)
+        for ts in threads:
+            try:
+                replies = await self.slack.read_thread(channel, ts, after)
+            except SlackApiError as e:
+                if why(e) in NOT_READABLE:
+                    continue
+                raise
+            self._keep_read(channel, kind, replies, floor, found)
+
+    def _keep_read(self, channel: str, kind: str, msgs: list[dict], floor: float,
+                   found: list[tuple[str, str]]) -> None:
+        """Each message read that is after `floor` and starts something, oldest
+        first, kept as the watcher keeps one, with its task made, as a handler
+        makes it: what the read has not handed on. A message whose own steps
+        raise is logged once and passed over; the store's errors end the read."""
+        for m in sorted(msgs, key=lambda m: float(m["ts"])):
+            key = f"{channel}:{m['ts']}"
+            try:
+                event = {**m, "channel": channel, "channel_type": kind}
+                # a thread's first message, as its live event gave it
+                if event.get("thread_ts") == event["ts"]:
+                    del event["thread_ts"]
+                if float(event["ts"]) <= floor:
+                    continue
+                taken = self.watcher.trigger(event)
+            except (sqlite3.Error, OSError):
+                raise
+            except Exception as e:
+                if key not in self._read_faults:
+                    self._read_faults.add(key)
+                    log.warning("could not read back %s: %s", key, str(e) or type(e).__name__)
+                continue
+            # a reply in an email task's thread is left to Slack sending it again
+            if taken is None or not taken[1]:
+                continue
+            p = taken[0]
+            if not self.store.first_time(key, p):
+                continue
+            k = kept_key(p)
+            self._unhanded[k] = p
+            found.append(k)
+            if p["kind"] in CONVERSATION_KINDS:
+                self.store.create_task(None, channel, p["task_key"], kind=p["kind"], reply_thread=p.get("reply_thread"))
+            self._marked.add(k)
+
+    def _hand_on(self, channel: str | None = None, only: set | None = None) -> None:
+        """Each message a read kept and has not handed on, in `channel` and
+        among `only` when given, to a handler as slack_loop makes one, oldest
+        first, if it is still kept: one deleted meanwhile is not. When reading
+        which are kept raises, none is handed on."""
+        keys = [k for k in self._unhanded if (channel is None or k[0] == channel) and (only is None or k in only)]
+        still: set[tuple[str, str]] = set()
+        for conv in {(k[0], self._unhanded[k]["task_key"]) for k in keys}:
+            still |= {kept_key(r) for r in self.store.kept(*conv)}
+        for k in sorted(keys, key=lambda k: float(k[1])):
+            p = self._unhanded.pop(k)
+            self._marked.discard(k)
+            if k in still:
+                self._handler(Event(source="slack", dedupe_key=f"{k[0]}:{k[1]}", payload=p), handed=True)
+
     # --- slack thread replies -> agentic sessions ---
 
-    async def handle_slack(self, ev: Event) -> None:
+    async def handle_slack(self, ev: Event, handed: bool = False) -> None:
+        """A member's message, or a deletion. `handed`: a message a read back
+        from Slack hands on, which goes past the gate first (_run_memory_reply)."""
         try:
-            await self._handle_slack(ev)
+            await self._handle_slack(ev, handed)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -2155,10 +2742,15 @@ class Processor:
             return "⚠️ I hit an internal error handling that reply."
         return FAILED_GROUP if p.get("channel_type") == "mpim" else FAILED
 
-    async def _handle_slack(self, ev: Event) -> None:
+    async def _handle_slack(self, ev: Event, handed: bool = False) -> None:
         p = ev.payload
         if p.get("kind") == "deleted":
-            self._withdraw(p["channel"], p["ts"])
+            try:
+                self._withdraw(p["channel"], p["ts"])
+            except Exception:
+                # a deletion owes nothing: its row stays due, and the next
+                # start's late add meets message_not_found
+                log.exception("could not forget %s in %s, deleted", p["ts"], p["channel"])
             return
         task = self.store.get_task_by_thread(p["channel"], p["task_key"])
         if task is None:
@@ -2177,9 +2769,11 @@ class Processor:
                           p["task_key"], p["channel"])
                 return
         state: dict[str, bool] = {}
-        reply = self._run_task_reply if task["kind"] == "email" else self._run_memory_reply
         try:
-            await reply(task, p, state)
+            if task["kind"] == "email":
+                await self._run_task_reply(task, p, state)
+            else:
+                await self._run_memory_reply(task, p, state, handed)
         except asyncio.CancelledError:
             # Cancelled anywhere — queued on the lock or semaphore, mid-run, or
             # while posting. The Slack event id is already committed, so Slack
@@ -2295,7 +2889,7 @@ class Processor:
                 await self.slack.reply(p.get("reply_thread"), text, channel=channel)
                 self.store.mark_run_notified(run_id)
 
-    async def _run_memory_reply(self, task, p: dict, state: dict) -> None:
+    async def _run_memory_reply(self, task, p: dict, state: dict, handed: bool = False) -> None:
         """A message from someone on the allowlist, wherever it was sent; one
         not let in owes nothing. It waits for the conversation's turn, and the
         session that turn starts takes every message that arrived since the
@@ -2307,11 +2901,32 @@ class Processor:
         waits for the next turn. Whatever raises before the turn's outcome is
         recorded gets her note in its place. From when its sender is let in
         until it is no longer kept, the message carries her reaction, which
-        says she has it."""
+        says she has it.
+
+        While a read back from Slack has not finished its conversation, the
+        message waits at the gate, so that what was missed there comes first
+        and joins its turn. One the read hands on (`handed`) goes straight on
+        past it; any other that found the gate open yields once, so that what
+        the step that opened it made goes first. One that waited is woken
+        after what that step made, and in the order the lines came."""
         if not self._let_in(p):
             state["recorded"] = True  # nothing is said there, so nothing is owed
             return
-        self._react(kept_key(p))
+        self._eyes(kept_key(p))
+        if not self.gate.is_open(p["channel"]):
+            await self.gate.wait(p["channel"])
+        elif not handed:
+            await asyncio.sleep(0)
+        if kept_key(p) in self._gone:
+            state["recorded"] = True  # deleted while it waited
+            del self._gone[kept_key(p)]
+            try:
+                # its row, when it was kept after the deletion was handled, as
+                # when the deletion could not be recorded as seen
+                self._unreact(self.store.forget([kept_key(p)]))
+            except Exception:
+                log.exception("could not forget %s in %s, deleted while it waited", p["ts"], p["channel"])
+            return
         waiting = self._waiting.setdefault(task["id"], [])
         waiting.append(p)
         if more := self._additions.get(task["id"]):
@@ -2343,6 +2958,10 @@ class Processor:
             nonlocal took, more
             took = True
             if again is None:
+                # Slack's answer to the late reaction on each, holding the
+                # slot, so that one Slack says is gone is withdrawn before it
+                # is framed, and the turns queued behind keep their order
+                await self._late_answered(lambda: [kept_key(m) for m in waiting + kept_there])
                 # with what the run cap or a hold kept here, the budget
                 # having let the turn run
                 there = {kept_key(m) for m in waiting}
@@ -2375,7 +2994,14 @@ class Processor:
             framed = await self._frame_turn(task, batch, state, fresh)
             return None if framed is None else (*framed, fresh)
 
+        kept_there: list[dict] = []
         try:
+            # her reaction on every message the turn will take that lacks it
+            # in this run, as one taken up after a stop or kept by the run cap
+            # or a hold, before the turn asks for a session's place
+            kept_there = self._kept_here(task, ("capped", "held"))
+            for m in waiting + kept_there:
+                self._eyes(kept_key(m))
             await self.memory_turn(task, None, None, channel=p["channel"], reply_thread=p.get("reply_thread"),
                                    owed=True, state=state, frame=frame, group=p.get("channel_type") == "mpim")
         except Exception as e:
@@ -2497,24 +3123,31 @@ class Processor:
         can take a whole session of another conversation: the turn's newest
         message framed with the others, with who is in the conversation now
         and with the earlier sessions that took its messages, and that
-        message's time in the household's zone. A turn whose newest message
-        is older than LATE_TURN_S, as one run again after a stop, takes the
-        session's start for its time instead, and says when the message was
-        sent and when she was not running since the turn's oldest one. None
-        when there is nothing to run: every message withdrawn while it
+        message's time in the household's zone. A turn whose first message
+        is older than LATE_TURN_S, as one run again after a stop or read back
+        from Slack, takes the session's start for its time instead, and says
+        when a message was sent, the newest when it is itself that old, or
+        else the first, and when she was not running since the first. Judged
+        by the first: a line sent as she comes back joins what was missed in
+        its conversation, and a turn judged by that line would read as
+        ordinary conversation, the missed line as one she saw and let pass.
+        None when there is nothing to run: every message withdrawn while it
         waited, or a frame that could not be built, which posts her note."""
         if not batch:
             return None
         p = max(batch, key=lambda m: float(m["ts"]))
+        first = min(batch, key=lambda m: float(m["ts"]))
         now = datetime.fromtimestamp(float(p["ts"]), self.cfg.zone)
-        late = None
-        if datetime.now(self.cfg.zone) - now > timedelta(seconds=LATE_TURN_S):
-            now = datetime.now(self.cfg.zone)
-            oldest = datetime.fromtimestamp(min(float(m["ts"]) for m in batch), timezone.utc)
+        late, dated = None, None
+        at_now = datetime.now(self.cfg.zone)
+        if at_now - datetime.fromtimestamp(float(first["ts"]), self.cfg.zone) > timedelta(seconds=LATE_TURN_S):
+            dated = p if at_now - now > timedelta(seconds=LATE_TURN_S) else first
+            now = at_now
+            oldest = datetime.fromtimestamp(float(first["ts"]), timezone.utc)
             late = [(a, b) for a, b in self.store.down() if b - a >= DOWN_NAMED and b > oldest]
         opening = tuple(vault.RETRIED.format(sid8=s[:8]) for s in (more.earlier if more is not None else ()))
         try:
-            arrival = await self._memory_arrival(p, batch, now, more, opening=opening, late=late)
+            arrival = await self._memory_arrival(p, batch, now, more, opening=opening, late=late, dated=dated)
         except Exception as e:
             log.exception("could not frame %s in %s", p["ts"], p["channel"])
             await self._note_failure(task, p, f"could not gather what was said here: {e}", state,
@@ -2618,16 +3251,18 @@ class Processor:
         # its run, when it started, why, whether Claude Code said so, and
         # the alert's class
         first = None
-        if frame is not None:
-            # what is still owed here goes first, before the session is
-            # framed, so that it is among what she said there and the
-            # session's answer follows it
-            await self.deliver_pending(task["id"])
         queued = time.monotonic()
         async with self.runner.agent_sem:
             # apart from the session's own time: with one session at a time,
             # another conversation's can come first
             waited = time.monotonic() - queued
+            if frame is not None:
+                # what is still owed here goes first, before the session is
+                # framed, so that it is among what she said there and the
+                # session's answer follows it. Holding the slot, so that the
+                # turns asking for it keep the order they asked in, for at
+                # most OWED_IN_SLOT_S
+                await self._post_owed(task["id"], channel)
             while True:
                 if (verdict := await self.check_budget(reserve_usd=reserve)) != "ok":
                     if owed:
@@ -3057,8 +3692,10 @@ class Processor:
     def _withdraw(self, channel: str, ts: str) -> None:
         """A message deleted while it waited for its turn is not handed to a
         session, and is no longer kept unless an answer to it is."""
-        self._unreact(self.store.forget([(channel, ts)]))
-        # nor held by its turn: its row and its reaction are gone already
+        self._gone[(channel, ts)] = asyncio.get_running_loop().time()
+        self._unhanded.pop((channel, ts), None)
+        self._marked.discard((channel, ts))
+        # nor held by its turn; its row and its reaction go last, below
         for holding in self._in_turn.values():
             holding.rows.pop((channel, ts), None)
         for waiting in self._waiting.values():
@@ -3066,6 +3703,9 @@ class Processor:
         # one a running session took and was never handed is not put back
         for more in self._additions.values():
             more.withdrawn.add((channel, ts))
+        # last, so that a store that raises here leaves it withdrawn from
+        # every turn all the same
+        self._unreact(self.store.forget([(channel, ts)]))
 
     def _let_in(self, p: dict) -> bool:
         """Whether the sender of a message, whom the watcher found on the
@@ -3092,7 +3732,8 @@ class Processor:
 
     async def _memory_arrival(self, p: dict, batch: list[dict], now: datetime,
                               more: Additions | None = None, opening: tuple[str, ...] = (),
-                              late: list[tuple[datetime, datetime]] | None = None) -> str:
+                              late: list[tuple[datetime, datetime]] | None = None,
+                              dated: dict | None = None) -> str:
         """The newest message of a turn as its session is handed it: who said
         it, where, who reads the answer and which of them are outside the
         household, and what came before, the turn's other messages, however
@@ -3100,8 +3741,9 @@ class Processor:
         not say who reads, the session is told so, and the turn's speakers are
         named. `opening` is the further sentences of its opening line, before
         which, for a turn that reaches its session `late`, go when the
-        message was sent and each interval she was not running. `more` keeps
-        the place, the time and the names it gives."""
+        message `dated` was sent, `p` unless it is given, and each interval
+        she was not running. `more` keeps the place, the time and the names it
+        gives."""
         try:
             ids, unlisted = await self._readers(p), False
         except Exception as e:
@@ -3156,7 +3798,8 @@ class Processor:
                 log.warning("could not read who is in this Slack for %s: %s", p["channel"], e)
                 outside = True
         if late is not None:
-            opening = (vault.LATE_TURN.format(speaker=named[p["user"]], sent=vault.stamp(float(p["ts"]), now)),
+            dated = dated or p
+            opening = (vault.LATE_TURN.format(speaker=named[dated["user"]], sent=vault.stamp(float(dated["ts"]), now)),
                        *(vault.DOWN.format(since=vault.stamp(a.timestamp(), now), until=vault.stamp(b.timestamp(), now))
                          for a, b in late), *opening)
         return vault.arrival_text(
@@ -3198,7 +3841,9 @@ class Processor:
         works, as that session is handed it, in the place its opening frame
         named, whoever reads the conversation by then: the session's one
         answer reaches whoever reads it when it is posted, as any answer
-        does."""
+        does. A late one only once Slack has answered her reaction on it, so
+        that one it says is gone is neither handed nor put back."""
+        await self._late_answered(lambda: [kept_key(p)])
         own = await self.slack.own_ids()
         # a member's message: every id it mentions is named
         want = ({p["user"]} | set(MENTION_RE.findall(p.get("text") or ""))) - more.told.keys()
@@ -3296,6 +3941,13 @@ async def open_store(cfg: Config) -> Store:
             # to delete. Doctor counts from when this start began.
             store.set_meta("started_at", utcnow())
             store.set_meta("sessions_left_running", "0")
+            # what Slack sent before a store's first start was never hers to
+            # read back; a store from before `heard_from` was kept reads back
+            # its upgrade's own stop, once
+            if (up := store.get_meta("up_at")) is None:
+                store.set_meta("heard_from", utcnow())
+            elif store.get_meta("heard_from") is None:
+                store.set_meta("heard_from", (datetime.fromisoformat(up) - HEARD_MARGIN).isoformat(timespec="seconds"))
             # her running time starts with a store's first start
             if store.get_meta("up_at") is None:
                 store.set_meta("up_at", utcnow())
@@ -3399,25 +4051,43 @@ async def run_daemon(cfg: Config) -> None:
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, stop.set)
 
+    # What was sent while she was not running is read back from Slack, and a
+    # line sent meanwhile waits at the gate, her reaction on it, for the
+    # start's step. slack_loop starts with it: an owner reply arriving now
+    # must not sit undispatched in the queue.
+    reading = processor.read_at_start(slack_watcher)
+    tasks = [asyncio.create_task(processor.slack_loop())]
+    stopped = asyncio.ensure_future(stop.wait())
+    await asyncio.wait({reading, stopped}, timeout=READ_WAIT_S, return_when=asyncio.FIRST_COMPLETED)
+    stopped.cancel()
+    # The start's step, with no await until the gate opens. A stop during the
+    # read starts nothing more, but the interval she was down is recorded,
+    # since the stop's end writes `up_at`.
+    if stop.is_set():
+        processor.stopping = True
+    kept = processor.collected(kept)
     # once the start has got this far: one that dies before, as in a restart
     # loop, leaves `up_at` and the intervals as they were
     store.came_up(utcnow())
     log.info("wanda running (enforcement=%s, email triage=%s, agent=%s)", cfg.enforcement,
              cfg.email_triage_model if cfg.email_triage else "off", cfg.agent_model)
-    # made before slack_loop's task, so that each holds its conversation's
-    # lock before a message from the queue there waits on it
-    for task, keys in kept:
-        processor.take_up(task, keys)
-    # slack_loop starts first: recovery can take many paced Slack calls, and an
-    # owner reply arriving during it must not sit undispatched in the queue.
-    tasks = [asyncio.create_task(processor.slack_loop())]
-    await processor.startup_recovery()
-    # with triage off nothing reaches the mail queue, and the loop still
-    # retries undelivered answers and flushes alerts
-    tasks.append(asyncio.create_task(processor.loop()))
-    # what starts sessions nobody's message asks for, which a stop ends first
-    starting = [asyncio.create_task(processor.clock_loop()), asyncio.create_task(processor.names_loop())]
-    await stop.wait()
+    # made before the gate opens, whoever has waited longest first, so that
+    # each holds its conversation's lock, and its place for a session, before
+    # a line waiting there goes on
+    if not processor.stopping:
+        for task, keys in kept:
+            processor.take_up(task, keys)
+    processor.gate.open_all()
+    starting = []
+    if not processor.stopping:
+        # after the gate opens: its owed posts can take many paced calls
+        await processor.startup_recovery()
+        # with triage off nothing reaches the mail queue, and the loop still
+        # retries undelivered answers and flushes alerts
+        tasks.append(asyncio.create_task(processor.loop()))
+        # what starts sessions nobody's message asks for, which a stop ends first
+        starting = [asyncio.create_task(processor.clock_loop()), asyncio.create_task(processor.names_loop())]
+        await stop.wait()
     for t in starting:
         t.cancel()
     # the watcher, slack_loop and the mail loop go on meanwhile: a message
@@ -3549,20 +4219,40 @@ async def run_doctor(cfg: Config, smoke: bool) -> int:
             report(f"last look for {uid} ({household.told(uid) or 'not let in'})", clock.look_healthy(
                 last, datetime.now(cfg.zone), running, clock.first_start(at, quiet)), last or "none yet")
         # a member's message kept and not yet answered, due longer than a
-        # look may run and two sessions more since it was sent, or since the
-        # last start, which runs again what a stop left: its turn did not
-        # come, or wrote nothing when it ended
+        # look may run and two sessions more since it was sent, since the
+        # last start, which runs again what a stop left, or since it was
+        # kept, as one read back from Slack: its turn did not come, or wrote
+        # nothing when it ended
         taken = [r for r in store.kept() if r["state"] != "answered"]
         since = store.get_meta("started_at")
+        never = datetime.min.replace(tzinfo=timezone.utc)
         overdue = [r for r in taken if r["state"] == "due" and datetime.now(timezone.utc) - max(
             datetime.fromtimestamp(float(r["ts"]), timezone.utc),
-            datetime.fromisoformat(since) if since else datetime.min.replace(tzinfo=timezone.utc),
+            datetime.fromisoformat(since) if since else never,
+            datetime.fromisoformat(r["received_at"]) if r["received_at"] else never,
         ) > running + timedelta(seconds=2 * cfg.agent_timeout_s)]
         report("messages taken and not yet answered", not overdue, f"{len(taken)}" + (
             f", {len(overdue)} due longer than a turn takes" if overdue else "") if taken else "none")
         for r in overdue:
             print(f"      {r['channel']}, the message of {datetime.fromtimestamp(float(r['ts']), zone):%Y-%m-%d %H:%M}"
                   f" (ts {r['ts']}), taken by {r['tries']} session(s) that did not finish")
+        # Each pass keeps `heard_from` HEARD_MARGIN behind `up_at` while her
+        # connection holds and nothing is to be read; one that stays down, or
+        # a read needed and not done, holds it while `up_at` moves on. A
+        # start counts as a time she heard Slack (`started_at`), so its own
+        # read has ten minutes.
+        heard, up = store.get_meta("heard_from"), store.get_meta("up_at")
+        if heard and up:
+            heard_at = datetime.fromisoformat(heard) + HEARD_MARGIN
+            behind = datetime.fromisoformat(up) - max(heard_at, datetime.fromisoformat(since) if since else never)
+            if behind > timedelta(minutes=10):
+                report(f"she has not heard from Slack since {vault.stamp(heard_at.timestamp(), datetime.now(zone))} "
+                       "(the log says why)", False)
+            else:
+                # never later than now: a new store, and the step that moves
+                # it by hand, set `heard_from` to now with no margin
+                report("heard from Slack", True,
+                       vault.stamp(min(heard_at, datetime.now(timezone.utc)).timestamp(), datetime.now(zone)))
         # the timed reminders not given, with who asked and why, which their
         # alert leaves out. Its session may have closed the item, and the
         # clock wakes only for an open one, so the command reopens it too

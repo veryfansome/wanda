@@ -258,3 +258,40 @@ def test_meta_and_digest(store):
     assert store.get_digest("2026-08-31") is None
     store.set_digest("2026-08-31", "C1", "9.9")
     assert store.get_digest("2026-08-31")["thread_ts"] == "9.9"
+
+
+def test_the_threads_of_hers_a_session_ran_in_within_30_days_are_listed(store):
+    """What a read back from Slack reads whatever the age of its first
+    message: a mention's, a guest's and a DM's thread a session ran in; not
+    an email task's, which is never read back, nor a DM's one conversation,
+    nor a thread with no run, or whose last run is 31 days old."""
+    now = datetime(2026, 10, 7, 12, 0, tzinfo=timezone.utc)
+
+    def ran(channel, thread, kind, days, reply_thread=None, run_kind="agent"):
+        task = store.create_task(None, channel, thread, kind=kind, reply_thread=reply_thread)
+        if days is not None:
+            store.record_run(kind=run_kind, task_id=task, session_id="s", started_at=(now - timedelta(days=days))
+                             .isoformat(timespec="seconds"), exit_code=0, cost_usd=0.0, status="ok")
+    ran("C1", "10.1", "mention", 2)
+    ran("C1", "11.1", "mention_guest", 29)
+    ran("D1", "12.1", "dm", 1, reply_thread="12.1")
+    ran("D1", "conversation", "dm", 1)
+    ran("C2", "13.1", "email", 1)
+    ran("C1", "14.1", "mention", None)
+    ran("C1", "15.1", "mention", 31)
+    ran("C1", "16.1", "mention", 1, run_kind="note")
+    assert store.threads(now) == [("C1", "10.1"), ("C1", "11.1"), ("D1", "12.1")]
+
+
+def test_a_message_kept_carries_when_it_was_seen_until_the_record_is_pruned(store):
+    """A message stays kept until it is answered; the record of when it was
+    seen goes at seven days, and the message is listed without it."""
+    p = {"channel": "D1", "ts": "1.1", "task_key": "conversation"}
+    store.first_time("D1:1.1", p)
+    [row] = store.kept()
+    assert datetime.fromisoformat(row["received_at"]) <= datetime.now(timezone.utc)
+    store._exec("UPDATE slack_events SET received_at=?",
+                ((datetime.now(timezone.utc) - timedelta(days=8)).isoformat(timespec="seconds"),))
+    store.prune_slack_events()
+    [row] = store.kept("D1", "conversation")
+    assert row["ts"] == "1.1" and row["received_at"] is None

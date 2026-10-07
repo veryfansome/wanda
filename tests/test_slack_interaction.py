@@ -821,3 +821,269 @@ def test_owned_thread_replies_work_without_a_mention(store):
     ev = fire(store, {"type": "message", "user": "U1", "channel": "C9", "channel_type": "channel",
                       "ts": "100.5", "thread_ts": "100.1", "text": "and the other one?"})
     assert ev is not None and ev.payload["kind"] == "task"
+
+
+# --- one classification for the live watcher and a read back from Slack ---
+
+DM_LINE = {"type": "message", "user": "U1", "channel": "D5", "channel_type": "im", "text": "hi"}
+# Every case the watcher's tests above take a message through: the tasks it
+# finds, the event, and the allowlist. Each is answered by `trigger` as `_take`
+# answers it.
+TRIGGER_CASES = [
+    ((), {"user": "U1", "channel": "C9", "channel_type": "channel", "ts": "100.1", "text": "<@UBOT> hi"}, ()),
+    ((), {"user": "U1", "channel": "C9", "channel_type": "channel", "ts": "100.9", "thread_ts": "100.1",
+          "text": "<@UBOT> and this?"}, ()),
+    ((("C9", "100.1", "mention_guest"),), {"user": "U2", "channel": "C9", "channel_type": "channel", "ts": "100.9",
+                                           "thread_ts": "100.1", "text": "yeah agreed"}, ()),
+    ((("C9", "100.1", "mention_guest"),), {"user": "U2", "channel": "C9", "channel_type": "channel", "ts": "101.0",
+                                           "thread_ts": "100.1", "text": "<@UBOT> thoughts?"}, ()),
+    ((), {"user": "U1", "channel": "D5", "channel_type": "im", "ts": "7.7", "text": "<@UBOT> hi"}, ()),
+    ((), {"user": "U1", "channel": "D5", "channel_type": "im", "ts": "1.1", "text": "hey"}, ()),
+    ((), {"user": "U1", "channel": "D5", "channel_type": "mpim", "ts": "1.1", "text": "hey"}, ()),
+    ((), {"user": "U1", "channel": "C9", "channel_type": "channel", "ts": "1.1", "text": "morning all"}, ()),
+    ((("C_TRIAGE", "77.1", "email"),), {"user": "U1", "channel": "C_TRIAGE", "channel_type": "channel",
+                                        "ts": "77.2", "thread_ts": "77.1", "text": "do it"}, ()),
+    ((), {"user": "UBOT", "channel": "D5", "channel_type": "im", "ts": "1.1", "text": "x"}, ()),
+    ((), {"bot_id": "B1", "user": "U2", "channel": "D5", "channel_type": "im", "ts": "1.2", "text": "x"}, ()),
+    ((), {"user": "U_STRANGER", "channel": "C9", "channel_type": "channel", "ts": "1.1", "text": "<@UBOT> hi"},
+     ("U_ME",)),
+    ((), {"user": "U_STRANGER", "channel": "C9", "channel_type": "channel", "ts": "1.1", "text": "<@UBOT> hi"}, ()),
+    ((("C9", "50.1", "mention"),), {"user": "U_STRANGER", "channel": "C9", "channel_type": "channel", "ts": "60.3",
+                                    "thread_ts": "50.1", "text": "hi"}, ("U_ME",)),
+    ((("C_ALERTS", "70.1", "mention"),), {"user": "U1", "channel": "C_ALERTS", "channel_type": "group",
+                                          "ts": "70.5", "thread_ts": "70.1", "text": "what does this mean?"}, ()),
+    ((("C9", "50.1", "mention"),), {"user": "U1", "channel": "C9", "channel_type": "channel", "ts": "90.3",
+                                    "thread_ts": "50.1", "text": "and"}, ()),
+    ((), {"user": "U1", "channel": "C9", "channel_type": "channel", "ts": "90.2", "thread_ts": "8.8",
+          "text": "<@UBOT> hi"}, ()),
+    ((), {"user": "U1", "channel": "D5", "channel_type": "im", "ts": "9.1", "text": "with a file",
+          "subtype": "file_share", "files": [{"name": "a.pdf"}, {}]}, ()),
+    ((), {"user": "U1", "channel": "D5", "channel_type": "im", "ts": "9.2", "text": "joined",
+          "subtype": "channel_join"}, ()),
+    ((), {"user": "U1", "channel": "C9", "channel_type": "channel", "ts": "9.9", "text": "<@UBOT|wanda> hi"}, ()),
+    ((("C_TRIAGE", "77.1", "email"),), {"user": "U1", "channel": "C_TRIAGE", "channel_type": "channel",
+                                        "ts": "77.9", "thread_ts": "77.1", "text": "<@UBOT> handle this"}, ()),
+    ((("C9", "100.1", "mention"),), {"user": "U1", "channel": "C9", "channel_type": "channel", "ts": "100.5",
+                                     "thread_ts": "100.1", "text": "and the other one?"}, ()),
+    ((("C_TRIAGE", "77.1", "email"),), {"type": "app_mention", "user": "U1", "channel": "C_TRIAGE", "ts": "77.5",
+                                        "thread_ts": "77.1", "text": "<@UBOT> go ahead"}, ()),
+]
+
+
+@pytest.mark.parametrize("tasks, event, owners", TRIGGER_CASES)
+def test_trigger_answers_as_the_live_watcher_takes(tmp_path, tasks, event, owners):
+    """A message read back from Slack is classified by `trigger`, which the
+    live path runs too: what it hands on and whether it is kept are what the
+    watcher puts on the queue and keeps, and None is a message it drops.
+    Since `_take` calls `trigger`, this holds them together through a
+    change; the tests above are what pin how a message is classified."""
+    live, read = Store(tmp_path / "live.db"), Store(tmp_path / "read.db")
+    for s in (live, read):
+        for channel, thread, kind in tasks:
+            s.create_task(None, channel, thread, kind=kind)
+    event = {"type": "message", **event}
+    kw = {"slack_owner_user_ids": list(owners)} if owners else {}
+    ev = fire(live, dict(event), **kw)
+    w, _, loop = watcher(read, **kw)
+    loop.close()
+    got = w.trigger(dict(event))
+    if ev is None:
+        assert got is None
+    else:
+        payload, memory = got
+        assert payload == ev.payload
+        assert memory == bool(live.kept(payload["channel"], payload["task_key"]))
+    live.close()
+    read.close()
+
+
+def test_a_deletion_records_its_message_as_seen(store):
+    """Seen, so that a read back of Slack or Slack sending it again does not
+    take it once it is gone; and its withdrawal is queued."""
+    w, q, loop = watcher(store)
+    w._handle(w.client, FakeReq({"type": "message", "subtype": "message_deleted", "channel": "D5",
+                                 "deleted_ts": "5.5"}))
+    w._handle(w.client, FakeReq({**DM_LINE, "ts": "5.5"}))
+    loop.run_until_complete(asyncio.sleep(0))
+    loop.close()
+    assert [ev.payload["kind"] for ev in (q.get_nowait() for _ in range(q.qsize()))] == ["deleted"]
+    assert store.kept() == []
+
+
+def test_a_deletion_whose_record_fails_is_still_withdrawn(store, monkeypatch, caplog):
+    w, q, loop = watcher(store)
+
+    def full(key, payload=None):
+        raise sqlite3.OperationalError("database or disk is full")
+    monkeypatch.setattr(store, "first_time", full)
+    w._handle(w.client, FakeReq({"type": "message", "subtype": "message_deleted", "channel": "D5",
+                                 "deleted_ts": "5.5"}))
+    loop.run_until_complete(asyncio.sleep(0))
+    loop.close()
+    assert q.get_nowait().payload == {"kind": "deleted", "channel": "D5", "ts": "5.5"}
+    assert "could not record 5.5 in D5 as deleted: database or disk is full" in caplog.text
+
+
+def test_a_line_the_watcher_could_not_keep_is_owed_a_read_back(store, monkeypatch):
+    """The store refusing the write, as on a full disk: Slack is told it
+    arrived and sends nothing again, so a read back is owed; the error still
+    reaches the SDK's log, and the envelope is acknowledged."""
+    w, q, loop = watcher(store)
+    acked = []
+    w.client = SimpleNamespace(send_socket_mode_response=lambda r: acked.append(r.envelope_id))
+
+    def full(key, payload=None):
+        raise sqlite3.OperationalError("database or disk is full")
+    monkeypatch.setattr(store, "first_time", full)
+    with pytest.raises(sqlite3.OperationalError):
+        w._handle(w.client, FakeReq({**DM_LINE, "ts": "2.2"}))
+    loop.run_until_complete(asyncio.sleep(0))
+    loop.close()
+    ev = q.get_nowait()
+    assert (ev.dedupe_key, ev.payload) == ("owed:env1", {"kind": "owed"}) and acked == ["env1"]
+
+
+# --- a new connection to Slack ---
+
+class _Conn:
+    """A connection that is open until closed, as the SDK's says."""
+
+    def __init__(self, session_id):
+        self.session_id, self.open, self.last_ping_pong_time = session_id, True, None
+
+    def is_active(self):
+        return self.open
+
+    def close(self):
+        self.open = False
+
+    def check_state(self):
+        pass
+
+
+def connections(monkeypatch, heard):
+    """The watcher's client with the SDK's connect stubbed, as a connection
+    that opens: no network."""
+    from slack_sdk.socket_mode.builtin.client import SocketModeClient
+    from slack_sdk.web import WebClient
+    from wanda.watchers.slack_watcher import Connections
+
+    made = iter(f"s{i}" for i in range(1, 10))
+
+    def connect(self):
+        old = self.current_session
+        self.current_session = _Conn(next(made))
+        if old:
+            old.close()
+    monkeypatch.setattr(SocketModeClient, "connect", connect)
+    monkeypatch.setattr(SocketModeClient, "issue_new_wss_url", lambda self: "wss://stub.invalid/")
+    return Connections(app_token="xapp-stub", web_client=WebClient(token="xoxb-stub"),
+                       heard=heard if callable(heard) else lambda session, refresh: heard.append((session, refresh)))
+
+
+def test_a_new_connection_after_one_closed_or_refreshed_is_heard_and_the_first_is_not(monkeypatch):
+    """Every connection goes through `connect`: the start's, which replaces
+    none and says nothing; the monitor's after one closed, which replaces
+    one that is closed; and Slack's refresh, which opens the new connection
+    with the old still open."""
+    import json
+    import time
+
+    heard = []
+    c = connections(monkeypatch, heard)
+    try:
+        c.connect()
+        assert heard == []
+        c.current_session.close()
+        c.connect_to_new_endpoint()
+        assert heard == [("s2", False)]
+        c.enqueue_message(json.dumps({"type": "disconnect", "reason": "refresh_requested"}))
+        for _ in range(100):
+            if len(heard) == 2:
+                break
+            time.sleep(0.02)
+        assert heard == [("s2", False), ("s3", True)]
+    finally:
+        c.close()
+
+
+def test_a_new_connection_is_queued_as_heard_saying_whether_it_was_a_refresh(store, monkeypatch):
+    """The watcher's own `heard`, from the SDK's thread to the queue the
+    Processor reads: a reconnection after a closed connection, then Slack's
+    refresh."""
+    import json
+    import time
+
+    w, q, loop = watcher(store)
+    c = connections(monkeypatch, w._heard)
+    try:
+        c.connect()
+        c.current_session.close()
+        c.connect_to_new_endpoint()
+        c.enqueue_message(json.dumps({"type": "disconnect", "reason": "refresh_requested"}))
+        for _ in range(100):
+            loop.run_until_complete(asyncio.sleep(0))
+            if q.qsize() == 2:
+                break
+            time.sleep(0.02)
+    finally:
+        c.close()
+        loop.close()
+    assert [(ev.source, ev.dedupe_key, ev.payload) for ev in (q.get_nowait() for _ in range(q.qsize()))] == [
+        ("slack", "heard:s2", {"kind": "heard", "session": "s2", "refresh": False}),
+        ("slack", "heard:s3", {"kind": "heard", "session": "s3", "refresh": True})]
+
+
+def test_a_try_that_opens_nothing_is_not_heard_and_the_next_that_opens_is(store, monkeypatch):
+    """With the SDK's own connect and a socket that cannot be made, nothing
+    raises and nothing is heard; the next try that opens is."""
+    import socket
+
+    from slack_sdk.socket_mode.builtin import connection as conn_mod
+    from slack_sdk.socket_mode.builtin.client import SocketModeClient
+    from slack_sdk.web import WebClient
+    from wanda.watchers.slack_watcher import Connections
+
+    def refused(**kw):
+        raise ConnectionRefusedError("no socket here")
+    monkeypatch.setattr(conn_mod, "_establish_new_socket_connection", refused)
+    monkeypatch.setattr(SocketModeClient, "issue_new_wss_url", lambda self: "wss://stub.invalid/")
+    heard = []
+    c = Connections(app_token="xapp-stub", web_client=WebClient(token="xoxb-stub"),
+                    heard=lambda session, refresh: heard.append((session, refresh)))
+    a, b = socket.socketpair()
+    try:
+        c.connect()
+        c.current_app_monitor.shutdown()  # its own retry would race the one below
+        assert heard == [] and not c.is_connected()
+        c.connect()
+        assert heard == [] and not c.is_connected()
+        monkeypatch.setattr(conn_mod.Connection, "connect", lambda self: setattr(self, "sock", a))
+        c.connect()
+        assert heard == [(c.current_session.session_id, False)]
+        # the SDK's own connection, as the watcher reads it, before any pong
+        w, _, loop = watcher(store)
+        loop.close()
+        w.client = c
+        assert w.last_heard() == (c.current_session.session_id, None)
+    finally:
+        c.close()
+        a.close()
+        b.close()
+
+
+def test_last_heard_is_the_open_connections_last_pong(store):
+    """None with no client, as when a test stubs the start, and with the
+    connection closed; else its session and its last pong's time, which a
+    pong sets for its own session alone (slack_sdk's Connection)."""
+    w, _, loop = watcher(store)
+    loop.close()
+    w.client = None
+    assert w.last_heard() is None
+    conn = _Conn("s1")
+    w.client = SimpleNamespace(current_session=conn, is_connected=lambda: conn.is_active())
+    assert w.last_heard() == ("s1", None)
+    conn.last_ping_pong_time = 1791347800.5
+    assert w.last_heard() == ("s1", 1791347800.5)
+    conn.close()
+    assert w.last_heard() is None

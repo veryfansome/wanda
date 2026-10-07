@@ -102,6 +102,18 @@ def texts() -> list[tuple[str, str]]:
             opening=(vault.LATE_TURN.format(speaker="alice", sent="Wed 2026-09-30 23:58"),
                      vault.DOWN.format(since="Wed 2026-09-30 23:59", until="06:58"),
                      vault.RETRIED.format(sid8="3f9a1c2e")))))
+    # a turn whose first message reaches its session late: a backlog, the
+    # message it answers dated, and a missed line with a fresh one, the
+    # missed line dated
+    for place in vault.PLACES:
+        found.append((f"memory frame, a late backlog, {place}", vault.arrival_text(
+            place, "alice", "hi", ["alice"], [("16:40", "alice", "earlier")], unlisted=True,
+            opening=(vault.LATE_TURN.format(speaker="alice", sent="18:30"),
+                     vault.DOWN.format(since="16:41", until="19:39")))))
+        found.append((f"memory frame, a missed line and a fresh one, {place}", vault.arrival_text(
+            place, "alice", "hi", ["alice", "bob"], [("16:40", "bob", "earlier")], also=["bob"], unlisted=True,
+            opening=(vault.LATE_TURN.format(speaker="bob", sent="16:40"),
+                     vault.DOWN.format(since="16:41", until="19:39")))))
     for place in vault.PLACES:
         found.append((f"a message added while the session works, {place}",
                       vault.added_text(place, "alice", "hi", "09:06")))

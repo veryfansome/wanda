@@ -1003,11 +1003,16 @@ def test_a_start_knows_her_own_ids_before_any_session_or_exits_saying_why(tmp_pa
             return auth
 
     class Socket:
+        current_session = None
+
         def __init__(self, **kw):
             self.socket_mode_request_listeners = []
 
         def connect(self):
             pass
+
+        def is_connected(self):
+            return False
 
         def close(self):
             pass
@@ -1026,7 +1031,7 @@ def test_a_start_knows_her_own_ids_before_any_session_or_exits_saying_why(tmp_pa
         return {}
 
     monkeypatch.setattr(slack_watcher, "WebClient", Web)
-    monkeypatch.setattr(slack_watcher, "SocketModeClient", Socket)
+    monkeypatch.setattr(slack_watcher, "Connections", Socket)
     monkeypatch.setattr("wanda.actions.slack.SlackActions._call", call)
     monkeypatch.setattr("wanda.main.Processor.loop", one_pass)
     monkeypatch.setattr("wanda.main.Processor.startup_recovery", recovery)
@@ -1196,6 +1201,19 @@ class ConversationSlack(FakeSlack):
         self.asked: list[str] = []
         # each history read's arguments
         self.fetched: list[tuple] = []
+        # What a read back from Slack finds: the conversations she is in, as
+        # users.conversations gives them; each one's history and each
+        # thread's replies, by channel and by (channel, thread ts), which it
+        # reads as Slack does, from the time it is given; each call it made
+        # and its arguments; and an error to raise at a call, by its arguments
+        self.listed: list[dict] = []
+        self.histories: dict[str, list[dict]] = {}
+        self.replies_of: dict[tuple[str, str], list[dict]] = {}
+        self.read_calls = 0
+        self.reads: list[tuple] = []
+        self.read_errors: dict[tuple, BaseException] = {}
+        # the time each conversation's history was read back from
+        self.oldest: dict[str, float] = {}
 
     async def fetch_context(self, channel, thread_ts, since, counted=None):
         self.fetched.append((channel, thread_ts, since, counted))
@@ -1211,6 +1229,27 @@ class ConversationSlack(FakeSlack):
 
     def kept(self, ids):
         return {u: self.held[u] for u in ids if u in self.held}
+
+    def _read(self, *call, oldest=None):
+        self.read_calls += 1
+        self.reads.append(call)
+        if oldest is not None:
+            self.oldest[call[1]] = oldest
+        if (e := self.read_errors.get(call[:2]) or self.read_errors.get(call[:3])) is not None:
+            raise e
+
+    async def conversations(self):
+        self._read("conversations")
+        return list(self.listed)
+
+    async def read_history(self, channel, oldest):
+        self._read("history", channel, oldest=oldest)
+        yield sorted((m for m in self.histories.get(channel, []) if float(m["ts"]) >= oldest),
+                     key=lambda m: float(m["ts"]), reverse=True), False
+
+    async def read_thread(self, channel, ts, oldest):
+        self._read("thread", channel, ts)
+        return [m for m in self.replies_of.get((channel, ts), []) if float(m["ts"]) >= oldest or m["ts"] == ts]
 
     async def users(self, ids):
         known = {"U1": {"profile": {"display_name": "fzhu"}}, "U2": {"profile": {"display_name": "mei"}},
@@ -1282,9 +1321,12 @@ LATE_TURN_S = main.LATE_TURN_S
 def memory_processor(tmp_path, slack, runner, monkeypatch, snapshot=None):
     p, store = make(tmp_path, slack, data_dir=tmp_path, slack_owner_user_ids="U1,U2", tz="America/Los_Angeles")
     # the tests' messages are dated AT, before any test runs, and are framed
-    # at their own time, as a message just sent is; a test of a turn that
-    # comes late sets the threshold back and the time it runs at
+    # at their own time, as a message just sent is, and her reaction on each
+    # is made at once and not waited for, as on a message just sent; a test
+    # of a turn that comes late, or of a late reaction, sets the threshold
+    # back and the time it runs at
     monkeypatch.setattr(main, "LATE_TURN_S", 10 ** 9)
+    monkeypatch.setattr(main, "LATE_ADD_S", 10 ** 9)
     told(store)
     p.household = Household.load(store, p.cfg.slack_owner_user_ids)
     p.runner = runner
@@ -2867,9 +2909,9 @@ def test_a_message_nothing_will_answer_is_not_left_due(tmp_path, monkeypatch, en
     line = dm(f"{AT:.1f}", "is it paid?", user="U2" if ending == "a sender not let in" else "U1")
     keep(store, line)
     if ending == "an internal error before the frame":
-        async def broken(task_id=None):
+        async def broken(task_id, channel):
             raise RuntimeError("the store went away")
-        monkeypatch.setattr(p, "deliver_pending", broken)
+        monkeypatch.setattr(p, "_post_owed", broken)
         first = dm(f"{AT - 5:.1f}", "one")
         keep(store, first)
 
@@ -2905,6 +2947,26 @@ def test_a_message_nothing_will_answer_is_not_left_due(tmp_path, monkeypatch, en
                              "an internal error before the frame": [main.FAILED]}[ending]
 
 
+def test_what_is_owed_raising_while_its_turn_waits_for_it_ends_the_turn_before_its_frame(tmp_path, monkeypatch):
+    """The post of what is owed fails inside its bound: no session runs, and
+    her note waits behind the answer still owed there."""
+    runner = RecordingRunner(answer("Yes, it's paid."))
+    slack = ConversationSlack(history=[])
+    p, store, _ = memory_processor(tmp_path, slack, runner, monkeypatch)
+    task = store.create_task(None, "D1", "conversation", kind="dm")
+    store.record_run(kind="agent", task_id=task, session_id="s", started_at=utcnow(), exit_code=0,
+                     cost_usd=0.0, status="ok", result_text="An answer owed.", notified=0)
+
+    async def broken(task_id=None):
+        raise RuntimeError("the store went away")
+    monkeypatch.setattr(p, "deliver_pending", broken)
+    line = dm(f"{AT:.1f}", "is it paid?")
+    keep(store, line)
+    asyncio.run(p.handle_slack(line))
+    assert runner.calls == []
+    assert [r["result_text"] for r in store.pending_deliveries()] == ["An answer owed.", main.FAILED]
+
+
 class HeldNote(ConversationSlack):
     """Holds each post of her note `note` until `gate` is set, as a slow
     Slack would; `waiting` once one is held."""
@@ -2926,14 +2988,14 @@ def test_a_line_sent_while_her_note_on_a_failure_before_the_frame_posts_gets_its
     runner = RecordingRunner(answer("Yes, it's paid."))
     slack = HeldNote(history=[])
     p, store, _ = memory_processor(tmp_path, slack, runner, monkeypatch)
-    real, calls = p.deliver_pending, []
+    real, calls = p._post_owed, []
 
-    async def fails_once(task_id=None):
+    async def fails_once(task_id, channel):
         calls.append(task_id)
         if len(calls) == 1:
             raise RuntimeError("the store went away")
-        await real(task_id)
-    monkeypatch.setattr(p, "deliver_pending", fails_once)
+        await real(task_id, channel)
+    monkeypatch.setattr(p, "_post_owed", fails_once)
     one, two = dm(f"{AT:.1f}", "one"), dm(f"{AT + 10:.1f}", "is it paid?")
     keep(store, one), keep(store, two)
 
@@ -3179,8 +3241,10 @@ def a_start(tmp_path, monkeypatch, runner, slack, *, connect=(), dies=False,
     monkeypatch.setattr("wanda.main.SlackWatcher.stop", lambda self: watcher_stops and watcher_stops())
     monkeypatch.setattr("wanda.main.Processor.loop", loop or one_pass)
     monkeypatch.setattr("wanda.main.Processor.startup_recovery", dying if dies else recovery)
-    # framed at their own time, as in memory_processor
+    # framed at their own time, and her reaction made at once, as in
+    # memory_processor
     monkeypatch.setattr(main, "LATE_TURN_S", 10 ** 9)
+    monkeypatch.setattr(main, "LATE_ADD_S", 10 ** 9)
     monkeypatch.setattr("wanda.vault.prepare", lambda c, now, since=None: None)
     monkeypatch.setattr("wanda.vault.snapshot", snapshot or (lambda cfg, message: None))
     monkeypatch.setattr("wanda.vault.last_snapshot", lambda cfg: "none")
@@ -3290,8 +3354,9 @@ def test_a_kept_message_deleted_while_its_take_up_waits_is_not_run(tmp_path, mon
 
 
 def test_doctor_names_a_message_due_longer_than_a_turn_takes(tmp_path, capsys):
-    """Counted from the later of when it was sent and the last start, which
-    runs again what a stop left, so not at once after a start."""
+    """Counted from the latest of when it was sent, when it was kept and the
+    last start, which runs again what a stop left, so not at once after a
+    start."""
     from wanda.main import run_doctor
 
     c = Config(_env_file=None, data_dir=tmp_path, claude_bin="/bin/true", email_triage=False)
@@ -3299,6 +3364,8 @@ def test_doctor_names_a_message_due_longer_than_a_turn_takes(tmp_path, capsys):
     sent = datetime.now(timezone.utc) - timedelta(hours=3)
     keep(store, dm(f"{sent.timestamp():.1f}", "is it paid?"))
     keep(store, dm(f"{sent.timestamp() + 1:.1f}", "thanks"))
+    # kept as they were sent, live
+    store._exec("UPDATE slack_events SET received_at=?", (sent.isoformat(timespec="seconds"),))
     store._exec("UPDATE unanswered SET state='answered' WHERE ts=?", (f"{sent.timestamp() + 1:.1f}",))
     store.set_meta("started_at", utcnow())
     asyncio.run(run_doctor(c, smoke=False))

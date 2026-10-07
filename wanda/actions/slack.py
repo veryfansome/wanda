@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import sqlite3
 import time
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import datetime
 
 from slack_sdk import WebClient
@@ -38,6 +39,20 @@ NOT_THERE = {"no_reaction", "message_not_found", "channel_not_found"}
 # the most pages of 200 any one list is read in: a conversation's history or
 # a thread, a member list, the workspace
 MAX_CONTEXT_PAGES = 10
+# One call of a read back from Slack, or one late add of her reaction, every
+# this long: about 40 a minute, under the 50 a minute Slack allows an internal
+# app for each method (Tier 3), which frames' reads of history and threads
+# share.
+READ_EVERY_S = 1.5
+
+
+class CallFailed(Exception):
+    """Any failure of a read back's call but Slack's own answer, which stays
+    SlackApiError: the network, its timeout, the client. Wrapped at the call
+    because not all the client raises is an OSError (a reply cut short,
+    `http.client.IncompleteRead`, for one): unwrapped, such a failure would
+    read as a fault in handling what Slack gave, which passes one
+    conversation over, where a call that failed ends the read."""
 
 
 def truncate_text(text: str) -> str:
@@ -82,6 +97,10 @@ class SlackActions:
         self.names_web = WebClient(token=cfg.slack_bot_token, ssl=ssl_context(), timeout=10, retry_handlers=[])
         self._pace = asyncio.Lock()
         self._last_call = 0.0
+        # a read back's calls, paced on their own
+        self._read_pace = asyncio.Lock()
+        self._last_read = 0.0
+        self.read_calls = 0
         self._users: dict[str, dict] = {}
         self._own_ids: frozenset[str] = frozenset()
         self._dms: dict[str, str] = {}
@@ -95,6 +114,25 @@ class SlackActions:
                 return await asyncio.to_thread(getattr(self.web, method), **kwargs)
             finally:
                 self._last_call = time.monotonic()
+
+    async def _read(self, method: str, /, **kwargs):
+        """A call of a read back from Slack, on the names' client, outside
+        the posts' pacing, one every READ_EVERY_S. Whatever fails in it but
+        Slack's answer is raised as CallFailed, so that the read can tell a
+        call that failed from a fault in handling what the call gave."""
+        async with self._read_pace:
+            wait = READ_EVERY_S - (time.monotonic() - self._last_read)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self.read_calls += 1
+            try:
+                return await asyncio.to_thread(getattr(self.names_web, method), **kwargs)
+            except SlackApiError:
+                raise
+            except Exception as e:
+                raise CallFailed(f"{method}: {str(e) or type(e).__name__}") from e
+            finally:
+                self._last_read = time.monotonic()
 
     # --- task threads ---
 
@@ -190,18 +228,14 @@ class SlackActions:
         oldest outside a thread, the newest in one."""
         if not thread_ts:
             msgs: list[dict] = []
-            cursor, n = None, 0
-            for _ in range(MAX_CONTEXT_PAGES):
-                kwargs = {"channel": channel, "oldest": f"{since:.6f}", "limit": 200, "include_all_metadata": True}
-                if cursor:
-                    kwargs["cursor"] = cursor
-                resp = await self._call("conversations_history", **kwargs)
-                page = resp.get("messages") or []
-                msgs.extend(page)
-                n += sum(1 for m in page if counted(m)) if counted else 0
-                cursor = ((resp.get("response_metadata") or {}).get("next_cursor") or "").strip()
-                if not cursor or (counted and n >= EARLIER):
-                    break
+            n, pages = 0, 0
+            async with contextlib.aclosing(self._history(channel, since, self._call)) as history:
+                async for page, _ in history:
+                    msgs.extend(page)
+                    n += sum(1 for m in page if counted(m)) if counted else 0
+                    pages += 1
+                    if pages >= MAX_CONTEXT_PAGES or (counted and n >= EARLIER):
+                        break
             return list(reversed(msgs))
         msgs, more = await self._replies(channel, thread_ts, None)
         if not more:
@@ -215,9 +249,27 @@ class SlackActions:
         seen = {m.get("ts") for m in msgs}
         return msgs + [m for m in again if m.get("ts") not in seen]
 
-    async def _replies(self, channel: str, thread_ts: str, since: float | None) -> tuple[list[dict], bool]:
+    async def _history(self, channel: str, oldest: float,
+                       call: Callable[..., Awaitable]) -> AsyncIterator[tuple[list[dict], bool]]:
+        """A conversation's history back to `oldest`, a page at a time, newest
+        first, each with whether more follows, through `call`."""
+        cursor = None
+        while True:
+            kwargs = {"channel": channel, "oldest": f"{oldest:.6f}", "limit": 200, "include_all_metadata": True}
+            if cursor:
+                kwargs["cursor"] = cursor
+            resp = await call("conversations_history", **kwargs)
+            cursor = ((resp.get("response_metadata") or {}).get("next_cursor") or "").strip()
+            yield resp.get("messages") or [], bool(cursor)
+            if not cursor:
+                return
+
+    async def _replies(self, channel: str, thread_ts: str, since: float | None,
+                       call: Callable[..., Awaitable] | None = None) -> tuple[list[dict], bool]:
         """A thread's replies, earliest first, after `since` if given, and
-        whether MAX_CONTEXT_PAGES ran out with more to read."""
+        whether MAX_CONTEXT_PAGES ran out with more to read, through `call`,
+        the posts' pacing unless given."""
+        call = call or self._call
         msgs: list[dict] = []
         cursor = None
         for _ in range(MAX_CONTEXT_PAGES):
@@ -226,12 +278,43 @@ class SlackActions:
                 kwargs["oldest"] = f"{since:.6f}"
             if cursor:
                 kwargs["cursor"] = cursor
-            resp = await self._call("conversations_replies", **kwargs)
+            resp = await call("conversations_replies", **kwargs)
             msgs.extend(resp.get("messages") or [])
             cursor = ((resp.get("response_metadata") or {}).get("next_cursor") or "").strip()
             if not resp.get("has_more") or not cursor:
                 return msgs, False
         return msgs, True
+
+    # --- reading back what was sent while she could not hear Slack ---
+
+    async def conversations(self) -> list[dict]:
+        """Every conversation she is in that is not archived, as Slack lists
+        them (users.conversations), one opened while she could not hear
+        Slack included."""
+        found: list[dict] = []
+        cursor = None
+        for _ in range(MAX_CONTEXT_PAGES):
+            kwargs = {"types": "public_channel,private_channel,mpim,im", "exclude_archived": True, "limit": 200}
+            if cursor:
+                kwargs["cursor"] = cursor
+            resp = await self._read("users_conversations", **kwargs)
+            found.extend(resp.get("channels") or [])
+            cursor = ((resp.get("response_metadata") or {}).get("next_cursor") or "").strip()
+            if not cursor:
+                return found
+        # a list cut short would leave conversations unread
+        raise RuntimeError(f"she is in more conversations than one read lists ({MAX_CONTEXT_PAGES} pages of 200)")
+
+    def read_history(self, channel: str, oldest: float) -> AsyncIterator[tuple[list[dict], bool]]:
+        """A conversation's history back to `oldest`, as a read back reads
+        it, a page at a time, newest first."""
+        return self._history(channel, oldest, self._read)
+
+    async def read_thread(self, channel: str, thread_ts: str, oldest: float) -> list[dict]:
+        """A thread's replies after `oldest`, earliest first, as a read back
+        reads them; Slack gives its first message too, whatever its age."""
+        msgs, _ = await self._replies(channel, thread_ts, oldest, self._read)
+        return msgs
 
     def know_own_ids(self, ids: frozenset[str]) -> None:
         """Her bot user id and bot id, from the watcher's auth.test at
