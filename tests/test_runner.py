@@ -596,6 +596,22 @@ def test_a_streamed_session_claude_code_refused_says_why(tmp_path, monkeypatch, 
     assert not rr.ok and rr.api_error == error and rr.error == said and refused(rr) == why
 
 
+@pytest.mark.parametrize("error, said, why", [
+    ("rate_limit", "You've hit your limit · resets 5pm (America/Los_Angeles)", "usage limit"),
+    ("authentication_failed", "OAuth token revoked · Please run /login", "authentication"),
+    ("server_error", "API Error: 500 · Please run /login", None),
+    (None, "OAuth token revoked · Please run /login", "authentication"),
+], ids=["a usage limit", "a token refused", "another error", "no error given"])
+def test_a_turn_refused_before_a_later_one_is_read_by_its_own_result(tmp_path, monkeypatch, error, said, why):
+    """The first turn refused, and a background command's notice then began
+    one that reported: the session ran, and its first result, read by the
+    error kept beside it or by its words, says why as the last would."""
+    fake = standin(tmp_path, monkeypatch, refuse={"turn": "first", "error": error, "said": said}, notify="after")
+    rr, _ = streamed(tmp_path, fake)
+    assert rr.ok and len(rr.results) == 2 and rr.api_errors == [error, None]
+    assert refused(rr, 0) == why and refused(rr, 1) is None
+
+
 @pytest.mark.parametrize("said, why", [
     ("You've hit your limit · resets 5pm", "usage limit"),
     ("Usage limit reached ∙ resets at 5pm", "usage limit"),

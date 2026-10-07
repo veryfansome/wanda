@@ -1971,12 +1971,16 @@ def test_a_failure_a_second_session_would_meet_gets_her_note_at_once(tmp_path, m
     (said_by_claude("Usage limit reached ∙ resets at 5pm"), "usage limit"),
     (said_by_claude("Login expired · Please run /login"), "authentication"),
     (said_by_claude("OAuth token revoked · Please run /login"), "authentication"),
-], ids=["rate_limit", "Usage limit reached", "Login expired", "OAuth token revoked"])
+    (said_by_claude("You've hit your limit · resets 5pm", api_error="rate_limit", api_errors=["rate_limit"],
+                    results=[{"type": "result", "subtype": "success", "is_error": True,
+                              "result": "You've hit your limit · resets 5pm"}]), "usage limit"),
+], ids=["rate_limit", "Usage limit reached", "Login expired", "OAuth token revoked", "refused at its one result"])
 def test_a_session_claude_code_refused_holds_its_message_with_nothing_said(tmp_path, monkeypatch, caplog, ended,
                                                                            why):
     """Not tried once more, and no note yet: its message is held, its
     reaction on, the session that ran nothing counted toward no daily cap,
-    and the hold begins; its line in the log ends "; held"."""
+    and the hold begins; its line in the log ends "; held". Refused at its
+    first result, nothing of it ran, so the held row names no session."""
     import logging
 
     runner = RecordingRunner(ended, answer("Yes."))
@@ -2059,15 +2063,59 @@ def test_a_message_whose_handling_fails_before_its_turn_gets_her_note(tmp_path, 
     assert slack.replies == ["⚠️ I hit an internal error handling that reply."]
 
 
+def turn_result(out=None, subtype="error_during_execution", said=None):
+    """One turn's result: a report, or an error of `subtype`, in Claude
+    Code's words `said` when it gave some."""
+    if out is not None:
+        return {"type": "result", "subtype": "success", "is_error": False, "result": json.dumps(out),
+                "structured_output": out}
+    return {"type": "result", "subtype": subtype, "is_error": True, **({"result": said} if said else {})}
+
+
+def ended(results, api_errors=None):
+    """A streamed session that gave `results`, one a turn, as the runner
+    reads it."""
+    last = results[-1]
+    ok = not last.get("is_error")
+    return RunResult(ok=ok, envelope=last, structured=last.get("structured_output"), result_text=last.get("result"),
+                     error=None if ok else last.get("result") or last["subtype"], results=results,
+                     api_errors=api_errors or [])
+
+
+class Taking(RecordingRunner):
+    """Its first session is handed the next message added to its
+    conversation, once one waits, before it ends as it is given (`took`
+    holds what it was handed); the rest report as RecordingRunner's do."""
+
+    def __init__(self, *reports):
+        super().__init__(*reports)
+        self.took: list[str] = []
+
+    async def run(self, prompt, **kw):
+        if not self.calls and (feed := kw.get("feed")) is not None:
+            await until(lambda: feed.waiting, "a message added while it works")
+            self.took.append(await feed.next())
+        return await super().run(prompt, **kw)
+
+
+def added_while_it_works(p, runner, *texts):
+    """fan's first line, and his second added while its session works."""
+    async def go():
+        first = asyncio.create_task(p.handle_slack(dm(f"{AT:.1f}", texts[0])))
+        await until(lambda: runner.calls or p._in_turn, "the first turn")
+        await p.handle_slack(dm(f"{AT + 30:.1f}", texts[1]))
+        await first
+        await reactions_end(p)
+    asyncio.run(go())
+
+
 def test_a_failed_turn_before_one_that_answers_is_not_run_again(tmp_path, monkeypatch):
     """A later turn of the session answered after it, and saw what it was
-    begun by; a turn a background command's notice began then failed, which
-    is logged and alerted alone."""
-    def result(out=None):
-        return ({"type": "result", "subtype": "success", "is_error": False, "result": json.dumps(out),
-                 "structured_output": out} if out else
-                {"type": "result", "subtype": "error_during_execution", "is_error": True})
-    results = [result(answer("Noted.")), result(), result(answer("And the plumber's at 5.")), result()]
+    begun by: it is kept for the alert as answered by a later turn. A turn a
+    background command's notice began then failed, which is logged and
+    alerted alone."""
+    results = [turn_result(answer("Noted.")), turn_result(), turn_result(answer("And the plumber's at 5.")),
+               turn_result()]
     monkeypatch.setattr("wanda.vault.turn_starts", lambda v, sid: [
         vault.Turn(True, []), vault.Turn(True, ["two"]), vault.Turn(True, ["three"]), vault.Turn(False, [])])
     runner = RecordingRunner(RunResult(ok=False, envelope=results[-1], error="error_during_execution",
@@ -2077,7 +2125,220 @@ def test_a_failed_turn_before_one_that_answers_is_not_run_again(tmp_path, monkey
     asyncio.run(p.handle_slack(dm(f"{AT:.1f}", "one")))
     assert len(runner.calls) == 1 and slack.replies == ["And the plumber's at 5."]
     assert failed_runs(store) == [("agent", "ok", "error_during_execution")] and p._waiting[1] == []
-    assert json.loads(store.get_meta("failed_runs"))[0]["then"] == "not tried again, no note"
+    assert [f["then"] for f in json.loads(store.get_meta("failed_runs"))] == [
+        "answered by a later turn", "not tried again, no note"]
+
+
+@pytest.mark.parametrize("api_errors,why", [([], "other"), (["rate_limit", None], "usage limit")],
+                         ids=["a failure", "a refusal"])
+def test_a_first_turn_that_failed_before_a_second_answered_is_told_beside_the_answer(tmp_path, monkeypatch,
+                                                                                     caplog, api_errors, why):
+    """The answer is posted, the run is an answer's, and the failure is kept
+    for the alert once, under its own class, as answered by a later turn."""
+    import logging
+
+    said = "You've hit your limit · resets 5pm" if api_errors else None
+    rr = ended([turn_result(said=said), turn_result(answer("Yes, at 5."))], api_errors)
+    monkeypatch.setattr("wanda.vault.turn_starts", lambda v, sid: [vault.Turn(True, []), vault.Turn(True, ["two"])])
+    slack = ConversationSlack(history=[])
+    p, store, _ = memory_processor(tmp_path, slack, RecordingRunner(rr), monkeypatch)
+    with caplog.at_level(logging.INFO, logger="wanda"):
+        asyncio.run(p.handle_slack(dm(f"{AT:.1f}", "is the plumber coming?")))
+    assert slack.replies == ["Yes, at 5."] and failed_runs(store) == [("agent", "ok", None)]
+    [failed] = json.loads(store.get_meta("failed_runs"))
+    assert (failed["why"], failed["then"]) == (why, "answered by a later turn")
+    [line] = session_lines(caplog)
+    assert line.endswith(f", 10 characters to post, an earlier turn failed: {said or 'error_during_execution'}")
+    assert store.get_meta("held_since") is None
+
+
+@pytest.mark.parametrize("shape", ["no transcript", "its message deleted"])
+def test_an_earlier_failed_turn_is_noted_only_beside_a_posted_answer_to_a_members_turn(tmp_path, monkeypatch,
+                                                                                      caplog, shape):
+    """With no transcript no turn is known to be a member's, and with its
+    message deleted the answer is posted nowhere: either way no failed turn
+    is kept for the alert as answered by a later turn, nor named on the
+    line; with no transcript, a later turn that said nothing is not named
+    either."""
+    import logging
+
+    results = [turn_result(), turn_result(answer("Yes, at 5."))]
+    if shape == "no transcript":
+        results.append(turn_result(answer("")))
+    runner = RecordingRunner(ended(results))
+    monkeypatch.setattr("wanda.vault.turn_starts", lambda v, sid: None if shape == "no transcript" else [
+        vault.Turn(True, []), vault.Turn(True, ["two"])])
+    p, store, _ = memory_processor(tmp_path, ConversationSlack(history=[]), runner, monkeypatch)
+    keep(store, line := dm(f"{AT:.1f}", "is the plumber coming?"))
+    if shape == "its message deleted":
+        run = runner.run
+
+        async def deleted_while_it_runs(prompt, **kw):
+            await p.handle_slack(deletion(f"{AT:.1f}"))
+            return await run(prompt, **kw)
+        monkeypatch.setattr(runner, "run", deleted_while_it_runs)
+    with caplog.at_level(logging.INFO, logger="wanda"):
+        settle(p, p.handle_slack(line))
+    assert p.slack.replies == ([] if shape == "its message deleted" else ["Yes, at 5."])
+    assert store.get_meta("failed_runs") is None
+    [said] = session_lines(caplog)
+    assert said.endswith(", 10 characters, not posted: its messages were deleted" if shape == "its message deleted"
+                         else ", 10 characters to post")
+
+
+@pytest.mark.parametrize("failure,api_errors,then", [
+    (turn_result(), [], "again"),
+    (turn_result(subtype="error_max_budget_usd"), [], "rest"),
+    (turn_result(said="You've hit your limit · resets 5pm"), [None, "rate_limit", None], "held"),
+    (turn_result(said="Login expired · Please run /login"), [], "held"),
+    (turn_result(said="API Error: 500 · Please run /login"), [None, "server_error", None], "again"),
+], ids=["a failure", "its budget spent", "a usage limit", "a refusal in its words", "another error"])
+def test_a_member_turn_that_failed_after_the_answer_is_answered_though_a_notice_reported_after_it(
+        tmp_path, monkeypatch, caplog, failure, api_errors, then):
+    """fan's line added after her answer began a turn that failed, and a
+    background command's notice then began one that reported: her answer is
+    posted, and his line is run again as the next turn, or gets FAILED_REST
+    when a second session would spend its budget too, or is held when Claude
+    Code refused that turn, as its own result says."""
+    import logging
+
+    runner = Taking(None, answer("Done, I'll call at 5."))
+    runner.reports[0] = ended([turn_result(answer("Yes, at 5.")), failure, turn_result(answer(""))], api_errors)
+    monkeypatch.setattr("wanda.vault.turn_starts", lambda v, sid: [
+        vault.Turn(True, []), vault.Turn(True, list(runner.took)), vault.Turn(False, [])])
+    monkeypatch.setattr("wanda.vault.handed", lambda v, sid: list(runner.took))
+    slack = ConversationSlack(history=[])
+    p, store, _ = memory_processor(tmp_path, slack, runner, monkeypatch)
+    keep(store, dm(f"{AT:.1f}", "is the plumber coming?"))
+    keep(store, dm(f"{AT + 30:.1f}", "and can you call him?"))
+    with caplog.at_level(logging.INFO, logger="wanda"):
+        added_while_it_works(p, runner, "is the plumber coming?", "and can you call him?")
+    assert len(runner.took) == 1
+    error = failure.get("result") or failure["subtype"]
+    if then == "again":
+        assert slack.replies == ["Yes, at 5.", "Done, I'll call at 5."] and len(runner.calls) == 2
+        assert vault.RETRIED.format(sid8=runner.calls[0][1]["session_id"][:8]) in runner.calls[1][0]
+        assert kept(store) == []
+    elif then == "rest":
+        assert slack.replies == ["Yes, at 5.", main.FAILED_REST] and len(runner.calls) == 1
+        assert kept(store) == []
+    else:
+        assert slack.replies == ["Yes, at 5."] and len(runner.calls) == 1
+        assert [r[:2] for r in kept(store)] == [(f"{AT + 30:.1f}", "held")]
+    follow = {"again": "run again as the next turn", "rest": "a note asks for it again", "held": "held"}[then]
+    lines = session_lines(caplog)
+    assert lines[0].endswith(f", 10 characters to post, then failed: {error}; {follow}")
+    assert failed_runs(store)[0] == ("agent", "ok", error)
+
+
+@pytest.mark.parametrize("first,api_errors", [
+    (turn_result(), []),
+    (turn_result(said="You've hit your limit · resets 5pm"), ["rate_limit", None, None, None]),
+], ids=["a failure", "a refusal"])
+def test_a_notices_answer_after_a_failed_member_turn_is_posted_and_a_later_failed_one_run_again(tmp_path,
+                                                                                               monkeypatch,
+                                                                                               caplog, first,
+                                                                                               api_errors):
+    """fan's first turn failed, a background command's notice then began a
+    turn that answered, his added line's turn failed, and another notice's
+    turn reported nothing: her answer is posted, his added line run again as
+    the next turn, read from its own turn's result whatever the first turn's
+    failure, and the first turn kept for the alert as answered by a later
+    turn."""
+    import logging
+
+    runner = Taking(None, answer("Done, I'll call at 5."))
+    runner.reports[0] = ended([first, turn_result(answer("The plumber's at 5.")), turn_result(),
+                               turn_result(answer(""))], api_errors)
+    monkeypatch.setattr("wanda.vault.turn_starts", lambda v, sid: [
+        vault.Turn(True, []), vault.Turn(False, []), vault.Turn(True, list(runner.took)), vault.Turn(False, [])])
+    monkeypatch.setattr("wanda.vault.handed", lambda v, sid: list(runner.took))
+    slack = ConversationSlack(history=[])
+    p, store, _ = memory_processor(tmp_path, slack, runner, monkeypatch)
+    with caplog.at_level(logging.INFO, logger="wanda"):
+        added_while_it_works(p, runner, "is the plumber coming?", "and can you call him?")
+    assert slack.replies == ["The plumber's at 5.", "Done, I'll call at 5."] and len(runner.calls) == 2
+    assert [f["then"] for f in json.loads(store.get_meta("failed_runs"))] == [
+        "answered by a later turn", "run again as the next turn"]
+    assert session_lines(caplog)[0].endswith(
+        ", 19 characters to post, then failed: error_during_execution; run again as the next turn, "
+        f"an earlier turn failed: {first.get('result') or first['subtype']}")
+
+
+def test_a_notices_turn_that_failed_after_the_answer_is_logged_and_alerted_alone(tmp_path, monkeypatch, caplog):
+    """Another notice's turn reported after it: nothing more is said, and the
+    failure is the log's and the alert's."""
+    import logging
+
+    rr = ended([turn_result(answer("Yes, at 5.")), turn_result(), turn_result(answer(""))])
+    monkeypatch.setattr("wanda.vault.turn_starts", lambda v, sid: [
+        vault.Turn(True, []), vault.Turn(False, []), vault.Turn(False, [])])
+    slack = ConversationSlack(history=[])
+    p, store, _ = memory_processor(tmp_path, slack, RecordingRunner(rr), monkeypatch)
+    with caplog.at_level(logging.INFO, logger="wanda"):
+        asyncio.run(p.handle_slack(dm(f"{AT:.1f}", "is the plumber coming?")))
+    assert slack.replies == ["Yes, at 5."] and failed_runs(store) == [("agent", "ok", "error_during_execution")]
+    assert session_lines(caplog)[0].endswith(", 10 characters to post, then failed: error_during_execution")
+    asyncio.run(p._flush_failed())
+    [alert] = slack.alerts
+    assert alert.endswith(", Claude Code said: error_during_execution, not tried again, no note")
+
+
+def test_a_notices_turn_that_failed_between_two_member_turns_is_not_told(tmp_path, monkeypatch, caplog):
+    """The later member's turn answered: nothing is kept for the alert."""
+    import logging
+
+    rr = ended([turn_result(answer("Noted.")), turn_result(), turn_result(answer("Yes, at 5."))])
+    monkeypatch.setattr("wanda.vault.turn_starts", lambda v, sid: [
+        vault.Turn(True, []), vault.Turn(False, []), vault.Turn(True, ["two"])])
+    slack = ConversationSlack(history=[])
+    p, store, _ = memory_processor(tmp_path, slack, RecordingRunner(rr), monkeypatch)
+    with caplog.at_level(logging.INFO, logger="wanda"):
+        asyncio.run(p.handle_slack(dm(f"{AT:.1f}", "is the plumber coming?")))
+    assert slack.replies == ["Yes, at 5."] and failed_runs(store) == [("agent", "ok", None)]
+    assert store.get_meta("failed_runs") is None
+    assert session_lines(caplog)[0].endswith(", 10 characters to post")
+
+
+def test_a_member_turn_after_the_answer_that_said_nothing_is_marked_on_the_line(tmp_path, monkeypatch, caplog):
+    """Her first answer is posted; the line says a later turn said nothing,
+    for whoever reads the week's sessions to judge whether it needed a
+    reply."""
+    import logging
+
+    rr = ended([turn_result(answer("Yes, at 5.")), turn_result(answer(""))])
+    monkeypatch.setattr("wanda.vault.turn_starts", lambda v, sid: [vault.Turn(True, []), vault.Turn(True, ["two"])])
+    slack = ConversationSlack(history=[])
+    p, store, _ = memory_processor(tmp_path, slack, RecordingRunner(rr), monkeypatch)
+    with caplog.at_level(logging.INFO, logger="wanda"):
+        asyncio.run(p.handle_slack(dm(f"{AT:.1f}", "is the plumber coming?")))
+    assert slack.replies == ["Yes, at 5."] and store.get_meta("failed_runs") is None
+    assert session_lines(caplog)[0].endswith(", 10 characters to post, a later turn said nothing")
+
+
+def test_a_member_turn_refused_after_a_notices_failure_is_held_by_its_own_result(tmp_path, monkeypatch):
+    """After her answer a notice's turn failed, fan's added line's turn was
+    refused, and another notice's turn reported nothing: his line is held,
+    as its own turn's result says, not run again as the notice's failure
+    would have it; the hold names this session, whose turns ran first."""
+    runner = Taking(None)
+    runner.reports[0] = ended([turn_result(answer("Yes, at 5.")), turn_result(),
+                               turn_result(said="You've hit your limit · resets 5pm"), turn_result(answer(""))],
+                              [None, None, "rate_limit", None])
+    monkeypatch.setattr("wanda.vault.turn_starts", lambda v, sid: [
+        vault.Turn(True, []), vault.Turn(False, []), vault.Turn(True, list(runner.took)), vault.Turn(False, [])])
+    monkeypatch.setattr("wanda.vault.handed", lambda v, sid: list(runner.took))
+    slack = ConversationSlack(history=[])
+    p, store, _ = memory_processor(tmp_path, slack, runner, monkeypatch)
+    keep(store, dm(f"{AT:.1f}", "is the plumber coming?"))
+    keep(store, dm(f"{AT + 30:.1f}", "and can you call him?"))
+    added_while_it_works(p, runner, "is the plumber coming?", "and can you call him?")
+    assert slack.replies == ["Yes, at 5."] and len(runner.calls) == 1
+    sid = runner.calls[0][1]["session_id"]
+    assert kept(store) == [(f"{AT + 30:.1f}", "held", 0, sid)]
+    [failed] = json.loads(store.get_meta("failed_runs"))
+    assert (failed["why"], failed["then"]) == ("usage limit", "not tried again, held until Claude Code runs again")
+
 
 class Refusing(ConversationSlack):
     """A Slack that takes no post."""
@@ -5553,6 +5814,28 @@ def test_a_later_turn_claude_code_refused_holds_only_its_message_after_the_answe
     assert slack.replies == ["one answer to 1: can you remind me at 5"]
     assert failed_runs(store) == [("agent", "ok", "You've hit your limit · resets 5pm")]
     assert [r[:2] for r in kept(store)] == [(f"{AT + 30:.1f}", "held")]
+
+
+def test_a_hold_after_a_first_turn_that_ran_names_its_session_for_the_take_up(tmp_path, monkeypatch):
+    """fan's first turn failed after a step, and Claude Code refused the turn
+    his added line began, the last: both are held, each naming this
+    session, which may have written to memory before it was refused, so
+    that the session that takes them up is told of it."""
+    p, store, _, slack = standin_processor(tmp_path, monkeypatch, sessions=[
+        {"steps": [0.2], "reply_s": 1.5, "fail": "first",
+         "refuse": {"turn": "later", "error": "rate_limit", "said": "You've hit your limit · resets 5pm"}},
+        {"steps": [0.2]}])
+    asked, follow = dm(f"{AT:.1f}", "can you remind me at 5"), dm(f"{AT + 30:.1f}", "to call the plumber")
+    keep(store, asked), keep(store, follow)
+    conversation(p, (0, asked), (("tool_result", 1, 0.2), follow))
+    assert slack.replies == [] and failed_runs(store) == [("agent", "refused", "You've hit your limit · resets 5pm")]
+    [sid] = [r["session_id"] for r in store._query("SELECT session_id FROM runs")]
+    assert [(r[1], r[3]) for r in kept(store)] == [("held", sid), ("held", sid)]
+    store.end_hold()
+    a_pass(p)
+    assert slack.replies == ["one answer to 1: to call the plumber"] and kept(store) == []
+    taken_up = opening_text(tmp_path, -1)
+    assert vault.RETRIED.format(sid8=sid[:8]) in taken_up and "can you remind me at 5" in taken_up
 
 
 def test_a_failed_turn_a_background_commands_notice_began_leaves_the_answer_alone(tmp_path, monkeypatch):

@@ -74,14 +74,26 @@ class RunResult:
     # the `error` of a streamed session's last assistant event, which says
     # why the API would not answer
     api_error: str | None = None
+    # beside each of `results`, the `error` of its turn's last assistant
+    # event, or None
+    api_errors: list[str | None] = field(default_factory=list)
 
 
-def refused(rr: RunResult) -> str | None:
+def refused(rr: RunResult, i: int | None = None) -> str | None:
     """Why Claude Code would not run a session, "usage limit" or
-    "authentication", or None for any other failure (REFUSALS)."""
-    if rr.api_error is not None:
-        return REFUSALS.get(rr.api_error)
-    return next((why for why, saying in REFUSED_SAYING if saying.search(rr.error or "")), None)
+    "authentication", or None for any other failure (REFUSALS): as its last
+    turn ended, or as the turn of its result `i` did, read from that result
+    and the error kept beside it, whether or not a later turn went on."""
+    if i is None:
+        api_error, error = rr.api_error, rr.error
+    else:
+        ev = rr.results[i]
+        api_error = rr.api_errors[i] if i < len(rr.api_errors) else None
+        # a success's text is the model's, never Claude Code's
+        error = (ev.get("result") or ev.get("subtype")) if ev.get("is_error") else None
+    if api_error is not None:
+        return REFUSALS.get(api_error)
+    return next((why for why, saying in REFUSED_SAYING if saying.search(error or "")), None)
 
 
 def said(err: str) -> str:
@@ -240,6 +252,10 @@ class RunnerService:
         results: list[dict] = feed.results
         began = asyncio.Event()
         api_error: str | None = None
+        # each turn's own, kept beside its result: the session's last would
+        # otherwise stand for a turn before it
+        api_errors: list[str | None] = []
+        turn_error: str | None = None
 
         async def write_input() -> None:
             try:
@@ -260,7 +276,7 @@ class RunnerService:
                     proc.stdin.close()
 
         async def read_output() -> None:
-            nonlocal api_error
+            nonlocal api_error, turn_error
             async for line in proc.stdout:
                 if not line.strip():
                     continue
@@ -278,12 +294,14 @@ class RunnerService:
                     if missing:
                         raise ValueError(f"a result without {', '.join(missing)}")
                 if kind == "assistant":
-                    api_error = ev.get("error")
+                    api_error = turn_error = ev.get("error")
                 elif kind == "system" and ev.get("subtype") == "init":
                     began.set()
                     feed.began()
                 elif ev.get("type") == "result":
                     results.append(ev)
+                    api_errors.append(turn_error)
+                    turn_error = None
                     feed.close()
                     # the input closes now, not once a message being framed
                     # is ready: that one goes back on its list
@@ -300,7 +318,8 @@ class RunnerService:
                 await self._kill_group(proc)
                 left = await self._end_left_behind(proc.pid, mark)
                 return RunResult(ok=False, timed_out=True, cost_usd=max_budget_usd, results=results,
-                                 error=f"timed out after {timeout_s}s", left_running=left, api_error=api_error)
+                                 error=f"timed out after {timeout_s}s", left_running=left, api_error=api_error,
+                                 api_errors=api_errors)
             except asyncio.CancelledError:
                 self._kill_group_now(proc)
                 raise
@@ -310,7 +329,8 @@ class RunnerService:
                 await self._kill_group(proc)
                 left = await self._end_left_behind(proc.pid, mark)
                 return RunResult(ok=False, cost_usd=max_budget_usd, results=results, api_error=api_error,
-                                 error=f"could not read the session's output: {e}", left_running=left)
+                                 api_errors=api_errors, error=f"could not read the session's output: {e}",
+                                 left_running=left)
             finally:
                 feed.close()
                 for t in (writer, errors):
@@ -327,7 +347,7 @@ class RunnerService:
         if not results:
             err = stderr.decode("utf-8", "replace").strip()
             return RunResult(
-                ok=False, exit_code=proc.returncode, left_running=left, api_error=api_error,
+                ok=False, exit_code=proc.returncode, left_running=left, api_error=api_error, api_errors=api_errors,
                 # as for an envelope that never came: the ceiling, unless it
                 # ended too soon to have bought anything
                 cost_usd=max_budget_usd if time.monotonic() - t0 > MIN_BILLABLE_S else 0.0,
@@ -340,13 +360,14 @@ class RunnerService:
             # session's report, never an error to post
             err = stderr.decode("utf-8", "replace").strip()
             return RunResult(ok=False, exit_code=proc.returncode, results=results, left_running=left,
-                             api_error=api_error,
+                             api_error=api_error, api_errors=api_errors,
                              cost_usd=max_budget_usd if time.monotonic() - t0 > MIN_BILLABLE_S else 0.0,
                              error=f"claude exited {proc.returncode} after its last result" + said(err))
         rr = self._parse(proc.returncode, json.dumps(results[-1]).encode(), stderr)
         rr.results = results
         rr.left_running = left
         rr.api_error = api_error
+        rr.api_errors = api_errors
         return rr
 
     @staticmethod

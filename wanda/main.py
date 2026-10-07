@@ -342,6 +342,17 @@ def kept_key(m: dict) -> tuple[str, str]:
     return m["channel"], m["ts"]
 
 
+def turn_failure(ev: dict) -> tuple[str, bool] | None:
+    """How a turn's result failed, as the runner reads a result's error, or
+    by ending without its report, and whether the words are Claude Code's;
+    None for a report. A success's text is the model's, never an error."""
+    if ev.get("is_error"):
+        return ev.get("result") or ev.get("subtype") or "claude reported an error", True
+    if vault.report(ev.get("structured_output"), ev.get("result")) is None:
+        return "the session ended without its report", False
+    return None
+
+
 class ReadFailing(NamedTuple):
     """Reads back from Slack failing: since when, from what time the last
     one read, its error, how many have failed, and when the next is tried
@@ -2043,10 +2054,11 @@ class Processor:
 
     def _failed(self, run_id: int, at: str, error: str, claude: bool, why: str, then: str) -> None:
         """A message's turn that ended in her note, or in its messages run
-        again, or that failed after its answer with nothing more said: kept
-        for the `failed` alert of its class, `why`, by the run that failed,
-        when it started, the reason, Claude Code's own words marked as its,
-        and what followed."""
+        again, or that failed after its answer with nothing more said, or
+        whose session failed in a member's turn before an answer a later turn
+        gave ("answered by a later turn"): kept for the `failed` alert of its
+        class, `why`, by the run that failed, when it started, the reason,
+        Claude Code's own words marked as its, and what followed."""
         failed = json.loads(self.store.get_meta("failed_runs") or "[]")
         failed.append({"id": run_id, "at": at, "why": why, "then": then,
                        "said": truncate(f"Claude Code said: {error}" if claude else error, 300)})
@@ -3290,9 +3302,13 @@ class Processor:
         await self._post_run(note_id, note, p["channel"], p.get("reply_thread"))
 
     @staticmethod
-    def _fails_again(rr: RunResult) -> bool:
+    def _fails_again(rr: RunResult, i: int | None = None) -> bool:
         """Whether a second session would fail as this one did: out of time,
-        its budget spent, or an output the runner cannot read."""
+        its budget spent, or an output the runner cannot read; or as the turn
+        of its result `i` did, one before the session's end, whose budget
+        alone it can have spent, since the other two end the session."""
+        if i is not None:
+            return rr.results[i].get("subtype") == "error_max_budget_usd"
         return (rr.timed_out or (rr.envelope or {}).get("subtype") == "error_max_budget_usd"
                 or (rr.error or "").startswith("could not read the session's output"))
 
@@ -3332,14 +3348,18 @@ class Processor:
         turn that has not started its session by then. Its failure otherwise,
         or the retry's, gets her note (FAILED; `group`, in a group DM, its
         words for everyone there). One that answered and then failed in a
-        later turn begun by an added message, no later one reporting, has that
-        message run again as the conversation's next turn, framed with the
-        session that failed, or her note after the answer (FAILED_REST) when
-        that would fail the same way or is that next turn's own failure. One
+        later turn begun by an added message, no later turn of a member's
+        reporting, has that message run again as the conversation's next
+        turn, framed with the session that failed, or her note after the
+        answer (FAILED_REST) when that would fail the same way or is that next
+        turn's own failure, whichever turn gave the answer and whatever a turn
+        a background command's notice began did after the failure. One
         Claude Code refused to run holds its messages, or after an answer
         those that began the turn it refused, until a session runs again
-        (_claude_refused). Each such failure is kept for the `failed` alert,
-        with Claude Code's reason.
+        (_claude_refused), named by this session once a turn of it has given
+        a result. Each such failure is kept for the `failed` alert, with
+        Claude Code's reason, and so is a member's turn that failed before
+        the answer posted, which a later turn gave.
 
         `owed` is whether someone is waiting: if not, as for the clock, a
         refusal, a failure or a restart posts nothing, except that an answer
@@ -3500,25 +3520,35 @@ class Processor:
                     # (settle_wakes).
                     kept = vault.last_said(await asyncio.to_thread(vault.transcript_answers, self.cfg.vault_dir,
                                                                    sid))
-                # a turn before the last that failed, as the runner reads a
-                # result's error, or ended without its report, told when
-                # nothing was said; a success's text is the model's, never
-                # posted as an error. The flag is whether the words are
-                # Claude Code's.
-                failed = next(((ev.get("result") or ev.get("subtype") or "claude reported an error", True)
-                               if ev.get("is_error") else ("the session ended without its report", False)
-                               for ev in earlier
-                               if ev.get("is_error")
-                               or vault.report(ev.get("structured_output"), ev.get("result")) is None),
-                              None)
+                # each result's answer, None for a turn that failed or ended
+                # without its report
+                given = [None if turn_failure(ev) else vault.answers([ev])[0] for ev in rr.results]
+                # the result whose answer is posted: the last, or the last
+                # before it that says something
+                answered_at = (len(rr.results) - 1 if final
+                               else next((i for i in reversed(range(len(earlier))) if given[i]), -1))
+                # the result whose failure is told, and read for a refusal;
+                # None for the session's own end
+                at = None
                 if out is not None:
                     text, error, claude = final or kept, None, False
-                    if not text and failed is not None:
-                        error, claude = failed
+                    # a turn before the last that failed is told when nothing
+                    # was said, and, in a message's turn, when it came after
+                    # the answer posted: a member's message may have begun it,
+                    # and that answer does not cover it
+                    failing = [(i, f) for i, ev in enumerate(earlier) if (f := turn_failure(ev)) is not None
+                               and (not text or (more is not None and i > answered_at))]
+                    if failing:
+                        at, (error, claude) = failing[0]
                 else:
                     error, text = rr.error or "the session ended without its report", kept
                     claude = rr.error is not None and bool((rr.envelope or {}).get("is_error"))
-                refusal = refused(rr) if error else None
+                # which turn a member's message began, read once: for what
+                # follows a failure, and for a member's turn that failed
+                # before the answer posted or said nothing after it
+                starts = None
+                if more is not None and (len(rr.results) > 1 or (error and owed)):
+                    starts = await asyncio.to_thread(vault.turn_starts, self.cfg.vault_dir, sid)
                 # what follows a message's failure: "retry", a second session
                 # now; "note" or "rest", FAILED or FAILED_REST; "again", the
                 # messages that began the failed turn run as the next; "held",
@@ -3526,8 +3556,9 @@ class Processor:
                 # alert alone
                 then, after = "", False
                 if error and owed and more is not None:
-                    then, after, text = await self._after_failure(rr, out, more, sid, text, refusal, ran,
-                                                                  first is None)
+                    then, after, text, at = await self._after_failure(rr, out, more, sid, text, ran, first is None,
+                                                                      starts, answered_at, at)
+                refusal = refused(rr, at) if error else None
                 # every message the turn held was deleted while it ran: what
                 # she said is kept and posted nowhere, and nothing follows,
                 # neither a second session nor a note nor a hold
@@ -3574,7 +3605,13 @@ class Processor:
             held = ()
             if then == "held":
                 back = {kept_key(m) for m in more.held}
-                held = more.holding.refused([k for k in more.holding.rows if not after or k in back], sid)
+                keys = [k for k in more.holding.rows if not after or k in back]
+                # past the session's first result an earlier turn ran to its
+                # end and may have written to memory: the hold names this
+                # session, so that the try that takes them up is told of it
+                refused_at = at if at is not None else len(rr.results) - (rr.envelope is not None)
+                held = (tuple((k, sid) for k in keys) if refused_at > 0
+                        else more.holding.refused(keys, sid))
                 # a try holds again what was held before it, which her note
                 # has said already
                 was = {kept_key(r): r["state"] for r in self.store.kept(task["slack_channel"], task["thread_ts"])}
@@ -3636,6 +3673,21 @@ class Processor:
             await self._claude_refused(task if newly else None)
         else:
             self._claude_ran(began)
+        # a member's turn that failed before the turn whose answer is posted,
+        # whose message that answer had in view, is only noted, while that
+        # answer is posted; a member's turn after it that said nothing is
+        # marked on the line. With no transcript no turn is known to be a
+        # member's
+        before, quiet = [], False
+        if text and more is not None and starts is not None and len(rr.results) > 1:
+            member = [i >= len(starts) or starts[i].member for i in range(len(rr.results))]
+            if not gone:
+                before = [(i, f) for i in range(answered_at) if member[i] and (f := turn_failure(rr.results[i]))]
+            quiet = any(member[i] and given[i] == "" for i in range(answered_at + 1, len(rr.results)))
+        if owed:
+            for i, (failure, by_claude) in before:
+                self._failed(run_id, started, failure, by_claude, refused(rr, i) or "other",
+                             "answered by a later turn")
         follow = {"retry": "; trying once more", "note": "; a note asks for it again",
                   "rest": "; a note asks for it again", "again": "; run again as the next turn",
                   "held": "; held"}.get(then, "")
@@ -3671,6 +3723,10 @@ class Processor:
             outcome = f"{'silent, then ' if after else ''}failed: {error}{follow}" + (unposted if gone else "")
         else:
             outcome = "silent"
+        if before:
+            outcome += f", an earlier turn failed: {before[0][1][0]}"
+        if quiet:
+            outcome += ", a later turn said nothing"
         if more is not None and more.holding is not None and more.holding.deleted and not (gone and (text or error)):
             # what was taken back while she worked, which her answer may
             # still give back
@@ -3689,12 +3745,16 @@ class Processor:
         await self.put_back()
 
     async def _after_failure(self, rr: RunResult, out: dict | None, more: Additions, sid: str, text: str,
-                             refusal: str | None, ran: float, first: bool) -> tuple[str, bool, str]:
+                             ran: float, first: bool, starts: list[vault.Turn] | None, answered_at: int,
+                             at: int | None) -> tuple[str, bool, str, int | None]:
         """What follows a message's session that failed somewhere, by which of
-        its turns a member's message began (vault.turn_starts) and which of
-        those reported: what follows (memory_turn's `then`), whether it
-        failed after a member's turn reported, and the answer to post."""
-        starts = await asyncio.to_thread(vault.turn_starts, self.cfg.vault_dir, sid)
+        its turns a member's message began (`starts`, vault.turn_starts) and
+        which of those reported: what follows (memory_turn's `then`), whether
+        it failed after a member's turn reported, the answer to post, and the
+        result whose failure decides it, read for a refusal or a spent budget:
+        that of the first member's turn that failed after the last report and
+        after the answer posted (`answered_at`), where there is one, and
+        otherwise `at`, None being the session's own end."""
         # each turn's report, None for one that failed; a session that gave
         # no result is read as one turn, by its outcome
         reports = [None if ev.get("is_error") else vault.report(ev.get("structured_output"), ev.get("result"))
@@ -3707,14 +3767,21 @@ class Processor:
         # her note: FAILED_REST when the turn ran again what a later turn
         # failed on after her answer
         told = "rest" if more.rerun else "note"
-        if not reported:
-            if refusal:
-                return "held", False, ""
-            if first and not more.rerun and not self._fails_again(rr) and ran <= self.cfg.agent_timeout_s / 2:
-                return "retry", False, ""
-            return told, False, ""
-        failed = [i for i in range(reported[-1] + 1, n) if member[i] and (i >= len(reports) or reports[i] is None)]
+        if not reported and not text:
+            if refused(rr, at):
+                return "held", False, "", at
+            if (first and not more.rerun and not self._fails_again(rr, at)
+                    and ran <= self.cfg.agent_timeout_s / 2):
+                return "retry", False, "", at
+            return told, False, "", at
+        # a member's turn that failed before the posted answer's turn had its
+        # message in view of that answer: only those failing after both it and
+        # the last report are answered or told
+        since = max(reported[-1] if reported else -1, answered_at if text else -1)
+        failed = [i for i in range(since + 1, n) if member[i] and (i >= len(reports) or reports[i] is None)]
         if failed:
+            at = failed[0] if failed[0] < len(rr.results) else None
+            refusal = refused(rr, at)
             # what follows is for the messages that began the failed turns, and
             # nothing follows for one deleted since: she does not answer, or
             # ask again for, what was taken back
@@ -3724,25 +3791,25 @@ class Processor:
                 # next turn runs it, where a refusal holds it: a note would ask
                 # for what is answered next. With none put back, every message
                 # it was handed was deleted, or it was handed none
-                return "again" if more.returned else "", True, text
+                return "again" if more.returned else "", True, text, at
             began = [t for i in failed if i < len(starts) for t in starts[i].texts]
             if began and not more.standing(began):
-                return "", True, text
+                return "", True, text, at
             more.ask(began)
             if refusal and more.hold_back(began):
-                return "held", True, text
-            if refusal or self._fails_again(rr):
-                return "rest", True, text
+                return "held", True, text, at
+            if refusal or self._fails_again(rr, at):
+                return "rest", True, text, at
             if more.run_again(began, sid):
-                return "again", True, text
-            return "rest", True, text
+                return "again", True, text, at
+            return "rest", True, text, at
         # nothing said, and a member's turn failed before the one that
         # reported: the failure is told. A turn a background command's notice
         # began, or an exit, after the last report is the log's and the
         # alert's alone.
         if not text and any(member[i] and (i >= len(reports) or reports[i] is None) for i in range(reported[-1])):
-            return told, False, text
-        return "", False, text
+            return told, False, text, at
+        return "", False, text, at
 
     async def _post_run(self, run_id: int, text: str, channel: str, reply_thread: str | None) -> None:
         """Posts a recorded run's text, unless a run recorded before it there
