@@ -1,6 +1,7 @@
 //! What a session is set up with, how it is run, and what is read back out.
 
-use crate::arrival::{arrival_text, clock_text, prompt_for, weekday, Input};
+use crate::arrival::{arrival_text, clock_text, prompt_for, Input};
+use memory::due::weekday;
 use memory::text::py_repr;
 use memory::vault::Vault;
 use memory::{index, transcript};

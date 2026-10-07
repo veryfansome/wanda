@@ -338,14 +338,21 @@ fn local_offset_seconds(_now: i64) -> i64 {
 /// A deadline counted from the wrong today looks like any other date; its
 /// distance from the right one does not.
 fn by_from_today(by: &str) -> Option<String> {
-    let today = today();
-    let n = days_from_civil(by)? - days_from_civil(&today)?;
+    by_from(by, &today())
+}
+
+/// The distance, and the weekday the date falls on, so a weekday said back
+/// about it is the calendar's. Today's goes unnamed: a session's system prompt
+/// names it already.
+fn by_from(by: &str, today: &str) -> Option<String> {
+    let n = days_from_civil(by)? - days_from_civil(today)?;
+    let day = due::weekday(by);
     Some(match n {
         0 => format!("(--by {by} is today, {today})"),
-        1 => format!("(--by {by} is 1 day after today, {today})"),
-        -1 => format!("(--by {by} is 1 day before today, {today})"),
-        n if n > 0 => format!("(--by {by} is {n} days after today, {today})"),
-        n => format!("(--by {by} is {} days before today, {today})", -n),
+        1 => format!("(--by {by}, a {day}, is 1 day after today, {today})"),
+        -1 => format!("(--by {by}, a {day}, is 1 day before today, {today})"),
+        n if n > 0 => format!("(--by {by}, a {day}, is {n} days after today, {today})"),
+        n => format!("(--by {by}, a {day}, is {} days before today, {today})", -n),
     })
 }
 
@@ -2030,6 +2037,26 @@ mod tests {
         assert_eq!(date_or_die("2028-02-29", "--by"), Ok("2028-02-29".into()));
         assert_eq!(date_or_die("2026-10-01T23:59", "--by"), Ok("2026-10-01T23:59".into()));
         assert_eq!(date_or_die("2026-10-01", "--by"), Ok("2026-10-01".into()));
+    }
+
+    #[test]
+    fn a_by_is_echoed_with_its_weekday_and_its_distance_from_today() {
+        let today = "2026-10-06";
+        assert_eq!(by_from("2026-10-21", today).as_deref(),
+                   Some("(--by 2026-10-21, a Wednesday, is 15 days after today, 2026-10-06)"));
+        assert_eq!(by_from("2026-10-21T09:00", today).as_deref(),
+                   Some("(--by 2026-10-21T09:00, a Wednesday, is 15 days after today, 2026-10-06)"));
+        assert_eq!(by_from("2026-10-07", today).as_deref(),
+                   Some("(--by 2026-10-07, a Wednesday, is 1 day after today, 2026-10-06)"));
+        assert_eq!(by_from("2026-10-06", today).as_deref(),
+                   Some("(--by 2026-10-06 is today, 2026-10-06)"));
+        assert_eq!(by_from("2026-10-05", today).as_deref(),
+                   Some("(--by 2026-10-05, a Monday, is 1 day before today, 2026-10-06)"));
+        assert_eq!(by_from("2026-09-28", today).as_deref(),
+                   Some("(--by 2026-09-28, a Monday, is 8 days before today, 2026-10-06)"));
+        // with no today to count from there is no distance to give
+        assert_eq!(by_from("2026-10-21", ""), None);
+        assert_eq!(by_from("", today), None);
     }
 
     #[test]

@@ -58,7 +58,7 @@ pub const MORNING: &str = "It is {weekday}, {time}, and this is my look at the d
 /// A morning look, and below it the list `memory::due::for_look` gives for
 /// that person, when it gives one.
 pub fn clock_text(inp: &Input, listed: &[String]) -> String {
-    let mut woke = MORNING.replace("{weekday}", weekday(&inp.date))
+    let mut woke = MORNING.replace("{weekday}", memory::due::weekday(&inp.date))
         .replace("{time}", &inp.text).replace("{speaker}", &inp.speaker);
     if !listed.is_empty() {
         woke += &format!("\n\n    {}", listed.join("\n    "));
@@ -76,21 +76,6 @@ pub fn last_look(inputs: &[Input], at: &Input) -> String {
         .max()
         .unwrap_or_else(|| memory::due::days_from_civil(&at.date)
             .map(|d| memory::due::civil_from_days(d - 1)).unwrap_or_default())
-}
-
-/// The day of the week a date falls on.
-pub fn weekday(date: &str) -> &'static str {
-    const DAYS: [&str; 7] = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
-                             "Saturday"];
-    // the month's offset in Sakamoto's method, January first
-    const OFFSET: [i64; 12] = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4];
-    let num = |r: std::ops::Range<usize>| date.get(r).and_then(|x| x.parse::<i64>().ok());
-    let (Some(y), Some(m), Some(d)) = (num(0..4), num(5..7), num(8..10)) else { return "" };
-    if !(1..=12).contains(&m) {
-        return "";
-    }
-    let y = if m < 3 { y - 1 } else { y };
-    DAYS[(y + y / 4 - y / 100 + y / 400 + OFFSET[(m - 1) as usize] + d).rem_euclid(7) as usize]
 }
 
 /// The arrival as the session sees it. For a thread, `members` is who is in it
@@ -259,16 +244,6 @@ mod tests {
     #[test]
     fn the_parser_reads_back_every_prompt() {
         check_prompt_shape().unwrap();
-    }
-
-    #[test]
-    fn weekdays_fall_where_the_calendar_puts_them() {
-        assert_eq!(weekday("2026-01-01"), "Thursday");
-        assert_eq!(weekday("2026-10-01"), "Thursday");
-        assert_eq!(weekday("2024-02-29"), "Thursday");
-        assert_eq!(weekday("2026-03-01"), "Sunday");
-        assert_eq!(weekday("2000-01-01"), "Saturday");
-        assert_eq!(weekday("2026-13-01"), "");
     }
 
     #[test]

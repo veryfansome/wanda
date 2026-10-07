@@ -37,6 +37,21 @@ pub fn civil_from_days(z: i64) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
+/// The day of the week a date falls on.
+pub fn weekday(date: &str) -> &'static str {
+    const DAYS: [&str; 7] = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
+                             "Saturday"];
+    // the month's offset in Sakamoto's method, January first
+    const OFFSET: [i64; 12] = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4];
+    let num = |r: std::ops::Range<usize>| date.get(r).and_then(|x| x.parse::<i64>().ok());
+    let (Some(y), Some(m), Some(d)) = (num(0..4), num(5..7), num(8..10)) else { return "" };
+    if !(1..=12).contains(&m) {
+        return "";
+    }
+    let y = if m < 3 { y - 1 } else { y };
+    DAYS[(y + y / 4 - y / 100 + y / 400 + OFFSET[(m - 1) as usize] + d).rem_euclid(7) as usize]
+}
+
 /// What a morning look is handed above the list.
 pub const LOOK_HEAD: &str = "Come due for {name} after {after}:";
 /// The labels her own node goes by, which only her own undertakings link to;
@@ -322,6 +337,16 @@ mod tests {
     /// The ids a look lists, in its order.
     fn listed(look: &[String]) -> Vec<&str> {
         look.iter().filter_map(|l| l.strip_prefix('`')?.split('`').next()).collect()
+    }
+
+    #[test]
+    fn weekdays_fall_where_the_calendar_puts_them() {
+        assert_eq!(weekday("2026-01-01"), "Thursday");
+        assert_eq!(weekday("2026-10-01"), "Thursday");
+        assert_eq!(weekday("2024-02-29"), "Thursday");
+        assert_eq!(weekday("2026-03-01"), "Sunday");
+        assert_eq!(weekday("2000-01-01"), "Saturday");
+        assert_eq!(weekday("2026-13-01"), "");
     }
 
     #[test]
