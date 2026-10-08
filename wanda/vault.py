@@ -332,21 +332,23 @@ def names(ids, users: dict[str, dict], told: dict[str, str], namesakes, own: fro
           marked: bool = True) -> dict[str, str]:
     """Slack id to the name a frame calls each of `ids` by, and every
     member's besides. A member is called by the name sessions are told
-    (`told`), and her own ids by Slack's name, so that a mention of her reads
-    as her name. Anyone else, where `marked`, by the first of their display
-    name, full name and Slack name that can be used, in quotation marks: an
-    allowed id (`kin`) unmarked, anyone else outside the household, and either
-    as another person where the name is, or looks like (`alike`), one of
-    `namesakes`, which a member goes or went by. One with no name to use, or
-    whom Slack did not describe (`users`), is called by their id. In a 1:1 DM
-    (`marked` false) by the name Slack shows, marked only as another person."""
+    (`told`), and her own ids by her name (`household.NAME`), never by her
+    Slack app's, so that a mention of her reads as her name whatever the app
+    is called, and finds her own node in memory. Anyone else, where
+    `marked`, by the first of their display name, full name and Slack name
+    that can be used, in quotation marks: an allowed id (`kin`) unmarked,
+    anyone else outside the household, and either as another person where
+    the name is, or looks like (`alike`), one of `namesakes`, which a member
+    goes or went by. One with no name to use, or whom Slack did not describe
+    (`users`), is called by their id. In a 1:1 DM (`marked` false) by the
+    name Slack shows, marked only as another person."""
     out = {}
     for uid in ids:
         if uid in told:
             continue
         u = users.get(uid)
         if uid in own:
-            out[uid] = next((f for f in _fields(u or {}) if f), uid)
+            out[uid] = household.NAME
         elif not marked:
             name = next((n for f in _fields(u or {}) if (n := household.spelled(f))), uid)
             out[uid] = name + (NAMESAKE if alike(name, namesakes) else "")

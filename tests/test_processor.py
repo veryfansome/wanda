@@ -1659,6 +1659,21 @@ def test_a_frame_looks_up_every_mention_of_a_members_and_few_of_anyone_elses(tmp
     assert "fan now says:\n\n    who are they, @UT1 (outside the household)?\n" in first
 
 
+def test_a_frame_names_her_wanda_whatever_her_slack_app_is_called(tmp_path, monkeypatch):
+    """A test copy runs on an app of its own, wanda-scratch: what its
+    sessions are shown names her wanda, earlier lines and the turn's alike,
+    whatever Slack's record of her says."""
+    slack = ConversationSlack(members=["U1", "UBOT"])
+    # Slack's record of her bot user, as the test copy's app names it
+    slack.held["UBOT"] = {"is_bot": True, "profile": {"display_name": "wanda-scratch"}}
+    runner = RecordingRunner()
+    p, _, _ = memory_processor(tmp_path, slack, runner, monkeypatch)
+    asyncio.run(p.handle_slack(dm(f"{AT:.1f}", "<@UBOT> the one from Tuesday")))
+    first = runner.calls[0][0]
+    assert "fan: @wanda can you check the invoice?" in first and "@wanda the one from Tuesday" in first
+    assert "scratch" not in first
+
+
 def test_a_thread_of_lines_mentioning_thousands_is_framed_at_once(tmp_path, monkeypatch):
     """The frame holds a session slot, and the event loop with it, while it
     picks which mentions to look up: 49 lines of 3,000 ids each take one
@@ -3013,6 +3028,21 @@ def test_a_message_added_while_its_session_works_names_whom_it_mentions_as_its_f
                  (("tool_use", 1, 0.1), dm(f"{AT + 30:.1f}", "<@U3> too", channel_type=channel_type)))
     place = "dm" if channel_type == "im" else "group"
     assert handed_texts(tmp_path) == [[vault.added_text(place, "fan", said, "16:40")]]
+
+
+@pytest.mark.parametrize("channel_type,place", [("im", "dm"), ("mpim", "group")])
+def test_a_message_added_while_its_session_works_names_her_wanda_whatever_her_slack_app_is_called(
+        tmp_path, monkeypatch, channel_type, place):
+    """As its frame does: a test copy's app is named otherwise, and a
+    mention of her still reads @wanda."""
+    slack = ConversationSlack(members=["U1", "U2", "UBOT"], history=[])
+    # Slack's record of her bot user, as the test copy's app names it
+    slack.held["UBOT"] = {"is_bot": True, "name": "wanda_scratch",
+                          "profile": {"display_name": "wanda-scratch", "real_name": "wanda-scratch"}}
+    p, _, _, slack = standin_processor(tmp_path, monkeypatch, slack=slack, steps=[1.0, 0.2])
+    conversation(p, (0, dm(f"{AT:.1f}", "who's coming?", channel_type=channel_type)),
+                 (("tool_use", 1, 0.1), dm(f"{AT + 30:.1f}", "<@UBOT> and you?", channel_type=channel_type)))
+    assert handed_texts(tmp_path) == [[vault.added_text(place, "fan", "@wanda and you?", "16:40")]]
 
 
 def test_a_session_no_one_messaged_takes_in_nothing(tmp_path, monkeypatch):

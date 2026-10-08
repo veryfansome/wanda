@@ -33,8 +33,11 @@ SEVERAL = (" (after ", " (then ")
 NOW = " now"
 # Slack's answers that show no one: an id is never let in on one of them alone
 SHUT = ("user_not_found", "user_not_visible", "bot", "deleted")
+# her name, by which `mem` finds her own node (SELF_NAME, memory/src/lib.rs):
+# a mention of her reads as it in every frame, whatever her Slack app is called
+NAME = "wanda"
 # the labels `mem` resolves to her own node (memory/src/lib.rs)
-SELF = ("me", "wanda")
+SELF = ("me", NAME)
 # the longest label `mem entity` takes (SUMMARY_MAX in memory/src/lib.rs)
 LABEL_MAX = 140
 # a label `mem entity` refuses for looking like an id: a hash id, or a kind

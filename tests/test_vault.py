@@ -26,7 +26,7 @@ import pytest
 
 from wanda import clock, vault
 from wanda.config import Config
-from wanda.household import Household, flaw
+from wanda.household import NAME, SELF, Household, flaw
 from wanda.transcript import harmless, plain
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -655,6 +655,28 @@ def test_her_mention_reads_as_her_name_in_every_frame():
     assert vault.added_text("dm", named["U1"], said, "16:41").startswith(
         "fan adds this in the same direct message at 16:41, before anything I say back has been sent:\n\n"
         "    @wanda the plumber is Tuesday")
+
+
+def test_her_mention_reads_as_her_name_whatever_her_app_is_called():
+    """A test copy runs on a Slack app of its own, named otherwise: a
+    mention of her still reads @wanda, the name memory finds her own node
+    by, in a 1:1 DM and elsewhere, and with no record of her at all."""
+    h = household()
+    scratch = {"is_bot": True, "name": "wanda_scratch",
+               "profile": {"display_name": "wanda-scratch", "real_name": "wanda-scratch"}}
+    for users in ({"U1": {}, "UBOT": scratch}, {"U1": {}}):
+        for marked in (True, False):
+            named = vault.names(["U1", "UBOT"], users, h.told_names(), h.namesakes(), OWN, h.allowed, marked)
+            assert named["UBOT"] == "wanda"
+            said = vault.message_text("<@UBOT> the plumber is Tuesday", None, named)
+            assert said == "@wanda the plumber is Tuesday"
+
+
+def test_her_name_and_labels_are_the_ones_mem_finds_her_own_node_by():
+    src = (ROOT / "memory/src/lib.rs").read_text()
+    label = re.search(r'pub const SELF_LABEL: &str = "(\w+)";', src).group(1)
+    name = re.search(r'pub const SELF_NAME: &str = "(\w+)";', src).group(1)
+    assert name == NAME and (label, name) == SELF
 
 
 # Names a person may give themselves in Slack, each rendered into every frame
