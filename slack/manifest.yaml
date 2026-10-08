@@ -12,6 +12,8 @@
 #
 # Changing scopes requires REINSTALLING the app (Install App -> Reinstall) and
 # copying the new xoxb- token into .env.
+# wanda-scratch, the checks' app, is then reinstalled too, from its own file
+# (slack/manifest-scratch.yaml), its new token into its own variable.
 #
 # `wanda slack search` additionally needs a user token (xoxp-) with search:read,
 # which is a user scope: add it under oauth_config.scopes.user, reinstall, and

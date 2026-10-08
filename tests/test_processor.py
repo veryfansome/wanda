@@ -4547,6 +4547,31 @@ def test_doctor_says_whether_the_bot_token_can_put_her_reaction_on(tmp_path, cap
     assert f"  {line}" in capsys.readouterr().out
 
 
+@pytest.mark.parametrize("name", ["wanda", "wanda-scratch"])
+def test_doctor_names_the_bot_user_its_token_belongs_to(tmp_path, capsys, monkeypatch, name):
+    """Beside its id, the name auth.test gives for the bot user, when it
+    gives one: the household's token and a test copy's are told apart at a
+    glance."""
+    from slack_sdk.web.slack_response import SlackResponse
+
+    class Web:
+        def __init__(self, **kw):
+            pass
+
+        def auth_test(self):
+            return SlackResponse(client=None, http_verb="POST", api_url="auth.test", req_args={}, status_code=200,
+                                 data={"ok": True, "user_id": "UBOT", "user": name, "team": "household"},
+                                 headers={"x-oauth-scopes": "chat:write,reactions:write"})
+
+        def apps_connections_open(self, app_token):
+            return {"ok": True}
+    monkeypatch.setattr("slack_sdk.WebClient", Web)
+    c = Config(_env_file=None, data_dir=tmp_path, claude_bin="/bin/true", email_triage=False,
+               slack_bot_token="xoxb-x", slack_app_token="xapp-y")
+    asyncio.run(main.run_doctor(c, smoke=False))
+    assert f"  ✓ bot token — bot user UBOT ({name}) in household; reactions:write\n" in capsys.readouterr().out
+
+
 # --- the run cap, and Claude Code's limit ---
 
 def a_pass(p):

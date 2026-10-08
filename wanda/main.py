@@ -4671,8 +4671,13 @@ async def run_doctor(cfg: Config, smoke: bool) -> int:
             # the scopes the token was given, which Slack sends in a header
             # with every answer, a header's name having no fixed case
             scopes = next((v for k, v in auth.headers.items() if k.lower() == "x-oauth-scopes"), "")
+            # the bot user's Slack name beside its id says which app the
+            # token is: the household's bot token and a test copy's
+            # (wanda-scratch) sit side by side in .env, and either works in
+            # the other's place until a reaction or a post is refused
+            bot = auth["user_id"] + (f" ({auth['user']})" if auth.get("user") else "")
             if "reactions:write" in {s.strip() for s in scopes.split(",")}:
-                report("bot token", True, f"bot user {auth['user_id']} in {auth['team']}; reactions:write")
+                report("bot token", True, f"bot user {bot} in {auth['team']}; reactions:write")
             else:
                 report("bot token", False, "the token lacks reactions:write: update the app from "
                                            "slack/manifest.yaml and reinstall it (README, Setup, step 3)")

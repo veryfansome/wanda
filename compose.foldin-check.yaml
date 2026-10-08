@@ -1,24 +1,26 @@
 # Live checks of a message added while a session works, and the re-check a
 # move of CLAUDE_VERSION waits for, laid over compose.wanda.yaml in a project
 # of their own, so that the household's vault, run store, home directory,
-# transcripts and image are left alone. The name below takes the place of
-# compose.wanda.yaml's even when -p is left out, so the vault and the run
-# store are this project's own named volumes, wanda-foldin-check_vault and
+# transcripts, image and Slack app are left alone. The name below takes the
+# place of compose.wanda.yaml's even when -p is left out, so the vault and the
+# run store are this project's own named volumes, wanda-foldin-check_vault and
 # wanda-foldin-check_store, the only ones `down -v` here can remove; the home
 # directory and the transcripts are a directory of its own; and the image is
-# its own, so a re-check's build never retags the household's. Whatever
-# .env says, it runs no morning look, and one session at a time, since a
-# check has one session wait for another's to end; and no email triage, even
-# once compose.wanda.yaml turns it on. Its clock still gives a timed reminder
-# asked for here at its time, while this runs. Only one daemon may hold the
-# Slack app's connection, so the household's is stopped for as long as this
-# runs, and messages sent meanwhile reach this vault and are not remembered.
-# The checks' lines and this daemon's answers stay in the household's
-# conversations, where the household's sessions read them as earlier lines
-# for 12 hours, so a check uses only facts and requests the household keeps.
+# its own, so a re-check's build never retags the household's. Whatever .env
+# says, it runs no morning look, and one session at a time, since a check has
+# one session wait for another's to end; and no email triage, even once
+# compose.wanda.yaml turns it on. Its clock still gives a timed reminder asked
+# for here at its time, while this runs. It runs as a Slack app of its own,
+# wanda-scratch (slack/manifest-scratch.yaml), and will not start without that
+# app's two tokens and its alerts channel, a private one holding only fan and
+# wanda-scratch. It connects only with the values set for wanda-scratch, so it
+# never takes wanda's connection from her own variables: the household runs on
+# meanwhile, and what is said to wanda-scratch reaches this vault alone, is
+# not remembered, and stays in conversations no household session reads. Only
+# one daemon may hold an app's connection, so one scratch at a time runs on
+# wanda-scratch.
 # From the household's worktree:
 #
-#   docker compose -f compose.wanda.yaml stop
 #   mkdir -p ~/wanda-foldin-check/transcripts
 #   docker compose -p wanda-foldin-check -f compose.wanda.yaml -f compose.foldin-check.yaml build --build-arg CLAUDE_VERSION=<the version checked>
 #       a re-check only
@@ -26,12 +28,16 @@
 #   ... the checks; then
 #   docker compose -p wanda-foldin-check -f compose.wanda.yaml -f compose.foldin-check.yaml down -v --rmi all
 #   rm -rf ~/wanda-foldin-check
-#   docker compose -f compose.wanda.yaml start
 name: wanda-foldin-check
 services:
   wanda:
     image: wanda-foldin-check
     environment:
+      # wanda-scratch's, in place of wanda's (compose.wanda.yaml): unset or
+      # empty, the scratch does not start
+      WANDA_SLACK_BOT_TOKEN: ${WANDA_SCRATCH_SLACK_BOT_TOKEN:?set it in .env, to wanda-scratch's bot token, as slack/manifest-scratch.yaml says}
+      WANDA_SLACK_APP_TOKEN: ${WANDA_SCRATCH_SLACK_APP_TOKEN:?set it in .env, to wanda-scratch's app-level token, as slack/manifest-scratch.yaml says}
+      WANDA_ALERT_CHANNEL: ${WANDA_SCRATCH_ALERT_CHANNEL:?set it in .env, to the id of the private channel holding only fan and wanda-scratch, for its alerts}
       WANDA_MORNINGS: ""
       WANDA_MEMORY_SESSIONS: "1"
       WANDA_EMAIL_TRIAGE: "off"

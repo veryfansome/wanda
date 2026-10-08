@@ -1,0 +1,77 @@
+# Slack app manifest for wanda-scratch: the test copy of wanda that
+# compose.foldin-check.yaml runs during a check, so that a check never runs on
+# the household's app and the household runs on meanwhile. It is
+# slack/manifest.yaml with three values changed, display_information's name
+# and description and features.bot_user.display_name, which
+# tests/test_scratch_app.py holds it to: when slack/manifest.yaml changes,
+# this file changes with it, and the app is updated from it and reinstalled.
+# Create at https://api.slack.com/apps -> Create New App -> From a manifest,
+# paste this file, then:
+#   1. Basic Information -> App-Level Tokens -> generate one with scope
+#      connections:write  -> WANDA_SCRATCH_SLACK_APP_TOKEN (xapp-...)
+#   2. Install App to workspace -> Bot User OAuth Token ->
+#      WANDA_SCRATCH_SLACK_BOT_TOKEN (xoxb-...)
+#   3. Basic Information -> Display Information: an icon unlike wanda's, so
+#      that nobody picks one app for the other in Slack's lists
+#   4. A private channel holding only fan; /invite @wanda-scratch there, and
+#      its channel id -> WANDA_SCRATCH_ALERT_CHANNEL, for the scratch's alerts
+# Delayed Events (Event Subscriptions) stays off: no check needs it, and with
+# it on Slack could resend into a check a line sent here between checks.
+# Never put it in a conversation wanda is in, nor wanda in one of its own: a
+# conversation that holds both apps shows each to the other's sessions as
+# someone outside the household.
+#
+# Changing scopes requires REINSTALLING the app (Install App -> Reinstall) and
+# copying the new xoxb- token into .env, as WANDA_SCRATCH_SLACK_BOT_TOKEN:
+# where Slack gives the bot user's name, the household's doctor then still
+# names wanda on its `bot token` line, and a check's doctor names this app.
+display_information:
+  name: wanda-scratch
+  description: Test copy of wanda that answers only while fan runs a check. Anything sent here at other times gets no answer; talk to wanda instead.
+  background_color: "#333333"
+features:
+  bot_user:
+    display_name: wanda-scratch
+    always_online: true
+  app_home:
+    # Without this nobody can DM the bot at all.
+    messages_tab_enabled: true
+    messages_tab_read_only_enabled: false
+    home_tab_enabled: false
+oauth_config:
+  scopes:
+    bot:
+      # Mentions are detected from message text, so app_mentions:read and the
+      # app_mention event are deliberately absent: Slack would deliver a second
+      # envelope per mention that wanda discards.
+      - chat:write
+      - channels:history
+      - channels:read
+      - groups:history
+      - groups:read
+      - im:history
+      - im:read
+      - im:write
+      - mpim:history
+      - mpim:read
+      - mpim:write
+      # her reaction on a member's message from when she takes it until her
+      # answer is posted, which says she has it: she is otherwise silent
+      # until she has something to say
+      - reactions:write
+      - users:read
+settings:
+  event_subscriptions:
+    bot_events:
+      - message.channels
+      - message.groups
+      - message.im
+      - message.mpim
+  interactivity:
+    # No buttons or modals: the watcher only handles events_api
+    # envelopes and discards interactive payloads.
+    is_enabled: false
+  org_deploy_enabled: false
+  socket_mode_enabled: true
+  token_rotation_enabled: false
+  is_mcp_enabled: false
